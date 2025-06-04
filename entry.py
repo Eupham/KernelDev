@@ -326,19 +326,19 @@ def main():
     print("\n" + "="*40)
     print("TEST 2: LOSS REDUCTION")
     print("="*40)
-    streaming_losses, reference_losses = tester.test_loss_reduction(num_epochs=10)
+    flash_losses, reference_losses = tester.test_loss_reduction(num_epochs=10)
     
     # Plot loss curves
-    tester.plot_loss_curves(streaming_losses, reference_losses)
+    tester.plot_loss_curves(flash_losses, reference_losses)
     
     # Check if both models can reduce loss
-    streaming_reduced = streaming_losses[0] > streaming_losses[-1]
+    flash_reduced = flash_losses[0] > flash_losses[-1]
     reference_reduced = reference_losses[0] > reference_losses[-1]
     
     print(f"\nLoss reduction results:")
-    print(f"  Streaming model reduced loss: {streaming_reduced}")
+    print(f"  Flash model reduced loss: {flash_reduced}")
     print(f"  Reference model reduced loss: {reference_reduced}")
-    print(f"  Initial vs Final - Streaming: {streaming_losses[0]:.6f} -> {streaming_losses[-1]:.6f}")
+    print(f"  Initial vs Final - Flash: {flash_losses[0]:.6f} -> {flash_losses[-1]:.6f}")
     print(f"  Initial vs Final - Reference: {reference_losses[0]:.6f} -> {reference_losses[-1]:.6f}")
     
     # Test 3: Performance Benchmark
@@ -353,11 +353,11 @@ def main():
     print("SUMMARY")
     print("="*60)
     print(f"✓ Gradient accuracy test: {'PASSED' if gradient_test_passed else 'FAILED'}")
-    print(f"✓ Loss reduction test: {'PASSED' if streaming_reduced else 'FAILED'}")
+    print(f"✓ Loss reduction test: {'PASSED' if flash_reduced else 'FAILED'}")
     print(f"✓ Modules separated successfully: fwd.py and bwd.py")
-    print(f"✓ Integration test: {'PASSED' if gradient_test_passed and streaming_reduced else 'FAILED'}")
+    print(f"✓ Integration test: {'PASSED' if gradient_test_passed and flash_reduced else 'FAILED'}")
     
-    overall_success = gradient_test_passed and streaming_reduced
+    overall_success = gradient_test_passed and flash_reduced
     print(f"\nOverall test result: {'SUCCESS' if overall_success else 'PARTIAL SUCCESS'}")
     
     if not overall_success:
