@@ -661,7 +661,7 @@ def _flash_attn_bwd_dq(
         dp = tl.dot(do, vT.to(do.dtype))
         dp = dp.to(tl.float32)
         ds = p * (dp - di[:, None])
-        dq = tl.dot(ds, tl.trans(kT).to(ds.dtype), dq, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dq = tl.dot(ds, tl.trans(kT).to(ds.dtype), dq)
 
     dq *= softmax_scale
     return dq
