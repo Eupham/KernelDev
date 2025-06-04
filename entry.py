@@ -208,7 +208,7 @@ def test_grad_accuracy(dtype_test=torch.float32):
         # Optionally, one could gradcheck streaming_attention_reference on CPU.
         return
 
-    B, H, T, HEAD_DIM = 1, 1, 8, 4
+    B, H, T, HEAD_DIM = 1, 1, 8, 16
     context_size, back_contexts = 4, 0
 
     q_double = torch.randn(B, H, T, HEAD_DIM, device=device, dtype=torch.double, requires_grad=True)
