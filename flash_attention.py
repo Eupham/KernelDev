@@ -318,25 +318,28 @@ def _self_attn_fwd(
     # The shapes are (B, H, T) for M_val and LogSumExp_val.
     # q_token_idx is the start of the current tile.
     # tl.arange(0, TILE_Q_SIZE) gives offsets within the tile.
+    # q_tile_indices is q_token_idx + tl.arange(0, TILE_Q_SIZE)
 
-    current_q_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
+    # Define the actual indices for storing into M_val and LogSumExp_val
+    # These are (B,H,T) so we need to map q_tile_indices appropriately.
+    # The batch and head are program_id(0) and program_id(1).
+    # q_tile_indices are already the correct sequence dimension indices.
 
-    # Create masks for storing m_i and l_i, similar to need_q_mask but for individual elements
+    m_val_ptr = M_val + batch * stride_mb + head * stride_mh + q_tile_indices * stride_mt
+    l_val_ptr = LogSumExp_val + batch * stride_lb + head * stride_lh + q_tile_indices * stride_lt
+
     if LEN_PRESENT:
-        store_mask = current_q_indices < seq_len
+        store_mask = q_tile_indices < seq_len
+        tl.store(m_val_ptr, m_i, mask=store_mask)
+        tl.store(l_val_ptr, l_i, mask=store_mask)
     else:
-        # If no lens tensor, all positions up to T are valid, handled by boundary_check on store
-        # or by ensuring TILE_Q_SIZE aligns with T, or no mask if always < seq_len.
-        # For simplicity, if not LEN_PRESENT, assume all are valid within the tile.
-        # However, Triton store with block_ptr might handle boundary internally based on shape.
-        # Explicit mask is safer for row-wise stores into a flat tensor representation.
-        store_mask = current_q_indices < T # Should always be true if q_token_idx < seq_len
-
-    m_offsets = batch * stride_mb + head * stride_mh + current_q_indices * stride_mt
-    tl.store(M_val + m_offsets, m_i, mask=store_mask if LEN_PRESENT else None, boundary_check=(0,) if not LEN_PRESENT else (False,)) # boundary_check might be redundant with mask
-
-    l_offsets = batch * stride_lb + head * stride_lh + current_q_indices * stride_lt
-    tl.store(LogSumExp_val + l_offsets, l_i, mask=store_mask if LEN_PRESENT else None, boundary_check=(0,) if not LEN_PRESENT else (False,))
+        # If not LEN_PRESENT, all tokens up to T are valid.
+        # Mask ensures we don't write past T for tiles that might partially exceed T
+        # (though program guards should prevent q_token_idx >= T).
+        # More importantly, if T is not perfectly divisible by TILE_Q_SIZE.
+        store_mask = q_tile_indices < T
+        tl.store(m_val_ptr, m_i, mask=store_mask)
+        tl.store(l_val_ptr, l_i, mask=store_mask)
 
 # fmt: on
 

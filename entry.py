@@ -171,84 +171,59 @@ def test_accuracy(batch_size, num_heads, seq_len, head_dim, dtype, device, use_l
     return True
 
 
-def benchmark_speed(batch_size, num_heads, seq_len, head_dim, dtype, device, use_lens, is_causal, prescale, autotune_custom, num_repeats=10, num_warmup=3):
-    print(f"\n--- Speed Benchmark ---")
+# (generate_inputs function and other parts of entry.py remain the same)
+
+def benchmark_speed(batch_size, num_heads, seq_len, head_dim, dtype, device, use_lens, is_causal, prescale, autotune_custom, num_repeats=20, num_warmup=5):
+    print(f"\n--- Speed Benchmark (using time.perf_counter) ---")
     print(f"Params: B={batch_size}, H={num_heads}, T={seq_len}, D={head_dim}, dtype={dtype}, device={device}, use_lens={use_lens}, is_causal={is_causal}, prescale={prescale}, autotune_custom={autotune_custom}")
     print(f"Warmup: {num_warmup} repeats, Main: {num_repeats} repeats.")
 
     q, k, v, lens_custom, attn_mask_sdpa = generate_inputs(batch_size, num_heads, seq_len, head_dim, dtype, device, True, use_lens, is_causal)
-    do = torch.randn_like(q) # Assuming dO has same shape as Q for this example, should be like V.
-    if v.shape[-1] != q.shape[-1]: # If head_dim_v is different
-        do = torch.randn((batch_size, num_heads, seq_len, v.shape[-1]), dtype=dtype, device=device)
-    else:
-        do = torch.randn_like(v)
 
+    # Determine dO shape based on V's head dimension
+    if v.shape[-1] != q.shape[-1]: # If head_dim_v is different for V
+        do_shape = (batch_size, num_heads, seq_len, v.shape[-1])
+    else:
+        do_shape = v.shape
+    do = torch.randn(do_shape, dtype=dtype, device=device)
 
     sm_scale = head_dim ** -0.5
 
     # --- Custom Flash Attention ---
-    # Forward
-    stmt_fwd_custom = "self_attention(q, k, v, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)"
-    # Backward
-    # Setup for backward: run forward first
-    setup_bwd_custom = "output_custom = self_attention(q, k, v, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)"
-    stmt_bwd_custom = "output_custom.backward(do, retain_graph=True)" # Use retain_graph=True if benchmarking repeatedly
-
-    custom_globals = {'self_attention': self_attention, 'q': q, 'k': k, 'v': v, 'lens_custom': lens_custom, 'sm_scale': sm_scale, 'autotune_custom': autotune_custom, 'prescale': prescale, 'is_causal': is_causal, 'do': do}
-
+    print("\nBenchmarking Custom Flash Attention:")
     try:
-        # Warmup for custom forward
-        for _ in range(num_warmup):
-            eval(stmt_fwd_custom, custom_globals)
-        torch.cuda.synchronize()
-        # Benchmark custom forward
-        fwd_timer_custom = torch.utils.benchmark.Timer(stmt=stmt_fwd_custom, globals=custom_globals, num_threads=1)
-        fwd_result_custom = fwd_timer_custom.timeit(num_repeats)
-        fwd_avg_custom = fwd_result_custom.mean * 1000 # ms
-
-        # Warmup for custom backward
-        for _ in range(num_warmup):
-            eval(setup_bwd_custom, custom_globals) # output_custom is created here
-            eval(stmt_bwd_custom, {**custom_globals, 'output_custom': custom_globals['self_attention'](q,k,v,lens_custom,sm_scale=sm_scale,autotune=autotune_custom,prescale=prescale,is_causal=is_causal)}) # output_custom needs to be from the current scope
-            # Clear grads for next warmup iter
-            if q.grad is not None: q.grad.zero_()
-            if k.grad is not None: k.grad.zero_()
-            if v.grad is not None: v.grad.zero_()
-
-        torch.cuda.synchronize()
-        # Benchmark custom backward
-        # Need to ensure 'output_custom' is correctly set up for each timing loop
-        # Timer does its own looping, so setup needs to be part of it or done once if state is not changing.
-        # For autograd, state (grads) does change.
-        # A more robust way for backward is to wrap in a function.
-        def custom_fwd_bwd_once():
-            # Clear grads before each run
-            if q.grad is not None: q.grad.zero_()
-            if k.grad is not None: k.grad.zero_()
-            if v.grad is not None: v.grad.zero_()
-
-            output_custom = self_attention(q, k, v, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)
-            output_custom.backward(do)
-            torch.cuda.synchronize() # Ensure backward is done
-
-        def custom_bwd_only_after_fwd():
-            # Assumes fwd has run and q,k,v grads are None or zeroed
-            # Clear grads before each run
-            if q.grad is not None: q.grad.zero_()
-            if k.grad is not None: k.grad.zero_()
-            if v.grad is not None: v.grad.zero_()
-            # Re-run forward to get output_custom in the current grad tape context for THIS iteration
-            output_custom = self_attention(q, k, v, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)
-            output_custom.backward(do)
+        # Forward Pass
+        fwd_times_custom = []
+        for i in range(num_warmup + num_repeats):
+            if i == num_warmup: torch.cuda.synchronize() # Synchronize before starting main measurements
+            start_time = time.perf_counter()
+            output_custom_fwd = self_attention(q, k, v, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)
             torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            if i >= num_warmup:
+                fwd_times_custom.append(end_time - start_time)
 
-        # Benchmark custom fwd+bwd
-        timer_fwd_bwd_custom = torch.utils.benchmark.Timer(stmt="custom_fwd_bwd_once()", globals={'custom_fwd_bwd_once': custom_fwd_bwd_once})
-        fwd_bwd_result_custom = timer_fwd_bwd_custom.timeit(num_repeats)
-        fwd_bwd_avg_custom = fwd_bwd_result_custom.mean * 1000 # ms
+        fwd_avg_custom = (sum(fwd_times_custom) / len(fwd_times_custom)) * 1000 if fwd_times_custom else float('nan')
 
-        # Estimate backward time (less precise than dedicated bwd timer)
-        bwd_avg_custom = fwd_bwd_avg_custom - fwd_avg_custom
+        # Combined Forward + Backward Pass
+        fwd_bwd_times_custom = []
+        for i in range(num_warmup + num_repeats):
+            # Clear grads before each run
+            if q.grad is not None: q.grad.zero_()
+            if k.grad is not None: k.grad.zero_()
+            if v.grad is not None: v.grad.zero_()
+
+            if i == num_warmup: torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            output_custom_fwd_bwd = self_attention(q, k, v, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)
+            output_custom_fwd_bwd.backward(do)
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            if i >= num_warmup:
+                fwd_bwd_times_custom.append(end_time - start_time)
+
+        fwd_bwd_avg_custom = (sum(fwd_bwd_times_custom) / len(fwd_bwd_times_custom)) * 1000 if fwd_bwd_times_custom else float('nan')
+        bwd_avg_custom = fwd_bwd_avg_custom - fwd_avg_custom if not (fwd_avg_custom == float('nan') or fwd_bwd_avg_custom == float('nan')) else float('nan')
 
         print(f"Custom Flash Attention: Forward: {fwd_avg_custom:.3f} ms | Backward (estimated): {bwd_avg_custom:.3f} ms | Fwd+Bwd: {fwd_bwd_avg_custom:.3f} ms")
 
@@ -258,51 +233,48 @@ def benchmark_speed(batch_size, num_heads, seq_len, head_dim, dtype, device, use
         traceback.print_exc()
         fwd_avg_custom, bwd_avg_custom, fwd_bwd_avg_custom = float('nan'), float('nan'), float('nan')
 
-
     # --- PyTorch SDPA ---
-    # Forward
-    stmt_fwd_ref = "F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_sdpa, is_causal=is_causal_sdpa, scale=sm_scale if not prescale else None)"
-    # Backward
-    setup_bwd_ref = "output_ref = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_sdpa, is_causal=is_causal_sdpa, scale=sm_scale if not prescale else None)"
-    stmt_bwd_ref = "output_ref.backward(do, retain_graph=True)"
-
-    # SDPA's is_causal flag should be True if we want causal and there's no attn_mask for padding.
-    # If attn_mask_sdpa is present (due to use_lens), SDPA's is_causal should be False if the mask already handles causality,
-    # or True if the mask is only for padding and SDPA should still add causality.
-    # The generate_inputs creates attn_mask_sdpa only for padding. So, if is_causal is true, SDPA's is_causal should also be true.
-    is_causal_sdpa = is_causal
-
-    ref_globals = {'F': F, 'q': q, 'k': k, 'v': v, 'attn_mask_sdpa': attn_mask_sdpa, 'is_causal_sdpa': is_causal_sdpa, 'sm_scale': sm_scale, 'prescale': prescale, 'do': do}
+    print("\nBenchmarking PyTorch SDPA:")
+    is_causal_sdpa = is_causal # As per previous logic for SDPA causal flag
 
     try:
-        # Warmup for ref forward
-        for _ in range(num_warmup):
-            eval(stmt_fwd_ref, ref_globals)
-        torch.cuda.synchronize()
-        # Benchmark ref forward
-        fwd_timer_ref = torch.utils.benchmark.Timer(stmt=stmt_fwd_ref, globals=ref_globals, num_threads=1)
-        fwd_result_ref = fwd_timer_ref.timeit(num_repeats)
-        fwd_avg_ref = fwd_result_ref.mean * 1000 # ms
+        # Forward Pass
+        fwd_times_ref = []
+        for i in range(num_warmup + num_repeats):
+            if i == num_warmup: torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            output_ref_fwd = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_sdpa, is_causal=is_causal_sdpa, scale=sm_scale if not prescale else None)
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            if i >= num_warmup:
+                fwd_times_ref.append(end_time - start_time)
 
-        def ref_fwd_bwd_once():
+        fwd_avg_ref = (sum(fwd_times_ref) / len(fwd_times_ref)) * 1000 if fwd_times_ref else float('nan')
+
+        # Combined Forward + Backward Pass
+        fwd_bwd_times_ref = []
+        for i in range(num_warmup + num_repeats):
             if q.grad is not None: q.grad.zero_()
             if k.grad is not None: k.grad.zero_()
             if v.grad is not None: v.grad.zero_()
-            output_ref = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_sdpa, is_causal=is_causal_sdpa, scale=sm_scale if not prescale else None)
-            output_ref.backward(do)
-            torch.cuda.synchronize()
 
-        # Benchmark ref fwd+bwd
-        timer_fwd_bwd_ref = torch.utils.benchmark.Timer(stmt="ref_fwd_bwd_once()", globals={'ref_fwd_bwd_once': ref_fwd_bwd_once, 'q':q, 'k':k, 'v':v, 'attn_mask_sdpa':attn_mask_sdpa, 'is_causal_sdpa':is_causal_sdpa, 'sm_scale':sm_scale, 'prescale':prescale, 'do':do, 'F':F})
-        fwd_bwd_result_ref = timer_fwd_bwd_ref.timeit(num_repeats)
-        fwd_bwd_avg_ref = fwd_bwd_result_ref.mean * 1000 # ms
-        bwd_avg_ref = fwd_bwd_avg_ref - fwd_avg_ref
+            if i == num_warmup: torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            output_ref_fwd_bwd = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_sdpa, is_causal=is_causal_sdpa, scale=sm_scale if not prescale else None)
+            output_ref_fwd_bwd.backward(do)
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            if i >= num_warmup:
+                fwd_bwd_times_ref.append(end_time - start_time)
+
+        fwd_bwd_avg_ref = (sum(fwd_bwd_times_ref) / len(fwd_bwd_times_ref)) * 1000 if fwd_bwd_times_ref else float('nan')
+        bwd_avg_ref = fwd_bwd_avg_ref - fwd_avg_ref if not (fwd_avg_ref == float('nan') or fwd_bwd_avg_ref == float('nan')) else float('nan')
 
         print(f"PyTorch SDPA:       Forward: {fwd_avg_ref:.3f} ms | Backward (estimated): {bwd_avg_ref:.3f} ms | Fwd+Bwd: {fwd_bwd_avg_ref:.3f} ms")
 
-        if fwd_avg_custom is not float('nan') and fwd_avg_ref is not float('nan') and fwd_avg_ref > 0:
+        if not (fwd_avg_custom == float('nan') or fwd_avg_ref == float('nan') or fwd_avg_ref == 0):
             print(f"Custom Speedup vs SDPA (Fwd): {fwd_avg_ref/fwd_avg_custom:.2f}x")
-        if fwd_bwd_avg_custom is not float('nan') and fwd_bwd_avg_ref is not float('nan') and fwd_bwd_avg_ref > 0 :
+        if not (fwd_bwd_avg_custom == float('nan') or fwd_bwd_avg_ref == float('nan') or fwd_bwd_avg_ref == 0):
             print(f"Custom Speedup vs SDPA (Fwd+Bwd): {fwd_bwd_avg_ref/fwd_bwd_avg_custom:.2f}x")
 
     except Exception as e:
@@ -310,6 +282,7 @@ def benchmark_speed(batch_size, num_heads, seq_len, head_dim, dtype, device, use
         import traceback
         traceback.print_exc()
 
+# (main function that calls benchmark_speed and test_accuracy remains the same)
 def main():
     parser = argparse.ArgumentParser(description="Flash Attention Implementation Test and Benchmark")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
