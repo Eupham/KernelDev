@@ -21,7 +21,7 @@ def _streaming_attention(
     prescale_qk: bool,
     precision: str,
 ):
-    requires_grad = any(i.requires_grad for i in (q, k, v))
+    requires_grad = any([t.requires_grad for t in [q, k, v]])
     if sm_scale is None:
         HEAD_DIM = q.size(-1)
         sm_scale = HEAD_DIM**-0.5
