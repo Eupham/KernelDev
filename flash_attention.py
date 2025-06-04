@@ -820,12 +820,18 @@ def _self_attn_bwd(
         is_last_kv_tile = (kv_tile_idx == num_kv_tiles - 1)
 
         # kt_tile_ptr has block_shape=(HEAD_DIM, TILE_K_SIZE)
-        # boundary_check=(False, True) means check dim 1 (TILE_K_SIZE) but not dim 0 (HEAD_DIM)
-        kt_tile = tl.load(kt_tile_ptr, boundary_check=(False, True) if is_last_kv_tile else None) # (HEAD_DIM, TILE_K_SIZE)
+        if is_last_kv_tile:
+            kt_boundary_check = (tl.constexpr(False), tl.constexpr(True))
+        else:
+            kt_boundary_check = (tl.constexpr(False), tl.constexpr(False))
+        kt_tile = tl.load(kt_tile_ptr, boundary_check=kt_boundary_check) # (HEAD_DIM, TILE_K_SIZE)
 
         # v_tile_ptr has block_shape=(TILE_K_SIZE, HEAD_DIM)
-        # boundary_check=(True, False) means check dim 0 (TILE_K_SIZE) but not dim 1 (HEAD_DIM)
-        v_tile = tl.load(v_tile_ptr, boundary_check=(True, False) if is_last_kv_tile else None)   # (TILE_K_SIZE, HEAD_DIM)
+        if is_last_kv_tile:
+            v_boundary_check = (tl.constexpr(True), tl.constexpr(False))
+        else:
+            v_boundary_check = (tl.constexpr(False), tl.constexpr(False))
+        v_tile = tl.load(v_tile_ptr, boundary_check=v_boundary_check)   # (TILE_K_SIZE, HEAD_DIM)
 
         # --- Recompute S = Q @ K^T ---
         s_qk = tl.dot(q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32) # (TILE_Q_SIZE, TILE_K_SIZE)
