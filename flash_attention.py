@@ -676,7 +676,7 @@ def _self_attn_bwd(
     Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, # Inputs from fwd
     O: tl.tensor, DO: tl.tensor, # Output from fwd and its gradient
     DQ: tl.tensor, DKt: tl.tensor, DV: tl.tensor, # Outputs: Gradients for Q, K^T, V
-    softmax_m: tl.tensor, softmax_l: tl.tensor, # Softmax stats (can be passed if saved, or recomputed)
+    M_fwd: tl.tensor, L_fwd: tl.tensor, # M_fwd, L_fwd (softmax stats from fwd pass)
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
     stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,
@@ -685,6 +685,8 @@ def _self_attn_bwd(
     stride_dqb: int, stride_dqh: int, stride_dqt: int, stride_dqk: int,
     stride_dkb: int, stride_dkh: int, stride_dkk: int, stride_dkt: int,
     stride_dvb: int, stride_dvh: int, stride_dvt: int, stride_dvk: int,
+    stride_mfwdb: int, stride_mfwdh: int, stride_mfwdt: int, # Strides for M_fwd
+    stride_lfwdb: int, stride_lfwdh: int, stride_lfwdt: int, # Strides for L_fwd
     lens_stride: int,
     T: int,
     PRESCALE: tl.constexpr,
@@ -767,9 +769,30 @@ def _self_attn_bwd(
     # These would typically be stored from fwd or recomputed.
     # Assuming they are passed for now (or use placeholder if recomputing them)
     # In a full implementation, these would be computed block by block like in forward.
-    m_i = tl.load(softmax_m + batch * T + q_token_idx + tl.arange(0, TILE_Q_SIZE), boundary_check=(0,))
-    l_i = tl.load(softmax_l + batch * T + q_token_idx + tl.arange(0, TILE_Q_SIZE), boundary_check=(0,))
+
+    # q_tile_indices represents the sequence dimension indices for the current tile
+    q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
+
+    # Construct pointers for M_fwd and L_fwd for the current batch, head, and tile
+    m_fwd_ptr = M_fwd + batch * stride_mfwdb + head * stride_mfwdh + q_tile_indices * stride_mfwdt
+    l_fwd_ptr = L_fwd + batch * stride_lfwdb + head * stride_lfwdh + q_tile_indices * stride_lfwdt
+
+    # Define the mask for loading
+    if LEN_PRESENT:
+        load_mask = q_tile_indices < seq_len
+    else:
+        # If not LEN_PRESENT, all tokens up to T are valid for loading.
+        # Mask ensures we don't attempt to read beyond T if TILE_Q_SIZE causes q_tile_indices to exceed T.
+        load_mask = q_tile_indices < T
+
+    # Load m_i and l_i using the new pointers and mask, without boundary_check
+    m_i = tl.load(m_fwd_ptr, mask=load_mask, other=-float("inf")) # Pad with -inf if m_i is used in max
+    l_i = tl.load(l_fwd_ptr, mask=load_mask, other=0.0)      # Pad with 0 if l_i is used in sum
+
     l_i_rcp = 1.0 / l_i # Reciprocal for normalization
+    # Handle cases where l_i might be zero due to masking or underflow, to avoid NaN in rcp
+    l_i_rcp = tl.where(l_i == 0.0, 0.0, l_i_rcp)
+
 
     do_tile = tl.load(do_ptr, boundary_check=(0,)) # (TILE_Q_SIZE, HEAD_DIM)
 
@@ -1100,13 +1123,15 @@ def attention_backward_adapter(
         q, kt, v, lens, # Inputs Q, K^T, V, L (lens)
         o, do,          # Fwd output O and its grad dO
         dq, dkt, dv,    # Output grads for Q, K^T, V
-        m_fwd, l_fwd,   # Softmax stats from fwd (passed as base ptrs as per current _self_attn_bwd)
+        m_fwd, l_fwd,   # M_fwd, L_fwd tensors
         # Strides for Q, K^T, V
         *strides(q), *strides(kt), *strides(v),
         # Strides for O, dO
         *strides(o), *strides(do),
         # Strides for dQ, dK^T, dV
         *strides(dq), *strides(dkt), *strides(dv),
+        # Strides for M_fwd, L_fwd
+        *(strides(m_fwd)), *(strides(l_fwd)),
         # Lens stride
         *(strides(lens) if lens is not None else [0]),
         T=T,
