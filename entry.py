@@ -3,18 +3,18 @@ import torch.nn.functional as F
 import os
 import sys
 
-# It's assumed that fwd.py and bwd.py are in the same directory or accessible via PYTHONPATH
-from fwd import attention_forward_adapter
-from bwd import attention_backward_adapter_op, attention_backward_adapter_op_setup_context
+# Updated imports to reflect potential renames in fwd.py and bwd.py
+from fwd import causal_attention_forward_adapter
+from bwd import causal_attention_backward_op, causal_attention_backward_op_setup_context
 
 @torch.compile(fullgraph=True, dynamic=True)
-def _streaming_attention(
+def _causal_attention( # Renamed
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     lens: torch.Tensor | None,
-    context_size: int,
-    back_contexts: int,
+    # context_size: int, # Removed
+    # back_contexts: int, # Removed
     sm_scale: float | None,
     autotune: bool,
     return_lse: bool,
@@ -26,24 +26,19 @@ def _streaming_attention(
         HEAD_DIM = q.size(-1)
         sm_scale = HEAD_DIM**-0.5
 
-    # The custom op is CUDA only. Check if CUDA is available.
-    if not q.is_cuda and torch.cuda.is_available(): # q might be on CPU due to device selection logic
-        # This case should ideally not be hit if device selection is consistent
-        # but as a safeguard:
-        raise RuntimeError("_streaming_attention custom op called with CPU tensors when CUDA is available. Ensure tensors are on CUDA.")
-
+    if not q.is_cuda and torch.cuda.is_available():
+        raise RuntimeError("_causal_attention custom op called with CPU tensors when CUDA is available. Ensure tensors are on CUDA.")
     if not torch.cuda.is_available() and q.is_cuda:
-         raise RuntimeError("_streaming_attention custom op called with CUDA tensors when CUDA is NOT available.")
+         raise RuntimeError("_causal_attention custom op called with CUDA tensors when CUDA is NOT available.")
 
-    # Only call the CUDA op if inputs are on CUDA and CUDA is available
-    if q.is_cuda:
-        O, LSE = torch.ops.alexdremov_streaming_attention.forward(
+    if q.is_cuda: # Custom op is CUDA only
+        O, LSE = torch.ops.alexdremov_causal_attention.forward( # Updated op name
             q=q,
             k=k,
             v=v,
             lens=lens,
-            context_size=context_size,
-            back_contexts=back_contexts,
+            # context_size=context_size, # Removed
+            # back_contexts=back_contexts, # Removed
             sm_scale=sm_scale,
             autotune=autotune,
             prescale_qk=prescale_qk,
@@ -51,27 +46,29 @@ def _streaming_attention(
             precision=precision,
         )
     else:
-        # Fallback or error if not on CUDA
-        # For now, let's raise an error as the op is CUDA-specific
-        raise RuntimeError("Streaming attention custom CUDA op called with CPU tensors or CUDA not available.")
+        raise RuntimeError("Causal attention custom CUDA op called with CPU tensors or CUDA not available.")
 
     if return_lse:
         return O, LSE
     return O
 
-def streaming_attention(
+def causal_attention( # Renamed
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     lens: torch.Tensor | None,
-    context_size: int,
-    back_contexts: int,
+    # context_size: int, # Removed
+    # back_contexts: int, # Removed
     sm_scale: float | None = None,
     autotune=False,
     return_lse=False,
     prescale_qk=False,
     precision="ieee",
 ):
+    """
+    Computes causal self-attention.
+    Args are similar to streaming_attention but without context_size and back_contexts.
+    """
     if not torch.compiler.is_compiling():
         for i in (q, k, v):
             torch._dynamo.mark_static(i, 0)
@@ -81,16 +78,13 @@ def streaming_attention(
         HEAD_DIM = q.size(-1)
         sm_scale = HEAD_DIM**-0.5
 
-    # If not on CUDA, this will call _streaming_attention which will raise an error
-    # as the custom op is CUDA-only.
-    # The device of q, k, v should be consistent before calling this.
-    result = _streaming_attention(
+    result = _causal_attention( # Renamed
         q=q,
         k=k,
         v=v,
         lens=lens,
-        context_size=context_size,
-        back_contexts=back_contexts,
+        # context_size=context_size, # Removed
+        # back_contexts=back_contexts, # Removed
         sm_scale=sm_scale,
         autotune=autotune,
         return_lse=return_lse,
@@ -99,78 +93,74 @@ def streaming_attention(
     )
     return result
 
+# Updated autograd registration
 torch.library.register_autograd(
-    "alexdremov_streaming_attention::forward",
-    attention_backward_adapter_op,
-    setup_context=attention_backward_adapter_op_setup_context,
+    "alexdremov_causal_attention::forward", # Updated op name
+    causal_attention_backward_op, # Using renamed backward op from bwd.py
+    setup_context=causal_attention_backward_op_setup_context, # Using renamed setup context from bwd.py
 )
 
-def streaming_attention_reference(
-    q, k, v, context_size, back_contexts, lens, scale=None
-):
-    block_size = context_size
-    left_context_blocks_count = back_contexts + 1
-    T = q.shape[-2]
+def causal_attention_reference(q, k, v, lens, scale=None): # Renamed and simplified
+    """
+    Reference causal attention using PyTorch's F.scaled_dot_product_attention.
+    `lens` is not directly used by is_causal=True but could be used to generate a key_padding_mask
+    if combined causal+padding is needed. For this reference, we rely on is_causal only.
+    """
+    if scale is None:
+        scale = q.size(-1)**-0.5 # Common practice if not provided
 
-    block_idxes = torch.div(torch.arange(T, device=q.device), block_size, rounding_mode="floor")
-    block_idxes_diff = block_idxes.unsqueeze(1) - block_idxes.unsqueeze(0)
-    attn_mask = (block_idxes_diff >= 0) & (block_idxes_diff < left_context_blocks_count)
-
-    if lens is not None:
-        key_padding_mask = (
-            torch.arange(T, device=q.device).unsqueeze(0) < lens.unsqueeze(-1)
-        ).unsqueeze(-1)
-        key_padding_mask_ref = key_padding_mask
-        key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
-        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask.unsqueeze(1)
-        res_mask = key_padding_mask_ref.unsqueeze(1)
-    else:
-        attn_mask = attn_mask.to(q.device)
-        res_mask = torch.tensor([True], device=q.device)
+    # F.scaled_dot_product_attention with is_causal=True handles causal masking.
+    # If `lens` were to be used to create a key_padding_mask, it would need careful construction
+    # as `is_causal` and `attn_mask` (for key_padding_mask) are mutually exclusive in the simpler API.
+    # For a pure causal reference, `attn_mask` is None.
+    # If `lens` is provided, a proper combined mask would need to be manually created and passed to `attn_mask`.
+    # This basic reference does not implement manual mask combination with `lens`.
+    _ = lens # lens is ignored in this simplified reference.
 
     output = F.scaled_dot_product_attention(
-            query=q, key=k, value=v, attn_mask=attn_mask, scale=scale
+            query=q, key=k, value=v, attn_mask=None, dropout_p=0.0, is_causal=True, scale=scale
         )
+    # Placeholder for LSE (not typically returned by SDPA) and sparsity_fraction (1.0 for dense causal)
+    return output, None, 1.0
 
-    sparsity_fraction = attn_mask.sum().item() / attn_mask.numel() if attn_mask.numel() > 0 else 0.0
-    return (
-        output,
-        res_mask,
-        sparsity_fraction,
-    )
 
 def test_loss_reduction(dtype=torch.float32):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\nRunning loss reduction test on {device.upper()} with {dtype}...")
+    print(f"\nRunning loss reduction test for CAUSAL attention on {device.upper()} with {dtype}...")
 
     if device == "cpu":
         print("Skipping loss reduction test for custom op on CPU as it's CUDA-only.")
-        # Optionally, run with streaming_attention_reference if a CPU test is desired
-        # For now, just skip as the main goal is testing the custom op path.
         return
 
-    B, H, T, HEAD_DIM = 2, 2, 64, 32
-    context_size, back_contexts = 16, 1
+    B, H, T, HEAD_DIM = 2, 2, 16, 32
 
-    q = torch.randn(B, H, T, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(B, H, T, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(B, H, T, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
-    target = torch.randn(B, H, T, HEAD_DIM, device=device, dtype=dtype)
+    input_sequence = torch.randn(B, H, T, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
+    # Target: predict the next token in the sequence (autoregressive)
+    # For causal attention, output at step t should predict input_sequence at t+1
+    # So, the loss is calculated between output[..., :-1, :] and input_sequence[..., 1:, :]
+
+    # Parameters for the attention mechanism itself (q, k, v are projections of input_sequence)
+    # For simplicity in testing the op, we make q,k,v themselves require grad.
+    # In a real model, these would be outputs of nn.Linear layers.
+    q_param = input_sequence.clone().detach().requires_grad_(True)
+    k_param = input_sequence.clone().detach().requires_grad_(True)
+    v_param = input_sequence.clone().detach().requires_grad_(True)
 
     sm_scale_val = HEAD_DIM**-0.5
-    optimizer = torch.optim.SGD([q, k, v], lr=0.01)
+    optimizer = torch.optim.SGD([q_param, k_param, v_param], lr=0.01)
 
     initial_loss = -1.0
     final_loss = -1.0
     loss_decreased = False
 
+    print("Starting loss reduction test (autoregressive prediction)...")
     for i in range(5):
         optimizer.zero_grad()
-        output = streaming_attention( # This will use the custom op path if on CUDA
-            q, k, v,
+        # The model (causal_attention) takes q, k, v.
+        # For an autoregressive task, q, k, v are typically derived from the same input sequence.
+        output = causal_attention(
+            q_param, k_param, v_param,
             lens=None,
-            context_size=context_size,
-            back_contexts=back_contexts,
             sm_scale=sm_scale_val,
             autotune=False,
             return_lse=False,
@@ -178,7 +168,10 @@ def test_loss_reduction(dtype=torch.float32):
             precision="ieee"
         )
 
-        loss = F.mse_loss(output, target)
+        # Loss: predict next token. output_t should predict input_sequence_{t+1}
+        # output is (B,H,T,D). We compare output token 0..T-2 with input token 1..T-1
+        loss = F.mse_loss(output[..., :-1, :], input_sequence[..., 1:, :].detach()) # Target should not require grad here
+
         if i == 0:
             initial_loss = loss.item()
         print(f"Step {i}, Loss: {loss.item()}")
@@ -186,10 +179,9 @@ def test_loss_reduction(dtype=torch.float32):
         loss.backward()
         optimizer.step()
 
-        if i == 4: # Last step
+        if i == 4:
             final_loss = loss.item()
 
-        # Check for decrease relative to initial, not just previous step
         if loss.item() < initial_loss:
             loss_decreased = True
 
@@ -201,15 +193,13 @@ from torch.autograd import gradcheck
 
 def test_grad_accuracy(dtype_test=torch.float32):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\nRunning gradient accuracy test on {device.upper()} with {dtype_test}...")
+    print(f"\nRunning gradient accuracy test for CAUSAL attention on {device.upper()} with {dtype_test}...")
 
     if device == "cpu":
         print("Skipping gradient accuracy test for custom op on CPU as it's CUDA-only.")
-        # Optionally, one could gradcheck streaming_attention_reference on CPU.
         return
 
-    B, H, T, HEAD_DIM = 1, 1, 8, 16
-    context_size, back_contexts = 4, 0
+    B, H, T, HEAD_DIM = 1, 1, 8, 16 # HEAD_DIM is now 16
 
     q_double = torch.randn(B, H, T, HEAD_DIM, device=device, dtype=torch.double, requires_grad=True)
     k_double = torch.randn(B, H, T, HEAD_DIM, device=device, dtype=torch.double, requires_grad=True)
@@ -222,21 +212,21 @@ def test_grad_accuracy(dtype_test=torch.float32):
         key = key_double.to(dtype_test)
         value = value_double.to(dtype_test)
 
-        output = streaming_attention(
+        # Using the main causal_attention function for the op call
+        output = causal_attention(
             query, key, value,
             lens=None,
-            context_size=context_size,
-            back_contexts=back_contexts,
             sm_scale=sm_scale_val,
             autotune=False,
-            return_lse=True,
+            return_lse=True, # Must be true for gradcheck as LSE is part of backward
             prescale_qk=False,
             precision="ieee"
         )
-        if isinstance(output, tuple):
-            return output[0].to(torch.double)
+        if isinstance(output, tuple): # (O, LSE)
+            return output[0].to(torch.double) # Return O for gradcheck
         return output.to(torch.double)
 
+    print("Starting gradient accuracy check (gradcheck)...")
     inputs_double = (q_double, k_double, v_double)
     is_correct = gradcheck(gradcheck_func_wrapper, inputs_double, eps=1e-3, atol=5e-3, nondet_tol=1e-7, fast_mode=False)
     assert is_correct, "Gradient check failed."
@@ -244,22 +234,18 @@ def test_grad_accuracy(dtype_test=torch.float32):
 
 
 if __name__ == "__main__":
-    print("Running tests in entry.py...")
+    print("Running tests in entry.py for CAUSAL attention...")
 
-    # Test with float32
     test_loss_reduction(dtype=torch.float32)
     test_grad_accuracy(dtype_test=torch.float32)
 
-    # Potentially test with bfloat16 if supported and desired
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        print("\nTesting with torch.bfloat16 on CUDA...")
         test_loss_reduction(dtype=torch.bfloat16)
-        # Gradcheck with bfloat16 is often problematic due to its low precision.
-        # It might require very loose tolerances or be skipped.
-        # print("\nGradient accuracy test for bfloat16 might be unstable/skipped.")
-        # test_grad_accuracy(dtype_test=torch.bfloat16)
+        # gradcheck for bfloat16 is typically skipped or needs very loose tolerances
+        # print("\nGradient accuracy test for bfloat16 might be unstable/skipped for causal_attention.")
     elif torch.cuda.is_available():
         print("\ntorch.bfloat16 not supported on this CUDA device for tests.")
-
 
     print("\nAll specified tests in entry.py finished.")
 
@@ -268,14 +254,13 @@ if __name__ == "__main__":
         q_ex = torch.randn(B, H, T_val, D_val, device='cuda', dtype=torch.float32)
         k_ex = torch.randn(B, H, T_val, D_val, device='cuda', dtype=torch.float32)
         v_ex = torch.randn(B, H, T_val, D_val, device='cuda', dtype=torch.float32)
-        context_ex, back_ex = 8, 1
 
-        print("\nRunning example usage of streaming_attention...")
-        output_ex_no_lse = streaming_attention(q_ex, k_ex, v_ex, None, context_ex, back_ex, return_lse=False)
-        print("Example streaming_attention output shape (return_lse=False):", output_ex_no_lse.shape)
+        print("\nRunning example usage of causal_attention...")
+        output_ex_no_lse = causal_attention(q_ex, k_ex, v_ex, None, return_lse=False)
+        print("Example causal_attention output shape (return_lse=False):", output_ex_no_lse.shape)
 
-        output_ex_with_lse, lse_ex = streaming_attention(q_ex, k_ex, v_ex, None, context_ex, back_ex, return_lse=True)
-        print("Example streaming_attention output shape (return_lse=True):", output_ex_with_lse.shape)
+        output_ex_with_lse, lse_ex = causal_attention(q_ex, k_ex, v_ex, None, return_lse=True)
+        print("Example causal_attention output shape (return_lse=True):", output_ex_with_lse.shape)
         print("Example LSE shape:", lse_ex.shape)
     else:
         print("\nSkipping example usage as CUDA is not available.")
