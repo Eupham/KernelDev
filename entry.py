@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import time
 import argparse
 from typing import Optional
+from torch.autograd import gradcheck # Import gradcheck
 
 # Assuming flash_attention.py is in the same directory or accessible in PYTHONPATH
 from flash_attention import self_attention
@@ -11,17 +12,13 @@ from flash_attention import self_attention
 # This is a fallback and should ideally not be needed if the environment is set up for custom ops.
 try:
     torch.ops.alexdremov_flash_attention.forward
-    torch.ops.alexdremov_flash_attention.backward
+    # We don't expect a backward op to be registered anymore
+    # torch.ops.alexdremov_flash_attention.backward
 except AttributeError:
-    print("Warning: Custom ops 'alexdremov_flash_attention::forward/backward' not found. Registering dummy ops for basic script execution.")
-    # This part is tricky because the actual registration is in flash_attention.py
-    # If that file itself fails to import due to triton/cuda issues, this script won't run far.
-    # This is more of a placeholder for thought. A real setup would ensure flash_attention.py is importable.
+    print("Warning: Custom op 'alexdremov_flash_attention::forward' not found. This script might not run correctly.")
     if not hasattr(torch.ops, 'alexdremov_flash_attention'):
-        torch.ops.load_library("") # This would need the path to the compiled .so if it were a C++ op.
-                                   # For Triton JIT, it's about availability of Triton and CUDA.
-        # This dynamic registration here is complex if flash_attention.py itself is the source of registration.
-        # For now, we'll assume flash_attention.py handles its own op registration when imported.
+        # This is a placeholder, actual loading depends on how custom ops are built/registered
+        # For Triton, importing flash_attention.py should handle JIT compilation and registration.
         pass
 
 
@@ -32,257 +29,118 @@ def generate_inputs(batch_size, num_heads, seq_len, head_dim, dtype, device, req
 
     lens = None
     if use_lens:
-        # Create somewhat realistic lengths, e.g., between seq_len/2 and seq_len
         min_len = seq_len // 2 if seq_len > 1 else 1
         lens = torch.randint(min_len, seq_len + 1, (batch_size,), device=device, dtype=torch.int32)
-        # Ensure at least one element has max length for certain tests if needed, or ensure all are valid.
         if batch_size > 0 and not (lens == seq_len).any():
-             lens[0] = seq_len # Ensure full context for at least one if seq_len is small
+             lens[0] = seq_len
 
-    # PyTorch SDPA requires attn_mask for causal or padding.
-    attn_mask = None
-    if is_causal and use_lens: # PyTorch SDPA needs combined mask
-        # Create a causal mask: (T, T)
-        causal_mask_matrix = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
-        # Create a padding mask: (B, 1, 1, T)
-        padding_mask_matrix = (torch.arange(seq_len, device=device)[None, :] < lens[:, None]).unsqueeze(1).unsqueeze(2)
-        # Combine: causal is True where attention is NOT allowed. SDPA wants True where allowed for mask.
-        # So, causal_mask_matrix should be True for elements to be masked out.
-        # Padding mask: True where valid.
-        # SDPA attn_mask: True means value is NOT masked, False means value IS masked.
-        # So, if causal_mask_matrix_sdpa = ~causal_mask_matrix
-        # And padding_mask_matrix_sdpa = padding_mask_matrix
-        # attn_mask = causal_mask_matrix_sdpa & padding_mask_matrix_sdpa (broadcasted)
-        # This gets complicated. SDPA takes bool mask where True = NOT MASK.
-        # Let's use SDPA's is_causal flag and generate a key_padding_mask if use_lens.
+    attn_mask_sdpa = None
+    if use_lens: # Only padding mask for SDPA if use_lens is true
+        # SDPA expects True where elements are NOT masked.
+        attn_mask_sdpa = (torch.arange(seq_len, device=device)[None, :] < lens[:, None]).unsqueeze(1).unsqueeze(2)
+        # For SDPA, if both causal and padding, is_causal=True handles causal, attn_mask handles padding.
+        # If only causal, is_causal=True, attn_mask=None.
+        # If only padding, is_causal=False, attn_mask=padding_mask.
 
-        # For SDPA: is_causal=True handles the causal part.
-        # For padding, SDPA expects a boolean mask (B, H, T_q, T_kv) or (B, 1, T_q, T_kv)
-        # where True means "do not mask" and False means "mask".
-        # Or, a float mask where -inf means "mask".
-        # Let's use boolean key padding mask.
-        # (B, T_kv) -> (B, 1, 1, T_kv)
-        attn_mask = (torch.arange(seq_len, device=device)[None, :] < lens[:, None]).unsqueeze(1).unsqueeze(2)
-        # This attn_mask is for key padding. SDPA's is_causal handles the causal part separately.
-        # If only causal, is_causal=True for SDPA, lens=None for custom.
-        # If only padding, is_causal=False for SDPA, pass lens for custom, pass attn_mask for SDPA.
-        # If both, is_causal=True for SDPA, pass lens for custom, pass attn_mask for SDPA.
+    return q, k, v, lens, attn_mask_sdpa
 
-    elif use_lens: # Only padding
-        attn_mask = (torch.arange(seq_len, device=device)[None, :] < lens[:, None]).unsqueeze(1).unsqueeze(2)
-
-    # If only causal, is_causal=True for our op. For SDPA, set is_causal=True. attn_mask=None.
-    # If no lens and not causal, attn_mask=None for SDPA.
-
-    return q, k, v, lens, attn_mask
 
 def test_accuracy(batch_size, num_heads, seq_len, head_dim, dtype, device, use_lens, is_causal, prescale, autotune_custom):
-    print(f"\n--- Accuracy Test ---")
+    print(f"\n--- Accuracy Test (Forward Pass Only) ---")
     print(f"Params: B={batch_size}, H={num_heads}, T={seq_len}, D={head_dim}, dtype={dtype}, device={device}, use_lens={use_lens}, is_causal={is_causal}, prescale={prescale}, autotune_custom={autotune_custom}")
 
-    q, k, v, lens_custom, attn_mask_sdpa = generate_inputs(batch_size, num_heads, seq_len, head_dim, dtype, device, True, use_lens, is_causal)
+    # Generate inputs, requires_grad=False as we only test forward
+    q, k, v, lens_custom, attn_mask_sdpa = generate_inputs(batch_size, num_heads, seq_len, head_dim, dtype, device, requires_grad=False, use_lens=use_lens, is_causal=is_causal)
 
-    # Our custom implementation
-    # Detach inputs for separate backward if comparing intermediate grads too.
-    q_cust, k_cust, v_cust = q.clone().requires_grad_(), k.clone().requires_grad_(), v.clone().requires_grad_()
-
+    sm_scale = head_dim ** -0.5
     try:
-        sm_scale = head_dim ** -0.5
-        output_custom = self_attention(q_cust, k_cust, v_cust, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)
-
-        # Backward pass for custom
-        # Create a dummy gradient for the output
-        do = torch.randn_like(output_custom)
-        output_custom.backward(do)
-
-        dq_custom, dk_custom, dv_custom = q_cust.grad, k_cust.grad, v_cust.grad
+        output_custom = self_attention(q, k, v, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)
     except Exception as e:
-        print(f"Error in custom self_attention: {e}")
-        # Print full traceback
+        print(f"Error in custom self_attention (forward pass): {e}")
         import traceback
         traceback.print_exc()
         return False
 
-    # PyTorch's scaled_dot_product_attention
-    q_ref, k_ref, v_ref = q.clone().requires_grad_(), k.clone().requires_grad_(), v.clone().requires_grad_()
-
-    # For SDPA:
-    # - if use_lens is True, attn_mask_sdpa is the key_padding_mask.
-    # - if is_causal is True, SDPA's is_causal flag handles it.
-    # - sm_scale is handled by default or can be passed.
     try:
-        output_ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, attn_mask=attn_mask_sdpa if use_lens else None, is_causal=is_causal and not use_lens, scale=sm_scale if not prescale else None)
-        # If prescale is True for custom, it means Q was prescaled. SDPA doesn't have direct prescale.
-        # If custom prescales Q, then SDPA should use scale=1.0.
-        # For now, assume sm_scale is the common scaling factor. If custom prescales, this comparison needs adjustment.
-        # The prescale in custom op means Q is multiplied by SM_SCALE * RCP_LN2.
-        # SDPA applies SM_SCALE. If PRESCALE is true in custom, then custom's SM_SCALE input should be 1.0.
-        # Let's adjust: if prescale is true for custom, then the `sm_scale` fed to it should be 1.0 for apples-to-apples.
-        # OR, ensure the sm_scale factor is correctly interpreted by both.
-        # The current `self_attention` wrapper calculates sm_scale if None. If prescale=True, this calculated sm_scale is still passed.
-        # The Triton kernel then does `q_tile *= softmax_scale` if PRESCALE. `softmax_scale` is `SM_SCALE * RCP_LN2`.
-        # This means if prescale=True, the effective scale is (SM_SCALE*RCP_LN2) * (SM_SCALE*RCP_LN2) if not careful.
-        # Let's assume `prescale=True` means the `sm_scale` argument to `self_attention` is effectively `1.0 / RCP_LN2`
-        # and the kernel only applies `q_tile *= RCP_LN2`.
-        # This part is tricky. For now, we use the same `sm_scale` for both, and `prescale` is a custom op feature.
-        # The comparison might show differences if `prescale` significantly alters scaling logic vs SDPA.
-
-        # Backward pass for reference
-        output_ref.backward(do) # Use same dO
-        dq_ref, dk_ref, dv_ref = q_ref.grad, k_ref.grad, v_ref.grad
+        # For F.scaled_dot_product_attention:
+        # - is_causal flag handles causal masking.
+        # - attn_mask (if provided) handles padding. It should be a boolean mask where True means "attend" and False means "mask".
+        output_ref = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_sdpa, is_causal=is_causal, scale=sm_scale)
     except Exception as e:
-        print(f"Error in PyTorch SDPA: {e}")
+        print(f"Error in PyTorch SDPA (forward pass): {e}")
         import traceback
         traceback.print_exc()
         return False
 
-    # Comparison
-    # Tolerances might need adjustment based on dtype
     fwd_atol = 1e-5 if dtype == torch.float32 else 1e-2
     fwd_rtol = 1e-4 if dtype == torch.float32 else 1e-1
-    bwd_atol = 1e-5 if dtype == torch.float32 else 1e-2
-    bwd_rtol = 1e-4 if dtype == torch.float32 else 1e-1
-
-    # Mask outputs if lens were used for custom op, as SDPA might handle padding differently (e.g. explicit zeroing vs not computing)
-    # Our custom op should correctly handle padding (output zero for padded tokens if q_mask is applied).
-    # SDPA also zeros out padded query token outputs if key_padding_mask is correctly applied.
-
     try:
         fwd_match = torch.allclose(output_custom, output_ref, atol=fwd_atol, rtol=fwd_rtol)
-        dq_match = torch.allclose(dq_custom, dq_ref, atol=bwd_atol, rtol=bwd_rtol)
-        dk_match = torch.allclose(dk_custom, dk_ref, atol=bwd_atol, rtol=bwd_rtol)
-        dv_match = torch.allclose(dv_custom, dv_ref, atol=bwd_atol, rtol=bwd_rtol)
+        print(f"Forward output match with SDPA: {fwd_match}")
+        if not fwd_match:
+            print("Forward pass output does NOT match SDPA.")
+            # print("Custom output sample:", output_custom[0,0,0,:min(5, output_custom.shape[-1])])
+            # print("Ref output sample:", output_ref[0,0,0,:min(5, output_ref.shape[-1])])
+            # print("Max difference:", (output_custom - output_ref).abs().max())
+        return fwd_match
     except Exception as e:
-        print(f"Error during torch.allclose: {e}")
+        print(f"Error during forward pass torch.allclose: {e}")
         return False
-
-    print(f"Forward output match: {fwd_match}")
-    print(f"dQ gradient match: {dq_match}")
-    print(f"dK gradient match: {dk_match}")
-    print(f"dV gradient match: {dv_match}")
-
-    if not (fwd_match and dq_match and dk_match and dv_match):
-        print("One or more accuracy checks failed.")
-        # Optional: print parts of the tensors that don't match.
-        # print("Custom output sample:", output_custom[0,0,0,:5])
-        # print("Ref output sample:", output_ref[0,0,0,:5])
-        # print("Difference output sample:", (output_custom - output_ref).abs().max())
-        return False
-    return True
-
-
-# (generate_inputs function and other parts of entry.py remain the same)
 
 def benchmark_speed(batch_size, num_heads, seq_len, head_dim, dtype, device, use_lens, is_causal, prescale, autotune_custom, num_repeats=20, num_warmup=5):
-    print(f"\n--- Speed Benchmark (using time.perf_counter) ---")
+    print(f"\n--- Speed Benchmark (Forward Pass Only, using time.perf_counter) ---")
     print(f"Params: B={batch_size}, H={num_heads}, T={seq_len}, D={head_dim}, dtype={dtype}, device={device}, use_lens={use_lens}, is_causal={is_causal}, prescale={prescale}, autotune_custom={autotune_custom}")
     print(f"Warmup: {num_warmup} repeats, Main: {num_repeats} repeats.")
 
-    q, k, v, lens_custom, attn_mask_sdpa = generate_inputs(batch_size, num_heads, seq_len, head_dim, dtype, device, True, use_lens, is_causal)
-
-    # Determine dO shape based on V's head dimension
-    if v.shape[-1] != q.shape[-1]: # If head_dim_v is different for V
-        do_shape = (batch_size, num_heads, seq_len, v.shape[-1])
-    else:
-        do_shape = v.shape
-    do = torch.randn(do_shape, dtype=dtype, device=device)
-
+    q, k, v, lens_custom, attn_mask_sdpa = generate_inputs(batch_size, num_heads, seq_len, head_dim, dtype, device, requires_grad=False, use_lens=use_lens, is_causal=is_causal) # requires_grad=False
     sm_scale = head_dim ** -0.5
 
-    # --- Custom Flash Attention ---
-    print("\nBenchmarking Custom Flash Attention:")
+    # --- Custom Flash Attention (Forward Only) ---
+    print("\nBenchmarking Custom Flash Attention (Forward):")
     try:
-        # Forward Pass
         fwd_times_custom = []
         for i in range(num_warmup + num_repeats):
-            if i == num_warmup: torch.cuda.synchronize() # Synchronize before starting main measurements
+            if i == num_warmup and device == 'cuda': torch.cuda.synchronize()
             start_time = time.perf_counter()
-            output_custom_fwd = self_attention(q, k, v, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)
-            torch.cuda.synchronize()
+            _ = self_attention(q, k, v, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)
+            if device == 'cuda': torch.cuda.synchronize()
             end_time = time.perf_counter()
             if i >= num_warmup:
                 fwd_times_custom.append(end_time - start_time)
 
         fwd_avg_custom = (sum(fwd_times_custom) / len(fwd_times_custom)) * 1000 if fwd_times_custom else float('nan')
-
-        # Combined Forward + Backward Pass
-        fwd_bwd_times_custom = []
-        for i in range(num_warmup + num_repeats):
-            # Clear grads before each run
-            if q.grad is not None: q.grad.zero_()
-            if k.grad is not None: k.grad.zero_()
-            if v.grad is not None: v.grad.zero_()
-
-            if i == num_warmup: torch.cuda.synchronize()
-            start_time = time.perf_counter()
-            output_custom_fwd_bwd = self_attention(q, k, v, lens_custom, sm_scale=sm_scale, autotune=autotune_custom, prescale=prescale, is_causal=is_causal)
-            output_custom_fwd_bwd.backward(do)
-            torch.cuda.synchronize()
-            end_time = time.perf_counter()
-            if i >= num_warmup:
-                fwd_bwd_times_custom.append(end_time - start_time)
-
-        fwd_bwd_avg_custom = (sum(fwd_bwd_times_custom) / len(fwd_bwd_times_custom)) * 1000 if fwd_bwd_times_custom else float('nan')
-        bwd_avg_custom = fwd_bwd_avg_custom - fwd_avg_custom if not (fwd_avg_custom == float('nan') or fwd_bwd_avg_custom == float('nan')) else float('nan')
-
-        print(f"Custom Flash Attention: Forward: {fwd_avg_custom:.3f} ms | Backward (estimated): {bwd_avg_custom:.3f} ms | Fwd+Bwd: {fwd_bwd_avg_custom:.3f} ms")
+        print(f"Custom Flash Attention: Forward: {fwd_avg_custom:.3f} ms")
 
     except Exception as e:
         print(f"Error benchmarking custom self_attention: {e}")
         import traceback
         traceback.print_exc()
-        fwd_avg_custom, bwd_avg_custom, fwd_bwd_avg_custom = float('nan'), float('nan'), float('nan')
+        fwd_avg_custom = float('nan')
 
-    # --- PyTorch SDPA ---
-    print("\nBenchmarking PyTorch SDPA:")
-    is_causal_sdpa = is_causal # As per previous logic for SDPA causal flag
-
+    # --- PyTorch SDPA (Forward Only) ---
+    print("\nBenchmarking PyTorch SDPA (Forward):")
     try:
-        # Forward Pass
         fwd_times_ref = []
         for i in range(num_warmup + num_repeats):
-            if i == num_warmup: torch.cuda.synchronize()
+            if i == num_warmup and device == 'cuda': torch.cuda.synchronize()
             start_time = time.perf_counter()
-            output_ref_fwd = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_sdpa, is_causal=is_causal_sdpa, scale=sm_scale if not prescale else None)
-            torch.cuda.synchronize()
+            _ = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_sdpa, is_causal=is_causal, scale=sm_scale)
+            if device == 'cuda': torch.cuda.synchronize()
             end_time = time.perf_counter()
             if i >= num_warmup:
                 fwd_times_ref.append(end_time - start_time)
 
         fwd_avg_ref = (sum(fwd_times_ref) / len(fwd_times_ref)) * 1000 if fwd_times_ref else float('nan')
+        print(f"PyTorch SDPA:       Forward: {fwd_avg_ref:.3f} ms")
 
-        # Combined Forward + Backward Pass
-        fwd_bwd_times_ref = []
-        for i in range(num_warmup + num_repeats):
-            if q.grad is not None: q.grad.zero_()
-            if k.grad is not None: k.grad.zero_()
-            if v.grad is not None: v.grad.zero_()
-
-            if i == num_warmup: torch.cuda.synchronize()
-            start_time = time.perf_counter()
-            output_ref_fwd_bwd = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_sdpa, is_causal=is_causal_sdpa, scale=sm_scale if not prescale else None)
-            output_ref_fwd_bwd.backward(do)
-            torch.cuda.synchronize()
-            end_time = time.perf_counter()
-            if i >= num_warmup:
-                fwd_bwd_times_ref.append(end_time - start_time)
-
-        fwd_bwd_avg_ref = (sum(fwd_bwd_times_ref) / len(fwd_bwd_times_ref)) * 1000 if fwd_bwd_times_ref else float('nan')
-        bwd_avg_ref = fwd_bwd_avg_ref - fwd_avg_ref if not (fwd_avg_ref == float('nan') or fwd_bwd_avg_ref == float('nan')) else float('nan')
-
-        print(f"PyTorch SDPA:       Forward: {fwd_avg_ref:.3f} ms | Backward (estimated): {bwd_avg_ref:.3f} ms | Fwd+Bwd: {fwd_bwd_avg_ref:.3f} ms")
-
-        if not (fwd_avg_custom == float('nan') or fwd_avg_ref == float('nan') or fwd_avg_ref == 0):
+        if not (fwd_avg_custom == float('nan') or fwd_avg_ref == float('nan') or fwd_avg_ref == 0 or fwd_avg_custom == 0) :
             print(f"Custom Speedup vs SDPA (Fwd): {fwd_avg_ref/fwd_avg_custom:.2f}x")
-        if not (fwd_bwd_avg_custom == float('nan') or fwd_bwd_avg_ref == float('nan') or fwd_bwd_avg_ref == 0):
-            print(f"Custom Speedup vs SDPA (Fwd+Bwd): {fwd_bwd_avg_ref/fwd_bwd_avg_custom:.2f}x")
-
     except Exception as e:
         print(f"Error benchmarking PyTorch SDPA: {e}")
         import traceback
         traceback.print_exc()
 
-# (main function that calls benchmark_speed and test_accuracy remains the same)
+
 def main():
     parser = argparse.ArgumentParser(description="Flash Attention Implementation Test and Benchmark")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
