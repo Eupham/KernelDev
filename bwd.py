@@ -646,7 +646,8 @@ def _flash_attn_bwd_dq(
                 boundary_check=(1,),
             )
 
-        qk = tl.dot(q, kT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        qk = tl.dot(q, kT)
+        qk = qk.to(tl.float32)
         if not PRESCALE_QK:
             qk = qk * softmax_scale * RCP_LN2
         p = tl.math.exp2(qk - m)
@@ -657,7 +658,8 @@ def _flash_attn_bwd_dq(
         mask = q_len_mask & (kv_indices[None, :] < seq_len) & causal_mask
 
         p = tl.where(mask, p, 0.0)
-        dp = tl.dot(do, vT.to(do.dtype), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dp = tl.dot(do, vT.to(do.dtype))
+        dp = dp.to(tl.float32)
         ds = p * (dp - di[:, None])
         dq = tl.dot(ds, tl.trans(kT).to(ds.dtype), dq, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
 
