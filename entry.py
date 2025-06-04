@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Entry point for testing streaming attention implementation.
+Entry point for testing flash attention implementation.
 Tests both loss reduction capability and gradient accuracy.
 """
 
@@ -16,8 +16,8 @@ import time
 import fwd
 import bwd
 
-class StreamingAttentionTest:
-    """Test class for streaming attention functionality."""
+class FlashAttentionTest:
+    """Test class for flash attention functionality."""
     
     def __init__(self, device: str = "cuda"):
         self.device = device
@@ -26,7 +26,7 @@ class StreamingAttentionTest:
         
     def create_test_data(self, batch_size: int = 2, seq_len: int = 1024, 
                         head_dim: int = 64, num_heads: int = 8) -> Tuple[torch.Tensor, ...]:
-        """Create test data for streaming attention."""
+        """Create test data for flash attention."""
         q = torch.randn(batch_size, num_heads, seq_len, head_dim, 
                        device=self.device, dtype=torch.float16, requires_grad=True)
         k = torch.randn(batch_size, num_heads, seq_len, head_dim, 
@@ -57,24 +57,23 @@ class StreamingAttentionTest:
         out = torch.matmul(attn_weights, v)
         return out
     
-    def streaming_attention_forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    def flash_attention_forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                                   scale: Optional[float] = None) -> torch.Tensor:
-        """Streaming attention forward pass using our implementation."""
+        """Flash attention forward pass using our implementation."""
         if scale is None:
             scale = 1.0 / (q.size(-1) ** 0.5)
         
         # Use the forward pass from our fwd module
-        # This assumes we have the streaming attention function available
         try:
-            # Try to use the streaming attention function
-            return fwd.streaming_attention_forward(q, k, v, scale)
+            # Try to use the flash attention function
+            return fwd.flash_attention_forward(q, k, v, scale)
         except AttributeError:
             # Fallback to a simplified version for testing
-            print("Warning: Using simplified streaming attention for testing")
+            print("Warning: Using simplified flash attention for testing")
             return self.reference_attention(q, k, v, scale)
     
     def test_gradient_accuracy(self, tolerance: float = 1e-3) -> bool:
-        """Test gradient accuracy between streaming and reference attention."""
+        """Test gradient accuracy between flash and reference attention."""
         print("Testing gradient accuracy...")
         
         # Create test data
@@ -90,19 +89,19 @@ class StreamingAttentionTest:
         loss_ref = out_ref.sum()
         loss_ref.backward()
         
-        # Streaming implementation
-        q_stream, k_stream, v_stream = q.clone().detach().requires_grad_(True), \
-                                       k.clone().detach().requires_grad_(True), \
-                                       v.clone().detach().requires_grad_(True)
+        # Flash implementation
+        q_flash, k_flash, v_flash = q.clone().detach().requires_grad_(True), \
+                                     k.clone().detach().requires_grad_(True), \
+                                     v.clone().detach().requires_grad_(True)
         
-        out_stream = self.streaming_attention_forward(q_stream, k_stream, v_stream, scale)
-        loss_stream = out_stream.sum()
-        loss_stream.backward()
+        out_flash = self.flash_attention_forward(q_flash, k_flash, v_flash, scale)
+        loss_flash = out_flash.sum()
+        loss_flash.backward()
         
         # Compare gradients
-        grad_q_diff = torch.abs(q_ref.grad - q_stream.grad).max().item()
-        grad_k_diff = torch.abs(k_ref.grad - k_stream.grad).max().item()
-        grad_v_diff = torch.abs(v_ref.grad - v_stream.grad).max().item()
+        grad_q_diff = torch.abs(q_ref.grad - q_flash.grad).max().item()
+        grad_k_diff = torch.abs(k_ref.grad - k_flash.grad).max().item()
+        grad_v_diff = torch.abs(v_ref.grad - v_flash.grad).max().item()
         
         print(f"Gradient differences:")
         print(f"  Q gradient max diff: {grad_q_diff:.6f}")
@@ -122,7 +121,7 @@ class StreamingAttentionTest:
         """Test loss reduction capability with a simple training loop."""
         print("Testing loss reduction capability...")
         
-        # Create a simple model using streaming attention
+        # Create a simple model using flash attention
         class SimpleModel(nn.Module):
             def __init__(self, hidden_dim: int = 256, num_heads: int = 8):
                 super().__init__()
@@ -142,8 +141,8 @@ class StreamingAttentionTest:
                 k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
                 v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
                 
-                # Use streaming attention
-                attn_out = test_instance.streaming_attention_forward(q, k, v)
+                # Use flash attention
+                attn_out = test_instance.flash_attention_forward(q, k, v)
                 attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
                 
                 return self.out_proj(attn_out)
@@ -177,11 +176,11 @@ class StreamingAttentionTest:
         test_instance = self
         
         # Create models
-        streaming_model = SimpleModel().to(self.device)
+        flash_model = SimpleModel().to(self.device)
         reference_model = ReferenceModel().to(self.device)
         
         # Copy weights to ensure fair comparison
-        reference_model.load_state_dict(streaming_model.state_dict())
+        reference_model.load_state_dict(flash_model.state_dict())
         
         # Create training data
         batch_size, seq_len, hidden_dim = 2, 128, 256
@@ -189,23 +188,23 @@ class StreamingAttentionTest:
         y_train = torch.randn(batch_size, seq_len, hidden_dim, device=self.device)
         
         # Optimizers
-        optimizer_streaming = optim.Adam(streaming_model.parameters(), lr=1e-3)
+        optimizer_flash = optim.Adam(flash_model.parameters(), lr=1e-3)
         optimizer_reference = optim.Adam(reference_model.parameters(), lr=1e-3)
         
         criterion = nn.MSELoss()
         
-        streaming_losses = []
+        flash_losses = []
         reference_losses = []
         
         # Training loop
         for epoch in range(num_epochs):
-            # Streaming model
-            optimizer_streaming.zero_grad()
-            out_streaming = streaming_model(x_train)
-            loss_streaming = criterion(out_streaming, y_train)
-            loss_streaming.backward()
-            optimizer_streaming.step()
-            streaming_losses.append(loss_streaming.item())
+            # Flash model
+            optimizer_flash.zero_grad()
+            out_flash = flash_model(x_train)
+            loss_flash = criterion(out_flash, y_train)
+            loss_flash.backward()
+            optimizer_flash.step()
+            flash_losses.append(loss_flash.item())
             
             # Reference model
             optimizer_reference.zero_grad()
@@ -216,13 +215,13 @@ class StreamingAttentionTest:
             reference_losses.append(loss_reference.item())
             
             if epoch % 2 == 0:
-                print(f"Epoch {epoch}: Streaming Loss = {loss_streaming.item():.6f}, "
+                print(f"Epoch {epoch}: Flash Loss = {loss_flash.item():.6f}, "
                       f"Reference Loss = {loss_reference.item():.6f}")
         
-        print(f"Final losses - Streaming: {streaming_losses[-1]:.6f}, "
+        print(f"Final losses - Flash: {flash_losses[-1]:.6f}, "
               f"Reference: {reference_losses[-1]:.6f}")
         
-        return streaming_losses, reference_losses
+        return flash_losses, reference_losses
     
     def benchmark_performance(self, seq_lengths: List[int] = [128, 256, 512, 1024]) -> None:
         """Benchmark performance comparison."""
@@ -238,18 +237,18 @@ class StreamingAttentionTest:
             
             # Warm up
             for _ in range(3):
-                _ = self.streaming_attention_forward(q, k, v)
+                _ = self.flash_attention_forward(q, k, v)
                 _ = self.reference_attention(q, k, v)
             
             torch.cuda.synchronize()
             
-            # Benchmark streaming
+            # Benchmark flash attention
             start_time = time.time()
             for _ in range(10):
-                _ = self.streaming_attention_forward(q, k, v)
+                _ = self.flash_attention_forward(q, k, v)
             torch.cuda.synchronize()
-            streaming_time = (time.time() - start_time) / 10
-            streaming_times.append(streaming_time)
+            flash_time = (time.time() - start_time) / 10
+            streaming_times.append(flash_time)
             
             # Benchmark reference
             start_time = time.time()
@@ -259,16 +258,16 @@ class StreamingAttentionTest:
             reference_time = (time.time() - start_time) / 10
             reference_times.append(reference_time)
             
-            print(f"  Streaming: {streaming_time*1000:.2f}ms, Reference: {reference_time*1000:.2f}ms")
+            print(f"  Flash: {flash_time*1000:.2f}ms, Reference: {reference_time*1000:.2f}ms")
         
         # Plot results
         try:
             plt.figure(figsize=(10, 6))
-            plt.plot(seq_lengths, streaming_times, 'b-o', label='Streaming Attention')
+            plt.plot(seq_lengths, streaming_times, 'b-o', label='Flash Attention')
             plt.plot(seq_lengths, reference_times, 'r-o', label='Reference Attention')
             plt.xlabel('Sequence Length')
             plt.ylabel('Time (seconds)')
-            plt.title('Performance Comparison: Streaming vs Reference Attention')
+            plt.title('Performance Comparison: Flash vs Reference Attention')
             plt.legend()
             plt.grid(True)
             plt.savefig('/workspaces/KernelDev/performance_comparison.png')
@@ -276,12 +275,12 @@ class StreamingAttentionTest:
         except ImportError:
             print("Matplotlib not available, skipping plot generation")
     
-    def plot_loss_curves(self, streaming_losses: List[float], reference_losses: List[float]) -> None:
+    def plot_loss_curves(self, flash_losses: List[float], reference_losses: List[float]) -> None:
         """Plot loss curves for comparison."""
         try:
             plt.figure(figsize=(10, 6))
-            epochs = range(len(streaming_losses))
-            plt.plot(epochs, streaming_losses, 'b-o', label='Streaming Attention')
+            epochs = range(len(flash_losses))
+            plt.plot(epochs, flash_losses, 'b-o', label='Flash Attention')
             plt.plot(epochs, reference_losses, 'r-o', label='Reference Attention')
             plt.xlabel('Epoch')
             plt.ylabel('Loss')

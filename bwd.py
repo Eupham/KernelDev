@@ -69,9 +69,9 @@ def strides(t: torch.Tensor, expected_size=None):
     return [t.stride(i) for i in range(t.ndim)]
 
 
-def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
-    min_size = min(CONTEXT_SIZE, 64)
-    max_size = CONTEXT_SIZE * 4
+def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
+    min_size = 64
+    max_size = min(HEAD_DIM * 4, 256)
     min_pipeline, max_pipeline = 1, 3
     min_warps, max_warps = 1, 8
 
@@ -121,19 +121,18 @@ def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
             )
         ]
 
-    logger.warning(f"Start benchmarking backward streaming_attention {len(configs) = }")
+    logger.warning(f"Start benchmarking backward flash_attention {len(configs) = }")
     return configs
 
 
 # fmt: off
 @triton.jit
-def _streaming_attn_bwd_precompute(
+def _flash_attn_bwd_precompute(
     O: tl.tensor, DO: tl.tensor, RES: tl.tensor,
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int,  #
     stride_dob: int, stride_doh: int, stride_dot: int, stride_dok: int,  #
     stride_rb: int, stride_rh: int, stride_rt: int,
     T: int,
-    TIME_BUCKET: int,  #
     HEAD_DIM: tl.constexpr,
     DTYPE:  tl.constexpr,  #
     TILE_SIZE: tl.constexpr,
@@ -195,8 +194,8 @@ def _streaming_attn_bwd_precompute(
     dict(
         RCP_LN2=lambda _: math.log2(math.e),
         DQ_TILES_NUM=lambda args: triton.cdiv(args['T'], args["TILE_DQ_Q_SIZE"]),
-        PERFECT_DKV_MATCHING=lambda args : args['TILE_DK_Q_SIZE'] == args['TILE_DK_K_SIZE'] and args['TILE_DK_K_SIZE'] == args['CONTEXT_SIZE'],
-        PERFECT_DQ_MATCHING=lambda args : args['TILE_DQ_Q_SIZE'] == args['TILE_DQ_K_SIZE'] and args['TILE_DQ_K_SIZE'] == args['CONTEXT_SIZE'],
+        PERFECT_DKV_MATCHING=lambda args : args['TILE_DK_Q_SIZE'] == args['TILE_DK_K_SIZE'],
+        PERFECT_DQ_MATCHING=lambda args : args['TILE_DQ_Q_SIZE'] == args['TILE_DQ_K_SIZE'],
         DQ_Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DQ_Q_SIZE'] == 0,
         DQ_K_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DQ_K_SIZE'] == 0,
         DK_Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DK_Q_SIZE'] == 0,
@@ -204,7 +203,7 @@ def _streaming_attn_bwd_precompute(
     )
 )
 @triton.jit
-def _streaming_attn_bwd(
+def _flash_attn_bwd(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, L: tl.tensor, #
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor, DK: tl.tensor, DV: tl.tensor,
@@ -219,11 +218,8 @@ def _streaming_attn_bwd(
     stride_dvb: int, stride_dvh: int, stride_dvt: int, stride_dvk: int,  #
     lens_stride: int,
     T: int,  #
-    TIME_BUCKET: int,  #
     DQ_TILES_NUM: int,  #
     HEAD_DIM: tl.constexpr,  #
-    CONTEXT_SIZE: tl.constexpr,  #
-    CONTEXTS_BACK: tl.constexpr,  #
     DTYPE: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
@@ -251,7 +247,7 @@ def _streaming_attn_bwd(
         seq_len = T
 
     if dkv_worker:
-        _streaming_attn_bwd_dkdv_inner(
+        _flash_attn_bwd_dkdv_inner(
             Q, K, V, DELTA, LSE, DO, DK, DV,
             stride_qb, stride_qh, stride_qt, stride_qk,
             stride_kb, stride_kh, stride_kt, stride_kk,
@@ -267,8 +263,6 @@ def _streaming_attn_bwd(
             seq_len=seq_len,
             T=T,
             HEAD_DIM=HEAD_DIM,
-            CONTEXT_SIZE=CONTEXT_SIZE,
-            CONTEXTS_BACK=CONTEXTS_BACK,
             INPUT_PRECISION=INPUT_PRECISION,
             SM_SCALE=SM_SCALE,
             PRESCALE_QK=PRESCALE_QK,
@@ -281,7 +275,7 @@ def _streaming_attn_bwd(
             PIPELINING=PIPELINING,
         )
     else:
-        _streaming_attn_bwd_dq_inner(
+        _flash_attn_bwd_dq_inner(
             Q, K, V, DELTA, LSE,
             DO, DQ,
             stride_qb, stride_qh, stride_qt, stride_qk,
@@ -297,8 +291,6 @@ def _streaming_attn_bwd(
             seq_len=seq_len,
             T=T,
             HEAD_DIM=HEAD_DIM,
-            CONTEXT_SIZE=CONTEXT_SIZE,
-            CONTEXTS_BACK=CONTEXTS_BACK,
             INPUT_PRECISION=INPUT_PRECISION,
             SM_SCALE=SM_SCALE,
             PRESCALE_QK=PRESCALE_QK,
@@ -313,7 +305,7 @@ def _streaming_attn_bwd(
 
 
 @triton.jit()
-def _streaming_attn_bwd_dq_inner(
+def _flash_attn_bwd_dq_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
@@ -329,8 +321,6 @@ def _streaming_attn_bwd_dq_inner(
     seq_len: tl.tensor,
     T: int,  #
     HEAD_DIM: tl.constexpr,  #
-    CONTEXT_SIZE: tl.constexpr,  #
-    CONTEXTS_BACK: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
     PRESCALE_QK: tl.constexpr,  #
@@ -417,13 +407,11 @@ def _streaming_attn_bwd_dq_inner(
     )
 
     dq = tl.zeros([TILE_DQ_Q_SIZE, HEAD_DIM], dtype=tl.float32)
-    dq = _streaming_attn_bwd_dq(
+    dq = _flash_attn_bwd_dq(
         dq, q, m, di, do,
         kt_tile_ptr, vt_tile_ptr,
         seq_len=seq_len,
         q_token_idx=q_token_idx,
-        CONTEXT_SIZE=CONTEXT_SIZE,
-        CONTEXTS_BACK=CONTEXTS_BACK,
         TILE_Q_SIZE=TILE_DQ_Q_SIZE,
         TILE_K_SIZE=TILE_DQ_K_SIZE,
         INPUT_PRECISION=INPUT_PRECISION,
@@ -451,7 +439,7 @@ def _streaming_attn_bwd_dq_inner(
 
 
 @triton.jit
-def _streaming_attn_bwd_dkdv_inner(
+def _flash_attn_bwd_dkdv_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor,
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DK: tl.tensor, DV: tl.tensor,
@@ -470,8 +458,6 @@ def _streaming_attn_bwd_dkdv_inner(
     seq_len: tl.tensor,
     T: int,  #
     HEAD_DIM: tl.constexpr,  #
-    CONTEXT_SIZE: tl.constexpr,  #
-    CONTEXTS_BACK: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
     PRESCALE_QK: tl.constexpr,  #
@@ -566,14 +552,12 @@ def _streaming_attn_bwd_dkdv_inner(
                 boundary_check=(0,),
             )
 
-    dk, dv = _streaming_attn_bwd_dkdv(
+    dk, dv = _flash_attn_bwd_dkdv(
         dk, dv,
         qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
         k, v,
         seq_len=seq_len,
         kv_token_idx=kv_token_idx,
-        CONTEXT_SIZE=CONTEXT_SIZE,
-        CONTEXTS_BACK=CONTEXTS_BACK,
         TILE_Q_SIZE=TILE_DK_Q_SIZE,
         TILE_K_SIZE=TILE_DK_K_SIZE,
         INPUT_PRECISION=INPUT_PRECISION,
@@ -615,14 +599,12 @@ def _streaming_attn_bwd_dkdv_inner(
 
 
 @triton.jit
-def _streaming_attn_bwd_dq(
+def _flash_attn_bwd_dq(
     dq: tl.tensor, q: tl.tensor, m: tl.tensor,
     di: tl.tensor, do: tl.tensor,
     kt_tile_ptr: tl.tensor, vt_tile_ptr: tl.tensor,
     seq_len: tl.tensor,
     q_token_idx: int,
-    CONTEXT_SIZE: tl.constexpr,
-    CONTEXTS_BACK: tl.constexpr,
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
@@ -633,21 +615,11 @@ def _streaming_attn_bwd_dq(
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
 ):
-    q_tile_min_context = q_token_idx // CONTEXT_SIZE
-    kv_start_tile_idx = max(
-        0, ((q_tile_min_context - CONTEXTS_BACK) * CONTEXT_SIZE)
-    ) // TILE_K_SIZE
-
+    # For causal masking, we only attend to tokens up to the current position
     q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
-    q_tile_max_context = (q_tile_max_token - 1) // CONTEXT_SIZE
-    kv_end_tile_idx = tl.cdiv(
-        min((q_tile_max_context + 1) * CONTEXT_SIZE, seq_len), TILE_K_SIZE
-    )
+    kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
 
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
-    if not PERFECT_MATCHING:
-        q_context_indices = q_tile_indices // CONTEXT_SIZE
-
     q_len_mask = q_tile_indices[:, None] < seq_len
     tile_k_arange = tl.arange(0, TILE_K_SIZE)
 
@@ -655,9 +627,7 @@ def _streaming_attn_bwd_dq(
     if PRESCALE_QK:
         q = q * softmax_scale * RCP_LN2
 
-    for kv_tile_idx in tl.range(
-        kv_start_tile_idx, kv_end_tile_idx, num_stages=PIPELINING
-    ):
+    for kv_tile_idx in tl.range(0, kv_end_tile_idx, num_stages=PIPELINING):
         kv_token_idx = kv_tile_idx * TILE_K_SIZE
         if K_BLOCK_DIVISIBLE:
             kT = tl.load(
@@ -682,14 +652,9 @@ def _streaming_attn_bwd_dq(
         p = tl.math.exp2(qk - m)
 
         kv_indices = kv_token_idx + tile_k_arange
-        mask = q_len_mask & (
-            kv_indices[None, :] < seq_len
-        )
-        if not PERFECT_MATCHING:
-            kv_context_indices = kv_indices // CONTEXT_SIZE
-            blocks_diff = q_context_indices[:, None] - kv_context_indices[None, :]
-            streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
-            mask &= streaming_mask
+        # Causal mask: only attend to tokens up to current position
+        causal_mask = q_tile_indices[:, None] >= kv_indices[None, :]
+        mask = q_len_mask & (kv_indices[None, :] < seq_len) & causal_mask
 
         p = tl.where(mask, p, 0.0)
         dp = tl.dot(do, vT.to(do.dtype), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
@@ -701,15 +666,13 @@ def _streaming_attn_bwd_dq(
 
 
 @triton.jit
-def _streaming_attn_bwd_dkdv(
+def _flash_attn_bwd_dkdv(
     dk: tl.tensor, dv: tl.tensor,
     qt_tile_ptr: tl.tensor, do_tile_ptr: tl.tensor,
     lse_tile_ptr: tl.tensor, delta_tile_ptr: tl.tensor,
     k: tl.tensor, v: tl.tensor,
     seq_len: tl.tensor,
     kv_token_idx: int,
-    CONTEXT_SIZE: tl.constexpr,
-    CONTEXTS_BACK: tl.constexpr,
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
@@ -720,33 +683,20 @@ def _streaming_attn_bwd_dkdv(
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
 ):
-    kv_tile_min_context = kv_token_idx // CONTEXT_SIZE
-    q_start_tile_idx = (kv_tile_min_context * CONTEXT_SIZE) // TILE_Q_SIZE
-
-    kv_tile_max_token = min(kv_token_idx + TILE_K_SIZE, seq_len) - 1
-    kv_tile_max_context = kv_tile_max_token // CONTEXT_SIZE
-    q_end_tile_idx = tl.cdiv(
-        min((kv_tile_max_context + CONTEXTS_BACK + 1) * CONTEXT_SIZE, seq_len),
-        TILE_Q_SIZE,
-    )
+    # For causal masking, we only need to consider query positions from kv_token_idx onwards
+    q_start_tile_idx = kv_token_idx // TILE_Q_SIZE
+    q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)
 
     kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
-    kv_context_indices = kv_indices // CONTEXT_SIZE
-
     tile_q_arange = tl.arange(0, TILE_Q_SIZE)
 
-    kv_lens_mask = (
-        kv_indices[:, None] < seq_len
-    )
+    kv_lens_mask = (kv_indices[:, None] < seq_len)
 
     if PRESCALE_QK:
         k *= RCP_LN2 * SM_SCALE
 
     for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx, num_stages=PIPELINING):
         q_token_idx = q_tile_idx * TILE_Q_SIZE
-        # NOTE: triton will not reorder loads
-        # if there are problems with shared memory, do and Di loads can be moved just before usage
-        # (via constexpr flag)
         if Q_BLOCK_DIVISIBLE:
             qT = tl.load(
                 tl.advance(qt_tile_ptr, (0, q_token_idx)),
@@ -785,14 +735,9 @@ def _streaming_attn_bwd_dkdv(
         pT = tl.math.exp2(qkT - m[None, :])
 
         q_tile_indices = q_token_idx + tile_q_arange
-        mask = kv_lens_mask & (
-            q_tile_indices[None, :] < seq_len
-        )
-        if not PERFECT_MATCHING:
-            q_context_indices = q_tile_indices // CONTEXT_SIZE
-            blocks_diff = q_context_indices[None, :] - kv_context_indices[:, None]
-            streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
-            mask &= streaming_mask
+        # Causal mask: only attend when query position >= key position
+        causal_mask = q_tile_indices[None, :] >= kv_indices[:, None]
+        mask = kv_lens_mask & (q_tile_indices[None, :] < seq_len) & causal_mask
         pT = tl.where(mask, pT, 0.0)
 
         dv = tl.dot(pT, do.to(pT.dtype), dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
@@ -818,25 +763,17 @@ def autotune_posthook(kwargs, exception=None):
 
 
 # Create backward kernels
-streaming_backward = triton.heuristics(
+flash_backward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
-        TILE_DQ_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
-        ),
-        TILE_DQ_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
-        ),
-        TILE_DK_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
-        ),
-        TILE_DK_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
-        ),
+        TILE_DQ_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, 64)),
+        TILE_DQ_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, 64)),
+        TILE_DK_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, 64)),
+        TILE_DK_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, 64)),
     )
-)(_streaming_attn_bwd)
+)(_flash_attn_bwd)
 
-streaming_backward_autotune = triton.autotune(
+flash_backward_autotune = triton.autotune(
     configs=[
         triton.Config(
             dict(
@@ -882,21 +819,18 @@ streaming_backward_autotune = triton.autotune(
     ],
     key=[
         "HEAD_DIM",
-        "CONTEXT_SIZE",
-        "CONTEXTS_BACK",
         "INPUT_PRECISION",
         "DTYPE",
-        "TIME_BUCKET",
     ],
     prune_configs_by=dict(early_config_prune=bwd_configs_pruner),
     pre_hook=autotune_prehook,
     post_hook=autotune_posthook,
-)(_streaming_attn_bwd)
+)(_flash_attn_bwd)
 
 
 # Backward adapter functions
 @torch.library.custom_op(
-    "alexdremov_streaming_attention::backward", mutates_args=(), device_types=("cuda",)
+    "flash_attention::backward", mutates_args=(), device_types=("cuda",)
 )
 def attention_backward_adapter(
     q: torch.Tensor,
@@ -906,8 +840,6 @@ def attention_backward_adapter(
     o: torch.Tensor,
     lse: torch.Tensor,
     do: torch.Tensor,
-    context_size: int,
-    back_contexts: int,
     sm_scale: float,
     autotune: bool,
     prescale_qk: bool,
@@ -921,7 +853,7 @@ def attention_backward_adapter(
         heads,
         triton.cdiv(T, args["TILE_SIZE"]),
     )
-    _streaming_attn_bwd_precompute[grid](
+    _flash_attn_bwd_precompute[grid](
         o,
         do,
         delta,
@@ -931,7 +863,6 @@ def attention_backward_adapter(
         T=T,
         HEAD_DIM=HEAD_DIM,
         DTYPE=q.dtype,
-        TIME_BUCKET=triton.next_power_of_2(T),
     )
 
     DQ = torch.zeros_like(q, memory_format=torch.contiguous_format)
@@ -944,7 +875,7 @@ def attention_backward_adapter(
         triton.cdiv(T, args["TILE_DQ_Q_SIZE"]) + triton.cdiv(T, args["TILE_DK_K_SIZE"]),
     )
 
-    bwd_fn = streaming_backward_autotune if autotune else streaming_backward
+    bwd_fn = flash_backward_autotune if autotune else flash_backward
     bwd_fn[grid](
         q,
         k,
@@ -968,9 +899,6 @@ def attention_backward_adapter(
         *(strides(lens, 1) if lens is not None else [0]),
         T=T,
         HEAD_DIM=HEAD_DIM,
-        CONTEXT_SIZE=context_size,
-        CONTEXTS_BACK=back_contexts,
-        TIME_BUCKET=triton.next_power_of_2(T),
         INPUT_PRECISION=precision,
         DTYPE=q.dtype,
         SM_SCALE=sm_scale,
@@ -980,7 +908,7 @@ def attention_backward_adapter(
     return DQ, DK, DV
 
 
-@torch.library.register_fake("alexdremov_streaming_attention::backward")
+@torch.library.register_fake("flash_attention::backward")
 def attention_backward_adapter_abstract(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -989,8 +917,6 @@ def attention_backward_adapter_abstract(
     o: torch.Tensor,
     lse: torch.Tensor,
     do: torch.Tensor,
-    context_size: int,
-    back_contexts: int,
     sm_scale: float | None,
     autotune: bool,
     prescale_qk: bool,

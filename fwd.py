@@ -66,9 +66,9 @@ def strides(t: torch.Tensor, expected_size=None):
     return [t.stride(i) for i in range(t.ndim)]
 
 
-def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
-    min_size = min(CONTEXT_SIZE, 64)
-    max_size = CONTEXT_SIZE * 4
+def fwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
+    min_size = 32
+    max_size = 128
     min_pipeline, max_pipeline = 1, 3
     min_warps, max_warps = 1, 8
 
@@ -106,7 +106,7 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
             )
         ]
 
-    logger.warning(f"Start benchmarking forward streaming_attention {len(configs) = }")
+    logger.warning(f"Start benchmarking forward flash_attention {len(configs) = }")
     return configs
 
 
@@ -115,12 +115,11 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
     dict(
         Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_Q_SIZE'] == 0,
         K_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_K_SIZE'] == 0,
-        PERFECT_MATCHING=lambda args : args['TILE_K_SIZE'] == args['TILE_Q_SIZE'] and args['TILE_Q_SIZE'] == args['CONTEXT_SIZE'],
         RCP_LN2=lambda _: math.log2(math.e),
     )
 )
 @triton.jit
-def _streaming_attn_fwd(
+def _flash_attn_fwd(
     Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, #
     LSE: tl.tensor, O: tl.tensor,  #
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
@@ -130,10 +129,7 @@ def _streaming_attn_fwd(
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
     lens_stride: int,
     T: int,  #
-    TIME_BUCKET:  int,  #
     HEAD_DIM: tl.constexpr,  #
-    CONTEXT_SIZE: tl.constexpr,  #
-    CONTEXTS_BACK: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
     DTYPE:  tl.constexpr,  #
@@ -144,7 +140,6 @@ def _streaming_attn_fwd(
     PIPELINING: tl.constexpr,  #
     Q_BLOCK_DIVISIBLE: tl.constexpr,  #
     K_BLOCK_DIVISIBLE: tl.constexpr,  #
-    PERFECT_MATCHING: tl.constexpr,  #
     RCP_LN2: tl.constexpr,  #
 ):
     batch = tl.program_id(0)
@@ -194,27 +189,12 @@ def _streaming_attn_fwd(
     m_i = tl.zeros([TILE_Q_SIZE], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([TILE_Q_SIZE], dtype=tl.float32)
     acc = tl.zeros([TILE_Q_SIZE, HEAD_DIM], dtype=tl.float32)
-    if not PERFECT_MATCHING:
-        q_attended = tl.zeros([TILE_Q_SIZE], dtype=tl.int1) > 0
 
-    q_tile_min_context = q_token_idx // CONTEXT_SIZE
-    kv_start_tile_idx = max(
-        0, ((q_tile_min_context - CONTEXTS_BACK) * CONTEXT_SIZE)
-    ) // TILE_K_SIZE
-
-    q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
-    q_tile_max_context = (q_tile_max_token - 1) // CONTEXT_SIZE
-    kv_end_tile_idx = tl.cdiv(
-        min((q_tile_max_context + 1) * CONTEXT_SIZE, seq_len), TILE_K_SIZE
-    )
+    # For causal attention, we only need to attend to tokens up to the current position
+    kv_end_tile_idx = tl.cdiv(min(q_token_idx + TILE_Q_SIZE, seq_len), TILE_K_SIZE)
 
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
-    q_lens_mask = (
-        q_tile_indices[:, None] < seq_len
-    )
-
-    if not PERFECT_MATCHING:
-        q_context_indices = q_tile_indices // CONTEXT_SIZE
+    q_lens_mask = q_tile_indices[:, None] < seq_len
 
     if Q_BLOCK_DIVISIBLE:
         q_tile = tl.load(q_tile_ptr)
@@ -230,9 +210,7 @@ def _streaming_attn_fwd(
     if PRESCALE_QK:
         q_tile = q_tile * softmax_scale
 
-    for kv_tile_idx in tl.range(
-        kv_start_tile_idx, kv_end_tile_idx, num_stages=PIPELINING
-    ):
+    for kv_tile_idx in tl.range(0, kv_end_tile_idx, num_stages=PIPELINING):
         last_iter = kv_tile_idx + 1 == kv_end_tile_idx
         kv_token_idx = kv_tile_idx * TILE_K_SIZE
 
@@ -258,29 +236,18 @@ def _streaming_attn_fwd(
         )
 
         kv_indices = kv_token_idx + tile_k_arange
-        mask = q_lens_mask & (
-            kv_indices[None, :] < seq_len
-        )
-        if not PERFECT_MATCHING:
-            kv_context_indices = kv_indices // CONTEXT_SIZE
-            blocks_diff = q_context_indices[:, None] - kv_context_indices[None, :]
-            streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
-            mask &= streaming_mask
-
-            q_attended |= tl.max(mask, 1) > 0
+        # Causal mask: only attend to previous tokens (including current)
+        causal_mask = q_tile_indices[:, None] >= kv_indices[None, :]
+        mask = q_lens_mask & (kv_indices[None, :] < seq_len) & causal_mask
 
         if not PRESCALE_QK:
             qk = qk * softmax_scale
         qk = tl.where(mask, qk, tl.cast(-float("inf"), qk.dtype))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        if not PERFECT_MATCHING:
-            m_ij_safe = tl.where(q_attended, m_ij, tl.cast(0, m_ij.dtype))
-        else:
-            m_ij_safe = m_ij
-        p = tl.math.exp2(qk - m_ij_safe[:, None])
+        p = tl.math.exp2(qk - m_ij[:, None])
         l_ij = tl.sum(p, 1)
-        alpha = tl.math.exp2(m_i - m_ij_safe)
+        alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
@@ -293,12 +260,8 @@ def _streaming_attn_fwd(
         )
         m_i = m_ij
 
-    if not PERFECT_MATCHING:
-        l_i = tl.where(q_attended, l_i, 1)
-        acc = acc / l_i[:, None]
-    else:
-        acc = acc / l_i[:, None]
-        acc = tl.where(q_lens_mask, acc, 0.0)
+    acc = acc / l_i[:, None]
+    acc = tl.where(q_lens_mask, acc, 0.0)
 
 
     obatch_head_offset = batch * stride_ob + head * stride_oh
@@ -360,19 +323,15 @@ def autotune_posthook(kwargs, exception=None):
 
 
 # Create forward kernels
-streaming_forward = triton.heuristics(
+flash_forward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
-        TILE_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
-        ),
-        TILE_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
-        ),
+        TILE_Q_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, 64)),
+        TILE_K_SIZE=lambda args: min(64, max(MIN_TILE_SIZE, 64)),
     )
-)(_streaming_attn_fwd)
+)(_flash_attn_fwd)
 
-streaming_forward_autotune = triton.autotune(
+flash_forward_autotune = triton.autotune(
     configs=[
         triton.Config(
             dict(
@@ -402,29 +361,24 @@ streaming_forward_autotune = triton.autotune(
     ],
     key=[
         "HEAD_DIM",
-        "CONTEXT_SIZE",
-        "CONTEXTS_BACK",
         "INPUT_PRECISION",
-        "TIME_BUCKET",
         "DTYPE",
     ],
     prune_configs_by=dict(early_config_prune=fwd_configs_pruner),
     pre_hook=autotune_prehook,
     post_hook=autotune_posthook,
-)(_streaming_attn_fwd)
+)(_flash_attn_fwd)
 
 
 # Forward adapter functions
 @torch.library.custom_op(
-    "alexdremov_streaming_attention::forward", mutates_args=(), device_types=("cuda",)
+    "flash_attention::forward", mutates_args=(), device_types=("cuda",)
 )
 def attention_forward_adapter(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     lens: torch.Tensor,
-    context_size: int,
-    back_contexts: int,
     sm_scale: float,
     autotune: bool,
     return_lse: bool,
@@ -433,7 +387,6 @@ def attention_forward_adapter(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
-    assert back_contexts >= 0 and context_size >= 1
     assert HEAD_DIM in {16, 32, 64, 128, 256}
     assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
     assert T == k.shape[-2] and T == v.shape[-2]
@@ -454,7 +407,7 @@ def attention_forward_adapter(
     )
 
     kt = k.transpose(-1, -2)  # just stride tricks, same data
-    fwd_fn = streaming_forward_autotune if autotune else streaming_forward
+    fwd_fn = flash_forward_autotune if autotune else flash_forward
     fwd_fn[grid](
         q,
         kt,
@@ -470,12 +423,9 @@ def attention_forward_adapter(
         *(strides(lens, 1) if lens is not None else [0]),
         T=T,
         HEAD_DIM=HEAD_DIM,
-        CONTEXT_SIZE=context_size,
-        CONTEXTS_BACK=back_contexts,
         INPUT_PRECISION=precision,
         PRESCALE_QK=prescale_qk,
         DTYPE=q.dtype,
-        TIME_BUCKET=triton.next_power_of_2(T),
         OUTPUT_LOGSUMEXP=return_lse,
         SM_SCALE=sm_scale,
     )
@@ -485,14 +435,12 @@ def attention_forward_adapter(
     return O, LSE
 
 
-@torch.library.register_fake("alexdremov_streaming_attention::forward")
+@torch.library.register_fake("flash_attention::forward")
 def attention_forward_adapter_abstract(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     lens: torch.Tensor | None,
-    context_size: int,
-    back_contexts: int,
     sm_scale: float | None,
     autotune: bool,
     return_lse: bool,
