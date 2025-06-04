@@ -250,13 +250,7 @@ def _flash_attn_fwd(
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
-        acc = tl.dot(
-            p.to(v_tile.dtype),
-            v_tile,
-            acc,
-            input_precision=INPUT_PRECISION,
-            out_dtype=tl.float32,
-        )
+        acc = tl.dot(p.to(v_tile.dtype), v_tile, acc)
         m_i = m_ij
 
     acc = acc / l_i[:, None]
