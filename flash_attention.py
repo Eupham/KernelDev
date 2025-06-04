@@ -820,18 +820,20 @@ def _self_attn_bwd(
         is_last_kv_tile = (kv_tile_idx == num_kv_tiles - 1)
 
         # kt_tile_ptr has block_shape=(HEAD_DIM, TILE_K_SIZE)
+        # We want to check the boundary for the second dimension (index 1) if it's the last tile.
         if is_last_kv_tile:
-            kt_boundary_check = (tl.constexpr(False), tl.constexpr(True))
+            kt_boundary_check_dims = (1,) # Check dimension 1
         else:
-            kt_boundary_check = (tl.constexpr(False), tl.constexpr(False))
-        kt_tile = tl.load(kt_tile_ptr, boundary_check=kt_boundary_check) # (HEAD_DIM, TILE_K_SIZE)
+            kt_boundary_check_dims = None # No check needed
+        kt_tile = tl.load(kt_tile_ptr, boundary_check=kt_boundary_check_dims) # (HEAD_DIM, TILE_K_SIZE)
 
         # v_tile_ptr has block_shape=(TILE_K_SIZE, HEAD_DIM)
+        # We want to check the boundary for the first dimension (index 0) if it's the last tile.
         if is_last_kv_tile:
-            v_boundary_check = (tl.constexpr(True), tl.constexpr(False))
+            v_boundary_check_dims = (0,) # Check dimension 0
         else:
-            v_boundary_check = (tl.constexpr(False), tl.constexpr(False))
-        v_tile = tl.load(v_tile_ptr, boundary_check=v_boundary_check)   # (TILE_K_SIZE, HEAD_DIM)
+            v_boundary_check_dims = None # No check needed
+        v_tile = tl.load(v_tile_ptr, boundary_check=v_boundary_check_dims)   # (TILE_K_SIZE, HEAD_DIM)
 
         # --- Recompute S = Q @ K^T ---
         s_qk = tl.dot(q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32) # (TILE_Q_SIZE, TILE_K_SIZE)
