@@ -66,10 +66,19 @@ class FlashAttentionTest:
         
         # Use the forward pass from our fwd module
         try:
+            # First ensure that custom ops are properly registered
+            import fwd  # This will register the forward operation
+            import register_autograd  # This will register the autograd function
+            
             # Call the flash attention custom op with proper precision setting
             lens = None  # No length masking for now
             # Use the precision matching input dtype
             precision = "fp16" if q.dtype == torch.float16 else "fp32"
+            
+            # Check if the operation exists
+            if not hasattr(torch.ops, 'flash_attention') or not hasattr(torch.ops.flash_attention, 'forward'):
+                raise RuntimeError("flash_attention::forward operation not found")
+                
             output, lse = torch.ops.flash_attention.forward(
                 q, k, v, lens, scale, 
                 autotune=False, return_lse=False, 
