@@ -7,18 +7,17 @@ This allows PyTorch to use our custom autograd function for backpropagation.
 import torch
 
 # Register the backward function for flash_attention::forward
-def flash_attention_backward_setup_context(ctx, inputs, outputs):
+def flash_attention_backward_setup_context(ctx, q, k, v, lens, sm_scale, autotune, return_lse, prescale_qk, precision, output=None):
     """Set up the context for backward pass."""
-    # Unpack inputs and save them
-    q, k, v, lens, sm_scale, autotune, return_lse, prescale_qk, precision = inputs
-    o, lse = outputs
+    o, lse = output if output else (None, None)
     
     ctx.save_for_backward(q, k, v, lens)
-    ctx.outputs = outputs
     ctx.sm_scale = sm_scale
     ctx.autotune = autotune
     ctx.prescale_qk = prescale_qk
     ctx.precision = precision
+    ctx.o = o
+    ctx.lse = lse
 
 def flash_attention_backward_adapter(ctx, grad_out, grad_lse=None):
     """Backward function for flash attention."""
