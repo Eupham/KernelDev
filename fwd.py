@@ -428,31 +428,54 @@ def causal_attention_forward_adapter( # Renamed
     )
 
     kt = k.transpose(-1, -2)
-    fwd_fn = causal_forward_autotune if autotune else causal_forward # Renamed
 
-    # Prepare kwargs for autotuner, including T for the pruner
-    autotune_kwargs = {
-        "q":q, "kt":kt, "v":v, "L":lens, "LSE":LSE, "O":O,
-        "stride_qb": q.stride(0), "stride_qh": q.stride(1), "stride_qt": q.stride(2), "stride_qk": q.stride(3),
-        "stride_kb": kt.stride(0), "stride_kh": kt.stride(1), "stride_kk": kt.stride(2), "stride_kt": kt.stride(3),
-        "stride_vb": v.stride(0), "stride_vh": v.stride(1), "stride_vt": v.stride(2), "stride_vk": v.stride(3),
-        "stride_mb": LSE.stride(0) if LSE is not None else 0,
-        "stride_mh": LSE.stride(1) if LSE is not None else 0,
-        "stride_mt": LSE.stride(2) if LSE is not None else 0,
-        "stride_ob": O.stride(0), "stride_oh": O.stride(1), "stride_ot": O.stride(2), "stride_ok": O.stride(3),
-        "lens_stride": lens.stride(0) if lens is not None else 0,
-        "T":T, "HEAD_DIM":HEAD_DIM,
-        # "CONTEXT_SIZE": context_size, "CONTEXTS_BACK": back_contexts, # Removed
-        "INPUT_PRECISION":precision, "PRESCALE_QK":prescale_qk, "DTYPE":q.dtype,
-        "TIME_BUCKET":triton.next_power_of_2(T), "OUTPUT_LOGSUMEXP":return_lse, "SM_SCALE":sm_scale,
-    }
+    # Define fixed/default values for kernel parameters
+    TILE_Q_SIZE_val = 64
+    TILE_K_SIZE_val = 64
+    PIPELINING_val = 1
 
+    # Calculate grid
+    grid_tuple = (batch, heads, triton.cdiv(T, TILE_Q_SIZE_val))
 
-    fwd_fn[grid](**autotune_kwargs)
+    # Calculate heuristic-derived constexpr values
+    RCP_LN2_val = math.log2(math.e)
+    Q_BLOCK_DIVISIBLE_val = (T % TILE_Q_SIZE_val == 0)
+    K_BLOCK_DIVISIBLE_val = (T % TILE_K_SIZE_val == 0)
 
+    # Determine num_warps and num_stages (e.g., from default config or fixed)
+    # Using common defaults; these might be part of _get_default_config_fwd if that was kept for direct use
+    num_warps_val = 4
+    num_stages_val = 3 # Often related to PIPELINING_val or a fixed good value
 
-    if LSE is None: # Should be handled by OUTPUT_LOGSUMEXP but as a safeguard
-        LSE = torch.empty(0, device=q.device) # Ensure it's on the same device
+    # NOTE: Calling kernel.run() directly.
+    # The autotuner/heuristic wrappers (@triton.autotune, @triton.heuristics)
+    # for _causal_attn_fwd were causing TypeErrors after kernel signature changes
+    # (removal of CONTEXT_SIZE, CONTEXTS_BACK).
+    # If autotuning is desired, these wrappers and their configurations for
+    # _causal_attn_fwd need to be carefully reviewed and updated.
+    _causal_attn_fwd.run(
+        Q=q, Kt=kt, V=v, L=lens, LSE=LSE, O=O,
+        stride_qb=q.stride(0), stride_qh=q.stride(1), stride_qt=q.stride(2), stride_qk=q.stride(3),
+        stride_kb=kt.stride(0), stride_kh=kt.stride(1), stride_kk=kt.stride(2), stride_kt=kt.stride(3),
+        stride_vb=v.stride(0), stride_vh=v.stride(1), stride_vt=v.stride(2), stride_vk=v.stride(3),
+        stride_mb=LSE.stride(0) if LSE is not None else 0,
+        stride_mh=LSE.stride(1) if LSE is not None else 0,
+        stride_mt=LSE.stride(2) if LSE is not None else 0,
+        stride_ob=O.stride(0), stride_oh=O.stride(1), stride_ot=O.stride(2), stride_ok=O.stride(3),
+        lens_stride=lens.stride(0) if lens is not None else 0,
+        T=T, TIME_BUCKET=triton.next_power_of_2(T), HEAD_DIM=HEAD_DIM,
+        INPUT_PRECISION=precision, SM_SCALE=sm_scale, DTYPE=q.dtype,
+        PRESCALE_QK=prescale_qk, OUTPUT_LOGSUMEXP=return_lse,
+        TILE_Q_SIZE=TILE_Q_SIZE_val, TILE_K_SIZE=TILE_K_SIZE_val, PIPELINING=PIPELINING_val,
+        Q_BLOCK_DIVISIBLE=Q_BLOCK_DIVISIBLE_val, K_BLOCK_DIVISIBLE=K_BLOCK_DIVISIBLE_val,
+        RCP_LN2=RCP_LN2_val,
+        grid=grid_tuple,
+        num_warps=num_warps_val,
+        num_stages=num_stages_val
+    )
+
+    if LSE is None:
+        LSE = torch.empty(0, device=q.device)
     return O, LSE
 
 
