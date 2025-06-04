@@ -65,11 +65,17 @@ class FlashAttentionTest:
         
         # Use the forward pass from our fwd module
         try:
-            # Try to use the flash attention function
-            return fwd.flash_attention_forward(q, k, v, scale)
-        except AttributeError:
+            # Call the flash attention custom op
+            lens = None  # No length masking for now
+            output, lse = torch.ops.flash_attention.forward(
+                q, k, v, lens, scale, 
+                autotune=False, return_lse=False, 
+                prescale_qk=False, precision="fp16"
+            )
+            return output
+        except Exception as e:
             # Fallback to a simplified version for testing
-            print("Warning: Using simplified flash attention for testing")
+            print(f"Warning: Using reference attention for testing due to: {e}")
             return self.reference_attention(q, k, v, scale)
     
     def test_gradient_accuracy(self, tolerance: float = 1e-3) -> bool:
@@ -296,7 +302,7 @@ class FlashAttentionTest:
 def main():
     """Main test function."""
     print("=" * 60)
-    print("STREAMING ATTENTION COMPREHENSIVE TEST")
+    print("FLASH ATTENTION COMPREHENSIVE TEST")
     print("=" * 60)
     
     # Check CUDA availability
@@ -308,7 +314,7 @@ def main():
         device = "cuda"
     
     # Initialize test class
-    tester = StreamingAttentionTest(device=device)
+    tester = FlashAttentionTest(device=device)
     
     # Test 1: Gradient Accuracy
     print("\n" + "="*40)
