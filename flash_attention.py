@@ -819,8 +819,13 @@ def _self_attn_bwd(
         # Boundary checks are important if TILE_K_SIZE doesn't divide seq_len
         is_last_kv_tile = (kv_tile_idx == num_kv_tiles - 1)
 
-        kt_tile = tl.load(kt_tile_ptr, boundary_check=(1,) if is_last_kv_tile else (False,)) # (HEAD_DIM, TILE_K_SIZE)
-        v_tile = tl.load(v_tile_ptr, boundary_check=(0,) if is_last_kv_tile else (False,))   # (TILE_K_SIZE, HEAD_DIM)
+        # kt_tile_ptr has block_shape=(HEAD_DIM, TILE_K_SIZE)
+        # boundary_check=(False, True) means check dim 1 (TILE_K_SIZE) but not dim 0 (HEAD_DIM)
+        kt_tile = tl.load(kt_tile_ptr, boundary_check=(False, True) if is_last_kv_tile else None) # (HEAD_DIM, TILE_K_SIZE)
+
+        # v_tile_ptr has block_shape=(TILE_K_SIZE, HEAD_DIM)
+        # boundary_check=(True, False) means check dim 0 (TILE_K_SIZE) but not dim 1 (HEAD_DIM)
+        v_tile = tl.load(v_tile_ptr, boundary_check=(True, False) if is_last_kv_tile else None)   # (TILE_K_SIZE, HEAD_DIM)
 
         # --- Recompute S = Q @ K^T ---
         s_qk = tl.dot(q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32) # (TILE_Q_SIZE, TILE_K_SIZE)
