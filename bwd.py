@@ -731,7 +731,8 @@ def _flash_attn_bwd_dkdv(
             )
         tl.static_assert(m.dtype == tl.float32)
 
-        qkT = tl.dot(k, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        qkT = tl.dot(k, qT)
+        qkT = qkT.to(tl.float32)
         if not PRESCALE_QK:
             qkT *= RCP_LN2 * SM_SCALE
         pT = tl.math.exp2(qkT - m[None, :])
@@ -742,11 +743,12 @@ def _flash_attn_bwd_dkdv(
         mask = kv_lens_mask & (q_tile_indices[None, :] < seq_len) & causal_mask
         pT = tl.where(mask, pT, 0.0)
 
-        dv = tl.dot(pT, do.to(pT.dtype), dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dv = tl.dot(pT, do.to(pT.dtype), dv)
         tl.static_assert(Di.dtype == tl.float32)
 
         # Compute dP and dS.
-        dpT = tl.dot(v.to(do.dtype), tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dpT = tl.dot(v.to(do.dtype), tl.trans(do))
+        dpT = dpT.to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
         dk = tl.dot(dsT, tl.trans(qT).to(dsT.dtype), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
     dk *= SM_SCALE
