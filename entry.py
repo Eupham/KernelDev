@@ -276,7 +276,7 @@ class FlashAttentionTest:
             plt.title('Performance Comparison: Flash vs Reference Attention')
             plt.legend()
             plt.grid(True)
-            plt.savefig('/workspaces/KernelDev/performance_comparison.png')
+            plt.savefig('./performance_comparison.png')
             print("Performance plot saved as 'performance_comparison.png'")
         except ImportError:
             print("Matplotlib not available, skipping plot generation")
@@ -293,7 +293,7 @@ class FlashAttentionTest:
             plt.title('Training Loss Comparison')
             plt.legend()
             plt.grid(True)
-            plt.savefig('/workspaces/KernelDev/loss_comparison.png')
+            plt.savefig('./loss_comparison.png')
             print("Loss comparison plot saved as 'loss_comparison.png'")
         except ImportError:
             print("Matplotlib not available, skipping plot generation")
