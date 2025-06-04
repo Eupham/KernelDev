@@ -362,7 +362,7 @@ def main():
     
     if not overall_success:
         print("\nNote: Some tests may show partial success due to simplified fallback implementations.")
-        print("For full functionality, ensure the streaming attention kernels are properly compiled.")
+        print("For full functionality, ensure the flash attention kernels are properly compiled.")
 
 
 if __name__ == "__main__":
