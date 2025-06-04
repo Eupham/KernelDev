@@ -231,9 +231,8 @@ def _flash_attn_fwd(
                 boundary_check=(0,),
             )
 
-        qk = tl.dot(
-            q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
-        )
+        qk = tl.dot(q_tile, kt_tile)
+        qk = qk.to(tl.float32)
 
         kv_indices = kv_token_idx + tile_k_arange
         # Causal mask: only attend to previous tokens (including current)
