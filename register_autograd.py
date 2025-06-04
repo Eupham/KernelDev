@@ -22,7 +22,6 @@ def flash_attention_backward_setup_context(ctx, q, k, v, lens, sm_scale, autotun
 def flash_attention_backward_adapter(ctx, grad_out, grad_lse=None):
     """Backward function for flash attention."""
     q, k, v, lens = ctx.saved_tensors
-    o, lse = ctx.outputs
     
     # Call the backward operation
     dq, dk, dv = torch.ops.flash_attention.backward(
@@ -30,8 +29,8 @@ def flash_attention_backward_adapter(ctx, grad_out, grad_lse=None):
         k=k,
         v=v,
         lens=lens,
-        o=o,
-        lse=lse,
+        o=ctx.o,
+        lse=ctx.lse,
         do=grad_out,
         sm_scale=ctx.sm_scale,
         autotune=ctx.autotune,
