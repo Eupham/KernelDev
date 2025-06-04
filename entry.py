@@ -65,12 +65,14 @@ class FlashAttentionTest:
         
         # Use the forward pass from our fwd module
         try:
-            # Call the flash attention custom op
+            # Call the flash attention custom op with proper precision setting
             lens = None  # No length masking for now
+            # Use the precision matching input dtype
+            precision = "fp16" if q.dtype == torch.float16 else "fp32"
             output, lse = torch.ops.flash_attention.forward(
                 q, k, v, lens, scale, 
                 autotune=False, return_lse=False, 
-                prescale_qk=False, precision="fp16"
+                prescale_qk=False, precision=precision
             )
             return output
         except Exception as e:
