@@ -750,7 +750,7 @@ def _flash_attn_bwd_dkdv(
         dpT = tl.dot(v.to(do.dtype), tl.trans(do))
         dpT = dpT.to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
-        dk = tl.dot(dsT, tl.trans(qT).to(dsT.dtype), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+        dk = tl.dot(dsT, tl.trans(qT).to(dsT.dtype), dk)
     dk *= SM_SCALE
     return dk, dv
 # fmt: on
