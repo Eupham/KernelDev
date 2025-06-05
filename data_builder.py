@@ -27,10 +27,10 @@ class DataBuilder:
     
     def __init__(
         self,
-        dataset_name: str = "wikitext",
-        dataset_config: str = "wikitext-2-raw-v1",
+        dataset_name: str = "allenai/c4",
+        dataset_config: str = "en",
         seq_len: int = 512,
-        max_samples: Optional[int] = None,
+        max_samples: Optional[int] = 2000,  # Default to 2000 records
         vocab_size: int = 256  # UTF-8 byte vocabulary
     ):
         self.dataset_name = dataset_name
