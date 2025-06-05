@@ -1,21 +1,21 @@
 import torch
+import torch.nn as nn # Added for LiteGPTModel parameters if not already there
 import torch.nn.functional as F
 import os
 import sys
-import inspect # Added import
+import inspect
 
 # Updated imports to reflect potential renames in fwd.py and bwd.py
-from fwd import causal_attention_forward_adapter
+# from model import LiteGPTModel # Moved to local scope to break circular import
+from fwd import causal_attention_forward_adapter # This might be unused if causal_attention is self-contained
 from bwd import causal_attention_backward_op, causal_attention_backward_op_setup_context
 
 @torch.compile(fullgraph=True, dynamic=True)
-def _causal_attention( # Renamed
+def _causal_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     lens: torch.Tensor | None,
-    # context_size: int, # Removed
-    # back_contexts: int, # Removed
     sm_scale: float | None,
     autotune: bool,
     return_lse: bool,
@@ -32,14 +32,9 @@ def _causal_attention( # Renamed
     if not torch.cuda.is_available() and q.is_cuda:
          raise RuntimeError("_causal_attention custom op called with CUDA tensors when CUDA is NOT available.")
 
-    if q.is_cuda: # Custom op is CUDA only
-        O, LSE = torch.ops.alexdremov_causal_attention.forward( # Updated op name
-            q=q,
-            k=k,
-            v=v,
-            lens=lens,
-            # context_size=context_size, # Removed
-            # back_contexts=back_contexts, # Removed
+    if q.is_cuda:
+        O, LSE = torch.ops.alexdremov_causal_attention.forward(
+            q=q, k=k, v=v, lens=lens,
             sm_scale=sm_scale,
             autotune=autotune,
             prescale_qk=prescale_qk,
@@ -53,23 +48,17 @@ def _causal_attention( # Renamed
         return O, LSE
     return O
 
-def causal_attention( # Renamed
+def causal_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     lens: torch.Tensor | None,
-    # context_size: int, # Removed
-    # back_contexts: int, # Removed
     sm_scale: float | None = None,
     autotune=False,
     return_lse=False,
     prescale_qk=False,
     precision="ieee",
 ):
-    """
-    Computes causal self-attention.
-    Args are similar to streaming_attention but without context_size and back_contexts.
-    """
     if not torch.compiler.is_compiling():
         for i in (q, k, v):
             torch._dynamo.mark_static(i, 0)
@@ -79,13 +68,8 @@ def causal_attention( # Renamed
         HEAD_DIM = q.size(-1)
         sm_scale = HEAD_DIM**-0.5
 
-    result = _causal_attention( # Renamed
-        q=q,
-        k=k,
-        v=v,
-        lens=lens,
-        # context_size=context_size, # Removed
-        # back_contexts=back_contexts, # Removed
+    result = _causal_attention(
+        q=q, k=k, v=v, lens=lens,
         sm_scale=sm_scale,
         autotune=autotune,
         return_lse=return_lse,
@@ -94,106 +78,102 @@ def causal_attention( # Renamed
     )
     return result
 
-# Updated autograd registration
 torch.library.register_autograd(
-    "alexdremov_causal_attention::forward", # Updated op name
-    causal_attention_backward_op, # Using renamed backward op from bwd.py
-    setup_context=causal_attention_backward_op_setup_context, # Using renamed setup context from bwd.py
+    "alexdremov_causal_attention::forward",
+    causal_attention_backward_op,
+    setup_context=causal_attention_backward_op_setup_context,
 )
 
-def causal_attention_reference(q, k, v, lens, scale=None): # Renamed and simplified
-    """
-    Reference causal attention using PyTorch's F.scaled_dot_product_attention.
-    `lens` is not directly used by is_causal=True but could be used to generate a key_padding_mask
-    if combined causal+padding is needed. For this reference, we rely on is_causal only.
-    """
+def causal_attention_reference(q, k, v, lens, scale=None):
     if scale is None:
-        scale = q.size(-1)**-0.5 # Common practice if not provided
-
-    # F.scaled_dot_product_attention with is_causal=True handles causal masking.
-    # If `lens` were to be used to create a key_padding_mask, it would need careful construction
-    # as `is_causal` and `attn_mask` (for key_padding_mask) are mutually exclusive in the simpler API.
-    # For a pure causal reference, `attn_mask` is None.
-    # If `lens` is provided, a proper combined mask would need to be manually created and passed to `attn_mask`.
-    # This basic reference does not implement manual mask combination with `lens`.
-    _ = lens # lens is ignored in this simplified reference.
-
+        scale = q.size(-1)**-0.5
+    _ = lens
     output = F.scaled_dot_product_attention(
             query=q, key=k, value=v, attn_mask=None, dropout_p=0.0, is_causal=True, scale=scale
         )
-    # Placeholder for LSE (not typically returned by SDPA) and sparsity_fraction (1.0 for dense causal)
     return output, None, 1.0
 
 
 def test_loss_reduction(dtype=torch.float32):
-    if dtype == torch.bfloat16:
-        print(f"Skipping {inspect.currentframe().f_code.co_name} for bfloat16 due to potential Triton compiler issues on some hardware.")
+    from model import LiteGPTModel # Local import
+    if dtype == torch.bfloat16: #This check should be before device selection for clarity
+        print(f"Skipping {inspect.currentframe().f_code.co_name} for bfloat16 due to potential Triton compiler issues or specific test setup needs.")
         return
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\nRunning loss reduction test for CAUSAL attention on {device.upper()} with {dtype}...")
+    print(f"\nRunning loss reduction test with LiteGPTModel on {device.upper()} with {dtype}...")
 
     if device == "cpu":
-        print("Skipping loss reduction test for custom op on CPU as it's CUDA-only.")
+        # LiteGPTModel uses causal_attention, which is CUDA-only. So skip on CPU.
+        print(f"Skipping {inspect.currentframe().f_code.co_name} on CPU as LiteGPTModel uses CUDA-only causal_attention.")
         return
 
-    B, H, T, HEAD_DIM = 2, 2, 16, 32
+    # Model parameters
+    B, T, embed_dim, vocab_size = 2, 16, 64, 100
+    num_layers, num_heads, ff_hidden_dim, max_seq_len = 2, 4, 128, 32 # T must be <= max_seq_len
 
-    input_sequence = torch.randn(B, H, T, HEAD_DIM, device=device, dtype=dtype, requires_grad=True)
-    # Target: predict the next token in the sequence (autoregressive)
-    # For causal attention, output at step t should predict input_sequence at t+1
-    # So, the loss is calculated between output[..., :-1, :] and input_sequence[..., 1:, :]
+    if T > max_seq_len:
+        print(f"Adjusting T from {T} to {max_seq_len} for test_loss_reduction as T > max_seq_len.")
+        T = max_seq_len
 
-    q_param = input_sequence.clone().detach().requires_grad_(True)
-    k_param = input_sequence.clone().detach().requires_grad_(True)
-    v_param = input_sequence.clone().detach().requires_grad_(True)
+    model = LiteGPTModel(num_layers, embed_dim, num_heads, ff_hidden_dim, vocab_size, max_seq_len).to(device)
 
-    sm_scale_val = HEAD_DIM**-0.5
-    optimizer = torch.optim.SGD([q_param, k_param, v_param], lr=0.01)
+    # Ensure model parameters are in the specified dtype for the test, especially for fp16
+    if dtype == torch.float16 or dtype == torch.bfloat16:
+        model = model.to(dtype)
 
+    # Synthetic Autoregressive Data (Token IDs)
+    input_ids = torch.randint(0, vocab_size, (B, T), device=device, dtype=torch.long)
+    # Target for CrossEntropyLoss should be (B * (T-1))
+    targets = input_ids[:, 1:].contiguous().view(-1)
+    # Input to model will be input_ids[:, :-1]
+    model_input_ids = input_ids[:, :-1].contiguous()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     initial_loss = -1.0
     final_loss = -1.0
     loss_decreased = False
 
-    print("Starting loss reduction test (autoregressive prediction)...")
+    print(f"Starting loss reduction test (autoregressive token prediction with LiteGPTModel, model dtype={next(model.parameters()).dtype})...")
+
+    use_fp16_autocast = (dtype == torch.float16)
+
     for i in range(5):
         optimizer.zero_grad()
-        output = causal_attention(
-            q_param, k_param, v_param,
-            lens=None,
-            sm_scale=sm_scale_val,
-            autotune=False,
-            return_lse=False,
-            prescale_qk=False,
-            precision="ieee"
-        )
 
-        loss = F.mse_loss(output[..., :-1, :], input_sequence[..., 1:, :].detach())
+        with torch.cuda.amp.autocast(enabled=use_fp16_autocast, dtype=torch.float16 if use_fp16_autocast else torch.float32):
+            logits = model(model_input_ids) # model_input_ids is (B, T-1)
+            # Logits will be (B, T-1, vocab_size)
+
+            current_loss = F.cross_entropy(logits.view(-1, vocab_size), targets)
 
         if i == 0:
-            initial_loss = loss.item()
-        print(f"Step {i}, Loss: {loss.item()}")
+            initial_loss = current_loss.item()
+        print(f"Step {i}, Loss: {current_loss.item()}")
 
-        loss.backward()
+        if use_fp16_autocast:
+            # Basic backward, GradScaler would be better for robust fp16 training
+            current_loss.backward()
+        else:
+            current_loss.backward()
+
         optimizer.step()
 
         if i == 4:
-            final_loss = loss.item()
+            final_loss = current_loss.item()
 
-        if loss.item() < initial_loss:
+        if current_loss.item() < initial_loss:
             loss_decreased = True
 
     assert loss_decreased, f"Loss did not decrease. Initial: {initial_loss}, Final: {final_loss}"
-    print("Loss reduction test passed.")
+    print("Loss reduction test with LiteGPTModel passed.")
 
 
 from torch.autograd import gradcheck
 
-# Renamed parameter to dtype_to_test for clarity within this function
 def test_grad_accuracy(dtype_to_test=torch.float32):
-    # gradcheck itself needs double for inputs, but op is tested with dtype_to_test
     if dtype_to_test == torch.bfloat16:
-        print(f"Skipping {inspect.currentframe().f_code.co_name} for bfloat16 due to potential Triton compiler issues on some hardware.")
+        print(f"Skipping {inspect.currentframe().f_code.co_name} for bfloat16 due to potential Triton compiler issues or specific test setup needs.")
         return
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -237,18 +217,28 @@ def test_grad_accuracy(dtype_to_test=torch.float32):
 
 
 if __name__ == "__main__":
+    from model import LiteGPTModel # Local import for main execution context
     print("Running tests in entry.py for CAUSAL attention...")
 
+    # Test with float32
     test_loss_reduction(dtype=torch.float32)
-    # In test_grad_accuracy, the parameter is named dtype_to_test, so we pass it as such.
     test_grad_accuracy(dtype_to_test=torch.float32)
 
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        print("\nTesting with torch.bfloat16 on CUDA...")
-        test_loss_reduction(dtype=torch.bfloat16)
-        test_grad_accuracy(dtype_to_test=torch.bfloat16)
-    elif torch.cuda.is_available():
-        print("\ntorch.bfloat16 not supported on this CUDA device for tests.")
+    if torch.cuda.is_available(): # Only run fp16/bf16 if CUDA is available
+        print("\nTesting with torch.float16 on CUDA (if supported by op)...")
+        test_loss_reduction(dtype=torch.float16)
+        # gradcheck for float16 is often very tricky and might require specific setup or be skipped.
+        # test_grad_accuracy(dtype_to_test=torch.float16)
+
+        if torch.cuda.is_bf16_supported():
+            print("\nTesting with torch.bfloat16 on CUDA...")
+            test_loss_reduction(dtype=torch.bfloat16) # Will be skipped by the new logic
+            test_grad_accuracy(dtype_to_test=torch.bfloat16) # Will be skipped
+        else:
+            print("\ntorch.bfloat16 not supported on this CUDA device for tests.")
+    else:
+        print("\nCUDA not available, skipping float16/bfloat16 tests that require CUDA.")
+
 
     print("\nAll specified tests in entry.py finished.")
 
@@ -265,5 +255,20 @@ if __name__ == "__main__":
         output_ex_with_lse, lse_ex = causal_attention(q_ex, k_ex, v_ex, None, return_lse=True)
         print("Example causal_attention output shape (return_lse=True):", output_ex_with_lse.shape)
         print("Example LSE shape:", lse_ex.shape)
+
+        # Example LiteGPTModel instantiation and forward pass
+        try:
+            print("\nRunning example LiteGPTModel instantiation and forward pass...")
+            model_params = {
+                "num_layers": 2, "embed_dim": 64, "num_heads": 4, "ff_hidden_dim": 128,
+                "vocab_size": 100, "max_seq_len": 32
+            }
+            example_model = LiteGPTModel(**model_params).to('cuda') # LiteGPTModel already imported locally in main
+            example_input_ids = torch.randint(0, model_params["vocab_size"], (B, T_val), device='cuda', dtype=torch.long)
+            example_logits = example_model(example_input_ids)
+            print("Example LiteGPTModel output logits shape:", example_logits.shape)
+        except Exception as e:
+            print(f"Error during LiteGPTModel example: {e}")
+
     else:
         print("\nSkipping example usage as CUDA is not available.")
