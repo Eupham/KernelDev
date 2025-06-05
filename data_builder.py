@@ -57,22 +57,41 @@ class DataBuilder:
             return f"[DECODE_ERROR: {tokens[:10]}...]"
     
     def load_raw_dataset(self):
-        """Load the raw dataset from HuggingFace."""
-        print(f"Loading dataset: {self.dataset_name}/{self.dataset_config}")
+        """Load the raw dataset from HuggingFace using streaming."""
+        print(f"Loading dataset: {self.dataset_name}/{self.dataset_config} with streaming")
+        print(f"Will load {self.max_samples} samples from the dataset")
         
         try:
-            dataset = load_dataset(self.dataset_name, self.dataset_config)
-            print(f"Dataset loaded successfully!")
-            print(f"Available splits: {list(dataset.keys())}")
+            # Use streaming to avoid loading entire dataset
+            dataset = load_dataset(
+                self.dataset_name, 
+                self.dataset_config, 
+                streaming=True,
+                split='train'
+            )
             
-            # Show dataset info
-            for split_name, split_data in dataset.items():
-                print(f"{split_name}: {len(split_data)} samples")
-                if len(split_data) > 0:
-                    print(f"Sample fields: {list(split_data[0].keys())}")
-                    print(f"Sample text preview: {str(split_data[0])[:200]}...")
+            print("Dataset streaming started successfully!")
             
-            return dataset
+            # Convert streaming dataset to list with max_samples limit
+            samples = []
+            for i, sample in enumerate(dataset):
+                if i >= self.max_samples:
+                    break
+                samples.append(sample)
+                if i % 500 == 0:  # Progress update every 500 samples
+                    print(f"Loaded {i+1} samples...")
+            
+            print(f"Successfully loaded {len(samples)} samples")
+            if len(samples) > 0:
+                print(f"Sample fields: {list(samples[0].keys())}")
+                print(f"Sample text preview: {str(samples[0])[:200]}...")
+            
+            # Return in expected format
+            return {
+                'train': samples,
+                'validation': samples[-200:],  # Use last 200 as validation
+                'test': samples[-100:]  # Use last 100 as test
+            }
             
         except Exception as e:
             print(f"Error loading dataset: {e}")
