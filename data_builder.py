@@ -72,25 +72,43 @@ class DataBuilder:
             
             print("Dataset streaming started successfully!")
             
-            # Convert streaming dataset to list with max_samples limit
+            # Convert streaming dataset to simple format with just 'text' field
             samples = []
             for i, sample in enumerate(dataset):
                 if i >= self.max_samples:
                     break
-                samples.append(sample)
+                
+                # Extract text content from sample - handle different field names
+                text_content = ""
+                if 'text' in sample:
+                    text_content = sample['text']
+                elif 'content' in sample:
+                    text_content = sample['content']
+                else:
+                    # Take first string field we find
+                    for key, value in sample.items():
+                        if isinstance(value, str) and value.strip():
+                            text_content = value
+                            break
+                
+                if text_content and text_content.strip():
+                    samples.append({'text': text_content})
+                
                 if i % 500 == 0:  # Progress update every 500 samples
                     print(f"Loaded {i+1} samples...")
             
-            print(f"Successfully loaded {len(samples)} samples")
+            print(f"Successfully loaded {len(samples)} samples with text content")
             if len(samples) > 0:
-                print(f"Sample fields: {list(samples[0].keys())}")
-                print(f"Sample text preview: {str(samples[0])[:200]}...")
+                print(f"Sample text preview: {samples[0]['text'][:200]}...")
             
-            # Return in expected format
+            # Split data for train/validation/test
+            train_split = int(0.8 * len(samples))
+            val_split = int(0.9 * len(samples))
+            
             return {
-                'train': samples,
-                'validation': samples[-200:],  # Use last 200 as validation
-                'test': samples[-100:]  # Use last 100 as test
+                'train': samples[:train_split],
+                'validation': samples[train_split:val_split],
+                'test': samples[val_split:]
             }
             
         except Exception as e:
