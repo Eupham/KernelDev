@@ -31,15 +31,18 @@ class DataBuilder:
         dataset_config: str = "en",
         seq_len: int = 512,
         max_samples: Optional[int] = 2000,  # Default to 2000 records
-        vocab_size: int = 256  # UTF-8 byte vocabulary
+        vocab_size: int = 256,  # UTF-8 byte vocabulary
+        max_eval_tokens: int = 50000  # Limit evaluation datasets for speed
     ):
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
         self.seq_len = seq_len
         self.max_samples = max_samples
         self.vocab_size = vocab_size
+        self.max_eval_tokens = max_eval_tokens
         
         print(f"Using UTF-8 byte tokenization with vocabulary size: {self.vocab_size}")
+        print(f"Max evaluation tokens per split: {self.max_eval_tokens}")
     
     def _tokenize_text(self, text: str) -> list:
         """Convert text to UTF-8 byte tokens."""
@@ -212,6 +215,13 @@ class DataBuilder:
         datasets = {}
         for split_name, tokens in tokenized_data.items():
             if len(tokens) > self.seq_len:
+                # Limit evaluation datasets to reasonable size
+                if split_name in ['validation', 'test']:
+                    # Limit to configured max tokens for faster evaluation
+                    if len(tokens) > self.max_eval_tokens:
+                        tokens = tokens[:self.max_eval_tokens]
+                        print(f"Limited {split_name} to {self.max_eval_tokens} tokens for faster evaluation")
+                
                 datasets[split_name] = TokenizedDataset(tokens, self.seq_len)
                 print(f"{split_name} dataset: {len(datasets[split_name])} samples")
             else:
@@ -257,14 +267,16 @@ def create_data_builder(
     dataset_name: str = "allenai/c4",
     dataset_config: str = "en",
     seq_len: int = 512,
-    max_samples: Optional[int] = 2000
+    max_samples: Optional[int] = 2000,
+    max_eval_tokens: int = 50000
 ) -> DataBuilder:
     """Factory function to create a DataBuilder instance."""
     return DataBuilder(
         dataset_name=dataset_name,
         dataset_config=dataset_config,
         seq_len=seq_len,
-        max_samples=max_samples
+        max_samples=max_samples,
+        max_eval_tokens=max_eval_tokens
     )
 
 

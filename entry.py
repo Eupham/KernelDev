@@ -24,7 +24,8 @@ def main():
         'dataset_name': 'allenai/c4',
         'dataset_config': 'en',
         'seq_len': 128,  # Reduced for T4
-        'max_samples': 2000  # Default for C4
+        'max_samples': 2000,  # Default for C4
+        'max_eval_tokens': 25000  # Reduced for faster evaluation
     }
     
     # Model configuration (T4-optimized)
@@ -118,7 +119,8 @@ def main():
     # Initial evaluation
     print(f"\n=== Initial Evaluation ===")
     if 'train' in dataloaders and 'validation' in dataloaders:
-        initial_train_loss = trainer.evaluate(dataloaders['train'])
+        # Limit initial evaluation to 500 batches for speed
+        initial_train_loss = trainer.evaluate(dataloaders['train'], max_batches=500)
         initial_val_loss = trainer.evaluate(dataloaders['validation'])
         print(f"Initial training loss: {initial_train_loss:.4f}")
         print(f"Initial validation loss: {initial_val_loss:.4f}")
@@ -139,7 +141,8 @@ def main():
         
         # Final evaluation
         if 'train' in dataloaders and 'validation' in dataloaders:
-            final_train_loss = trainer.evaluate(dataloaders['train'])
+            # Limit final evaluation to 500 batches for speed
+            final_train_loss = trainer.evaluate(dataloaders['train'], max_batches=500)
             final_val_loss = trainer.evaluate(dataloaders['validation'])
             print(f"Final training loss: {final_train_loss:.4f}")
             print(f"Final validation loss: {final_val_loss:.4f}")

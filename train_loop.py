@@ -169,14 +169,18 @@ class Trainer:
         
         return loss.item()
     
-    def evaluate(self, dataloader: DataLoader) -> float:
+    def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 1000) -> float:
         """Evaluate the model on a dataset."""
         self.model.eval()
         total_loss = 0
         num_batches = 0
         
         with torch.no_grad():
-            for batch in dataloader:
+            for batch_idx, batch in enumerate(dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    print(f"Evaluation limited to {max_batches} batches for speed")
+                    break
+                    
                 x, y = batch
                 x, y = x.to(self.config.device), y.to(self.config.device)
                 
