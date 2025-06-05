@@ -101,7 +101,14 @@ class TransformerBlock(nn.Module):
 
         # Concatenate heads and project back to embed_dim
         # (B, num_heads, T, head_dim) -> (B, T, num_heads, head_dim) -> (B, T, embed_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, self.embed_dim)
+        print(f"DEBUG: attn_output shape before transpose: {attn_output.shape}, numel: {attn_output.nelement()}")
+        transposed_attn = attn_output.transpose(1, 2)
+        print(f"DEBUG: attn_output shape after transpose: {transposed_attn.shape}, numel: {transposed_attn.nelement()}")
+        contiguous_attn = transposed_attn.contiguous()
+        print(f"DEBUG: attn_output shape after contiguous: {contiguous_attn.shape}, numel: {contiguous_attn.nelement()}")
+        print(f"DEBUG: Target view parameters: B={B}, T={T}, self.embed_dim={self.embed_dim}")
+        # Original line was: attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, self.embed_dim)
+        attn_output = contiguous_attn.view(B, T, self.embed_dim) # Use intermediate variable
         attn_output = self.attn_out_proj(attn_output) # (B, T, embed_dim)
 
         # First residual connection
