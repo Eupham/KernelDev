@@ -62,13 +62,49 @@ class DataBuilder:
         print(f"Will load {self.max_samples} samples from the dataset")
         
         try:
-            # Use streaming to avoid loading entire dataset
-            dataset = load_dataset(
-                self.dataset_name, 
-                self.dataset_config, 
-                streaming=True,
-                split='train'
-            )
+            # Try different approaches to load the dataset
+            dataset = None
+            
+            # Method 1: Try with explicit name and config
+            try:
+                print("Attempting to load with explicit config...")
+                dataset = load_dataset(
+                    self.dataset_name, 
+                    name=self.dataset_config,
+                    streaming=True,
+                    split='train',
+                    trust_remote_code=True
+                )
+                print("Success with explicit config!")
+            except Exception as e1:
+                print(f"Method 1 failed: {e1}")
+                
+                # Method 2: Try without config name
+                try:
+                    print("Attempting to load without config...")
+                    dataset = load_dataset(
+                        self.dataset_name,
+                        streaming=True,
+                        split='train',
+                        trust_remote_code=True
+                    )
+                    print("Success without config!")
+                except Exception as e2:
+                    print(f"Method 2 failed: {e2}")
+                    
+                    # Method 3: Try with different dataset entirely
+                    try:
+                        print("Attempting to load different dataset: wikitext...")
+                        dataset = load_dataset(
+                            "wikitext",
+                            "wikitext-2-raw-v1",
+                            streaming=True,
+                            split='train'
+                        )
+                        print("Success with wikitext!")
+                    except Exception as e3:
+                        print(f"Method 3 failed: {e3}")
+                        raise Exception("All dataset loading methods failed")
             
             print("Dataset streaming started successfully!")
             
