@@ -63,7 +63,7 @@ class StreamingAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        # Use streaming attention kernel
+        # Use streaming attention kernel with autotuning disabled for stability
         out = streaming_attention(
             q=q,
             k=k,
@@ -72,10 +72,10 @@ class StreamingAttention(nn.Module):
             context_size=self.context_size,
             back_contexts=self.back_contexts,
             sm_scale=self.scale,
-            autotune=False,
+            autotune=False,  # Disable autotuning for stability
             return_lse=False,
-            prescale_qk=True,
-            precision='tf32'
+            prescale_qk=False,  # Disable for better numerical stability
+            precision='ieee'  # Use IEEE precision for stability
         )
         
         # Reshape back

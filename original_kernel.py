@@ -1194,45 +1194,26 @@ streaming_backward_autotune = triton.autotune(
     configs=[
         triton.Config(
             dict(
-                PIPELINING=pipe,
-                TILE_DQ_Q_SIZE=tile_qq,
-                TILE_DQ_K_SIZE=tile_qk,
-                TILE_DK_Q_SIZE=tile_kq,
-                TILE_DK_K_SIZE=tile_kk,
+                PIPELINING=1,
+                TILE_DQ_Q_SIZE=16,
+                TILE_DQ_K_SIZE=16,
+                TILE_DK_Q_SIZE=16,
+                TILE_DK_K_SIZE=16,
             ),
-            num_warps=num_warps,
-            num_stages=pipe,
-        )
-        for num_warps in [4, 8]
-        for pipe in [1, 2, 3]
-        for tile_qq in [
-            2**i
-            for i in range(
-                int(math.log2(MIN_TILE_SIZE) + 0.1),
-                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-            )
-        ]
-        for tile_qk in [
-            2**i
-            for i in range(
-                int(math.log2(MIN_TILE_SIZE) + 0.1),
-                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-            )
-        ]
-        for tile_kq in [
-            2**i
-            for i in range(
-                int(math.log2(MIN_TILE_SIZE) + 0.1),
-                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-            )
-        ]
-        for tile_kk in [
-            2**i
-            for i in range(
-                int(math.log2(MIN_TILE_SIZE) + 0.1),
-                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-            )
-        ]
+            num_warps=2,
+            num_stages=1,
+        ),
+        triton.Config(
+            dict(
+                PIPELINING=1,
+                TILE_DQ_Q_SIZE=32,
+                TILE_DQ_K_SIZE=32,
+                TILE_DK_Q_SIZE=32,
+                TILE_DK_K_SIZE=32,
+            ),
+            num_warps=4,
+            num_stages=1,
+        ),
     ],
     key=[
         "HEAD_DIM",

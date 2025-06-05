@@ -7,7 +7,7 @@ This script creates a simple training loop to demonstrate loss reduction.
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import numpy as np
 import time
 from model import create_model
@@ -32,7 +32,7 @@ def train_step(model, batch, optimizer, scaler, device):
     
     optimizer.zero_grad()
     
-    with autocast():
+    with autocast('cuda'):
         logits = model(input_ids)
         # Calculate cross-entropy loss
         loss = nn.functional.cross_entropy(
@@ -103,7 +103,7 @@ def main():
     
     # Setup optimizer and scaler
     optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'])
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     
     # Generate training data
     print(f"\nGenerating {config['num_batches_per_epoch']} batches of dummy data...")
@@ -165,7 +165,7 @@ def main():
     with torch.no_grad():
         sample_input = torch.randint(0, config['vocab_size'], (1, 20)).to(device)
         
-        with autocast():
+        with autocast('cuda'):
             logits = model(sample_input)
             probs = torch.softmax(logits[0, -1], dim=-1)
             top_tokens = torch.topk(probs, 5)
