@@ -162,8 +162,6 @@ def main():
         'n_layers': 6,
         'n_heads': 8,
         'max_seq_len': 512,
-        'context_size': 64,
-        'back_contexts': 4,
         'mlp_ratio': 4
     }
     

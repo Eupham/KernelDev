@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from kernel import attention
+from original_kernel import flash_attention
 
 
 class RMSNorm(nn.Module):
@@ -29,7 +29,7 @@ class SwiGLU(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head attention using standard causal attention kernel."""
+    """Multi-head attention using flash attention kernel."""
     
     def __init__(self, dim, n_heads, head_dim=None):
         super().__init__()
@@ -49,8 +49,8 @@ class MultiHeadAttention(nn.Module):
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        # Use standard causal attention kernel
-        out = attention(
+        # Use flash attention kernel
+        out = flash_attention(
             q=q,
             k=k,
             v=v,
@@ -80,7 +80,7 @@ class TransformerBlock(nn.Module):
 
 
 class GPTModel(nn.Module):
-    """GPT-styled model using standard causal attention kernel."""
+    """GPT-styled model using flash attention kernel."""
     
     def __init__(
         self,
