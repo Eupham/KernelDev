@@ -73,20 +73,20 @@ def main():
         print(f"  Model dim: {optimal_config.model_dim}")
         print(f"  Expected throughput: {optimal_config.throughput:.1f} tokens/sec")
     
-    # Training configuration (adaptive based on optimization)
+    # Training configuration (T4-optimized)
     training_config = TrainingConfig(
-        num_epochs=2,
-        learning_rate=5e-4,
+        num_epochs=2,  # Reduced for T4
+        learning_rate=5e-4,  # Slightly higher for smaller model
         weight_decay=0.01,
-        warmup_steps=50,
+        warmup_steps=50,  # Reduced for T4
         max_grad_norm=1.0,
-        save_every=300,
-        eval_every=100,
-        log_every=25,
+        save_every=300,  # Reduced for T4
+        eval_every=100,  # Reduced for T4
+        log_every=25,  # Reduced for T4
         checkpoint_dir="checkpoints"
     )
     
-    batch_size = batch_size  # Use optimized batch size
+    batch_size = 2  # Small batch size for T4
     
     print(f"Device: {training_config.device}")
     print(f"Model config: {model_config}")
