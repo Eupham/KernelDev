@@ -405,6 +405,7 @@ def causal_attention_forward_adapter( # Renamed
     prescale_qk: bool,
     precision: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    print(f"DEBUG: Input q to causal_attention_forward_adapter: {q.shape}")
     batch, heads, T, HEAD_DIM = q.shape
 
     # assert back_contexts >= 0 and context_size >= 1 # Removed
