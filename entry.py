@@ -19,39 +19,39 @@ def main():
     print("=== GPT Model Training with Flash Attention ===")
     print("Setting up configuration...")
     
-    # Data configuration
+    # Data configuration (T4-optimized)
     data_config = {
         'dataset_name': 'wikitext',
         'dataset_config': 'wikitext-2-raw-v1',
-        'seq_len': 256,
-        'max_samples': 5000  # Limit samples for faster testing
+        'seq_len': 128,  # Reduced for T4
+        'max_samples': 2000  # Reduced for T4
     }
     
-    # Model configuration  
+    # Model configuration (T4-optimized)
     model_config = {
         'vocab_size': 256,  # UTF-8 byte vocabulary size
-        'dim': 384,
-        'n_layers': 6,
-        'n_heads': 6,
-        'max_seq_len': 512,
-        'mlp_ratio': 4,
+        'dim': 256,  # Reduced for T4
+        'n_layers': 4,  # Reduced for T4
+        'n_heads': 4,  # Reduced for T4
+        'max_seq_len': 256,  # Reduced for T4
+        'mlp_ratio': 2,  # Reduced for T4
         'causal': True  # Using causal attention
     }
     
-    # Training configuration
+    # Training configuration (T4-optimized)
     training_config = TrainingConfig(
-        num_epochs=3,
-        learning_rate=3e-4,
+        num_epochs=2,  # Reduced for T4
+        learning_rate=5e-4,  # Slightly higher for smaller model
         weight_decay=0.01,
-        warmup_steps=100,
+        warmup_steps=50,  # Reduced for T4
         max_grad_norm=1.0,
-        save_every=500,
-        eval_every=200,
-        log_every=50,
+        save_every=300,  # Reduced for T4
+        eval_every=100,  # Reduced for T4
+        log_every=25,  # Reduced for T4
         checkpoint_dir="checkpoints"
     )
     
-    batch_size = 4  # Small batch size for testing
+    batch_size = 2  # Small batch size for T4
     
     print(f"Device: {training_config.device}")
     print(f"Model config: {model_config}")

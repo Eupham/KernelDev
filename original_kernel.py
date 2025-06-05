@@ -7,8 +7,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-MAX_TILE_SIZE = 256
-MIN_TILE_SIZE = 32
+MAX_TILE_SIZE = 64  # Reduced for T4 compatibility
+MIN_TILE_SIZE = 16  # Reduced for T4 compatibility
 
 
 logger = logging.getLogger(__name__)
@@ -1156,8 +1156,8 @@ flash_forward_autotune = triton.autotune(
             num_warps=num_warps,
             num_stages=pipe,
         )
-        for num_warps in [4, 8]
-        for pipe in [1, 2]
+        for num_warps in [2, 4]  # Reduced warps for T4
+        for pipe in [1]  # Reduced pipelining for T4
         for tile_q in [
             2**i
             for i in range(
@@ -1189,16 +1189,16 @@ flash_backward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
         TILE_DQ_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
+            32, max(MIN_TILE_SIZE, triton.next_power_of_2(min(32, args["T"])))
         ),
         TILE_DQ_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
+            32, max(MIN_TILE_SIZE, triton.next_power_of_2(min(32, args["T"])))
         ),
         TILE_DK_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
+            32, max(MIN_TILE_SIZE, triton.next_power_of_2(min(32, args["T"])))
         ),
         TILE_DK_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
+            32, max(MIN_TILE_SIZE, triton.next_power_of_2(min(32, args["T"])))
         ),
     )
 )(_flash_attn_bwd)
