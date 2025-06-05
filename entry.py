@@ -8,6 +8,7 @@ from pathlib import Path
 from model import GPTModel
 from data_builder import DataBuilder, create_data_builder
 from train_loop import Trainer, TrainingConfig, create_trainer
+from t4_optimizer import run_t4_optimization
 
 
 def main():
@@ -19,39 +20,73 @@ def main():
     print("=== GPT Model Training with Flash Attention ===")
     print("Setting up configuration...")
     
-    # Data configuration (T4-optimized)
-    data_config = {
-        'dataset_name': 'wikitext',
-        'dataset_config': 'wikitext-2-raw-v1',
-        'seq_len': 128,  # Reduced for T4
-        'max_samples': 2000  # Reduced for T4
-    }
+    # Run T4 optimization first
+    print("\n=== T4 GPU OPTIMIZATION ===")
+    optimal_config = run_t4_optimization()
     
-    # Model configuration (T4-optimized)
-    model_config = {
-        'vocab_size': 256,  # UTF-8 byte vocabulary size
-        'dim': 256,  # Reduced for T4
-        'n_layers': 4,  # Reduced for T4
-        'n_heads': 4,  # Reduced for T4
-        'max_seq_len': 256,  # Reduced for T4
-        'mlp_ratio': 2,  # Reduced for T4
-        'causal': True  # Using causal attention
-    }
+    if optimal_config is None:
+        print("Optimization failed, using fallback configuration...")
+        # Fallback T4-safe configuration
+        data_config = {
+            'dataset_name': 'wikitext',
+            'dataset_config': 'wikitext-2-raw-v1',
+            'seq_len': 128,
+            'max_samples': 2000
+        }
+        
+        model_config = {
+            'vocab_size': 256,
+            'dim': 256,
+            'n_layers': 4,
+            'n_heads': 4,
+            'max_seq_len': 256,
+            'mlp_ratio': 2,
+            'causal': True
+        }
+        
+        batch_size = 2
+    else:
+        # Use optimized configuration
+        print("\n=== USING OPTIMIZED CONFIGURATION ===")
+        data_config = {
+            'dataset_name': 'wikitext',
+            'dataset_config': 'wikitext-2-raw-v1',
+            'seq_len': optimal_config.max_seq_len,
+            'max_samples': 2000
+        }
+        
+        model_config = {
+            'vocab_size': 256,
+            'dim': optimal_config.model_dim,
+            'n_layers': 4,  # Keep conservative for training stability
+            'n_heads': optimal_config.n_heads,
+            'max_seq_len': optimal_config.max_seq_len * 2,  # Allow room for generation
+            'mlp_ratio': 2,
+            'causal': True
+        }
+        
+        batch_size = optimal_config.max_batch_size
+        
+        print(f"Optimized settings:")
+        print(f"  Sequence length: {optimal_config.max_seq_len}")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Model dim: {optimal_config.model_dim}")
+        print(f"  Expected throughput: {optimal_config.throughput:.1f} tokens/sec")
     
-    # Training configuration (T4-optimized)
+    # Training configuration (adaptive based on optimization)
     training_config = TrainingConfig(
-        num_epochs=2,  # Reduced for T4
-        learning_rate=5e-4,  # Slightly higher for smaller model
+        num_epochs=2,
+        learning_rate=5e-4,
         weight_decay=0.01,
-        warmup_steps=50,  # Reduced for T4
+        warmup_steps=50,
         max_grad_norm=1.0,
-        save_every=300,  # Reduced for T4
-        eval_every=100,  # Reduced for T4
-        log_every=25,  # Reduced for T4
+        save_every=300,
+        eval_every=100,
+        log_every=25,
         checkpoint_dir="checkpoints"
     )
     
-    batch_size = 2  # Small batch size for T4
+    batch_size = batch_size  # Use optimized batch size
     
     print(f"Device: {training_config.device}")
     print(f"Model config: {model_config}")

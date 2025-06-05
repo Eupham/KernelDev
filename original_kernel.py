@@ -1259,6 +1259,39 @@ flash_backward_autotune = triton.autotune(
 )(_flash_attn_bwd)
 
 
+# T4 GPU optimization - these can be dynamically updated
+T4_OPTIMIZED = False
+T4_OPTIMAL_TILE_Q = 32
+T4_OPTIMAL_TILE_K = 32
+T4_OPTIMAL_WARPS = 4
+
+def set_t4_optimization(tile_q: int, tile_k: int, num_warps: int):
+    """Set T4-optimized tile sizes and warp count."""
+    global T4_OPTIMIZED, T4_OPTIMAL_TILE_Q, T4_OPTIMAL_TILE_K, T4_OPTIMAL_WARPS
+    T4_OPTIMIZED = True
+    T4_OPTIMAL_TILE_Q = tile_q
+    T4_OPTIMAL_TILE_K = tile_k
+    T4_OPTIMAL_WARPS = num_warps
+    print(f"T4 optimization enabled: tile_q={tile_q}, tile_k={tile_k}, warps={num_warps}")
+
+def get_optimized_tile_range():
+    """Get tile size range based on T4 optimization."""
+    if T4_OPTIMIZED:
+        # Use optimized values with small range around optimal
+        min_size = max(16, T4_OPTIMAL_TILE_Q // 2)
+        max_size = min(64, T4_OPTIMAL_TILE_Q * 2)
+        return [T4_OPTIMAL_TILE_Q, T4_OPTIMAL_TILE_K, min_size, max_size]
+    else:
+        return [32, 32, MIN_TILE_SIZE, MAX_TILE_SIZE]
+
+def get_optimized_warp_count():
+    """Get optimal warp count for T4."""
+    if T4_OPTIMIZED:
+        return [T4_OPTIMAL_WARPS]
+    else:
+        return [2, 4]
+
+
 @torch.library.custom_op(
     "flash_attention::forward", mutates_args=(), device_types=("cuda",)
 )
