@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from original_kernel import streaming_attention
+from kernel import attention
 
 
 class RMSNorm(nn.Module):
@@ -29,15 +29,13 @@ class SwiGLU(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head attention using streaming attention kernel."""
+    """Multi-head attention using standard causal attention kernel."""
     
-    def __init__(self, dim, n_heads, head_dim=None, context_size=512, back_contexts=4):
+    def __init__(self, dim, n_heads, head_dim=None):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = head_dim or dim // n_heads
-        self.context_size = context_size
-        self.back_contexts = back_contexts
         
         self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
@@ -51,14 +49,12 @@ class MultiHeadAttention(nn.Module):
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        # Use streaming attention kernel
-        out = streaming_attention(
+        # Use standard causal attention kernel
+        out = attention(
             q=q,
             k=k,
             v=v,
-            lens=None,
-            context_size=self.context_size,
-            back_contexts=self.back_contexts
+            lens=None
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -68,10 +64,10 @@ class MultiHeadAttention(nn.Module):
 class TransformerBlock(nn.Module):
     """Transformer block with pre-normalization."""
     
-    def __init__(self, dim, n_heads, mlp_ratio=4, context_size=512, back_contexts=4):
+    def __init__(self, dim, n_heads, mlp_ratio=4):
         super().__init__()
         self.norm1 = RMSNorm(dim)
-        self.attn = MultiHeadAttention(dim, n_heads, context_size=context_size, back_contexts=back_contexts)
+        self.attn = MultiHeadAttention(dim, n_heads)
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
@@ -84,7 +80,7 @@ class TransformerBlock(nn.Module):
 
 
 class GPTModel(nn.Module):
-    """GPT-styled model using streaming attention kernel."""
+    """GPT-styled model using standard causal attention kernel."""
     
     def __init__(
         self,
@@ -93,8 +89,6 @@ class GPTModel(nn.Module):
         n_layers=12,
         n_heads=12,
         max_seq_len=2048,
-        context_size=512,
-        back_contexts=4,
         mlp_ratio=4
     ):
         super().__init__()
@@ -110,9 +104,7 @@ class GPTModel(nn.Module):
             TransformerBlock(
                 dim=dim,
                 n_heads=n_heads,
-                mlp_ratio=mlp_ratio,
-                context_size=context_size,
-                back_contexts=back_contexts
+                mlp_ratio=mlp_ratio
             )
             for _ in range(n_layers)
         ])
