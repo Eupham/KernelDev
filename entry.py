@@ -1,190 +1,249 @@
-#!/usr/bin/env python3
-"""
-Entry script to test the GPT model's ability to reduce loss during training.
-This script creates a simple training loop to demonstrate loss reduction.
-"""
-
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.amp import GradScaler, autocast
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
-import time
-from model import create_model
+import matplotlib.pyplot as plt
+from model import GPTModel
 
 
-def generate_dummy_data(vocab_size, seq_len, batch_size, num_batches):
-    """Generate dummy training data"""
-    data = []
-    for _ in range(num_batches):
-        # Create random sequences
-        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
-        # Targets are the same sequence shifted by 1
-        targets = torch.cat([input_ids[:, 1:], torch.randint(0, vocab_size, (batch_size, 1))], dim=1)
-        data.append((input_ids, targets))
-    return data
-
-
-def train_step(model, batch, optimizer, scaler, device):
-    """Single training step"""
-    input_ids, targets = batch
-    input_ids, targets = input_ids.to(device), targets.to(device)
+class SimpleTextDataset(Dataset):
+    """Simple dataset for testing language modeling."""
     
-    optimizer.zero_grad()
+    def __init__(self, text, seq_len=128, vocab_size=1000):
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        
+        # Convert text to tokens (simple character-level tokenization)
+        self.chars = sorted(list(set(text)))
+        self.char_to_idx = {ch: i for i, ch in enumerate(self.chars)}
+        self.idx_to_char = {i: ch for i, ch in enumerate(self.chars)}
+        
+        # Pad vocab_size if needed
+        actual_vocab_size = len(self.chars)
+        if actual_vocab_size < vocab_size:
+            # Add padding tokens
+            for i in range(actual_vocab_size, vocab_size):
+                self.idx_to_char[i] = f'<PAD_{i}>'
+        
+        # Encode text
+        self.data = [self.char_to_idx.get(ch, 0) for ch in text]
+        
+    def __len__(self):
+        return max(1, len(self.data) - self.seq_len)
     
-    with autocast('cuda'):
-        logits = model(input_ids)
-        # Calculate cross-entropy loss
-        loss = nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)), 
-            targets.view(-1)
-        )
-    
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
-    
-    return loss.item()
+    def __getitem__(self, idx):
+        # Get sequence and target (next token prediction)
+        x = torch.tensor(self.data[idx:idx + self.seq_len], dtype=torch.long)
+        y = torch.tensor(self.data[idx + 1:idx + self.seq_len + 1], dtype=torch.long)
+        return x, y
 
 
-def calculate_perplexity(losses):
-    """Calculate perplexity from average loss"""
-    avg_loss = np.mean(losses)
-    return np.exp(avg_loss)
+def create_dummy_dataset(seq_len=128, vocab_size=1000, num_samples=1000):
+    """Create a dummy dataset with some patterns for the model to learn."""
+    # Create some simple patterns that the model can learn
+    patterns = [
+        "The quick brown fox jumps over the lazy dog. ",
+        "Hello world, this is a test sentence. ",
+        "Machine learning models can learn patterns in data. ",
+        "Artificial intelligence is transforming the world. ",
+        "Deep learning uses neural networks with many layers. "
+    ]
+    
+    # Repeat patterns to create a larger dataset
+    text = ""
+    for _ in range(num_samples // 10):
+        for pattern in patterns:
+            text += pattern
+    
+    return SimpleTextDataset(text, seq_len, vocab_size)
+
+
+def train_model(model, dataloader, optimizer, device, num_epochs=10):
+    """Train the model and track loss."""
+    model.train()
+    losses = []
+    
+    for epoch in range(num_epochs):
+        epoch_losses = []
+        
+        for batch_idx, (x, y) in enumerate(dataloader):
+            x, y = x.to(device), y.to(device)
+            
+            # Forward pass
+            logits, loss = model(x, y)
+            
+            if loss is not None:
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                epoch_losses.append(loss.item())
+            
+            # Print progress
+            if batch_idx % 10 == 0:
+                print(f'Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}, Loss: {loss.item():.4f}')
+        
+        avg_loss = np.mean(epoch_losses) if epoch_losses else float('inf')
+        losses.append(avg_loss)
+        print(f'Epoch {epoch+1} completed. Average Loss: {avg_loss:.4f}')
+    
+    return losses
+
+
+def evaluate_model(model, dataloader, device):
+    """Evaluate the model and return average loss."""
+    model.eval()
+    total_loss = 0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            logits, loss = model(x, y)
+            
+            if loss is not None:
+                total_loss += loss.item()
+                num_batches += 1
+    
+    return total_loss / num_batches if num_batches > 0 else float('inf')
+
+
+def plot_training_curve(losses):
+    """Plot the training loss curve."""
+    plt.figure(figsize=(10, 6))
+    plt.plot(losses, 'b-', linewidth=2)
+    plt.title('Training Loss Over Time', fontsize=16)
+    plt.xlabel('Epoch', fontsize=14)
+    plt.ylabel('Loss', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('training_loss.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def test_generation(model, dataset, device, num_tokens=100):
+    """Test the model's generation capability."""
+    model.eval()
+    
+    # Start with a random sequence from the dataset
+    start_idx = torch.randint(0, len(dataset), (1,))
+    x, _ = dataset[start_idx.item()]
+    x = x.unsqueeze(0).to(device)  # Add batch dimension
+    
+    print("Starting sequence:")
+    start_text = ''.join([dataset.idx_to_char.get(idx.item(), '?') for idx in x[0]])
+    print(f"'{start_text}'")
+    
+    # Generate new tokens
+    generated = model.generate(x, max_new_tokens=num_tokens, temperature=0.8, top_k=50)
+    
+    print("\nGenerated sequence:")
+    generated_text = ''.join([dataset.idx_to_char.get(idx.item(), '?') for idx in generated[0]])
+    print(f"'{generated_text}'")
 
 
 def main():
-    # Configuration
-    config = {
-        'vocab_size': 1000,  # Smaller vocab for faster training
-        'dim': 256,          # Smaller model for testing
-        'n_layers': 4,
-        'n_heads': 4,
-        'context_size': 128,
-        'back_contexts': 2,
-        'max_seq_len': 512,
-        'batch_size': 4,
-        'seq_len': 128,
-        'learning_rate': 1e-3,
-        'num_epochs': 10,
-        'num_batches_per_epoch': 20
-    }
-    
-    print("=" * 60)
-    print("GPT Model with Streaming Attention - Loss Reduction Test")
-    print("=" * 60)
-    print(f"Configuration:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
-    print("=" * 60)
-    
-    # Setup device
+    # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    if not torch.cuda.is_available():
-        print("Warning: CUDA not available, falling back to CPU. Performance will be limited.")
+    # Hyperparameters
+    vocab_size = 256  # Small vocab for testing
+    seq_len = 64
+    batch_size = 8
+    num_epochs = 20
+    learning_rate = 1e-3
     
-    # Create model
-    print("\nCreating model...")
-    model = create_model(
-        vocab_size=config['vocab_size'],
-        dim=config['dim'],
-        n_layers=config['n_layers'],
-        n_heads=config['n_heads'],
-        context_size=config['context_size'],
-        back_contexts=config['back_contexts'],
-        max_seq_len=config['max_seq_len']
-    ).to(device)
+    # Model configuration
+    model_config = {
+        'vocab_size': vocab_size,
+        'dim': 256,
+        'n_layers': 6,
+        'n_heads': 8,
+        'max_seq_len': 512,
+        'context_size': 64,
+        'back_contexts': 4,
+        'mlp_ratio': 4
+    }
     
-    num_params = model.get_num_params()
-    print(f"Model created with {num_params:,} parameters")
-    print(f"Model memory footprint: ~{num_params * 2 / 1e6:.1f} MB (fp16)")
+    print("Creating dataset...")
+    dataset = create_dummy_dataset(seq_len=seq_len, vocab_size=vocab_size, num_samples=1000)
     
-    # Setup optimizer and scaler
-    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'])
-    scaler = GradScaler('cuda')
+    # Split dataset into train and validation
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    # Generate training data
-    print(f"\nGenerating {config['num_batches_per_epoch']} batches of dummy data...")
-    train_data = generate_dummy_data(
-        config['vocab_size'],
-        config['seq_len'],
-        config['batch_size'],
-        config['num_batches_per_epoch']
-    )
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    # Training loop
-    print("\nStarting training...")
-    print("Epoch | Avg Loss | Perplexity | Time (s)")
-    print("-" * 45)
+    print(f"Dataset size: {len(dataset)}")
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Vocabulary size: {vocab_size}")
     
-    all_losses = []
-    epoch_times = []
+    # Initialize model
+    print("\nInitializing model...")
+    model = GPTModel(**model_config).to(device)
     
-    for epoch in range(config['num_epochs']):
-        epoch_start = time.time()
-        epoch_losses = []
-        
-        model.train()
-        for batch_idx, batch in enumerate(train_data):
-            loss = train_step(model, batch, optimizer, scaler, device)
-            epoch_losses.append(loss)
-            all_losses.append(loss)
-        
-        epoch_time = time.time() - epoch_start
-        epoch_times.append(epoch_time)
-        
-        avg_loss = np.mean(epoch_losses)
-        perplexity = calculate_perplexity(epoch_losses)
-        
-        print(f"{epoch+1:5d} | {avg_loss:8.4f} | {perplexity:10.2f} | {epoch_time:7.2f}")
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
     
-    print("-" * 45)
+    # Initialize optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     
-    # Final statistics
-    initial_loss = np.mean(all_losses[:config['num_batches_per_epoch']])
-    final_loss = np.mean(all_losses[-config['num_batches_per_epoch']:])
-    loss_reduction = ((initial_loss - final_loss) / initial_loss) * 100
+    # Evaluate initial loss
+    print("\nEvaluating initial model...")
+    initial_train_loss = evaluate_model(model, train_loader, device)
+    initial_val_loss = evaluate_model(model, val_loader, device)
+    print(f"Initial training loss: {initial_train_loss:.4f}")
+    print(f"Initial validation loss: {initial_val_loss:.4f}")
     
-    print(f"\nTraining Summary:")
-    print(f"  Initial loss (epoch 1): {initial_loss:.4f}")
-    print(f"  Final loss (epoch {config['num_epochs']}): {final_loss:.4f}")
-    print(f"  Loss reduction: {loss_reduction:.2f}%")
-    print(f"  Average time per epoch: {np.mean(epoch_times):.2f}s")
+    # Train model
+    print(f"\nStarting training for {num_epochs} epochs...")
+    losses = train_model(model, train_loader, optimizer, device, num_epochs)
     
-    # Test if model is learning
-    if loss_reduction > 5:  # At least 5% reduction
-        print(f"✅ SUCCESS: Model shows learning capability with {loss_reduction:.2f}% loss reduction!")
-    else:
-        print(f"⚠️  WARNING: Limited learning observed. Loss reduction: {loss_reduction:.2f}%")
+    # Evaluate final loss
+    print("\nEvaluating final model...")
+    final_train_loss = evaluate_model(model, train_loader, device)
+    final_val_loss = evaluate_model(model, val_loader, device)
+    print(f"Final training loss: {final_train_loss:.4f}")
+    print(f"Final validation loss: {final_val_loss:.4f}")
     
-    # Generate a sample
-    print(f"\nGenerating sample text...")
-    model.eval()
-    with torch.no_grad():
-        sample_input = torch.randint(0, config['vocab_size'], (1, 20)).to(device)
-        
-        with autocast('cuda'):
-            logits = model(sample_input)
-            probs = torch.softmax(logits[0, -1], dim=-1)
-            top_tokens = torch.topk(probs, 5)
-        
-        print(f"Input tokens: {sample_input[0].cpu().tolist()}")
-        print(f"Top 5 predicted next tokens: {top_tokens.indices.cpu().tolist()}")
-        print(f"Their probabilities: {top_tokens.values.cpu().tolist()}")
+    # Show improvement
+    train_improvement = initial_train_loss - final_train_loss
+    val_improvement = initial_val_loss - final_val_loss
+    print(f"\nTraining loss improvement: {train_improvement:.4f}")
+    print(f"Validation loss improvement: {val_improvement:.4f}")
     
-    # Model architecture summary
-    print(f"\nModel Architecture Summary:")
-    print(f"  - Using streaming attention with context_size={config['context_size']}")
-    print(f"  - Back contexts: {config['back_contexts']}")
-    print(f"  - Pre-norm architecture with RMSNorm (no weight param)")
-    print(f"  - SwiGLU activation in feedforward layers")
-    print(f"  - No bias parameters throughout the model")
-    print(f"  - FP16 precision")
+    # Plot training curve
+    print("\nPlotting training curve...")
+    plot_training_curve(losses)
     
-    print("\n" + "=" * 60)
-    print("Training completed!")
+    # Test generation
+    print("\nTesting text generation...")
+    try:
+        test_generation(model, dataset, device, num_tokens=50)
+    except Exception as e:
+        print(f"Generation test failed: {e}")
+    
+    # Save model
+    print("\nSaving model...")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'model_config': model_config,
+        'final_train_loss': final_train_loss,
+        'final_val_loss': final_val_loss,
+        'losses': losses
+    }, 'gpt_model_checkpoint.pt')
+    
+    print("Training completed successfully!")
+    print(f"Model demonstrates ability to reduce loss: {train_improvement > 0 and val_improvement > 0}")
 
 
 if __name__ == "__main__":

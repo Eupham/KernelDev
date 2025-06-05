@@ -1,216 +1,184 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from original_kernel import streaming_attention
 
 
 class RMSNorm(nn.Module):
-    """RMS Normalization without learnable weight parameter"""
-    def __init__(self, dim, eps=1e-8):
+    """RMS normalization without learnable weight parameters."""
+    
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
-        self.dim = dim
-
+    
     def forward(self, x):
-        # RMS normalization without weight scaling
-        rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
-        return x / rms
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
 
 class SwiGLU(nn.Module):
-    """SwiGLU activation function"""
+    """SwiGLU activation function for feed-forward network."""
+    
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        # No bias parameters as requested
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-
+    
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-class StreamingAttention(nn.Module):
-    """Multi-head streaming attention using the custom kernel"""
-    def __init__(self, dim, n_heads, context_size=512, back_contexts=4):
+class MultiHeadAttention(nn.Module):
+    """Multi-head attention using streaming attention kernel."""
+    
+    def __init__(self, dim, n_heads, head_dim=None, context_size=512, back_contexts=4):
         super().__init__()
-        assert dim % n_heads == 0
-        
         self.dim = dim
         self.n_heads = n_heads
-        self.head_dim = dim // n_heads
+        self.head_dim = head_dim or dim // n_heads
         self.context_size = context_size
         self.back_contexts = back_contexts
-        self.scale = self.head_dim ** -0.5
         
-        # No bias parameters
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
-
-    def forward(self, x, lens=None):
+        self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
+    
+    def forward(self, x):
         batch_size, seq_len, _ = x.shape
         
-        # Project to Q, K, V
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        # Reshape for multi-head attention
-        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        
-        # Use streaming attention kernel with autotuning disabled for stability
+        # Use streaming attention kernel
         out = streaming_attention(
             q=q,
             k=k,
             v=v,
-            lens=lens,
+            lens=None,
             context_size=self.context_size,
-            back_contexts=self.back_contexts,
-            sm_scale=self.scale,
-            autotune=False,  # Disable autotuning for stability
-            return_lse=False,
-            prescale_qk=False,  # Disable for better numerical stability
-            precision='ieee'  # Use IEEE precision for stability
+            back_contexts=self.back_contexts
         )
         
-        # Reshape back
-        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
-        
-        # Output projection
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(out)
 
 
 class TransformerBlock(nn.Module):
-    """Transformer block with prenorm architecture"""
-    def __init__(self, dim, n_heads, context_size=512, back_contexts=4, mlp_ratio=4.0):
+    """Transformer block with pre-normalization."""
+    
+    def __init__(self, dim, n_heads, mlp_ratio=4, context_size=512, back_contexts=4):
         super().__init__()
-        self.dim = dim
-        hidden_dim = int(dim * mlp_ratio)
-        
-        # Pre-normalization layers
-        self.attn_norm = RMSNorm(dim)
-        self.mlp_norm = RMSNorm(dim)
-        
-        # Attention and MLP layers
-        self.attn = StreamingAttention(dim, n_heads, context_size, back_contexts)
-        self.mlp = SwiGLU(dim, hidden_dim)
-
-    def forward(self, x, lens=None):
-        # Pre-norm attention
-        x = x + self.attn(self.attn_norm(x), lens)
-        
-        # Pre-norm MLP
-        x = x + self.mlp(self.mlp_norm(x))
-        
+        self.norm1 = RMSNorm(dim)
+        self.attn = MultiHeadAttention(dim, n_heads, context_size=context_size, back_contexts=back_contexts)
+        self.norm2 = RMSNorm(dim)
+        self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
+    
+    def forward(self, x):
+        # Pre-norm for attention
+        x = x + self.attn(self.norm1(x))
+        # Pre-norm for MLP
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
 class GPTModel(nn.Module):
-    """GPT-style model with streaming attention"""
+    """GPT-styled model using streaming attention kernel."""
+    
     def __init__(
         self,
-        vocab_size=50257,
+        vocab_size,
         dim=768,
         n_layers=12,
         n_heads=12,
+        max_seq_len=2048,
         context_size=512,
         back_contexts=4,
-        max_seq_len=2048,
-        mlp_ratio=4.0
+        mlp_ratio=4
     ):
         super().__init__()
-        self.vocab_size = vocab_size
         self.dim = dim
-        self.n_layers = n_layers
         self.max_seq_len = max_seq_len
         
         # Token and position embeddings (no bias)
-        self.token_embedding = nn.Embedding(vocab_size, dim)
-        self.position_embedding = nn.Embedding(max_seq_len, dim)
+        self.token_emb = nn.Embedding(vocab_size, dim)
+        self.pos_emb = nn.Embedding(max_seq_len, dim)
         
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(dim, n_heads, context_size, back_contexts, mlp_ratio)
+            TransformerBlock(
+                dim=dim,
+                n_heads=n_heads,
+                mlp_ratio=mlp_ratio,
+                context_size=context_size,
+                back_contexts=back_contexts
+            )
             for _ in range(n_layers)
         ])
         
-        # Final layer norm and output projection
-        self.final_norm = RMSNorm(dim)
-        self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        # Final norm and output projection
+        self.norm_out = RMSNorm(dim)
+        self.head = nn.Linear(dim, vocab_size, bias=False)
         
-        # Initialize weights
         self.apply(self._init_weights)
-
+    
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, input_ids, lens=None):
-        batch_size, seq_len = input_ids.shape
+    
+    def forward(self, x, targets=None):
+        batch_size, seq_len = x.shape
         
-        # Create position ids
-        pos_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        # Create position indices
+        pos = torch.arange(0, seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
         
-        # Embeddings
-        x = self.token_embedding(input_ids) + self.position_embedding(pos_ids)
+        # Token and position embeddings
+        x = self.token_emb(x) + self.pos_emb(pos)
         
         # Apply transformer blocks
         for block in self.blocks:
-            x = block(x, lens)
+            x = block(x)
         
-        # Final norm and projection
-        x = self.final_norm(x)
-        logits = self.lm_head(x)
+        # Final normalization and output projection
+        x = self.norm_out(x)
+        logits = self.head(x)
         
-        return logits
-
-    def get_num_params(self):
-        """Return the number of parameters in the model"""
-        return sum(p.numel() for p in self.parameters())
-
-
-def create_model(
-    vocab_size=50257,
-    dim=512,
-    n_layers=8,
-    n_heads=8,
-    context_size=256,
-    back_contexts=2,
-    max_seq_len=1024
-):
-    """Create a GPT model with streaming attention"""
-    model = GPTModel(
-        vocab_size=vocab_size,
-        dim=dim,
-        n_layers=n_layers,
-        n_heads=n_heads,
-        context_size=context_size,
-        back_contexts=back_contexts,
-        max_seq_len=max_seq_len
-    )
+        loss = None
+        if targets is not None:
+            # Compute cross-entropy loss
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1
+            )
+        
+        return logits, loss
     
-    # Convert to fp16 as requested
-    model = model.half()
-    
-    return model
-
-
-if __name__ == "__main__":
-    # Test model creation
-    model = create_model()
-    print(f"Model created with {model.get_num_params():,} parameters")
-    
-    # Test forward pass
-    batch_size, seq_len = 2, 64
-    input_ids = torch.randint(0, 50257, (batch_size, seq_len))
-    
-    with torch.cuda.amp.autocast():
-        logits = model(input_ids)
-        print(f"Output shape: {logits.shape}")
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """Generate new tokens using the model."""
+        self.eval()
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                # Crop sequence if it gets too long
+                idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
+                
+                # Forward pass
+                logits, _ = self(idx_cond)
+                logits = logits[:, -1, :] / temperature
+                
+                # Apply top-k filtering if specified
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                
+                # Sample from the distribution
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                
+                # Append to sequence
+                idx = torch.cat((idx, idx_next), dim=1)
+        
+        return idx

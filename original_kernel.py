@@ -137,39 +137,58 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
 
 
 def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
-    # Simplified and more stable configuration for backward pass
-    # Use conservative settings to avoid compilation issues
-    
-    # Conservative tile sizes to avoid memory issues
-    if HEAD_DIM <= 64:
-        tile_size = 16
-        num_warps = 2
-        num_stages = 1
-    elif HEAD_DIM <= 128:
-        tile_size = 32
-        num_warps = 4
-        num_stages = 1
-    else:  # HEAD_DIM >= 256
-        tile_size = 16
-        num_warps = 2
-        num_stages = 1
-    
-    # Return a single conservative configuration
-    configs = [
-        triton.Config(
-            dict(
-                PIPELINING=1,
-                TILE_DQ_Q_SIZE=tile_size,
-                TILE_DQ_K_SIZE=tile_size,
-                TILE_DK_Q_SIZE=tile_size,
-                TILE_DK_K_SIZE=tile_size,
-            ),
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-    ]
+    min_size = min(CONTEXT_SIZE, 64)
+    max_size = CONTEXT_SIZE * 4
+    min_pipeline, max_pipeline = 1, 3
+    min_warps, max_warps = 1, 8
 
-    logger.warning(f"Using simplified backward streaming_attention config: {len(configs)} config(s)")
+    if HEAD_DIM == 32 or HEAD_DIM == 16:
+        min_pipeline = 3
+        max_size = 64
+    if HEAD_DIM == 64:
+        min_pipeline = 2
+        max_size = 128
+        min_warps = 2
+        max_warps = 4
+    elif HEAD_DIM == 128:
+        max_size = 128
+        min_size = 64
+        max_pipeline = 2
+        min_pipeline = 1
+        max_warps = 4
+    elif HEAD_DIM == 256:
+        max_size = 64
+        min_size = 32
+        max_pipeline = 2
+        min_pipeline = 1
+        max_warps = 4
+
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_DQ_Q_SIZE"] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_DQ_K_SIZE"] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_DK_Q_SIZE"] <= max_size]
+    configs = [i for i in configs if min_size <= i.kwargs["TILE_DK_K_SIZE"] <= max_size]
+    configs = [
+        i for i in configs if min_pipeline <= i.kwargs["PIPELINING"] <= max_pipeline
+    ]
+    configs = [i for i in configs if min_warps <= i.num_warps <= max_warps]
+
+    default_config = _get_default_config_bwd(HEAD_DIM, DTYPE)
+    if default_config is not None:
+        configs += [
+            triton.Config(
+                dict(
+                    PIPELINING=default_config[3],
+                    TILE_DQ_Q_SIZE=default_config[0],
+                    TILE_DQ_K_SIZE=default_config[1],
+                    TILE_DK_Q_SIZE=default_config[0],
+                    TILE_DK_K_SIZE=default_config[1],
+                ),
+                num_warps=default_config[2],
+                num_stages=default_config[3],
+            )
+        ]
+
+    logger.warning(f"Start benchmarking backward streaming_attention {len(configs) = }")
     return configs
 
 
@@ -1194,26 +1213,45 @@ streaming_backward_autotune = triton.autotune(
     configs=[
         triton.Config(
             dict(
-                PIPELINING=1,
-                TILE_DQ_Q_SIZE=16,
-                TILE_DQ_K_SIZE=16,
-                TILE_DK_Q_SIZE=16,
-                TILE_DK_K_SIZE=16,
+                PIPELINING=pipe,
+                TILE_DQ_Q_SIZE=tile_qq,
+                TILE_DQ_K_SIZE=tile_qk,
+                TILE_DK_Q_SIZE=tile_kq,
+                TILE_DK_K_SIZE=tile_kk,
             ),
-            num_warps=2,
-            num_stages=1,
-        ),
-        triton.Config(
-            dict(
-                PIPELINING=1,
-                TILE_DQ_Q_SIZE=32,
-                TILE_DQ_K_SIZE=32,
-                TILE_DK_Q_SIZE=32,
-                TILE_DK_K_SIZE=32,
-            ),
-            num_warps=4,
-            num_stages=1,
-        ),
+            num_warps=num_warps,
+            num_stages=pipe,
+        )
+        for num_warps in [4, 8]
+        for pipe in [1, 2, 3]
+        for tile_qq in [
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
+        ]
+        for tile_qk in [
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
+        ]
+        for tile_kq in [
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
+        ]
+        for tile_kk in [
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
+        ]
     ],
     key=[
         "HEAD_DIM",
