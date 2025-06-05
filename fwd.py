@@ -471,7 +471,8 @@ def causal_attention_forward_adapter( # Renamed
         RCP_LN2=RCP_LN2_val,
         grid=grid_tuple,
         num_warps=num_warps_val,
-        num_stages=num_stages_val
+        num_stages=num_stages_val,
+        warmup=False # Added argument
     )
 
     if LSE is None:
