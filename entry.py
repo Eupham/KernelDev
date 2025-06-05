@@ -29,7 +29,7 @@ def main():
     
     # Model configuration  
     model_config = {
-        'vocab_size': 50257,  # GPT-2 tokenizer size
+        'vocab_size': 256,  # UTF-8 byte vocabulary size
         'dim': 384,
         'n_layers': 6,
         'n_heads': 6,
@@ -73,12 +73,12 @@ def main():
         # Update vocab size based on actual tokenizer
         actual_vocab_size = data_builder.get_vocab_size()
         model_config['vocab_size'] = actual_vocab_size
-        print(f"Updated vocab_size to: {actual_vocab_size}")
+        print(f"Confirmed vocab_size: {actual_vocab_size} (UTF-8 bytes)")
         
     except Exception as e:
         print(f"Error creating dataloaders: {e}")
         print("This might be due to missing datasets library or network issues.")
-        print("Please install with: pip install datasets tiktoken")
+        print("Please install with: pip install datasets")
         return
     
     # Show data info
