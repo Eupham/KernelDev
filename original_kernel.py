@@ -1106,10 +1106,10 @@ streaming_forward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
         TILE_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
         ),
         TILE_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
         ),
     )
 )(_streaming_attn_fwd)
@@ -1156,16 +1156,16 @@ streaming_backward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
         TILE_DQ_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
         ),
         TILE_DQ_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
         ),
         TILE_DK_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
         ),
         TILE_DK_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
         ),
     )
 )(_streaming_attn_bwd)
