@@ -132,7 +132,7 @@ def fwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
             )
         ]
 
-    logger.warning(f"Start benchmarking forward streaming_attention {len(configs) = }")
+    logger.warning(f"Start benchmarking forward flash_attention {len(configs) = }")
     return configs
 
 
@@ -188,7 +188,7 @@ def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
             )
         ]
 
-    logger.warning(f"Start benchmarking backward streaming_attention {len(configs) = }")
+    logger.warning(f"Start benchmarking backward flash_attention {len(configs) = }")
     return configs
 
 
@@ -202,7 +202,7 @@ def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
     )
 )
 @triton.jit
-def _streaming_attn_fwd(
+def _flash_attn_fwd(
     Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, #
     LSE: tl.tensor, O: tl.tensor,  #
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
@@ -289,7 +289,7 @@ def _streaming_attn_fwd(
     )
 
     if not PERFECT_MATCHING:
-        # No longer need q_context_indices for streaming
+        # No longer need q_context_indices for flash attention
         pass
 
     if Q_BLOCK_DIVISIBLE:
@@ -442,7 +442,7 @@ def _streaming_attn_fwd(
     )
 )
 @triton.jit
-def _streaming_attn_bwd_precompute(
+def _flash_attn_bwd_precompute(
     O: tl.tensor, DO: tl.tensor, RES: tl.tensor,
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int,  #
     stride_dob: int, stride_doh: int, stride_dot: int, stride_dok: int,  #
@@ -519,7 +519,7 @@ def _streaming_attn_bwd_precompute(
     )
 )
 @triton.jit
-def _streaming_attn_bwd(
+def _flash_attn_bwd(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, L: tl.tensor, #
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor, DK: tl.tensor, DV: tl.tensor,
@@ -564,7 +564,7 @@ def _streaming_attn_bwd(
         seq_len = T
 
     if dkv_worker:
-        _streaming_attn_bwd_dkdv_inner(
+        _flash_attn_bwd_dkdv_inner(
             Q, K, V, DELTA, LSE, DO, DK, DV,
             stride_qb, stride_qh, stride_qt, stride_qk,
             stride_kb, stride_kh, stride_kt, stride_kk,
@@ -592,7 +592,7 @@ def _streaming_attn_bwd(
             PIPELINING=PIPELINING,
         )
     else:
-        _streaming_attn_bwd_dq_inner(
+        _flash_attn_bwd_dq_inner(
             Q, K, V, DELTA, LSE,
             DO, DQ,
             stride_qb, stride_qh, stride_qt, stride_qk,
@@ -622,7 +622,7 @@ def _streaming_attn_bwd(
 
 
 @triton.jit()
-def _streaming_attn_bwd_dq_inner(
+def _flash_attn_bwd_dq_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
@@ -724,7 +724,7 @@ def _streaming_attn_bwd_dq_inner(
     )
 
     dq = tl.zeros([TILE_DQ_Q_SIZE, HEAD_DIM], dtype=tl.float32)
-    dq = _streaming_attn_bwd_dq(
+    dq = _flash_attn_bwd_dq(
         dq, q, m, di, do,
         kt_tile_ptr, vt_tile_ptr,
         seq_len=seq_len,
@@ -756,7 +756,7 @@ def _streaming_attn_bwd_dq_inner(
 
 
 @triton.jit
-def _streaming_attn_bwd_dkdv_inner(
+def _flash_attn_bwd_dkdv_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor,
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DK: tl.tensor, DV: tl.tensor,
@@ -869,7 +869,7 @@ def _streaming_attn_bwd_dkdv_inner(
                 boundary_check=(0,),
             )
 
-    dk, dv = _streaming_attn_bwd_dkdv(
+    dk, dv = _flash_attn_bwd_dkdv(
         dk, dv,
         qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
         k, v,
@@ -916,7 +916,7 @@ def _streaming_attn_bwd_dkdv_inner(
 
 
 @triton.jit
-def _streaming_attn_bwd_dq(
+def _flash_attn_bwd_dq(
     dq: tl.tensor, q: tl.tensor, m: tl.tensor,
     di: tl.tensor, do: tl.tensor,
     kt_tile_ptr: tl.tensor, vt_tile_ptr: tl.tensor,
@@ -993,7 +993,7 @@ def _streaming_attn_bwd_dq(
 
 
 @triton.jit
-def _streaming_attn_bwd_dkdv(
+def _flash_attn_bwd_dkdv(
     dk: tl.tensor, dv: tl.tensor,
     qt_tile_ptr: tl.tensor, do_tile_ptr: tl.tensor,
     lse_tile_ptr: tl.tensor, delta_tile_ptr: tl.tensor,
@@ -1102,7 +1102,7 @@ def autotune_posthook(kwargs, exception=None):
         kwargs["L"].add_(-kwargs["q"].size(2))  # L -= time
 
 
-streaming_forward = triton.heuristics(
+flash_forward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
         TILE_Q_SIZE=lambda args: min(
@@ -1112,8 +1112,8 @@ streaming_forward = triton.heuristics(
             64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
         ),
     )
-)(_streaming_attn_fwd)
-streaming_forward_autotune = triton.autotune(
+)(_flash_attn_fwd)
+flash_forward_autotune = triton.autotune(
     configs=[
         triton.Config(
             dict(
@@ -1150,9 +1150,9 @@ streaming_forward_autotune = triton.autotune(
     prune_configs_by=dict(early_config_prune=fwd_configs_pruner),
     pre_hook=autotune_prehook,
     post_hook=autotune_posthook,
-)(_streaming_attn_fwd)
+)(_flash_attn_fwd)
 
-streaming_backward = triton.heuristics(
+flash_backward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
         TILE_DQ_Q_SIZE=lambda args: min(
@@ -1168,8 +1168,8 @@ streaming_backward = triton.heuristics(
             64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
         ),
     )
-)(_streaming_attn_bwd)
-streaming_backward_autotune = triton.autotune(
+)(_flash_attn_bwd)
+flash_backward_autotune = triton.autotune(
     configs=[
         triton.Config(
             dict(
@@ -1222,11 +1222,11 @@ streaming_backward_autotune = triton.autotune(
     prune_configs_by=dict(early_config_prune=bwd_configs_pruner),
     pre_hook=autotune_prehook,
     post_hook=autotune_posthook,
-)(_streaming_attn_bwd)
+)(_flash_attn_bwd)
 
 
 @torch.library.custom_op(
-    "alexdremov_streaming_attention::forward", mutates_args=(), device_types=("cuda",)
+    "flash_attention::forward", mutates_args=(), device_types=("cuda",)
 )
 def attention_forward_adapter(
     q: torch.Tensor,
@@ -1261,7 +1261,7 @@ def attention_forward_adapter(
     )
 
     kt = k.transpose(-1, -2)  # just stride tricks, same data
-    fwd_fn = streaming_forward_autotune if autotune else streaming_forward
+    fwd_fn = flash_forward_autotune if autotune else flash_forward
     fwd_fn[grid](
         q,
         kt,
@@ -1290,7 +1290,7 @@ def attention_forward_adapter(
     return O, LSE
 
 
-@torch.library.register_fake("alexdremov_streaming_attention::forward")
+@torch.library.register_fake("flash_attention::forward")
 def attention_forward_adapter_abstract(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1309,7 +1309,7 @@ def attention_forward_adapter_abstract(
 
 
 @torch.library.custom_op(
-    "alexdremov_streaming_attention::backward", mutates_args=(), device_types=("cuda",)
+    "flash_attention::backward", mutates_args=(), device_types=("cuda",)
 )
 def attention_backward_adapter(
     q: torch.Tensor,
@@ -1332,7 +1332,7 @@ def attention_backward_adapter(
         heads,
         triton.cdiv(T, args["TILE_SIZE"]),
     )
-    _streaming_attn_bwd_precompute[grid](
+    _flash_attn_bwd_precompute[grid](
         o,
         do,
         delta,
@@ -1355,7 +1355,7 @@ def attention_backward_adapter(
         triton.cdiv(T, args["TILE_DQ_Q_SIZE"]) + triton.cdiv(T, args["TILE_DK_K_SIZE"]),
     )
 
-    fwd_fn = streaming_backward_autotune if autotune else streaming_backward
+    fwd_fn = flash_backward_autotune if autotune else flash_backward
     fwd_fn[grid](
         q,
         k,
@@ -1389,7 +1389,7 @@ def attention_backward_adapter(
     return DQ, DK, DV
 
 
-@torch.library.register_fake("alexdremov_streaming_attention::backward")
+@torch.library.register_fake("flash_attention::backward")
 def attention_backward_adapter_abstract(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1443,7 +1443,7 @@ def attention_backward_adapter_op(ctx, do, dlse):
     prescale_qk = ctx.prescale_qk
     precision = ctx.precision
 
-    DQ, DK, DV = torch.ops.alexdremov_streaming_attention.backward(
+    DQ, DK, DV = torch.ops.flash_attention.backward(
         q=q,
         k=k,
         v=v,
@@ -1461,7 +1461,7 @@ def attention_backward_adapter_op(ctx, do, dlse):
 
 
 torch.library.register_autograd(
-    "alexdremov_streaming_attention::forward",
+    "flash_attention::forward",
     attention_backward_adapter_op,
     setup_context=attention_backward_adapter_op_setup_context,
 )
@@ -1510,7 +1510,7 @@ def _flash_attention(
     precision: str,
 ):
     requires_grad = any(i.requires_grad for i in (q, k, v))
-    O, LSE = torch.ops.alexdremov_streaming_attention.forward(
+    O, LSE = torch.ops.flash_attention.forward(
         q=q,
         k=k,
         v=v,
