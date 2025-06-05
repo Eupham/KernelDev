@@ -31,11 +31,12 @@ class SwiGLU(nn.Module):
 class MultiHeadAttention(nn.Module):
     """Multi-head attention using flash attention kernel."""
     
-    def __init__(self, dim, n_heads, head_dim=None):
+    def __init__(self, dim, n_heads, head_dim=None, causal=True):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = head_dim or dim // n_heads
+        self.causal = causal
         
         self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
@@ -54,7 +55,8 @@ class MultiHeadAttention(nn.Module):
             q=q,
             k=k,
             v=v,
-            lens=None
+            lens=None,
+            causal=self.causal
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -64,10 +66,10 @@ class MultiHeadAttention(nn.Module):
 class TransformerBlock(nn.Module):
     """Transformer block with pre-normalization."""
     
-    def __init__(self, dim, n_heads, mlp_ratio=4):
+    def __init__(self, dim, n_heads, mlp_ratio=4, causal=True):
         super().__init__()
         self.norm1 = RMSNorm(dim)
-        self.attn = MultiHeadAttention(dim, n_heads)
+        self.attn = MultiHeadAttention(dim, n_heads, causal=causal)
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
@@ -89,7 +91,8 @@ class GPTModel(nn.Module):
         n_layers=12,
         n_heads=12,
         max_seq_len=2048,
-        mlp_ratio=4
+        mlp_ratio=4,
+        causal=True
     ):
         super().__init__()
         self.dim = dim
@@ -104,7 +107,8 @@ class GPTModel(nn.Module):
             TransformerBlock(
                 dim=dim,
                 n_heads=n_heads,
-                mlp_ratio=mlp_ratio
+                mlp_ratio=mlp_ratio,
+                causal=causal
             )
             for _ in range(n_layers)
         ])

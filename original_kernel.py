@@ -214,6 +214,7 @@ def _flash_attn_fwd(
     T: int,  #
     TIME_BUCKET:  int,  #
     HEAD_DIM: tl.constexpr,  #
+    CAUSAL: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
     DTYPE:  tl.constexpr,  #
@@ -277,11 +278,15 @@ def _flash_attn_fwd(
     if not PERFECT_MATCHING:
         q_attended = tl.zeros([TILE_Q_SIZE], dtype=tl.int1) > 0
 
-    # Standard causal attention - attend to all previous tokens
+    # Conditional attention range based on CAUSAL parameter
     kv_start_tile_idx = 0
     q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
-    # For causal attention, we can attend up to the last query token
-    kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
+    if CAUSAL:
+        # For causal attention, we can attend up to the last query token
+        kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
+    else:
+        # For non-causal attention, attend to all tokens
+        kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
 
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
     q_lens_mask = (
@@ -334,8 +339,11 @@ def _flash_attn_fwd(
         )
 
         kv_indices = kv_token_idx + tile_k_arange
-        # Standard causal mask: query tokens can only attend to key tokens at or before their position
-        causal_mask = q_tile_indices[:, None] >= kv_indices[None, :]
+        # Conditional causal mask based on CAUSAL parameter
+        if CAUSAL:
+            causal_mask = q_tile_indices[:, None] >= kv_indices[None, :]
+        else:
+            causal_mask = True  # No causal masking - attend to all tokens
         mask = q_lens_mask & (
             kv_indices[None, :] < seq_len
         ) & causal_mask
@@ -551,6 +559,7 @@ def _flash_attn_bwd(
     TILE_DQ_Q_SIZE: tl.constexpr, TILE_DQ_K_SIZE: tl.constexpr,  #
     TILE_DK_Q_SIZE: tl.constexpr, TILE_DK_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
+    CAUSAL: tl.constexpr,  #
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
@@ -590,6 +599,7 @@ def _flash_attn_bwd(
             TILE_DK_Q_SIZE=TILE_DK_Q_SIZE,
             TILE_DK_K_SIZE=TILE_DK_K_SIZE,
             PIPELINING=PIPELINING,
+            CAUSAL=CAUSAL,
         )
     else:
         _flash_attn_bwd_dq_inner(
@@ -618,6 +628,7 @@ def _flash_attn_bwd(
             TILE_DQ_Q_SIZE=TILE_DQ_Q_SIZE,
             TILE_DQ_K_SIZE=TILE_DQ_K_SIZE,
             PIPELINING=PIPELINING,
+            CAUSAL=CAUSAL,
         )
 
 
@@ -648,6 +659,7 @@ def _flash_attn_bwd_dq_inner(
     TILE_DQ_Q_SIZE: tl.constexpr,  #
     TILE_DQ_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
+    CAUSAL: tl.constexpr,  #
 ):
     q_tile_idx = tile_id
     q_token_idx = q_tile_idx * TILE_DQ_Q_SIZE
@@ -731,6 +743,7 @@ def _flash_attn_bwd_dq_inner(
         q_token_idx=q_token_idx,
         TILE_Q_SIZE=TILE_DQ_Q_SIZE,
         TILE_K_SIZE=TILE_DQ_K_SIZE,
+        CAUSAL=CAUSAL,
         INPUT_PRECISION=INPUT_PRECISION,
         PIPELINING=PIPELINING,
         K_BLOCK_DIVISIBLE=DQ_K_BLOCK_DIVISIBLE,
@@ -785,6 +798,7 @@ def _flash_attn_bwd_dkdv_inner(
     TILE_DK_Q_SIZE: tl.constexpr,  #
     TILE_DK_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
+    CAUSAL: tl.constexpr,  #
 ):
     kv_tile_idx = tile_id
     kv_token_idx = kv_tile_idx * TILE_DK_K_SIZE
@@ -877,6 +891,7 @@ def _flash_attn_bwd_dkdv_inner(
         kv_token_idx=kv_token_idx,
         TILE_Q_SIZE=TILE_DK_Q_SIZE,
         TILE_K_SIZE=TILE_DK_K_SIZE,
+        CAUSAL=CAUSAL,
         INPUT_PRECISION=INPUT_PRECISION,
         PERFECT_MATCHING=PERFECT_DKV_MATCHING,
         PIPELINING=PIPELINING,
@@ -924,6 +939,7 @@ def _flash_attn_bwd_dq(
     q_token_idx: int,
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
+    CAUSAL: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
     PERFECT_MATCHING: tl.constexpr,
     PIPELINING: tl.constexpr,
@@ -932,11 +948,15 @@ def _flash_attn_bwd_dq(
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
 ):
-    # Standard causal attention - attend to all previous tokens
+    # Conditional attention range based on CAUSAL parameter
     kv_start_tile_idx = 0
     q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
-    # For causal attention, we can attend up to the last query token
-    kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
+    if CAUSAL:
+        # For causal attention, we can attend up to the last query token
+        kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
+    else:
+        # For non-causal attention, attend to all tokens
+        kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
 
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
 
@@ -974,8 +994,11 @@ def _flash_attn_bwd_dq(
         p = tl.math.exp2(qk - m)
 
         kv_indices = kv_token_idx + tile_k_arange
-        # Standard causal mask: query tokens can only attend to key tokens at or before their position
-        causal_mask = q_tile_indices[:, None] >= kv_indices[None, :]
+        # Conditional causal mask based on CAUSAL parameter
+        if CAUSAL:
+            causal_mask = q_tile_indices[:, None] >= kv_indices[None, :]
+        else:
+            causal_mask = True  # No causal masking - attend to all tokens
         mask = q_len_mask & (
             kv_indices[None, :] < seq_len
         ) & causal_mask
@@ -1002,6 +1025,7 @@ def _flash_attn_bwd_dkdv(
     kv_token_idx: int,
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
+    CAUSAL: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
     PERFECT_MATCHING: tl.constexpr,
     PIPELINING: tl.constexpr,
@@ -1010,11 +1034,16 @@ def _flash_attn_bwd_dkdv(
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
 ):
-    # Standard causal attention - K,V tokens can attend from all future Q tokens
+    # Conditional logic for backward pass based on CAUSAL parameter
     kv_tile_max_token = min(kv_token_idx + TILE_K_SIZE, seq_len)
-    # For backward pass, we need to find which Q tiles can attend to this KV tile
-    q_start_tile_idx = kv_token_idx // TILE_Q_SIZE  # First Q tile that might attend to this KV
-    q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)  # All Q tiles can potentially attend
+    if CAUSAL:
+        # For causal attention: find which Q tiles can attend to this KV tile
+        q_start_tile_idx = kv_token_idx // TILE_Q_SIZE  # First Q tile that might attend to this KV
+        q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)  # All Q tiles can potentially attend
+    else:
+        # For non-causal attention: all Q tiles can attend to this KV tile
+        q_start_tile_idx = 0
+        q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)
 
     kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
 
@@ -1070,8 +1099,11 @@ def _flash_attn_bwd_dkdv(
         pT = tl.math.exp2(qkT - m[None, :])
 
         q_tile_indices = q_token_idx + tile_q_arange
-        # Standard causal mask: KV tokens can only be attended to by Q tokens at or after their position
-        causal_mask = q_tile_indices[None, :] >= kv_indices[:, None]
+        # Conditional causal mask based on CAUSAL parameter
+        if CAUSAL:
+            causal_mask = q_tile_indices[None, :] >= kv_indices[:, None]
+        else:
+            causal_mask = True  # No causal masking - attend to all tokens
         mask = kv_lens_mask & (
             q_tile_indices[None, :] < seq_len
         ) & causal_mask
@@ -1143,6 +1175,7 @@ flash_forward_autotune = triton.autotune(
     ],
     key=[
         "HEAD_DIM",
+        "CAUSAL",
         "INPUT_PRECISION",
         "TIME_BUCKET",
         "DTYPE",
@@ -1215,6 +1248,7 @@ flash_backward_autotune = triton.autotune(
     ],
     key=[
         "HEAD_DIM",
+        "CAUSAL",
         "INPUT_PRECISION",
         "DTYPE",
         "TIME_BUCKET",
@@ -1234,6 +1268,7 @@ def attention_forward_adapter(
     v: torch.Tensor,
     lens: torch.Tensor,
     sm_scale: float,
+    causal: bool,
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
@@ -1277,6 +1312,7 @@ def attention_forward_adapter(
         *(strides(lens, 1) if lens is not None else [0]),
         T=T,
         HEAD_DIM=HEAD_DIM,
+        CAUSAL=causal,
         INPUT_PRECISION=precision,
         PRESCALE_QK=prescale_qk,
         DTYPE=q.dtype,
@@ -1297,6 +1333,7 @@ def attention_forward_adapter_abstract(
     v: torch.Tensor,
     lens: torch.Tensor | None,
     sm_scale: float | None,
+    causal: bool,
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
@@ -1320,6 +1357,7 @@ def attention_backward_adapter(
     lse: torch.Tensor,
     do: torch.Tensor,
     sm_scale: float,
+    causal: bool,
     autotune: bool,
     prescale_qk: bool,
     precision: str,
@@ -1379,6 +1417,7 @@ def attention_backward_adapter(
         *(strides(lens, 1) if lens is not None else [0]),
         T=T,
         HEAD_DIM=HEAD_DIM,
+        CAUSAL=causal,
         TIME_BUCKET=triton.next_power_of_2(T),
         INPUT_PRECISION=precision,
         DTYPE=q.dtype,
@@ -1399,6 +1438,7 @@ def attention_backward_adapter_abstract(
     lse: torch.Tensor,
     do: torch.Tensor,
     sm_scale: float | None,
+    causal: bool,
     autotune: bool,
     prescale_qk: bool,
     precision: str,
@@ -1417,6 +1457,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         v,
         lens,
         sm_scale,
+        causal,
         autotune,
         return_lse,
         prescale_qk,
@@ -1430,6 +1471,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         LSE,
         lens,
     )
+    ctx.causal = causal
     ctx.autotune = autotune
     ctx.sm_scale = sm_scale
     ctx.prescale_qk = prescale_qk
@@ -1438,6 +1480,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
 
 def attention_backward_adapter_op(ctx, do, dlse):
     q, k, v, o, lse, lens = ctx.saved_tensors
+    causal = ctx.causal
     autotune = ctx.autotune
     sm_scale = ctx.sm_scale
     prescale_qk = ctx.prescale_qk
@@ -1452,12 +1495,13 @@ def attention_backward_adapter_op(ctx, do, dlse):
         lse=lse,
         do=do,
         sm_scale=sm_scale,
+        causal=causal,
         autotune=autotune,
         prescale_qk=prescale_qk,
         precision=precision,
     )
 
-    return DQ, DK, DV, None, None, None, None, None, None
+    return DQ, DK, DV, None, None, None, None, None, None, None
 
 
 torch.library.register_autograd(
@@ -1468,12 +1512,16 @@ torch.library.register_autograd(
 
 
 def flash_attention_reference(
-    q, k, v, lens=None, scale=None
+    q, k, v, lens=None, causal=True, scale=None
 ):
     T = q.shape[-2]
     
-    # Create causal mask - query can attend to all previous tokens
-    causal_mask = torch.tril(torch.ones(T, T, device=q.device, dtype=torch.bool))
+    if causal:
+        # Create causal mask - query can attend to all previous tokens
+        attn_mask = torch.tril(torch.ones(T, T, device=q.device, dtype=torch.bool))
+    else:
+        # No causal mask - bidirectional attention
+        attn_mask = torch.ones(T, T, device=q.device, dtype=torch.bool)
 
     if lens is not None:
         key_padding_mask = (
@@ -1481,10 +1529,9 @@ def flash_attention_reference(
         ).unsqueeze(-1)
         key_padding_mask_ref = key_padding_mask
         key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
-        attn_mask = causal_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask.unsqueeze(1)
+        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask.unsqueeze(1)
         res_mask = key_padding_mask_ref.unsqueeze(1)
     else:
-        attn_mask = causal_mask
         res_mask = torch.tensor([True], device="cuda")
 
     sparsity_fraction = attn_mask.sum().item() / attn_mask.numel()
@@ -1504,6 +1551,7 @@ def _flash_attention(
     v: torch.Tensor,
     lens: torch.Tensor | None,
     sm_scale: float | None,
+    causal: bool,
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
@@ -1516,6 +1564,7 @@ def _flash_attention(
         v=v,
         lens=lens,
         sm_scale=sm_scale,
+        causal=causal,
         autotune=autotune,
         prescale_qk=prescale_qk,
         return_lse=return_lse or requires_grad,
@@ -1532,14 +1581,17 @@ def flash_attention(
     v: torch.Tensor,
     lens: torch.Tensor | None = None,
     sm_scale: float | None = None,
+    causal: bool = True,
     autotune=False,
     return_lse=False,
     prescale_qk=False,
     precision="ieee",
 ):
     """
-    Computes standard causal self-attention with flash attention optimization.
-    Each query token can attend to all previous tokens in the sequence.
+    Computes self-attention with optional causal masking and flash attention optimization.
+    
+    When causal=True: Each query token can attend to all previous tokens in the sequence.
+    When causal=False: Each query token can attend to all tokens in the sequence (bidirectional).
 
     Unlike traditional attention mechanisms that store full attention matrices,
     flash attention maintains linear memory usage with quadratic time complexity.
@@ -1550,6 +1602,7 @@ def flash_attention(
         v (Tensor): The value tensor of shape `(batch, heads_num, time, head_dim)`
         lens (Tensor | None): Lengths of sequences of shape `(batch,)`
         sm_scale (float): Softmax scale, head_dim ** -0.5 by default
+        causal (bool): Whether to apply causal masking (default: True)
         autotune (bool): Use triton autotune for optimal kernel configuration
         prescale_qk (bool): Prescale Q in QK^T calculations — slightly faster if True, slightly lower precision
         precision (str): Precision for matmuls: 'ieee' or 'tf32'
@@ -1567,6 +1620,7 @@ def flash_attention(
         v=v,
         lens=lens,
         sm_scale=sm_scale,
+        causal=causal,
         autotune=autotune,
         return_lse=return_lse,
         prescale_qk=prescale_qk,
