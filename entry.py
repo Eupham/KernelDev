@@ -21,10 +21,10 @@ def main():
     
     # Data configuration (T4-optimized)
     data_config = {
-        'dataset_name': 'wikitext',
-        'dataset_config': 'wikitext-2-raw-v1',
+        'dataset_name': 'allenai/c4',
+        'dataset_config': 'en',
         'seq_len': 128,  # Reduced for T4
-        'max_samples': 2000  # Reduced for T4
+        'max_samples': 2000  # Default for C4
     }
     
     # Model configuration (T4-optimized)

@@ -191,10 +191,10 @@ class DataBuilder:
 
 
 def create_data_builder(
-    dataset_name: str = "wikitext",
-    dataset_config: str = "wikitext-2-raw-v1",
+    dataset_name: str = "allenai/c4",
+    dataset_config: str = "en",
     seq_len: int = 512,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = 2000
 ) -> DataBuilder:
     """Factory function to create a DataBuilder instance."""
     return DataBuilder(
@@ -211,8 +211,8 @@ if __name__ == "__main__":
     
     # Create data builder
     data_builder = create_data_builder(
-        dataset_name="wikitext",
-        dataset_config="wikitext-2-raw-v1",
+        dataset_name="allenai/c4",
+        dataset_config="en",
         seq_len=128,
         max_samples=1000
     )
