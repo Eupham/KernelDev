@@ -146,26 +146,16 @@ class DataBuilder:
             print(f"Tokenizing {split_name} split...")
             
             # Combine all text from this split
-            if isinstance(split_data, list):
-                # Fallback dataset format
-                all_text = ""
-                for item in split_data:
-                    if isinstance(item, dict) and 'text' in item:
-                        all_text += item['text'] + "\n"
-                    else:
-                        all_text += str(item) + "\n"
-            else:
-                # HuggingFace dataset format
-                all_text = ""
-                text_field = 'text' if 'text' in split_data[0] else list(split_data[0].keys())[0]
-                
-                max_samples = self.max_samples if self.max_samples else len(split_data)
-                for i, item in enumerate(split_data):
-                    if i >= max_samples:
-                        break
-                    text_content = item[text_field]
+            all_text = ""
+            for item in split_data:
+                if isinstance(item, dict) and 'text' in item:
+                    # Use 'text' field directly
+                    text_content = item['text']
                     if text_content and text_content.strip():  # Skip empty entries
                         all_text += text_content + "\n"
+                else:
+                    # Fallback to string representation
+                    all_text += str(item) + "\n"
             
             # Tokenize the combined text using UTF-8 bytes
             print(f"Text length for {split_name}: {len(all_text)} characters")
