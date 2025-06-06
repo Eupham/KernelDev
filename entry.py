@@ -62,7 +62,7 @@ def main():
         'vocab_size': 256,  # UTF-8 byte vocabulary size
         'dim': 512,  # Increased for better GPU utilization (T4 can handle this)
         'n_layers': 12,  # Increased for better GPU utilization
-        'n_heads': 24,  # Increased (dim must be divisible by n_heads: 1536/24=64)
+        'n_heads': 16,  # Increased (dim must be divisible by n_heads: 512/16=32)
         'max_seq_len': 2048,  # Increased sequence length
         'mlp_ratio': 4,  # Keep standard ratio
         'causal': True  # Using causal attention
