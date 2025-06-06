@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-MAX_TILE_SIZE = 64  # Reduced for T4 compatibility
+MAX_TILE_SIZE = 128  # Reduced for T4 compatibility
 MIN_TILE_SIZE = 16  # Reduced for T4 compatibility
 
 
