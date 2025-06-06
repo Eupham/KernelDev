@@ -1,0 +1,61 @@
+# High Quality Training Configuration (fp32, larger model)
+# For production-quality training
+
+training:
+  precision: 32              # Use fp32 for highest quality
+  epochs: 10                 # More epochs for better training
+  learning_rate: 0.0001      # Lower LR for stability
+  batch_size: null           # Auto-estimate batch size
+  weight_decay: 0.05         # Higher weight decay for regularization
+  warmup_steps: 500          # More warmup steps
+  max_grad_norm: 0.5         # Lower grad norm for stability
+  save_every: 1000           # Less frequent checkpoints
+  eval_every: 500            # Less frequent evaluation
+  log_every: 100             # Standard logging
+  checkpoint_dir: "checkpoints_quality"
+
+data:
+  dataset_name: "allenai/c4"
+  dataset_config: "en"
+  seq_len: 2048              # Longer sequences for better context
+  max_samples: 20000         # More samples for better training
+  max_eval_tokens: 100000    # More eval tokens
+  num_workers: 0
+  shuffle_train: true
+
+model:
+  vocab_size: 256
+  dim: 768                   # Larger model dimension
+  n_layers: 16               # More layers
+  n_heads: 12                # More heads
+  max_seq_len: 4096          # Longer max sequence
+  mlp_ratio: 4
+  causal: true
+
+hardware:
+  available_memory_gb: 15
+  device: "auto"
+  memory_buffer_gb: 3        # Larger buffer for stability
+
+evaluation:
+  max_eval_batches: 20       # More thorough evaluation
+  max_val_batches: 100
+
+generation:
+  max_length: 100            # Longer generation
+  temperature: 0.7           # Slightly more conservative
+  top_k: 40
+  test_prompts:
+    - ""
+    - "In a world where artificial intelligence"
+    - "The future of technology"
+    - "Once upon a time"
+
+logging:
+  show_gpu_info: true
+  show_memory_estimation: true
+  test_attention_modes: true
+  test_generation: true
+  save_training_plots: true
+
+random_seed: 42

@@ -23,7 +23,9 @@ class TrainingConfig:
         eval_every: int = 500,
         log_every: int = 100,
         checkpoint_dir: str = "checkpoints",
-        device: str = "auto"
+        device: str = "auto",
+        use_amp: bool = False,
+        scaler: Optional[Any] = None
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -34,6 +36,8 @@ class TrainingConfig:
         self.eval_every = eval_every
         self.log_every = log_every
         self.checkpoint_dir = checkpoint_dir
+        self.use_amp = use_amp
+        self.scaler = scaler
         
         # Auto-detect device
         if device == "auto":
@@ -148,24 +152,51 @@ class Trainer:
         x, y = batch
         x, y = x.to(self.config.device), y.to(self.config.device)
         
-        # Forward pass
-        logits, loss = self.model(x, y)
-        
-        if loss is None:
-            return 0.0
-        
-        # Backward pass
+        # Zero gradients
         self.optimizer.zero_grad()
-        loss.backward()
         
-        # Gradient clipping
-        if self.config.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.max_grad_norm
-            )
-        
-        self.optimizer.step()
+        if self.config.use_amp and self.config.scaler is not None:
+            # Mixed precision forward pass
+            with torch.cuda.amp.autocast():
+                logits, loss = self.model(x, y)
+            
+            if loss is None:
+                return 0.0
+            
+            # Mixed precision backward pass
+            self.config.scaler.scale(loss).backward()
+            
+            # Gradient clipping with mixed precision
+            if self.config.max_grad_norm > 0:
+                self.config.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm
+                )
+            
+            # Optimizer step with mixed precision
+            self.config.scaler.step(self.optimizer)
+            self.config.scaler.update()
+            
+        else:
+            # Standard precision forward pass
+            logits, loss = self.model(x, y)
+            
+            if loss is None:
+                return 0.0
+            
+            # Standard precision backward pass
+            loss.backward()
+            
+            # Gradient clipping
+            if self.config.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm
+                )
+            
+            # Optimizer step
+            self.optimizer.step()
         
         return loss.item()
     
@@ -184,7 +215,13 @@ class Trainer:
                 x, y = batch
                 x, y = x.to(self.config.device), y.to(self.config.device)
                 
-                logits, loss = self.model(x, y)
+                if self.config.use_amp:
+                    # Use mixed precision for evaluation
+                    with torch.cuda.amp.autocast():
+                        logits, loss = self.model(x, y)
+                else:
+                    # Standard precision evaluation
+                    logits, loss = self.model(x, y)
                 
                 if loss is not None:
                     total_loss += loss.item()
@@ -413,13 +450,23 @@ class Trainer:
                 # Start with a random token
                 x = torch.randint(0, self.data_builder.vocab_size, (1, 1)).to(self.config.device)
             
-            # Generate tokens
-            generated = self.model.generate(
-                x,
-                max_new_tokens=max_length,
-                temperature=temperature,
-                top_k=top_k
-            )
+            if self.config.use_amp:
+                # Use mixed precision for generation
+                with torch.cuda.amp.autocast():
+                    generated = self.model.generate(
+                        x,
+                        max_new_tokens=max_length,
+                        temperature=temperature,
+                        top_k=top_k
+                    )
+            else:
+                # Standard precision generation
+                generated = self.model.generate(
+                    x,
+                    max_new_tokens=max_length,
+                    temperature=temperature,
+                    top_k=top_k
+                )
             
             # Decode to text
             generated_text = self.data_builder.decode_tokens(generated[0])

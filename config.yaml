@@ -1,0 +1,133 @@
+# Configuration file for GPT Model Training with Flash Attention
+# This file contains all the parameters needed to run entry.py
+
+# Training Configuration
+training:
+  # Floating point precision: 16 for fp16/mixed precision, 32 for fp32
+  precision: 32
+  
+  # Number of training epochs
+  epochs: 3
+  
+  # Learning rate for optimization
+  learning_rate: 0.0003  # 3e-4
+  
+  # Batch size (if null, will be auto-estimated based on GPU memory)
+  batch_size: null
+  
+  # Weight decay for regularization
+  weight_decay: 0.01
+  
+  # Number of warmup steps for learning rate scheduler
+  warmup_steps: 100
+  
+  # Maximum gradient norm for clipping
+  max_grad_norm: 1.0
+  
+  # Checkpoint and logging intervals
+  save_every: 500      # Save checkpoint every N steps
+  eval_every: 200      # Evaluate on validation set every N steps
+  log_every: 50        # Log training metrics every N steps
+  
+  # Directory to save checkpoints and logs
+  checkpoint_dir: "checkpoints"
+
+# Data Configuration
+data:
+  # Dataset name from HuggingFace datasets
+  dataset_name: "allenai/c4"
+  
+  # Dataset configuration/subset
+  dataset_config: "en"
+  
+  # Sequence length for training
+  seq_len: 1024
+  
+  # Maximum number of samples to use from dataset
+  max_samples: 5000
+  
+  # Maximum tokens for evaluation
+  max_eval_tokens: 50000
+  
+  # DataLoader settings
+  num_workers: 0       # Set to 0 to avoid multiprocessing issues
+  shuffle_train: true  # Shuffle training data
+
+# Model Configuration
+model:
+  # Vocabulary size (will be updated based on tokenizer)
+  vocab_size: 256
+  
+  # Model dimension
+  dim: 512
+  
+  # Number of transformer layers
+  n_layers: 12
+  
+  # Number of attention heads (must divide dim evenly)
+  n_heads: 16
+  
+  # Maximum sequence length the model can handle
+  max_seq_len: 2048
+  
+  # MLP expansion ratio
+  mlp_ratio: 4
+  
+  # Use causal attention masking
+  causal: true
+
+# GPU/Memory Configuration
+hardware:
+  # Available GPU memory in GB (used for batch size estimation)
+  available_memory_gb: 15
+  
+  # Device to use ("auto", "cuda", "cpu")
+  device: "auto"
+  
+  # Memory buffer to reserve (GB)
+  memory_buffer_gb: 2
+
+# Evaluation Configuration
+evaluation:
+  # Maximum batches for initial/final evaluation (for speed)
+  max_eval_batches: 10
+  
+  # Maximum batches for regular validation during training
+  max_val_batches: 50
+
+# Text Generation Configuration (for testing)
+generation:
+  # Maximum length of generated text
+  max_length: 50
+  
+  # Temperature for sampling (higher = more random)
+  temperature: 0.8
+  
+  # Top-k sampling parameter
+  top_k: 50
+  
+  # Test prompts
+  test_prompts:
+    - ""      # Empty prompt
+    - "The"   # Simple prompt
+    - "In a world where"  # Creative prompt
+
+# Logging Configuration
+logging:
+  # Print GPU information at start
+  show_gpu_info: true
+  
+  # Show memory estimation details
+  show_memory_estimation: true
+  
+  # Test causal vs non-causal attention
+  test_attention_modes: true
+  
+  # Generate sample text after training
+  test_generation: true
+  
+  # Save training curves plot
+  save_training_plots: true
+
+# Random Seed (for reproducibility)
+random_seed: 42
