@@ -157,7 +157,7 @@ class Trainer:
         
         if self.config.use_amp and self.config.scaler is not None:
             # Mixed precision forward pass
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 logits, loss = self.model(x, y)
             
             if loss is None:
@@ -217,7 +217,7 @@ class Trainer:
                 
                 if self.config.use_amp:
                     # Use mixed precision for evaluation
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         logits, loss = self.model(x, y)
                 else:
                     # Standard precision evaluation
@@ -452,7 +452,7 @@ class Trainer:
             
             if self.config.use_amp:
                 # Use mixed precision for generation
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     generated = self.model.generate(
                         x,
                         max_new_tokens=max_length,

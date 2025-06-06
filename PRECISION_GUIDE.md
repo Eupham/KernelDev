@@ -74,8 +74,8 @@ python entry.py --precision 32 --seq-len 512 --epochs 1
 
 ### Mixed Precision Implementation
 - Uses PyTorch's Automatic Mixed Precision (AMP)
-- `torch.cuda.amp.autocast()` for forward pass
-- `torch.cuda.amp.GradScaler()` for gradient scaling
+- `torch.amp.autocast('cuda')` for forward pass
+- `torch.amp.GradScaler('cuda')` for gradient scaling
 - Automatic loss scaling and unscaling
 
 ### Memory Estimation

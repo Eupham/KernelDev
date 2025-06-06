@@ -111,15 +111,16 @@ def setup_precision(model, precision):
     """Setup model precision and return appropriate dtype and scaler."""
     if precision == 16:
         print(f"Setting up mixed precision training (fp16)...")
-        # Convert model to half precision
-        model.half()
+        # Keep model in fp32 for mixed precision training
+        # The model will be automatically cast to fp16 during forward pass
+        model.float()  # Don't convert to half, let autocast handle it
         dtype = torch.float16
         
-        # Setup gradient scaler for mixed precision
-        scaler = torch.cuda.amp.GradScaler()
+        # Setup gradient scaler for mixed precision (using new API)
+        scaler = torch.amp.GradScaler('cuda')
         use_amp = True
         
-        print("✓ Model converted to fp16")
+        print("✓ Model prepared for mixed precision training")
         print("✓ Gradient scaler initialized for mixed precision")
         
     else:  # precision == 32
