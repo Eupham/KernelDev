@@ -60,7 +60,7 @@ def main():
     # Model configuration (T4-optimized for better utilization)
     model_config = {
         'vocab_size': 256,  # UTF-8 byte vocabulary size
-        'dim': 1536,  # Increased for better GPU utilization (T4 can handle this)
+        'dim': 512,  # Increased for better GPU utilization (T4 can handle this)
         'n_layers': 12,  # Increased for better GPU utilization
         'n_heads': 24,  # Increased (dim must be divisible by n_heads: 1536/24=64)
         'max_seq_len': 2048,  # Increased sequence length
