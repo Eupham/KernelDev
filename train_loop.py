@@ -169,7 +169,7 @@ class Trainer:
         
         return loss.item()
     
-    def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 1000) -> float:
+    def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
         """Evaluate the model on a dataset."""
         self.model.eval()
         total_loss = 0

@@ -52,7 +52,7 @@ def main():
     data_config = {
         'dataset_name': 'allenai/c4',
         'dataset_config': 'en',
-        'seq_len': 2048,  # Increased for better GPU utilization
+        'seq_len': 1024,  # Increased for better GPU utilization
         'max_samples': 5000,  # Increased for more data
         'max_eval_tokens': 50000  # Increased for better evaluation
     }
@@ -156,9 +156,9 @@ def main():
     # Initial evaluation
     print(f"\n=== Initial Evaluation ===")
     if 'train' in dataloaders and 'validation' in dataloaders:
-        # Limit initial evaluation to 500 batches for speed
-        initial_train_loss = trainer.evaluate(dataloaders['train'], max_batches=500)
-        initial_val_loss = trainer.evaluate(dataloaders['validation'])
+        # Limit initial evaluation to 10 batches for speed
+        initial_train_loss = trainer.evaluate(dataloaders['train'], max_batches=10)
+        initial_val_loss = trainer.evaluate(dataloaders['validation'], max_batches=10)
         print(f"Initial training loss: {initial_train_loss:.4f}")
         print(f"Initial validation loss: {initial_val_loss:.4f}")
     
@@ -178,9 +178,9 @@ def main():
         
         # Final evaluation
         if 'train' in dataloaders and 'validation' in dataloaders:
-            # Limit final evaluation to 500 batches for speed
-            final_train_loss = trainer.evaluate(dataloaders['train'], max_batches=500)
-            final_val_loss = trainer.evaluate(dataloaders['validation'])
+            # Limit final evaluation to 10 batches for speed
+            final_train_loss = trainer.evaluate(dataloaders['train'], max_batches=10)
+            final_val_loss = trainer.evaluate(dataloaders['validation'], max_batches=10)
             print(f"Final training loss: {final_train_loss:.4f}")
             print(f"Final validation loss: {final_val_loss:.4f}")
             
