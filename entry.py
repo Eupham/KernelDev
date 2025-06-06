@@ -232,6 +232,7 @@ def main():
     print(f"Parameter dtype: {next(model.parameters()).dtype}")
     
     # Training configuration
+    inference_cfg = config.get('inference', {})
     training_config = TrainingConfig(
         num_epochs=training_cfg.get('epochs', 3),
         learning_rate=training_cfg.get('learning_rate', 3e-4),
@@ -244,7 +245,13 @@ def main():
         checkpoint_dir=training_cfg.get('checkpoint_dir', "checkpoints"),
         device=hardware_cfg.get('device', 'auto'),
         use_amp=use_amp,
-        scaler=scaler
+        scaler=scaler,
+        # Inference sampling parameters
+        inference_prompts=inference_cfg.get('prompts', ["", "The", "In", "Once upon a time"]),
+        inference_max_length=inference_cfg.get('max_length', 100),
+        inference_temperature=inference_cfg.get('temperature', 0.8),
+        inference_top_k=inference_cfg.get('top_k', 50),
+        inference_top_p=inference_cfg.get('top_p', 0.9)
     )
     
     # Estimate optimal batch size with precision consideration
@@ -439,6 +446,7 @@ def test_generation(trainer, data_builder, gen_cfg=None):
         max_length = gen_cfg.get('max_length', 50)
         temperature = gen_cfg.get('temperature', 0.8)
         top_k = gen_cfg.get('top_k', 50)
+        top_p = gen_cfg.get('top_p', 0.9)
         test_prompts = gen_cfg.get('test_prompts', ["", "The"])
         
         for prompt in test_prompts:
@@ -446,7 +454,8 @@ def test_generation(trainer, data_builder, gen_cfg=None):
                 prompt=prompt,
                 max_length=max_length,
                 temperature=temperature,
-                top_k=top_k
+                top_k=top_k,
+                top_p=top_p
             )
             
             if prompt:

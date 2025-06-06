@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Tuple, Any
 import time
 import os
+import json
+import math
 from pathlib import Path
 
 
@@ -25,7 +27,13 @@ class TrainingConfig:
         checkpoint_dir: str = "checkpoints",
         device: str = "auto",
         use_amp: bool = False,
-        scaler: Optional[Any] = None
+        scaler: Optional[Any] = None,
+        # Inference sampling parameters
+        inference_prompts: List[str] = None,
+        inference_max_length: int = 100,
+        inference_temperature: float = 0.8,
+        inference_top_k: int = 50,
+        inference_top_p: float = 0.9
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -38,6 +46,13 @@ class TrainingConfig:
         self.checkpoint_dir = checkpoint_dir
         self.use_amp = use_amp
         self.scaler = scaler
+        
+        # Inference sampling configuration
+        self.inference_prompts = inference_prompts or ["", "The", "In", "Once upon a time"]
+        self.inference_max_length = inference_max_length
+        self.inference_temperature = inference_temperature
+        self.inference_top_k = inference_top_k
+        self.inference_top_p = inference_top_p
         
         # Auto-detect device
         if device == "auto":
@@ -325,9 +340,38 @@ class Trainer:
                 if is_best:
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
             
-            # Regular checkpoint saving
+            # Regular checkpoint saving with inference sampling
             if self.metrics.total_steps % self.config.save_every == 0:
                 self.save_checkpoint(self.metrics.total_steps)
+                
+                # Generate inference sample at checkpoint
+                if val_loader is not None:
+                    print(f"\n=== Generating Inference Sample at Step {self.metrics.total_steps} ===")
+                    
+                    # Calculate perplexity
+                    perplexity = self.calculate_perplexity(val_loader, max_batches=20)
+                    
+                    # Get current validation loss (or calculate it if not available)
+                    current_val_loss = self.metrics.val_losses[-1] if self.metrics.val_losses else val_loss
+                    
+                    # Generate inference samples
+                    prompts = self.config.inference_prompts
+                    generated_texts = self.generate_inference_sample(
+                        prompts=prompts,
+                        max_length=self.config.inference_max_length,
+                        temperature=self.config.inference_temperature,
+                        top_k=self.config.inference_top_k,
+                        top_p=self.config.inference_top_p
+                    )
+                    
+                    # Save inference sample with metadata
+                    self.save_inference_sample(
+                        step=self.metrics.total_steps,
+                        val_loss=current_val_loss,
+                        perplexity=perplexity,
+                        generated_texts=generated_texts,
+                        prompts=prompts
+                    )
         
         # Epoch summary
         avg_loss = np.mean(epoch_losses)
@@ -432,7 +476,8 @@ class Trainer:
         prompt: str = "",
         max_length: int = 100,
         temperature: float = 0.8,
-        top_k: int = 50
+        top_k: int = 50,
+        top_p: float = None
     ) -> str:
         """Generate a text sample from the model."""
         if not self.data_builder:
@@ -457,7 +502,8 @@ class Trainer:
                         x,
                         max_new_tokens=max_length,
                         temperature=temperature,
-                        top_k=top_k
+                        top_k=top_k,
+                        top_p=top_p
                     )
             else:
                 # Standard precision generation
@@ -465,7 +511,8 @@ class Trainer:
                     x,
                     max_new_tokens=max_length,
                     temperature=temperature,
-                    top_k=top_k
+                    top_k=top_k,
+                    top_p=top_p
                 )
             
             # Decode to text
@@ -473,6 +520,143 @@ class Trainer:
             
         self.model.train()
         return generated_text
+    
+    def calculate_perplexity(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
+        """Calculate perplexity on a dataset."""
+        self.model.eval()
+        total_loss = 0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+                    
+                x, y = batch
+                x, y = x.to(self.config.device), y.to(self.config.device)
+                
+                if self.config.use_amp and self.config.scaler is not None:
+                    with torch.amp.autocast('cuda'):
+                        logits, loss = self.model(x, y)
+                else:
+                    logits, loss = self.model(x, y)
+                
+                if loss is not None:
+                    total_loss += loss.item()
+                    num_batches += 1
+        
+        self.model.train()
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+        perplexity = math.exp(avg_loss) if avg_loss != float('inf') else float('inf')
+        return perplexity
+    
+    def generate_inference_sample(
+        self,
+        prompts: List[str] = None,
+        max_length: int = 100,
+        temperature: float = 0.8,
+        top_k: int = 50,
+        top_p: float = 0.9
+    ) -> List[str]:
+        """Generate inference samples with top-k, top-p, and temperature sampling."""
+        if not self.data_builder:
+            return ["No data_builder provided for text generation."]
+        
+        if prompts is None:
+            prompts = ["", "The", "In", "Once upon a time"]
+        
+        self.model.eval()
+        generated_texts = []
+        
+        with torch.no_grad():
+            for prompt in prompts:
+                try:
+                    if prompt:
+                        # Tokenize prompt
+                        tokens = self.data_builder.tokenizer.encode(prompt)
+                        x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device)
+                    else:
+                        # Start with a random token
+                        x = torch.randint(0, self.data_builder.vocab_size, (1, 1)).to(self.config.device)
+                    
+                    # Generate tokens with top-k, top-p sampling
+                    generated = self.model.generate(
+                        x,
+                        max_new_tokens=max_length,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p
+                    )
+                    
+                    # Decode to text
+                    generated_text = self.data_builder.decode_tokens(generated[0])
+                    generated_texts.append(generated_text)
+                    
+                except Exception as e:
+                    generated_texts.append(f"Generation failed: {str(e)}")
+        
+        self.model.train()
+        return generated_texts
+    
+    def save_inference_sample(
+        self, 
+        step: int, 
+        val_loss: float, 
+        perplexity: float,
+        generated_texts: List[str],
+        prompts: List[str] = None
+    ):
+        """Save inference sample to JSON file with metadata."""
+        if prompts is None:
+            prompts = ["", "The", "In", "Once upon a time"]
+        
+        # Create inference samples directory
+        inference_dir = Path(self.config.checkpoint_dir) / "inference_samples"
+        inference_dir.mkdir(exist_ok=True)
+        
+        # Create sample entry
+        sample_entry = {
+            "step": step,
+            "validation_loss": val_loss,
+            "perplexity": perplexity,
+            "timestamp": time.time(),
+            "samples": []
+        }
+        
+        for prompt, generated_text in zip(prompts, generated_texts):
+            sample_entry["samples"].append({
+                "prompt": prompt,
+                "generated_text": generated_text
+            })
+        
+        # Load existing samples or create new list
+        samples_file = inference_dir / "inference_samples.json"
+        if samples_file.exists():
+            try:
+                with open(samples_file, 'r') as f:
+                    all_samples = json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                all_samples = []
+        else:
+            all_samples = []
+        
+        # Add new sample
+        all_samples.append(sample_entry)
+        
+        # Save updated samples
+        with open(samples_file, 'w') as f:
+            json.dump(all_samples, f, indent=2)
+        
+        # Print the generated samples
+        print(f"\n=== Inference Sample at Step {step} ===")
+        print(f"Validation Loss: {val_loss:.4f}")
+        print(f"Perplexity: {perplexity:.2f}")
+        for prompt, generated_text in zip(prompts, generated_texts):
+            if prompt:
+                print(f"Prompt: '{prompt}' → '{generated_text}'")
+            else:
+                print(f"No prompt → '{generated_text}'")
+        print("=" * 50)
 
 
 def create_trainer(

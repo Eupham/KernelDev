@@ -153,8 +153,8 @@ class GPTModel(nn.Module):
         
         return logits, loss
     
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """Generate new tokens using the model."""
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
+        """Generate new tokens using the model with top-k and top-p sampling."""
         self.eval()
         with torch.no_grad():
             for _ in range(max_new_tokens):
@@ -169,6 +169,21 @@ class GPTModel(nn.Module):
                 if top_k is not None:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float('Inf')
+                
+                # Apply top-p (nucleus) sampling if specified
+                if top_p is not None:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    
+                    # Remove tokens with cumulative probability above the threshold
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    # Shift the indices to the right to keep also the first token above the threshold
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    
+                    # Set logits to -inf for tokens to remove
+                    indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = -float('Inf')
                 
                 # Sample from the distribution
                 probs = F.softmax(logits, dim=-1)
