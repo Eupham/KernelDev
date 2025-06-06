@@ -488,8 +488,8 @@ class Trainer:
         
         with torch.no_grad():
             if prompt:
-                # Tokenize prompt
-                tokens = self.data_builder.tokenizer.encode(prompt)
+                # Tokenize prompt using DataBuilder's method
+                tokens = self.data_builder._tokenize_text(prompt)
                 x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device)
             else:
                 # Start with a random token
@@ -572,8 +572,8 @@ class Trainer:
             for prompt in prompts:
                 try:
                     if prompt:
-                        # Tokenize prompt
-                        tokens = self.data_builder.tokenizer.encode(prompt)
+                        # Tokenize prompt using DataBuilder's method
+                        tokens = self.data_builder._tokenize_text(prompt)
                         x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device)
                     else:
                         # Start with a random token
