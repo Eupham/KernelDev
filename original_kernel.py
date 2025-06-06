@@ -15,6 +15,19 @@ logger = logging.getLogger(__name__)
 
 
 # BLOCK_Q, BLOCK_K, num_warps, num_stages
+# T4-optimized configuration (compute capability 7.5)
+_t4_default_config = {
+    (torch.float32, 64): (64, 64, 4, 3),
+    (torch.float32, 128): (64, 32, 4, 3),
+    (torch.float32, 256): (32, 32, 4, 3),
+    (torch.bfloat16, 64): (128, 64, 4, 3),
+    (torch.bfloat16, 128): (64, 64, 4, 3),
+    (torch.bfloat16, 256): (64, 32, 4, 3),
+    (torch.float16, 64): (128, 64, 4, 3),
+    (torch.float16, 128): (64, 64, 4, 3),
+    (torch.float16, 256): (64, 32, 4, 3),
+}
+
 _h100_default_config = {
     (torch.float32, 64): (128, 32, 4, 3),
     (torch.float32, 128): (32, 64, 4, 3),
@@ -55,6 +68,12 @@ def _get_default_config_fwd(head_dim, dtype) -> tuple[int, int, int, int]:
         else:
             default_config = (128, 64, 4, 3)
         default_config = _a100_default_config.get((dtype, head_dim), default_config)
+    elif head_dim <= 256 and torch.cuda.get_device_capability() >= (7, 5):  # T4 and similar
+        if dtype == torch.float32:
+            default_config = (64, 64, 4, 3)
+        else:
+            default_config = (128, 64, 4, 3)
+        default_config = _t4_default_config.get((dtype, head_dim), default_config)
     else:  # modest hardware or extremely large head_dim
         if dtype == torch.float32:
             default_config = (32, 16, 4, 3)
@@ -81,6 +100,13 @@ def _get_default_config_bwd(head_dim, dtype) -> tuple[int, int, int, int]:
             return (64, 128, 8, 3)
         else:
             return (64, 64, 4, 2)
+    elif torch.cuda.get_device_capability() >= (7, 5):  # T4 and similar
+        if head_dim == 64:
+            return (64, 64, 4, 2)
+        elif head_dim == 128:
+            return (32, 64, 4, 2)
+        else:
+            return (32, 32, 4, 2)
     else:  # modest hardware or extremely large head_dim
         return (16, 16, 4, 1)
 

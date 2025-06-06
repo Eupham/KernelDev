@@ -10,7 +10,36 @@ from data_builder import DataBuilder, create_data_builder
 from train_loop import Trainer, TrainingConfig, create_trainer
 
 
+def print_gpu_info():
+    """Print comprehensive GPU information and optimization status."""
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        print(f"=== GPU Information ===")
+        print(f"Device: {torch.cuda.get_device_name(device)}")
+        print(f"Compute Capability: {torch.cuda.get_device_capability(device)}")
+        print(f"Total Memory: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.1f} GB")
+        print(f"Current Memory Usage: {torch.cuda.memory_allocated(device) / 1024**3:.1f} GB")
+        print(f"Current Memory Cached: {torch.cuda.memory_reserved(device) / 1024**3:.1f} GB")
+        
+        # Check if T4 optimizations will be applied
+        cap = torch.cuda.get_device_capability(device)
+        if cap >= (7, 5) and cap < (8, 0):
+            print("✓ T4-optimized flash attention kernels will be used")
+        elif cap >= (8, 0) and cap < (9, 0):
+            print("✓ A100-optimized flash attention kernels will be used")
+        elif cap >= (9, 0):
+            print("✓ H100-optimized flash attention kernels will be used")
+        else:
+            print("⚠ Using fallback flash attention kernels")
+        print()
+    else:
+        print("CUDA not available!")
+
+
 def main():
+    # Print GPU information first
+    print_gpu_info()
+    
     # Set random seed for reproducibility
     torch.manual_seed(42)
     np.random.seed(42)
@@ -19,40 +48,48 @@ def main():
     print("=== GPT Model Training with Flash Attention ===")
     print("Setting up configuration...")
     
-    # Data configuration (T4-optimized)
+    # Data configuration (T4-optimized for better utilization)
     data_config = {
         'dataset_name': 'allenai/c4',
         'dataset_config': 'en',
-        'seq_len': 1024,  # Reduced for T4
-        'max_samples': 2000,  # Default for C4
-        'max_eval_tokens': 25000  # Reduced for faster evaluation
+        'seq_len': 2048,  # Increased for better GPU utilization
+        'max_samples': 5000,  # Increased for more data
+        'max_eval_tokens': 50000  # Increased for better evaluation
     }
     
-    # Model configuration (T4-optimized)
+    # Model configuration (T4-optimized for better utilization)
     model_config = {
         'vocab_size': 256,  # UTF-8 byte vocabulary size
-        'dim': 1024,  # Reduced for T4
-        'n_layers': 8,  # Reduced for T4
-        'n_heads': 16,  # Reduced for T4
-        'max_seq_len': 1024,  # Reduced for T4
-        'mlp_ratio': 4,  # Reduced for T4
+        'dim': 1536,  # Increased for better GPU utilization (T4 can handle this)
+        'n_layers': 12,  # Increased for better GPU utilization
+        'n_heads': 24,  # Increased (dim must be divisible by n_heads: 1536/24=64)
+        'max_seq_len': 2048,  # Increased sequence length
+        'mlp_ratio': 4,  # Keep standard ratio
         'causal': True  # Using causal attention
     }
     
-    # Training configuration (T4-optimized)
+    # Training configuration (T4-optimized for better utilization)
+    # Training configuration (T4-optimized for better utilization)
     training_config = TrainingConfig(
-        num_epochs=2,  # Reduced for T4
-        learning_rate=5e-4,  # Slightly higher for smaller model
+        num_epochs=3,  # Increased for better training
+        learning_rate=3e-4,  # Standard learning rate
         weight_decay=0.01,
-        warmup_steps=50,  # Reduced for T4
+        warmup_steps=100,  # Increased warmup
         max_grad_norm=1.0,
-        save_every=300,  # Reduced for T4
-        eval_every=100,  # Reduced for T4
-        log_every=25,  # Reduced for T4
+        save_every=500,  # Reasonable checkpoint frequency
+        eval_every=200,  # Regular evaluation
+        log_every=50,  # Regular logging
         checkpoint_dir="checkpoints"
     )
     
-    batch_size = 2  # Small batch size for T4
+    # Estimate optimal batch size for T4
+    estimated_batch_size, memory_info = estimate_optimal_batch_size(model_config, available_memory_gb=15)
+    print(f"\n=== Memory Estimation ===")
+    print(memory_info)
+    
+    # Use a conservative batch size (slightly lower than estimated)
+    batch_size = min(estimated_batch_size, 16)  # Cap at 16 for safety
+    print(f"Using batch_size: {batch_size}")
     
     print(f"Device: {training_config.device}")
     print(f"Model config: {model_config}")
@@ -245,6 +282,55 @@ def test_generation(trainer, data_builder):
         
     except Exception as e:
         print(f"Text generation failed: {e}")
+
+
+def estimate_optimal_batch_size(model_config, available_memory_gb=15):
+    """Estimate optimal batch size for T4 GPU based on model parameters and sequence length."""
+    # Estimate memory usage per sample (very rough estimate)
+    # Memory = (parameters * 4 bytes) + (activations memory)
+    
+    dim = model_config['dim']
+    n_layers = model_config['n_layers']
+    seq_len = model_config['max_seq_len']
+    vocab_size = model_config['vocab_size']
+    
+    # Rough parameter count estimation
+    param_count = (
+        vocab_size * dim +  # embedding
+        n_layers * (
+            4 * dim * dim +  # attention weights (Q, K, V, O)
+            2 * dim +        # attention layer norms
+            8 * dim * dim +  # MLP weights (assuming 4x expansion)
+            2 * dim          # MLP layer norms
+        ) +
+        dim + vocab_size * dim  # final layer norm + output projection
+    )
+    
+    # Memory estimates (in GB)
+    model_memory = param_count * 4 / (1024**3)  # 4 bytes per parameter
+    activation_memory_per_sample = (seq_len * dim * n_layers * 4) / (1024**3)  # rough estimate
+    
+    # Reserve memory for gradients (same as model) and optimizer state (2x model for Adam)
+    total_model_memory = model_memory * 4  # model + gradients + optimizer state
+    
+    # Available memory for activations
+    available_for_activations = available_memory_gb - total_model_memory - 2  # 2GB buffer
+    
+    if available_for_activations <= 0:
+        return 1, f"Model too large! Estimated model memory: {total_model_memory:.1f}GB"
+    
+    # Estimate batch size
+    estimated_batch_size = max(1, int(available_for_activations / activation_memory_per_sample))
+    
+    info = (
+        f"Estimated memory usage:\n"
+        f"  Model + gradients + optimizer: {total_model_memory:.1f}GB\n"
+        f"  Activation memory per sample: {activation_memory_per_sample*1000:.1f}MB\n"
+        f"  Available for activations: {available_for_activations:.1f}GB\n"
+        f"  Recommended batch size: {estimated_batch_size}"
+    )
+    
+    return estimated_batch_size, info
 
 
 if __name__ == "__main__":
