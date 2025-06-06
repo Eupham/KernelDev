@@ -23,7 +23,7 @@ def main():
     data_config = {
         'dataset_name': 'allenai/c4',
         'dataset_config': 'en',
-        'seq_len': 128,  # Reduced for T4
+        'seq_len': 1024,  # Reduced for T4
         'max_samples': 2000,  # Default for C4
         'max_eval_tokens': 25000  # Reduced for faster evaluation
     }
@@ -34,8 +34,8 @@ def main():
         'dim': 256,  # Reduced for T4
         'n_layers': 4,  # Reduced for T4
         'n_heads': 4,  # Reduced for T4
-        'max_seq_len': 256,  # Reduced for T4
-        'mlp_ratio': 2,  # Reduced for T4
+        'max_seq_len': 1024,  # Reduced for T4
+        'mlp_ratio': 4,  # Reduced for T4
         'causal': True  # Using causal attention
     }
     
