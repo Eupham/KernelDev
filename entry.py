@@ -31,9 +31,9 @@ def main():
     # Model configuration (T4-optimized)
     model_config = {
         'vocab_size': 256,  # UTF-8 byte vocabulary size
-        'dim': 256,  # Reduced for T4
-        'n_layers': 4,  # Reduced for T4
-        'n_heads': 4,  # Reduced for T4
+        'dim': 1024,  # Reduced for T4
+        'n_layers': 8,  # Reduced for T4
+        'n_heads': 16,  # Reduced for T4
         'max_seq_len': 1024,  # Reduced for T4
         'mlp_ratio': 4,  # Reduced for T4
         'causal': True  # Using causal attention
