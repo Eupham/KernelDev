@@ -2,16 +2,31 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-import argparse
+import argparse # Keep this, but ArgumentParser might be used from new imports
 import yaml
 from pathlib import Path
 from typing import Dict, Any
+
+import sys
+import subprocess
+import socket
+import os
+# Ensure ArgumentParser and REMAINDER are available if argparse is re-imported or used directly
+from argparse import ArgumentParser, REMAINDER
+
 
 # Import our custom modules
 from model import GPTModel
 from data_builder import DataBuilder, create_data_builder
 from train_loop import Trainer, TrainingConfig, create_trainer
 
+
+def find_free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return str(port)
 
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load configuration from YAML file."""
@@ -57,55 +72,8 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     return config
 
 
-def parse_args():
-    """Parse command-line arguments for training configuration."""
-    parser = argparse.ArgumentParser(description='Train GPT model with configurable precision')
-    
-    parser.add_argument(
-        '--config',
-        type=str,
-        default='config.yaml',
-        help='Path to YAML configuration file (default: config.yaml)'
-    )
-    
-    parser.add_argument(
-        '--precision', 
-        type=int, 
-        choices=[16, 32], 
-        default=None,
-        help='Floating point precision: 16 for fp16/mixed precision, 32 for fp32 (overrides config)'
-    )
-    
-    parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=None,
-        help='Override batch size (overrides config and auto-estimation)'
-    )
-    
-    parser.add_argument(
-        '--seq-len',
-        type=int,
-        default=None,
-        help='Sequence length for training (overrides config)'
-    )
-    
-    parser.add_argument(
-        '--epochs',
-        type=int,
-        default=None,
-        help='Number of training epochs (overrides config)'
-    )
-    
-    parser.add_argument(
-        '--learning-rate',
-        type=float,
-        default=None,
-        help='Learning rate (overrides config)'
-    )
-    
-    return parser.parse_args()
-
+# Removed redundant parse_args() function.
+# All parsing is now handled in the if __name__ == "__main__": block.
 
 def setup_precision(model, precision):
     """Setup model precision and return appropriate dtype and scaler."""
@@ -161,15 +129,26 @@ def print_gpu_info():
         print("CUDA not available!")
 
 
-def main():
-    # Parse command-line arguments
-    args = parse_args()
-    
+def start_actual_training(cli_args):
+    """
+    Encapsulates the actual training setup and execution.
+    `cli_args` can be an argparse.Namespace object or a compatible dict/object.
+    """
     # Load configuration from YAML file
-    config = load_config(args.config)
+    # If cli_args is a namespace from parse_args in the new main, it should have 'config' attribute
+    config_file_path = cli_args.config if hasattr(cli_args, 'config') else 'config.yaml'
+    config = load_config(config_file_path)
     
     # Merge config with command-line arguments (CLI takes precedence)
-    config = merge_config_with_args(config, args)
+    # Ensure cli_args is a Namespace for merge_config_with_args if it expects one
+    # If cli_args might not be a full Namespace, adjust merge_config_with_args or pass parameters carefully
+    if not isinstance(cli_args, argparse.Namespace):
+        # If cli_args is not a namespace (e.g. from worker process re-parsing with limited args)
+        # we might need to be careful here. For now, assume it has compatible attributes.
+        # A cleaner way might be to pass a dictionary of overrides.
+        pass # Assuming cli_args has the necessary attributes like precision, batch_size etc.
+
+    config = merge_config_with_args(config, cli_args)
     
     # Extract configuration values with defaults
     training_cfg = config.get('training', {})
@@ -390,6 +369,7 @@ def main():
     
     print(f"\n=== Training Session Complete ===")
 
+# --- End of original main logic, now in start_actual_training ---
 
 def test_causal_attention(model, dataloaders, device, data_builder):
     """Test the difference between causal and non-causal attention."""
@@ -528,4 +508,118 @@ def estimate_optimal_batch_size(model_config, available_memory_gb=15, precision=
 
 
 if __name__ == "__main__":
-    main()
+    # Main argument parser for the entry script, including distributed launch args
+    parser = ArgumentParser(description="GPT Model Training Entry Script")
+    parser.add_argument(
+        "--nproc_per_node",
+        type=int,
+        default=1,
+        help="Number of processes to launch for distributed training on this node."
+    )
+    # Add other existing arguments from the original parse_args()
+    # These are arguments that the training script itself needs, not just the launcher.
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='config.yaml',
+        help='Path to YAML configuration file (default: config.yaml)'
+    )
+    parser.add_argument(
+        '--precision',
+        type=int,
+        choices=[16, 32],
+        default=None, # Default to None, so config file is source of truth unless overridden
+        help='Floating point precision: 16 for fp16/mixed precision, 32 for fp32 (overrides config)'
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=None, # Default to None
+        help='Override batch size (overrides config and auto-estimation)'
+    )
+    parser.add_argument(
+        '--seq-len',
+        type=int,
+        default=None, # Default to None
+        help='Sequence length for training (overrides config)'
+    )
+    parser.add_argument(
+        '--epochs',
+        type=int,
+        default=None, # Default to None
+        help='Number of training epochs (overrides config)'
+    )
+    parser.add_argument(
+        '--learning-rate',
+        type=float,
+        default=None, # Default to None
+        help='Learning rate (overrides config)'
+    )
+    # Use parse_args() which will capture all defined args.
+    # REMAINDER is not needed here as we explicitly define training args.
+    args = parser.parse_args()
+
+    if "IS_WORKER_PROCESS" in os.environ:
+        print(f"Worker process RANK: {os.environ.get('RANK', 'N/A')}, LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'N/A')} starting.")
+        # Worker processes receive all arguments and proceed to training
+        start_actual_training(args)
+    elif args.nproc_per_node > 1:
+        print(f"Main process launching {args.nproc_per_node} worker processes.")
+        master_addr = "127.0.0.1"
+        master_port = find_free_port()
+        world_size = args.nproc_per_node
+
+        processes = []
+
+        # Construct the base command for worker processes
+        # We need to pass all arguments *except* --nproc_per_node to the workers
+        worker_cmd_args = [sys.executable, sys.argv[0]] # script itself
+
+        # Iterate over sys.argv to rebuild arguments, skipping --nproc_per_node
+        skip_next_arg = False
+        for i, arg_val in enumerate(sys.argv[1:]):
+            if skip_next_arg:
+                skip_next_arg = False
+                continue
+            if arg_val == "--nproc_per_node":
+                skip_next_arg = True # Skip the value of nproc_per_node
+                continue
+            worker_cmd_args.append(arg_val)
+
+        for rank in range(world_size):
+            env = os.environ.copy()
+            env["MASTER_ADDR"] = master_addr
+            env["MASTER_PORT"] = master_port
+            env["WORLD_SIZE"] = str(world_size)
+            env["RANK"] = str(rank)
+            env["LOCAL_RANK"] = str(rank) # Assuming single-node, local_rank == rank
+            env["IS_WORKER_PROCESS"] = "1"
+            env["PYTHONUNBUFFERED"] = "1"
+
+            print(f"Launching worker RANK {rank} with command: {' '.join(worker_cmd_args)}")
+            try:
+                process = subprocess.Popen(worker_cmd_args, env=env)
+                processes.append(process)
+            except Exception as e:
+                print(f"Error launching process for RANK {rank}: {e}")
+                for p_term in processes:
+                    try: p_term.terminate()
+                    except: pass # best effort
+                sys.exit(1)
+
+
+        for rank, process in enumerate(processes):
+            process.wait()
+            if process.returncode != 0:
+                print(f"Worker process RANK {rank} (PID {process.pid}) exited with error code {process.returncode}.")
+
+        print("All worker processes finished.")
+        sys.exit(0) # Main launcher process exits after workers are done
+    else:
+        print("Running in single process mode (nproc_per_node = 1).")
+        # In single process mode, RANK and WORLD_SIZE might not be set by an external launcher.
+        # For consistency with how init_distributed in train_loop might expect these for non-DDP single GPU:
+        if "RANK" not in os.environ: os.environ["RANK"] = "0"
+        if "WORLD_SIZE" not in os.environ: os.environ["WORLD_SIZE"] = "1"
+        if "LOCAL_RANK" not in os.environ: os.environ["LOCAL_RANK"] = "0"
+        start_actual_training(args)

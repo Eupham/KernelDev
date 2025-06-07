@@ -70,47 +70,56 @@ class TrainingConfig:
         self.is_distributed = False # Will be set by init_distributed
 
 # Note: This function is called in Trainer.__init__ and sets Trainer's attributes.
-# It might be cleaner if this returned a status or if Trainer instance was passed.
-# For now, modifying Trainer's attributes directly from here.
 def init_distributed(trainer_instance: 'Trainer'):
     """Initializes the distributed training environment."""
     if dist.is_available() and dist.is_initialized():
         trainer_instance.is_distributed = True
+        # Ensure local_rank is set if already initialized
+        if hasattr(trainer_instance.config, 'local_rank') and trainer_instance.config.local_rank == -1:
+             trainer_instance.config.local_rank = int(os.environ.get('LOCAL_RANK', 0))
         return
 
-    rank = os.environ.get('RANK')
-    world_size = os.environ.get('WORLD_SIZE')
+    rank_env = os.environ.get('RANK')
+    world_size_env = os.environ.get('WORLD_SIZE')
+    local_rank_env = os.environ.get('LOCAL_RANK')
 
-    if rank is not None and world_size is not None:
+    if rank_env is not None and world_size_env is not None:
         try:
-            rank = int(rank)
-            world_size = int(world_size)
+            rank = int(rank_env)
+            world_size = int(world_size_env)
+
+            if local_rank_env is not None:
+                local_rank = int(local_rank_env)
+            else: # Fallback if LOCAL_RANK is not set (e.g. older torch versions or different launcher)
+                local_rank = rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+            trainer_instance.config.local_rank = local_rank
 
             if torch.cuda.is_available():
                 backend = 'nccl'
-                torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', rank % torch.cuda.device_count())))
+                torch.cuda.set_device(local_rank)
                 dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
                 trainer_instance.is_distributed = True
-                trainer_instance.config.local_rank = int(os.environ.get('LOCAL_RANK', rank % torch.cuda.device_count()))
-                print(f"Distributed training initialized (RANK {rank}/{world_size}) with backend: {backend}")
+                trainer_instance.config.device = torch.device(f"cuda:{local_rank}")
+                print(f"Distributed training initialized (RANK {rank}/{world_size}, LOCAL_RANK {local_rank}) with backend: {backend} on device {trainer_instance.config.device}")
             else:
                 print("CUDA not available. Distributed training with NCCL backend not possible.")
                 trainer_instance.is_distributed = False
         except ValueError:
-            print("RANK or WORLD_SIZE environment variables are not valid integers.")
+            print("RANK, WORLD_SIZE, or LOCAL_RANK environment variables are not valid integers.")
             trainer_instance.is_distributed = False
         except Exception as e:
             print(f"Error initializing distributed group: {e}")
             trainer_instance.is_distributed = False
     else:
-        print("RANK and WORLD_SIZE env variables not set. Running in non-distributed mode.")
+        print("RANK and/or WORLD_SIZE env variables not set. Running in non-distributed mode.")
         trainer_instance.is_distributed = False
 
     if not trainer_instance.is_distributed:
-        # Ensure device is set for non-distributed mode
         if trainer_instance.config.device == "auto" or not isinstance(trainer_instance.config.device, torch.device):
              trainer_instance.config.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Running on device: {trainer_instance.config.device}")
+        trainer_instance.config.local_rank = 0 # Default for non-distributed
+        print(f"Running in non-distributed mode on device: {trainer_instance.config.device}")
 
 
 class TrainingMetrics:
@@ -187,18 +196,16 @@ class Trainer:
         self.is_distributed = False # Will be set by init_distributed
 
         # Initialize distributed training
-        init_distributed(self) # Pass self to allow init_distributed to set Trainer's attributes
+        init_distributed(self)
 
         if self.is_distributed and dist.get_world_size() > 1:
-            # self.config.local_rank is set in init_distributed
-            self.config.device = torch.device(f"cuda:{self.config.local_rank}")
+            # self.config.device is set in init_distributed
             self.model.to(self.config.device)
-            self.model = DDP(self.model, device_ids=[self.config.local_rank], output_device=self.config.local_rank)
+            # find_unused_parameters can be true if some outputs of the model are not used in loss calculation
+            self.model = DDP(self.model, device_ids=[self.config.local_rank], output_device=self.config.local_rank, find_unused_parameters=False)
             print(f"Model moved to device: {self.config.device} and wrapped with DDP (world size: {dist.get_world_size()}).")
         else:
-            # Ensure device is correctly set if not distributed or world_size is 1
-            if not isinstance(self.config.device, torch.device): # if it was 'auto'
-                 self.config.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            # self.config.device is set in init_distributed or by original logic
             self.model.to(self.config.device)
             print(f"Model moved to device: {self.config.device} (non-distributed or world_size=1).")
 
@@ -310,21 +317,70 @@ class Trainer:
     
     def save_checkpoint(self, step: int, is_best: bool = False):
         """Save model checkpoint."""
-        # Only rank 0 saves checkpoints in distributed mode
-        if self.is_distributed and dist.get_rank() != 0:
-            return
+        if not self.is_distributed or dist.get_rank() == 0:
+            model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
+            checkpoint = {
+                'step': step,
+                'model_state_dict': model_to_save.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'metrics': self.metrics.__dict__, # Note: metrics are rank-local
+                'config': self.config.__dict__
+            }
 
-        model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
-        checkpoint = {
-            'step': step,
-            'model_state_dict': model_to_save.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'metrics': self.metrics.__dict__,
-            'config': self.config.__dict__
-        }
+            checkpoint_path = os.path.join(
+                self.config.checkpoint_dir,
+                f'checkpoint_step_{step}.pt'
+            )
+            torch.save(checkpoint, checkpoint_path)
+
+            if is_best:
+                best_path = os.path.join(
+                    self.config.checkpoint_dir,
+                    'best_checkpoint.pt'
+                )
+                torch.save(checkpoint, best_path)
+
+            print(f"Checkpoint saved by Rank 0: {checkpoint_path}")
+        else:
+            # Ensure all processes are synchronized before rank 0 might save a new checkpoint
+            # or other processes might proceed with a new model state if loading occurs.
+            if self.is_distributed:
+                dist.barrier()
         
-        # Save regular checkpoint
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model checkpoint."""
+        # Ensure all processes load the same checkpoint
+        # In DDP, it's common to load checkpoint on all ranks,
+        # or load on rank 0 and then broadcast. Loading on all ranks is simpler.
+        map_location = self.config.device
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+
+        state_dict = checkpoint['model_state_dict']
+        model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
+
+        # Handle 'module.' prefix differences
+        current_keys_have_module = all(k.startswith('module.') for k in model_to_load.state_dict().keys())
+        checkpoint_keys_have_module = all(k.startswith('module.') for k in state_dict.keys())
+
+        if isinstance(self.model, DDP): # Current model is DDP
+            if not checkpoint_keys_have_module: # Checkpoint from non-DDP
+                # self.model.module.load_state_dict(state_dict) # Already handled by model_to_load
+                pass
+            else: # Checkpoint from DDP (has module. prefix)
+                new_state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+                state_dict = new_state_dict
+        else: # Current model is NOT DDP
+            if checkpoint_keys_have_module: # Checkpoint from DDP
+                new_state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+                state_dict = new_state_dict
+            # else: non-DDP to non-DDP, no change needed
+
+        model_to_load.load_state_dict(state_dict)
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        # Restore metrics (rank-local)
         checkpoint_path = os.path.join(
             self.config.checkpoint_dir,
             f'checkpoint_step_{step}.pt'
@@ -343,43 +399,9 @@ class Trainer:
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""
-        # Ensure checkpoint is loaded on the correct device mapping
-        map_location = self.config.device if self.config.device else 'cpu'
-        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+        checkpoint = torch.load(checkpoint_path, map_location=self.config.device)
         
-        state_dict = checkpoint['model_state_dict']
-
-        # Determine the model to load into (DDP module or raw model)
-        model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
-
-        # Adjust state_dict keys if checkpoint was saved from DDP and current model is not DDP,
-        # or if checkpoint was saved from non-DDP and current model is DDP.
-        # Generally, it's best practice to save the model.module.state_dict().
-
-        # If current model is DDP, but checkpoint is not (no 'module.' prefix)
-        if isinstance(self.model, DDP) and not all(k.startswith('module.') for k in state_dict.keys()):
-            # This case should ideally not happen if saved correctly from DDP
-            # but handle it by loading into model.module directly
-            pass # model_to_load is already self.model.module
-        # If current model is not DDP, but checkpoint is (has 'module.' prefix)
-        elif not isinstance(self.model, DDP) and any(k.startswith('module.') for k in state_dict.keys()):
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if k.startswith('module.'):
-                    new_state_dict[k[7:]] = v # remove 'module.'
-                else:
-                    new_state_dict[k] = v # keep as is, though this mix is unusual
-            state_dict = new_state_dict
-        # If current model is DDP and checkpoint is also (has 'module.' prefix)
-        # This is common if checkpoint was from DDP's state_dict() directly, not model.module.state_dict()
-        # We prefer loading into model.module, so strip 'module.' if model_to_load is model.module
-        elif isinstance(self.model, DDP) and all(k.startswith('module.') for k in state_dict.keys()):
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                 new_state_dict[k[7:]] = v # remove 'module.'
-            state_dict = new_state_dict
-
-        model_to_load.load_state_dict(state_dict)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
@@ -401,7 +423,7 @@ class Trainer:
         epoch_losses = []
         start_time = time.time()
 
-        if self.is_distributed and hasattr(train_loader.sampler, 'set_epoch'):
+        if self.is_distributed and hasattr(train_loader.sampler, 'set_epoch') and dist.get_world_size() > 1:
             train_loader.sampler.set_epoch(epoch)
         
         for batch_idx, batch in enumerate(train_loader):
@@ -423,7 +445,8 @@ class Trainer:
                 step_time=step_time
             )
             
-            # Logging (only on rank 0)
+
+            # Logging (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
                self.metrics.total_steps % self.config.log_every == 0:
                 avg_step_time = self.metrics.get_avg_step_time()
@@ -433,30 +456,31 @@ class Trainer:
                     f"Step Time: {avg_step_time:.3f}s"
                 )
             
-            # Evaluation (only on rank 0)
+            # Evaluation (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
                val_loader is not None and \
                self.metrics.total_steps % self.config.eval_every == 0:
                 val_loss = self.evaluate(val_loader)
-                self.metrics.update(val_loss=val_loss) # Note: metrics are per-rank, consider aggregating
+                self.metrics.update(val_loss=val_loss) # rank-local metric
                 
-                is_best = val_loss < self.metrics.best_val_loss # This best_val_loss is rank-local
+                is_best = val_loss < self.metrics.best_val_loss # rank-local best
                 print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
                 
-                # Save checkpoint if it's the best (also handled by rank 0 check in save_checkpoint)
-                if is_best:
+                if is_best: # save_checkpoint itself is rank 0 guarded
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
             
-            # Regular checkpoint saving with inference sampling (only on rank 0)
+            # Regular checkpoint saving & inference (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
+               self.metrics.total_steps > 0 and \
                self.metrics.total_steps % self.config.save_every == 0:
-                self.save_checkpoint(self.metrics.total_steps)
+                self.save_checkpoint(self.metrics.total_steps) # rank 0 guarded
                 
-                if val_loader is not None: # Inference only on rank 0
+                if val_loader is not None:
                     print(f"\n=== Generating Inference Sample at Step {self.metrics.total_steps} (Rank 0) ===")
                     perplexity = self.calculate_perplexity(val_loader, max_batches=20)
-                    current_val_loss = self.metrics.val_losses[-1] if self.metrics.val_losses else (val_loss if 'val_loss' in locals() else float('inf'))
-                    
+                    # Use last val_loss from metrics if available, else current val_loss if eval was just run
+                    current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (val_loss if 'val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
+
                     prompts = self.config.inference_prompts
                     generated_texts = self.generate_inference_sample(
                         prompts=prompts,
@@ -467,15 +491,17 @@ class Trainer:
                     )
                     self.save_inference_sample(
                         step=self.metrics.total_steps,
-                        val_loss=current_val_loss,
+                        val_loss=current_val_loss_for_sample,
                         perplexity=perplexity,
                         generated_texts=generated_texts,
                         prompts=prompts
                     )
         
-        # Epoch summary (only on rank 0)
+        # Epoch summary (only on rank 0 if distributed)
         if not self.is_distributed or dist.get_rank() == 0:
-            avg_loss = np.mean(epoch_losses) # Note: this is rank-local avg_loss
+            # This epoch_losses is from rank 0 only if distributed.
+            # For a true average, losses would need to be gathered.
+            avg_loss = np.mean(epoch_losses) if epoch_losses else float('nan')
             epoch_time = time.time() - start_time
             print(
                 f"Epoch {epoch+1} completed (Rank {dist.get_rank() if self.is_distributed else 0}): "
@@ -493,52 +519,48 @@ class Trainer:
         """Main training loop."""
         print(f"Starting training for {self.config.num_epochs} epochs...")
 
-        # Create DistributedSampler if DDP is enabled and world_size > 1
         train_sampler = None
         val_sampler = None
         if self.is_distributed and dist.get_world_size() > 1:
             train_sampler = DistributedSampler(train_loader.dataset, shuffle=True, num_replicas=dist.get_world_size(), rank=dist.get_rank())
+            # Keep existing train_loader settings like num_workers, pin_memory
             train_loader = DataLoader(
                 train_loader.dataset,
-                batch_size=train_loader.batch_size,
+                batch_size=train_loader.batch_size, # Use existing batch_size
                 sampler=train_sampler,
-                num_workers=train_loader.num_workers,
-                pin_memory=train_loader.pin_memory
+                num_workers=getattr(train_loader, 'num_workers', 0),
+                pin_memory=getattr(train_loader, 'pin_memory', False)
             )
             if val_loader:
                 val_sampler = DistributedSampler(val_loader.dataset, shuffle=False, num_replicas=dist.get_world_size(), rank=dist.get_rank())
                 val_loader = DataLoader(
                     val_loader.dataset,
-                    batch_size=val_loader.batch_size,
+                    batch_size=getattr(val_loader, 'batch_size', 1), # Use existing or default
                     sampler=val_sampler,
-                    num_workers=val_loader.num_workers,
-                    pin_memory=val_loader.pin_memory
+                    num_workers=getattr(val_loader, 'num_workers', 0),
+                    pin_memory=getattr(val_loader, 'pin_memory', False)
                 )
 
         if not self.is_distributed or dist.get_rank() == 0:
-            print(f"Training batches per epoch: {len(train_loader)}")
+            print(f"Training batches per epoch (Rank 0 view): {len(train_loader)}")
             if val_loader:
-                print(f"Validation batches: {len(val_loader)}")
+                print(f"Validation batches (Rank 0 view): {len(val_loader)}")
         
-        # Initial evaluation (only on rank 0 to avoid redundant logging)
+        # Initial evaluation (only on rank 0)
         if val_loader and (not self.is_distributed or dist.get_rank() == 0):
             initial_val_loss = self.evaluate(val_loader)
-            # self.metrics are per-rank, consider how to handle this for "initial loss"
-            # For now, rank 0's metric is updated.
-            if not self.is_distributed or dist.get_rank() == 0:
-                 self.metrics.update(val_loss=initial_val_loss)
+            self.metrics.update(val_loss=initial_val_loss) # rank-local metric
             print(f"Initial validation loss (Rank 0): {initial_val_loss:.4f}")
         
         try:
             for epoch in range(self.config.num_epochs):
                 if self.is_distributed and train_sampler is not None and dist.get_world_size() > 1:
-                    train_sampler.set_epoch(epoch) # Important for shuffling
+                    train_sampler.set_epoch(epoch)
 
                 avg_loss = self.train_epoch(train_loader, val_loader, epoch) # avg_loss is rank-local
                 
-                # Save final checkpoint for epoch (only on rank 0)
-                if not self.is_distributed or dist.get_rank() == 0:
-                    self.save_checkpoint(self.metrics.total_steps)
+                # Save final checkpoint for epoch (rank 0 guarded in save_checkpoint)
+                self.save_checkpoint(self.metrics.total_steps)
         
         except KeyboardInterrupt:
             print("\nTraining interrupted by user.")
@@ -548,13 +570,13 @@ class Trainer:
             raise
         
         finally:
-            # Save final metrics (only on rank 0)
+            # Save final metrics (rank 0 guarded)
             if not self.is_distributed or dist.get_rank() == 0:
                 metrics_path = os.path.join(
                     self.config.checkpoint_dir,
-                    'training_metrics.pt'
+                    'training_metrics.pt' # rank 0's metrics
                 )
-                self.metrics.save_metrics(metrics_path) # rank 0's metrics
+                self.metrics.save_metrics(metrics_path)
                 print(f"Training metrics saved (Rank 0): {metrics_path}")
     
     def plot_training_curves(self, save_path: Optional[str] = None):
