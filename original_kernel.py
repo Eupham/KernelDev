@@ -1,5 +1,6 @@
 import logging
 import math
+import torch._dynamo
 import os
 
 import torch
@@ -1603,6 +1604,7 @@ def flash_attention_reference(
     )
 
 
+@torch._dynamo.disable
 @torch.compile(fullgraph=True, dynamic=True)
 def _flash_attention(
     q: torch.Tensor,

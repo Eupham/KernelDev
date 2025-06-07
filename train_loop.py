@@ -1,6 +1,9 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Tuple, Any
@@ -62,6 +65,22 @@ class TrainingConfig:
         
         # Create checkpoint directory
         Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+        self.local_rank = -1 # For DDP
+
+def init_distributed():
+    """Initializes the distributed training environment."""
+    if dist.is_available() and dist.is_initialized():
+        return
+
+    backend = 'nccl' # or 'gloo' for CPU
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', 0)))
+        dist.init_process_group(backend=backend)
+        print(f"Distributed training initialized with backend: {backend}, world size: {dist.get_world_size()}")
+    else:
+        # Fallback or error for non-CUDA environments if NCCL is specified
+        print("CUDA not available. Distributed training not initialized with NCCL.")
 
 
 class TrainingMetrics:
@@ -135,9 +154,19 @@ class Trainer:
         self.config = config
         self.data_builder = data_builder
         self.metrics = TrainingMetrics()
-        
-        # Move model to device
-        self.model.to(self.config.device)
+
+        # Initialize distributed training
+        init_distributed()
+
+        if dist.is_initialized():
+            self.config.local_rank = int(os.environ['LOCAL_RANK'])
+            self.config.device = torch.device(f"cuda:{self.config.local_rank}")
+            self.model.to(self.config.device)
+            self.model = DDP(self.model, device_ids=[self.config.local_rank], output_device=self.config.local_rank)
+            print(f"Model moved to device: {self.config.device} and wrapped with DDP.")
+        else:
+            # Move model to device (single GPU or CPU)
+            self.model.to(self.config.device)
         
         # Initialize optimizer
         self.optimizer = torch.optim.AdamW(
@@ -247,9 +276,10 @@ class Trainer:
     
     def save_checkpoint(self, step: int, is_best: bool = False):
         """Save model checkpoint."""
+        model_state_dict = self.model.module.state_dict() if isinstance(self.model, DDP) else self.model.state_dict()
         checkpoint = {
             'step': step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_state_dict,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'metrics': self.metrics.__dict__,
@@ -277,7 +307,27 @@ class Trainer:
         """Load model checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location=self.config.device)
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
+        # Adjust for DDP model if necessary
+        if isinstance(self.model, DDP):
+            # Remove 'module.' prefix if it exists from DDP saving
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v  # remove 'module.' prefix
+                else:
+                    new_state_dict[k] = v
+            self.model.module.load_state_dict(new_state_dict)
+        else:
+            # Handle cases where checkpoint was saved with DDP but loading without
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'): # If loading a DDP checkpoint into a non-DDP model
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            self.model.load_state_dict(new_state_dict)
+
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
@@ -298,6 +348,9 @@ class Trainer:
         self.model.train()
         epoch_losses = []
         start_time = time.time()
+
+        if dist.is_initialized() and hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
         
         for batch_idx, batch in enumerate(train_loader):
             step_start = time.time()
@@ -391,22 +444,49 @@ class Trainer:
     ):
         """Main training loop."""
         print(f"Starting training for {self.config.num_epochs} epochs...")
+
+        # Create DistributedSampler if DDP is enabled
+        train_sampler = None
+        val_sampler = None
+        if dist.is_initialized():
+            train_sampler = DistributedSampler(train_loader.dataset, shuffle=True)
+            train_loader = DataLoader(
+                train_loader.dataset,
+                batch_size=train_loader.batch_size,
+                sampler=train_sampler,
+                num_workers=train_loader.num_workers,
+                pin_memory=train_loader.pin_memory
+            )
+            if val_loader:
+                val_sampler = DistributedSampler(val_loader.dataset, shuffle=False)
+                val_loader = DataLoader(
+                    val_loader.dataset,
+                    batch_size=val_loader.batch_size,
+                    sampler=val_sampler,
+                    num_workers=val_loader.num_workers,
+                    pin_memory=val_loader.pin_memory
+                )
+
         print(f"Training batches per epoch: {len(train_loader)}")
         if val_loader:
             print(f"Validation batches: {len(val_loader)}")
         
-        # Initial evaluation
-        if val_loader:
+        # Initial evaluation (only on rank 0 to avoid redundant logging)
+        if val_loader and (not dist.is_initialized() or dist.get_rank() == 0):
             initial_val_loss = self.evaluate(val_loader)
             self.metrics.update(val_loss=initial_val_loss)
             print(f"Initial validation loss: {initial_val_loss:.4f}")
         
         try:
             for epoch in range(self.config.num_epochs):
+                if dist.is_initialized() and train_sampler is not None:
+                    train_sampler.set_epoch(epoch) # Important for shuffling
+
                 avg_loss = self.train_epoch(train_loader, val_loader, epoch)
                 
-                # Save final checkpoint for epoch
-                self.save_checkpoint(self.metrics.total_steps)
+                # Save final checkpoint for epoch (only on rank 0)
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    self.save_checkpoint(self.metrics.total_steps)
         
         except KeyboardInterrupt:
             print("\nTraining interrupted by user.")
