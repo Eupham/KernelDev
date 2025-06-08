@@ -640,6 +640,7 @@ class Trainer:
             return ""
         
         self.model.eval()
+        model_to_generate_from = self.model.module if isinstance(self.model, DDP) else self.model
         
         with torch.no_grad():
             if prompt:
@@ -653,7 +654,7 @@ class Trainer:
             if self.config.use_amp:
                 # Use mixed precision for generation
                 with torch.amp.autocast('cuda'):
-                    generated = self.model.generate(
+                    generated = model_to_generate_from.generate(
                         x,
                         max_new_tokens=max_length,
                         temperature=temperature,
@@ -662,7 +663,7 @@ class Trainer:
                     )
             else:
                 # Standard precision generation
-                generated = self.model.generate(
+                generated = model_to_generate_from.generate(
                     x,
                     max_new_tokens=max_length,
                     temperature=temperature,
@@ -721,6 +722,7 @@ class Trainer:
             prompts = ["", "The", "In", "Once upon a time"]
         
         self.model.eval()
+        model_to_generate_from = self.model.module if isinstance(self.model, DDP) else self.model
         generated_texts = []
         
         with torch.no_grad():
@@ -735,7 +737,7 @@ class Trainer:
                         x = torch.randint(0, self.data_builder.vocab_size, (1, 1)).to(self.config.device)
                     
                     # Generate tokens with top-k, top-p sampling
-                    generated = self.model.generate(
+                    generated = model_to_generate_from.generate(
                         x,
                         max_new_tokens=max_length,
                         temperature=temperature,
