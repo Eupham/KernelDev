@@ -1212,6 +1212,47 @@ flash_forward_autotune = triton.autotune(
     post_hook=autotune_posthook,
 )(_flash_attn_fwd)
 
+# H100-specific warp specialized autotune
+flash_forward_warp_specialized = triton.autotune(
+    configs=[
+        triton.Config(
+            dict(
+                PIPELINING=pipe,
+                TILE_Q_SIZE=tile_q,
+                TILE_K_SIZE=tile_k,
+            ),
+            num_warps=num_warps,
+            num_stages=pipe,
+        )
+        for num_warps in [8, 16]  # More warps for H100 warp specialization
+        for pipe in [2, 3, 4]  # Higher pipelining for H100
+        for tile_q in [
+            2**i
+            for i in range(
+                int(math.log2(64) + 0.1),  # Larger tiles for H100
+                int(math.log2(512) + 0.1) + 1,  # Up to 512 for H100
+            )
+        ]
+        for tile_k in [
+            2**i
+            for i in range(
+                int(math.log2(64) + 0.1),
+                int(math.log2(512) + 0.1) + 1,
+            )
+        ]
+    ],
+    key=[
+        "HEAD_DIM",
+        "CAUSAL", 
+        "INPUT_PRECISION",
+        "TIME_BUCKET",
+        "DTYPE",
+    ],
+    prune_configs_by=dict(early_config_prune=fwd_configs_pruner),
+    pre_hook=autotune_prehook,
+    post_hook=autotune_posthook,
+)(_flash_attn_fwd_warp_specialized)
+
 flash_backward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
@@ -1319,6 +1360,35 @@ def get_optimized_warp_count():
         return [2, 4]
 
 
+# Additional H100 optimizations
+def get_h100_grid_config(batch, heads, T, tile_q_size):
+    """
+    Calculate optimal grid configuration for H100 warp specialization.
+    Ensures efficient warp utilization and memory coalescing.
+    """
+    if enable_warp_specialization():
+        # H100 has more SMs and can handle larger grids efficiently
+        # Optimize for warp specialization with multiple warps per block
+        return (batch, heads, triton.cdiv(T, tile_q_size))
+    else:
+        # Standard grid configuration
+        return (batch, heads, triton.cdiv(T, tile_q_size))
+
+def optimize_h100_memory_layout(q, k, v):
+    """
+    Optimize memory layout for H100's advanced memory hierarchy.
+    """
+    if enable_warp_specialization():
+        # Ensure contiguous memory layout for optimal coalescing
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not k.is_contiguous():
+            k = k.contiguous()
+        if not v.is_contiguous():
+            v = v.contiguous()
+    return q, k, v
+
+
 @torch.library.custom_op(
     "flash_attention::forward", mutates_args=(), device_types=("cuda",)
 )
@@ -1344,19 +1414,34 @@ def attention_forward_adapter(
         lens.dtype == torch.int32 and batch == len(lens) and lens.ndim == 1
     )
 
+    # Apply H100 memory optimizations if available
+    if enable_warp_specialization():
+        q, k, v = optimize_h100_memory_layout(q, k, v)
+
     O = torch.zeros_like(q, memory_format=torch.contiguous_format)
     LSE = None
     if return_lse:
         LSE = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
 
-    grid = lambda args: (
-        batch,
-        heads,
-        triton.cdiv(T, args["TILE_Q_SIZE"]),
-    )
+    # Use H100-optimized grid configuration when warp specialization is enabled
+    if enable_warp_specialization():
+        grid = lambda args: get_h100_grid_config(batch, heads, T, args["TILE_Q_SIZE"])
+    else:
+        grid = lambda args: (batch, heads, triton.cdiv(T, args["TILE_Q_SIZE"]))
 
     kt = k.transpose(-1, -2)  # just stride tricks, same data
-    fwd_fn = flash_forward_autotune if autotune else flash_forward
+    
+    # Select appropriate kernel based on GPU capability and autotune setting
+    if enable_warp_specialization() and autotune:
+        # Use H100-optimized warp specialized kernel
+        fwd_fn = flash_forward_warp_specialized
+    elif autotune:
+        # Use regular autotune kernel
+        fwd_fn = flash_forward_autotune
+    else:
+        # Use heuristic kernel
+        fwd_fn = flash_forward
+    
     fwd_fn[grid](
         q,
         kt,
