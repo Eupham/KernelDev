@@ -126,18 +126,35 @@ if using_modal:
         print("Working directory:", os.getcwd())
         print("Files in current directory:", os.listdir("."))
         
-        # Change to project directory
-        os.chdir("/root/kerneldev")
-        print("Changed to kerneldev directory")
-        print("Files in kerneldev directory:", os.listdir("."))
+        # Find the correct project directory
+        project_dir = "/root/kerneldev"
+        if os.path.exists("/root/kerneldev/KernelDev"):
+            project_dir = "/root/kerneldev/KernelDev"
+        elif os.path.exists("/root/kerneldev") and "entry.py" not in os.listdir("/root/kerneldev"):
+            # Look for entry.py in subdirectories
+            for item in os.listdir("/root/kerneldev"):
+                subdir = os.path.join("/root/kerneldev", item)
+                if os.path.isdir(subdir) and "entry.py" in os.listdir(subdir):
+                    project_dir = subdir
+                    break
+        
+        print(f"Using project directory: {project_dir}")
+        os.chdir(project_dir)
+        print("Files in project directory:", os.listdir("."))
+        
+        # Verify entry.py exists
+        if not os.path.exists("entry.py"):
+            print("ERROR: entry.py not found in project directory!")
+            print("Available files:", os.listdir("."))
+            return "entry.py not found"
         
         # Set up environment
-        os.environ['PYTHONPATH'] = '/root/kerneldev'
+        os.environ['PYTHONPATH'] = project_dir
         
         # Import and run training
         try:
             import sys
-            sys.path.insert(0, '/root/kerneldev')
+            sys.path.insert(0, project_dir)
             
             # Run the entry point
             import subprocess
@@ -145,7 +162,7 @@ if using_modal:
                 sys.executable, "entry.py", 
                 "--config", "config.yaml",
                 "--precision", "16"  # Use mixed precision on H100
-            ], capture_output=True, text=True, cwd="/root/kerneldev")
+            ], capture_output=True, text=True, cwd=project_dir)
             
             print("STDOUT:", result.stdout)
             print("STDERR:", result.stderr)
@@ -191,15 +208,27 @@ if using_modal:
         """
         print("Running training on A100...")
         
-        # Change to project directory
-        os.chdir("/root/kerneldev")
+        # Find the correct project directory (same logic as H100)
+        project_dir = "/root/kerneldev"
+        if os.path.exists("/root/kerneldev/KernelDev"):
+            project_dir = "/root/kerneldev/KernelDev"
+        elif os.path.exists("/root/kerneldev") and "entry.py" not in os.listdir("/root/kerneldev"):
+            # Look for entry.py in subdirectories
+            for item in os.listdir("/root/kerneldev"):
+                subdir = os.path.join("/root/kerneldev", item)
+                if os.path.isdir(subdir) and "entry.py" in os.listdir(subdir):
+                    project_dir = subdir
+                    break
+        
+        print(f"Using project directory: {project_dir}")
+        os.chdir(project_dir)
         
         # Set up environment
-        os.environ['PYTHONPATH'] = '/root/kerneldev'
+        os.environ['PYTHONPATH'] = project_dir
         
         try:
             import sys
-            sys.path.insert(0, '/root/kerneldev')
+            sys.path.insert(0, project_dir)
             
             # Run the entry point with A100-optimized settings
             import subprocess
@@ -208,7 +237,7 @@ if using_modal:
                 "--config", "config.yaml",
                 "--precision", "16",  # Use mixed precision
                 "--batch_size", "8"   # Smaller batch size for A100
-            ], capture_output=True, text=True, cwd="/root/kerneldev")
+            ], capture_output=True, text=True, cwd=project_dir)
             
             print("STDOUT:", result.stdout)
             print("STDERR:", result.stderr)
@@ -246,21 +275,31 @@ if using_modal:
         """
         print("Running inference testing on H100...")
         
-        # Change to project directory
-        os.chdir("/root/kerneldev")
+        # Find the correct project directory
+        project_dir = "/root/kerneldev"
+        if os.path.exists("/root/kerneldev/KernelDev"):
+            project_dir = "/root/kerneldev/KernelDev"
+        elif os.path.exists("/root/kerneldev") and "entry.py" not in os.listdir("/root/kerneldev"):
+            for item in os.listdir("/root/kerneldev"):
+                subdir = os.path.join("/root/kerneldev", item)
+                if os.path.isdir(subdir) and "test_inference.py" in os.listdir(subdir):
+                    project_dir = subdir
+                    break
+        
+        os.chdir(project_dir)
         
         # Set up environment
-        os.environ['PYTHONPATH'] = '/root/kerneldev'
+        os.environ['PYTHONPATH'] = project_dir
         
         try:
             import sys
-            sys.path.insert(0, '/root/kerneldev')
+            sys.path.insert(0, project_dir)
             
             # Run inference tests
             import subprocess
             result = subprocess.run([
                 sys.executable, "test_inference.py"
-            ], capture_output=True, text=True, cwd="/root/kerneldev")
+            ], capture_output=True, text=True, cwd=project_dir)
             
             print("STDOUT:", result.stdout)
             print("STDERR:", result.stderr)
@@ -283,21 +322,31 @@ if using_modal:
         """
         print("Running precision testing on H100...")
         
-        # Change to project directory
-        os.chdir("/root/kerneldev")
+        # Find the correct project directory
+        project_dir = "/root/kerneldev"
+        if os.path.exists("/root/kerneldev/KernelDev"):
+            project_dir = "/root/kerneldev/KernelDev"
+        elif os.path.exists("/root/kerneldev") and "entry.py" not in os.listdir("/root/kerneldev"):
+            for item in os.listdir("/root/kerneldev"):
+                subdir = os.path.join("/root/kerneldev", item)
+                if os.path.isdir(subdir) and "test_precision.py" in os.listdir(subdir):
+                    project_dir = subdir
+                    break
+        
+        os.chdir(project_dir)
         
         # Set up environment
-        os.environ['PYTHONPATH'] = '/root/kerneldev'
+        os.environ['PYTHONPATH'] = project_dir
         
         try:
             import sys
-            sys.path.insert(0, '/root/kerneldev')
+            sys.path.insert(0, project_dir)
             
             # Run precision tests
             import subprocess
             result = subprocess.run([
                 sys.executable, "test_precision.py"
-            ], capture_output=True, text=True, cwd="/root/kerneldev")
+            ], capture_output=True, text=True, cwd=project_dir)
             
             print("STDOUT:", result.stdout)
             print("STDERR:", result.stderr)
