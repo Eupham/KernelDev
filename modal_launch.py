@@ -156,17 +156,54 @@ if using_modal:
             import sys
             sys.path.insert(0, project_dir)
             
-            # Run the entry point
-            import subprocess
-            result = subprocess.run([
-                sys.executable, "entry.py", 
-                "--config", "config.yaml",
-                "--precision", "16"  # Use mixed precision on H100
-            ], capture_output=True, text=True, cwd=project_dir)
+            # Import the entry module directly instead of subprocess
+            print("Importing entry module...")
             
-            print("STDOUT:", result.stdout)
-            print("STDERR:", result.stderr)
-            print("Return code:", result.returncode)
+            # First, let's check what modules are available
+            print("Available Python files:", [f for f in os.listdir('.') if f.endswith('.py')])
+            
+            # Check if we can import the required modules
+            try:
+                import torch
+                print(f"PyTorch version: {torch.__version__}")
+                print(f"CUDA available: {torch.cuda.is_available()}")
+                if torch.cuda.is_available():
+                    print(f"CUDA device: {torch.cuda.get_device_name()}")
+            except Exception as e:
+                print(f"PyTorch import error: {e}")
+            
+            # Try importing entry with timeout/error handling
+            print("About to import entry module...")
+            try:
+                import entry
+                print("Entry module imported successfully!")
+            except Exception as e:
+                print(f"Error importing entry module: {e}")
+                import traceback
+                traceback.print_exc()
+                return f"Entry import error: {e}"
+            
+            # Set up sys.argv to simulate command line arguments
+            original_argv = sys.argv.copy()
+            sys.argv = ["entry.py", "--config", "config.yaml", "--precision", "16"]
+            
+            print("Running training directly...")
+            try:
+                # Run the main function directly
+                entry.main()
+                print("Training completed successfully!")
+                return_code = 0
+            except SystemExit as e:
+                print(f"Training exited with code: {e.code}")
+                return_code = e.code if e.code is not None else 0
+            except Exception as e:
+                print(f"Training error: {e}")
+                import traceback
+                traceback.print_exc()
+                return_code = 1
+            finally:
+                # Restore original sys.argv
+                sys.argv = original_argv
             
             # Save any generated plots to volume
             try:
@@ -187,7 +224,7 @@ if using_modal:
             except Exception as e:
                 print(f"Error copying results to volume: {e}")
             
-            return f"Training completed with return code: {result.returncode}"
+            return f"Training completed with return code: {return_code}"
             
         except Exception as e:
             print(f"Training failed: {e}")
@@ -230,17 +267,31 @@ if using_modal:
             import sys
             sys.path.insert(0, project_dir)
             
-            # Run the entry point with A100-optimized settings
-            import subprocess
-            result = subprocess.run([
-                sys.executable, "entry.py", 
-                "--config", "config.yaml",
-                "--precision", "16",  # Use mixed precision
-                "--batch_size", "8"   # Smaller batch size for A100
-            ], capture_output=True, text=True, cwd=project_dir)
+            # Import the entry module directly
+            print("Importing entry module...")
+            import entry
             
-            print("STDOUT:", result.stdout)
-            print("STDERR:", result.stderr)
+            # Set up sys.argv to simulate command line arguments
+            original_argv = sys.argv.copy()
+            sys.argv = ["entry.py", "--config", "config.yaml", "--precision", "16", "--batch_size", "8"]
+            
+            print("Running A100 training directly...")
+            try:
+                # Run the main function directly
+                entry.main()
+                print("A100 training completed successfully!")
+                return_code = 0
+            except SystemExit as e:
+                print(f"A100 training exited with code: {e.code}")
+                return_code = e.code if e.code is not None else 0
+            except Exception as e:
+                print(f"A100 training error: {e}")
+                import traceback
+                traceback.print_exc()
+                return_code = 1
+            finally:
+                # Restore original sys.argv
+                sys.argv = original_argv
             
             # Save results
             try:
@@ -257,7 +308,7 @@ if using_modal:
             except Exception as e:
                 print(f"Error copying results: {e}")
             
-            return f"A100 training completed with return code: {result.returncode}"
+            return f"A100 training completed with return code: {return_code}"
             
         except Exception as e:
             return f"A100 training error: {e}"
