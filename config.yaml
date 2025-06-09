@@ -4,13 +4,13 @@
 # Training Configuration
 training:
   # Floating point precision: 16 for fp16/mixed precision, 32 for fp32
-  precision: 32
+  precision: 16
   
   # Number of training epochs
   epochs: 3
   
   # Learning rate for optimization
-  learning_rate: 0.0003  # 3e-4
+  learning_rate: 0.00003  # 3e-5
   
   # Batch size (if null, will be auto-estimated based on GPU memory)
   batch_size: null
@@ -44,7 +44,7 @@ data:
   seq_len: 1024
   
   # Maximum number of samples to use from dataset
-  max_samples: 5000
+  max_samples: 500000
   
   # Maximum tokens for evaluation
   max_eval_tokens: 50000
@@ -59,7 +59,7 @@ model:
   vocab_size: 256
   
   # Model dimension
-  dim: 512
+  dim: 2048
   
   # Number of transformer layers
   n_layers: 12
@@ -79,13 +79,13 @@ model:
 # GPU/Memory Configuration
 hardware:
   # Available GPU memory in GB (used for batch size estimation)
-  available_memory_gb: 15
+  available_memory_gb: 79
   
   # Device to use ("auto", "cuda", "cpu")
   device: "auto"
   
   # Memory buffer to reserve (GB)
-  memory_buffer_gb: 2
+  memory_buffer_gb: 4
 
 # Evaluation Configuration
 evaluation:
