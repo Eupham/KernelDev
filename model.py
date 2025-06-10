@@ -117,6 +117,9 @@ class GPTModel(nn.Module):
         self.norm_out = RMSNorm(dim)
         self.head = nn.Linear(dim, vocab_size, bias=False)
         
+        # Weight tying: share weights between token embedding and output head
+        self.head.weight = self.token_emb.weight
+        
         self.apply(self._init_weights)
     
     def _init_weights(self, module):

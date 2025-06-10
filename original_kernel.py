@@ -338,14 +338,12 @@ def _flash_attn_fwd(
     if PRESCALE_QK:
         q_tile = q_tile * softmax_scale
 
-    
     for kv_tile_idx in tl.range(
-        kv_start_tile_idx, kv_end_tile_idx, num_stages=PIPELINING, warp_specialize=False
+        kv_start_tile_idx, kv_end_tile_idx, num_stages=PIPELINING
     ):
         last_iter = kv_tile_idx + 1 == kv_end_tile_idx
         kv_token_idx = kv_tile_idx * TILE_K_SIZE
 
-        # Producer warps: Load K and V tiles asynchronously
         if K_BLOCK_DIVISIBLE or not last_iter:
             kt_tile = tl.load(
                 tl.advance(kt_tile_ptr, (0, kv_token_idx)),
@@ -1174,87 +1172,34 @@ flash_forward = triton.heuristics(
         ),
     )
 )(_flash_attn_fwd)
-def _get_h100_warp_spec_configs():
-    """Generate H100-specific warp specialization configurations."""
-    configs = []
-    
-    # Check if we're on H100 (compute capability 9.0+)
-    if torch.cuda.is_available() and torch.cuda.get_device_capability() >= (9, 0):
-        # H100 warp specialization configs
-        h100_configs = [
-            # Standard configs without warp specialization for compatibility
-            *[
-                triton.Config(
-                    dict(
-                        PIPELINING=pipe,
-                        TILE_Q_SIZE=tile_q,
-                        TILE_K_SIZE=tile_k,
-                    ),
-                    num_warps=num_warps,
-                    num_stages=pipe,
-                )
-                for num_warps in [8, 16]  # H100 optimal warp counts
-                for pipe in [2, 4]  # H100 deeper pipelining
-                for tile_q in [64, 128]  # H100 optimal tile sizes
-                for tile_k in [64, 128]
-            ],
-            # H100 warp specialization configs
-            *[
-                triton.Config(
-                    dict(
-                        PIPELINING=pipe,
-                        TILE_Q_SIZE=tile_q,
-                        TILE_K_SIZE=tile_k,
-                    ),
-                    num_warps=num_warps,
-                    num_stages=pipe,
-                    num_consumer_groups=consumer_groups,
-                    num_buffers_warp_spec=buffers,
-                )
-                for num_warps in [8, 16]  # Total warps
-                for pipe in [2, 4]  # Pipeline depth for overlap
-                for tile_q in [64, 128]  # Larger tiles for H100
-                for tile_k in [64, 128]
-                for consumer_groups in [1, 2]  # 1-2 consumer warp groups
-                for buffers in [2, 4]  # 2-4 ping-pong buffers
-                if consumer_groups < num_warps // 2  # Ensure enough warps for producers
-            ]
-        ]
-        configs.extend(h100_configs)
-    else:
-        # Fallback configs for non-H100 GPUs
-        configs = [
-            triton.Config(
-                dict(
-                    PIPELINING=pipe,
-                    TILE_Q_SIZE=tile_q,
-                    TILE_K_SIZE=tile_k,
-                ),
-                num_warps=num_warps,
-                num_stages=pipe,
-            )
-            for num_warps in [2, 4]  # Reduced warps for T4/A100
-            for pipe in [1, 2]  # Conservative pipelining
-            for tile_q in [
-                2**i
-                for i in range(
-                    int(math.log2(MIN_TILE_SIZE) + 0.1),
-                    int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-                )
-            ]
-            for tile_k in [
-                2**i
-                for i in range(
-                    int(math.log2(MIN_TILE_SIZE) + 0.1),
-                    int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-                )
-            ]
-        ]
-    
-    return configs
-
 flash_forward_autotune = triton.autotune(
-    configs=_get_h100_warp_spec_configs(),
+    configs=[
+        triton.Config(
+            dict(
+                PIPELINING=pipe,
+                TILE_Q_SIZE=tile_q,
+                TILE_K_SIZE=tile_k,
+            ),
+            num_warps=num_warps,
+            num_stages=pipe,
+        )
+        for num_warps in [2, 4]  # Reduced warps for T4
+        for pipe in [1]  # Reduced pipelining for T4
+        for tile_q in [
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
+        ]
+        for tile_k in [
+            2**i
+            for i in range(
+                int(math.log2(MIN_TILE_SIZE) + 0.1),
+                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
+            )
+        ]
+    ],
     key=[
         "HEAD_DIM",
         "CAUSAL",
