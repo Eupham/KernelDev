@@ -17,6 +17,15 @@ This project now supports fp32 (full precision), fp16 (mixed precision), and bf1
 - Faster training on modern GPUs with Tensor Cores
 - Automatic loss scaling to prevent gradient underflow
 
+### BF16 (Bfloat16 Mixed Precision)
+- Uses bfloat16 (16-bit brain floating point) for forward pass and gradients
+- Maintains 32-bit precision for critical operations (optimizer states)
+- Reduced memory usage (~50% reduction, same as fp16)
+- Better numerical stability than fp16 due to wider dynamic range
+- Typically doesn't require gradient scaling
+- Faster training on modern GPUs (A100, H100, RTX 30xx/40xx series)
+- Best balance of speed, memory efficiency, and stability
+
 ## Usage Examples
 
 ### Basic Usage
@@ -27,17 +36,23 @@ python entry.py
 # fp16 mixed precision training
 python entry.py --precision 16
 
+# bf16 mixed precision training
+python entry.py --precision bf16
+
 # fp32 explicit
 python entry.py --precision 32
 ```
 
 ### Advanced Configuration
 ```bash
-# fp16 with custom batch size and sequence length
-python entry.py --precision 16 --batch-size 32 --seq-len 2048
+# bf16 with custom batch size and sequence length
+python entry.py --precision bf16 --batch-size 32 --seq-len 2048
 
-# fp16 with more epochs and custom learning rate
-python entry.py --precision 16 --epochs 10 --learning-rate 5e-4
+# bf16 with more epochs and custom learning rate
+python entry.py --precision bf16 --epochs 10 --learning-rate 5e-4
+
+# fp16 with custom configuration
+python entry.py --precision 16 --batch-size 16 --seq-len 1024
 
 # fp32 with reduced sequence length for testing
 python entry.py --precision 32 --seq-len 512 --epochs 1
@@ -47,7 +62,7 @@ python entry.py --precision 32 --seq-len 512 --epochs 1
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--precision` | int | 32 | Floating point precision (16 or 32) |
+| `--precision` | str | 32 | Floating point precision (16, 32, or "bf16") |
 | `--batch-size` | int | auto | Override batch size estimation |
 | `--seq-len` | int | 1024 | Sequence length for training |
 | `--epochs` | int | 3 | Number of training epochs |
@@ -59,15 +74,24 @@ python entry.py --precision 32 --seq-len 512 --epochs 1
 - **FP16**: ~50% reduction in model parameter memory
 - **FP16**: ~50% reduction in activation memory
 - **FP16**: Gradients and optimizer states remain in fp32 for stability
+- **BF16**: ~50% reduction in model parameter memory (same as fp16)
+- **BF16**: ~50% reduction in activation memory (same as fp16)
+- **BF16**: Gradients and optimizer states remain in fp32 for stability
 
 ### Speed
 - **FP16**: Faster on GPUs with Tensor Cores (T4, V100, A100, RTX series)
 - **FP16**: May be slower on older GPUs without Tensor Core support
 - **FP16**: Automatic mixed precision handles precision switching
+- **BF16**: Fastest on modern GPUs (A100, H100, RTX 30xx/40xx series)
+- **BF16**: Better hardware support on newer architectures
+- **BF16**: More stable training due to wider dynamic range
 
 ### Accuracy
 - **FP16**: Minimal accuracy loss with proper loss scaling
 - **FP16**: Automatic gradient scaling prevents underflow
+- **BF16**: Better numerical stability than fp16
+- **BF16**: Wider dynamic range reduces risk of overflow/underflow
+- **BF16**: Often doesn't require gradient scaling
 - **FP32**: Maximum precision for research or when stability is critical
 
 ## Technical Details
