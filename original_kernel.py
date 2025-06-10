@@ -116,7 +116,7 @@ def _hadamard_transform_kernel(
     head_id = tl.program_id(1)
     token_id = tl.program_id(2)
     
-    if (batch_id >= B) or (head_id >= H) or (token_id >= T):
+    if (batch_id >= B) | (head_id >= H) | (token_id >= T):
         return
     
     # Load signs for this head
