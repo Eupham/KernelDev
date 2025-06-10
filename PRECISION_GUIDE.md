@@ -167,6 +167,15 @@ Using full precision training (fp32)...
 Parameter dtype: torch.float32
 ```
 
+### FP16 Training
+```
+=== Setting up Precision ===
+Setting up mixed precision training (fp16)...
+✓ Model prepared for mixed precision training
+✓ Gradient scaler initialized for mixed precision
+Parameter dtype: torch.float32
+```
+
 ### BF16 Training
 ```
 === Setting up Precision ===
