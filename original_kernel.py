@@ -338,13 +338,14 @@ def _flash_attn_fwd(
     if PRESCALE_QK:
         q_tile = q_tile * softmax_scale
 
+    
     for kv_tile_idx in tl.range(
-        kv_start_tile_idx, kv_end_tile_idx, num_stages=PIPELINING
+        kv_start_tile_idx, kv_end_tile_idx, num_stages=PIPELINING, warp_specialize=False
     ):
         last_iter = kv_tile_idx + 1 == kv_end_tile_idx
         kv_token_idx = kv_tile_idx * TILE_K_SIZE
 
-        # H100 warp specialization: Producer warps load K and V tiles asynchronously
+        # Producer warps: Load K and V tiles asynchronously
         if K_BLOCK_DIVISIBLE or not last_iter:
             kt_tile = tl.load(
                 tl.advance(kt_tile_ptr, (0, kv_token_idx)),
@@ -361,10 +362,6 @@ def _flash_attn_fwd(
                 tl.advance(v_tile_ptr, (kv_token_idx, 0)),
                 boundary_check=(0,),
             )
-        
-        # H100 warp specialization: Barrier ensures producer warps finish loading
-        # before consumer warps start computing on the loaded tiles
-        tl.barrier()
 
         qk = tl.dot(
             q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
