@@ -4,7 +4,7 @@
 # Training Configuration
 training:
   # Floating point precision: 16 for fp16/mixed precision, 32 for fp32, "bf16" for bfloat16/mixed precision
-  precision: 16
+  precision: bf16
   
   # Number of training epochs
   epochs: 3
