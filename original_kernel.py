@@ -1868,19 +1868,19 @@ class IncoherentFlashAttention(torch.autograd.Function):
             if HEAD_DIM & (HEAD_DIM - 1) != 0:
                 raise ValueError(f"Head dimension {HEAD_DIM} must be a power of 2 for incoherent processing")
             
-            # Generate or use provided random signs
+            # Use same signs for both Q and K as per research paper
             if hadamard_signs_q is None:
-                hadamard_signs_q = generate_hadamard_signs(HEAD_DIM, q.device, q.dtype)
-            if hadamard_signs_k is None:
-                hadamard_signs_k = generate_hadamard_signs(HEAD_DIM, k.device, k.dtype)
+                hadamard_signs = generate_hadamard_signs(HEAD_DIM, q.device, q.dtype)
+            else:
+                hadamard_signs = hadamard_signs_q
             
             # Save signs for backward pass
-            ctx.hadamard_signs_q = hadamard_signs_q
-            ctx.hadamard_signs_k = hadamard_signs_k
+            ctx.hadamard_signs = hadamard_signs
             
             # Use PyTorch implementation for better consistency
-            q_transformed = hadamard_transform(q, hadamard_signs_q)
-            k_transformed = hadamard_transform(k, hadamard_signs_k)
+            # Apply the same orthogonal transform to both Q and K
+            q_transformed = hadamard_transform(q, hadamard_signs)
+            k_transformed = hadamard_transform(k, hadamard_signs)
         
         # Run flash attention on transformed tensors
         requires_grad = any(i.requires_grad for i in (q, k, v))
@@ -1912,8 +1912,8 @@ class IncoherentFlashAttention(torch.autograd.Function):
         if ctx.incoherent_processing:
             # For incoherent processing, we need to apply the forward transform again
             # because the attention backward expects the transformed Q and K
-            q_transformed = hadamard_transform(q, ctx.hadamard_signs_q)
-            k_transformed = hadamard_transform(k, ctx.hadamard_signs_k)
+            q_transformed = hadamard_transform(q, ctx.hadamard_signs)
+            k_transformed = hadamard_transform(k, ctx.hadamard_signs)
             
             # Compute gradients using transformed Q and K (matching forward pass)
             DQ, DK, DV = torch.ops.flash_attention.backward(
@@ -1933,8 +1933,8 @@ class IncoherentFlashAttention(torch.autograd.Function):
             
             # Apply inverse Hadamard transform to gradients to get gradients w.r.t. original Q and K
             # This applies the chain rule: dL/dQ_orig = dL/dQ_transformed * dQ_transformed/dQ_orig
-            DQ = hadamard_inverse_transform(DQ, ctx.hadamard_signs_q)
-            DK = hadamard_inverse_transform(DK, ctx.hadamard_signs_k)
+            DQ = hadamard_inverse_transform(DQ, ctx.hadamard_signs)
+            DK = hadamard_inverse_transform(DK, ctx.hadamard_signs)
         else:
             # Normal backward pass without incoherent processing
             DQ, DK, DV = torch.ops.flash_attention.backward(
@@ -2073,11 +2073,10 @@ if __name__ == "__main__":
         
         # Apply Hadamard transform for incoherent processing
         print("\nApplying Hadamard transform...")
-        hadamard_signs_q = generate_hadamard_signs(D, q_outliers.device, q_outliers.dtype)
-        hadamard_signs_k = generate_hadamard_signs(D, k_outliers.device, k_outliers.dtype)
+        hadamard_signs = generate_hadamard_signs(D, q_outliers.device, q_outliers.dtype)
         
-        q_transformed = hadamard_transform(q_outliers, hadamard_signs_q)
-        k_transformed = hadamard_transform(k_outliers, hadamard_signs_k)
+        q_transformed = hadamard_transform(q_outliers, hadamard_signs)
+        k_transformed = hadamard_transform(k_outliers, hadamard_signs)
         
         print(f"Q transformed - Min: {q_transformed.min():.3f}, Max: {q_transformed.max():.3f}, Std: {q_transformed.std():.3f}")
         print(f"K transformed - Min: {k_transformed.min():.3f}, Max: {k_transformed.max():.3f}, Std: {k_transformed.std():.3f}")
@@ -2085,8 +2084,8 @@ if __name__ == "__main__":
         # Test Triton-based Hadamard transform for consistency (optional)
         print("Testing Triton-based Hadamard transform (optional)...")
         try:
-            q_triton = apply_hadamard_triton(q_outliers, hadamard_signs_q)
-            k_triton = apply_hadamard_triton(k_outliers, hadamard_signs_k)
+            q_triton = apply_hadamard_triton(q_outliers, hadamard_signs)
+            k_triton = apply_hadamard_triton(k_outliers, hadamard_signs)
             
             triton_error_q = F.mse_loss(q_transformed, q_triton).item()
             triton_error_k = F.mse_loss(k_transformed, k_triton).item()
@@ -2162,14 +2161,13 @@ if __name__ == "__main__":
         
         # Test with pre-computed signs
         print("Testing with pre-computed Hadamard signs...")
-        hadamard_signs_q = generate_hadamard_signs(D, q.device, q.dtype)
-        hadamard_signs_k = generate_hadamard_signs(D, k.device, k.dtype)
+        hadamard_signs = generate_hadamard_signs(D, q.device, q.dtype)
         
         out_precomputed = flash_attention(
             q, k, v, 
             incoherent_processing=True,
-            hadamard_signs_q=hadamard_signs_q,
-            hadamard_signs_k=hadamard_signs_k
+            hadamard_signs_q=hadamard_signs,
+            hadamard_signs_k=hadamard_signs
         )
         print(f"Pre-computed signs output shape: {out_precomputed.shape}")
         
@@ -2207,14 +2205,13 @@ if __name__ == "__main__":
         out_ref = flash_attention(q_ref, k_ref, v_ref, incoherent_processing=False)
         
         # Test: Compute attention with incoherent processing using the same signs
-        hadamard_signs_q = generate_hadamard_signs(D, q.device, q.dtype)
-        hadamard_signs_k = generate_hadamard_signs(D, k.device, k.dtype)
+        hadamard_signs = generate_hadamard_signs(D, q.device, q.dtype)
         
         out_incoherent = flash_attention(
             q, k, v, 
             incoherent_processing=True,
-            hadamard_signs_q=hadamard_signs_q,
-            hadamard_signs_k=hadamard_signs_k
+            hadamard_signs_q=hadamard_signs,
+            hadamard_signs_k=hadamard_signs
         )
         
         # Test gradients
@@ -2243,19 +2240,45 @@ if __name__ == "__main__":
         print(f"K gradient MSE difference: {grad_k_diff:.8f}")
         print(f"V gradient MSE difference: {grad_v_diff:.8f}")
         
-        # The outputs will be different due to incoherent processing
-        # But the differences should be bounded and not too large
-        tolerance = 0.5  # Increased tolerance for incoherent processing differences
+        # For incoherent processing, we expect the outputs to be different but the implementation
+        # should be mathematically correct. Let's set realistic tolerances:
+        output_tolerance = 0.02  # Allow 2% difference in outputs due to transform effects
+        grad_tolerance = 0.01    # Gradients should be more accurate (1% difference)
+        v_tolerance = 0.005      # V gradients should be very similar since V isn't transformed
         
-        if out_diff < tolerance:
-            print("✓ Outputs are reasonably similar")
+        # Check output difference
+        if out_diff < output_tolerance:
+            print("✓ Outputs are reasonably similar for incoherent processing")
         else:
-            print(f"⚠ Info: Output difference is significant ({out_diff:.8f}) due to incoherent processing")
+            print(f"✗ Error: Output difference too large ({out_diff:.8f} > {output_tolerance})")
             
-        if grad_v_diff < tolerance:
+        # Check Q and K gradient differences (these will be larger due to transformation)
+        if grad_q_diff < grad_tolerance:
+            print("✓ Q gradients are acceptably different")
+        else:
+            print(f"✗ Error: Q gradient difference too large ({grad_q_diff:.8f} > {grad_tolerance})")
+            
+        if grad_k_diff < grad_tolerance:
+            print("✓ K gradients are acceptably different")
+        else:
+            print(f"✗ Error: K gradient difference too large ({grad_k_diff:.8f} > {grad_tolerance})")
+            
+        # Check V gradient difference (should be smallest since V isn't transformed)
+        if grad_v_diff < v_tolerance:
             print("✓ V gradients are similar (V is not transformed)")
         else:
-            print(f"⚠ Info: V gradients differ ({grad_v_diff:.8f}) due to indirect effects of incoherent processing")
+            print(f"✗ Error: V gradients differ too much ({grad_v_diff:.8f} > {v_tolerance})")
+        
+        # Overall assessment
+        all_passed = (out_diff < output_tolerance and 
+                     grad_q_diff < grad_tolerance and 
+                     grad_k_diff < grad_tolerance and 
+                     grad_v_diff < v_tolerance)
+        
+        if all_passed:
+            print("✓ All correctness tests passed!")
+        else:
+            print("✗ Some correctness tests failed - implementation needs fixing")
         
         return out_diff, grad_q_diff, grad_k_diff, grad_v_diff
 
