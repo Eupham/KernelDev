@@ -30,15 +30,15 @@ _t4_default_config = {
 }
 
 _h100_default_config = {
-    (torch.float32, 64): (128, 32, 16, 4),
-    (torch.float32, 128): (32, 64, 16, 4),
-    (torch.float32, 256): (32, 32, 16, 4),
-    (torch.bfloat16, 64): (128, 128, 16, 4),
-    (torch.bfloat16, 128): (128, 64, 32, 4),
-    (torch.bfloat16, 256): (64, 32, 16, 4),
-    (torch.float16, 64): (128, 128, 16, 4),
-    (torch.float16, 128): (128, 128, 32, 4),
-    (torch.float16, 256): (64, 32, 16, 4),
+    (torch.float32, 64): (128, 32, 8, 4),
+    (torch.float32, 128): (32, 64, 8, 4),
+    (torch.float32, 256): (32, 32, 8, 4),
+    (torch.bfloat16, 64): (128, 128, 8, 4),
+    (torch.bfloat16, 128): (128, 64, 16, 4),
+    (torch.bfloat16, 256): (64, 32, 8, 4),
+    (torch.float16, 64): (128, 128, 8, 4),
+    (torch.float16, 128): (128, 128, 16, 4),
+    (torch.float16, 256): (64, 32, 8, 4),
 }
 
 _a100_default_config = {
