@@ -1909,27 +1909,48 @@ class IncoherentFlashAttention(torch.autograd.Function):
     def backward(ctx, grad_output, grad_lse=None):
         q, k, v, o, lse, lens = ctx.saved_tensors
         
-        # Compute gradients using flash attention backward
-        DQ, DK, DV = torch.ops.flash_attention.backward(
-            q=q if not ctx.incoherent_processing else hadamard_transform(q, ctx.hadamard_signs_q),
-            k=k if not ctx.incoherent_processing else hadamard_transform(k, ctx.hadamard_signs_k),
-            v=v,
-            lens=lens,
-            o=o,
-            lse=lse,
-            do=grad_output,
-            sm_scale=ctx.sm_scale,
-            causal=ctx.causal,
-            autotune=ctx.autotune,
-            prescale_qk=ctx.prescale_qk,
-            precision=ctx.precision,
-        )
-        
-        # Apply inverse Hadamard transform to gradients if incoherent processing was used
         if ctx.incoherent_processing:
-            # Transform gradients back to original space using proper inverse
+            # For incoherent processing, we need to apply the forward transform again
+            # because the attention backward expects the transformed Q and K
+            q_transformed = hadamard_transform(q, ctx.hadamard_signs_q)
+            k_transformed = hadamard_transform(k, ctx.hadamard_signs_k)
+            
+            # Compute gradients using transformed Q and K (matching forward pass)
+            DQ, DK, DV = torch.ops.flash_attention.backward(
+                q=q_transformed,
+                k=k_transformed,
+                v=v,
+                lens=lens,
+                o=o,
+                lse=lse,
+                do=grad_output,
+                sm_scale=ctx.sm_scale,
+                causal=ctx.causal,
+                autotune=ctx.autotune,
+                prescale_qk=ctx.prescale_qk,
+                precision=ctx.precision,
+            )
+            
+            # Apply inverse Hadamard transform to gradients to get gradients w.r.t. original Q and K
+            # This applies the chain rule: dL/dQ_orig = dL/dQ_transformed * dQ_transformed/dQ_orig
             DQ = hadamard_inverse_transform(DQ, ctx.hadamard_signs_q)
             DK = hadamard_inverse_transform(DK, ctx.hadamard_signs_k)
+        else:
+            # Normal backward pass without incoherent processing
+            DQ, DK, DV = torch.ops.flash_attention.backward(
+                q=q,
+                k=k,
+                v=v,
+                lens=lens,
+                o=o,
+                lse=lse,
+                do=grad_output,
+                sm_scale=ctx.sm_scale,
+                causal=ctx.causal,
+                autotune=ctx.autotune,
+                prescale_qk=ctx.prescale_qk,
+                precision=ctx.precision,
+            )
         
         return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None
 
