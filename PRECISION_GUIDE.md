@@ -132,22 +132,29 @@ This will:
 
 ### Common Issues
 
-1. **CUDA Out of Memory with fp16**
-   - Even with fp16, you might need to reduce batch size on smaller GPUs
+1. **CUDA Out of Memory with fp16/bf16**
+   - Even with reduced precision, you might need to reduce batch size on smaller GPUs
    - Use `--batch-size` to override automatic estimation
 
 2. **NaN losses with fp16**
    - Very rare with automatic loss scaling
    - Try reducing learning rate if it occurs
+   - Consider switching to bf16 for better stability
 
-3. **Slower fp16 performance**
-   - Older GPUs may not benefit from fp16
+3. **NaN losses with bf16**
+   - Extremely rare due to wider dynamic range
+   - Usually indicates other issues (learning rate too high, model instability)
+
+4. **Slower fp16/bf16 performance**
+   - Older GPUs may not benefit from reduced precision
    - T4 and newer GPUs should show speedup
+   - A100/H100 show best bf16 performance
 
 ### GPU Compatibility
-- **T4**: Good fp16 speedup with Tensor Cores
-- **V100**: Excellent fp16 performance
-- **A100/H100**: Best fp16 performance
+- **T4**: Good fp16 speedup with Tensor Cores, limited bf16 support
+- **V100**: Excellent fp16 performance, limited bf16 support  
+- **A100/H100**: Best bf16 and fp16 performance, bf16 recommended
+- **RTX 30xx/40xx**: Excellent bf16 and fp16 performance
 - **Older GPUs**: May prefer fp32
 
 ## Example Output
