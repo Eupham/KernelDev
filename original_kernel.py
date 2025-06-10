@@ -1877,10 +1877,16 @@ class IncoherentFlashAttention(torch.autograd.Function):
             # Save signs for backward pass
             ctx.hadamard_signs = hadamard_signs
             
+            # Debug: Print to verify transforms are being applied
+            print(f"DEBUG: Applying Hadamard transform. Q before: min={q.min():.4f}, max={q.max():.4f}")
+            
             # Use PyTorch implementation for better consistency
             # Apply the same orthogonal transform to both Q and K
             q_transformed = hadamard_transform(q, hadamard_signs)
             k_transformed = hadamard_transform(k, hadamard_signs)
+            
+            print(f"DEBUG: Q after transform: min={q_transformed.min():.4f}, max={q_transformed.max():.4f}")
+            print(f"DEBUG: K after transform: min={k_transformed.min():.4f}, max={k_transformed.max():.4f}")
         
         # Run flash attention on transformed tensors
         requires_grad = any(i.requires_grad for i in (q, k, v))
