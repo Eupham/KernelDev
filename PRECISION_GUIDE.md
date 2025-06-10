@@ -105,13 +105,15 @@ python entry.py --precision 32 --seq-len 512 --epochs 1
 ### Memory Estimation
 The batch size estimation now accounts for precision:
 - FP16: 2 bytes per parameter/activation
+- BF16: 2 bytes per parameter/activation (same as fp16)
 - FP32: 4 bytes per parameter/activation
 - Optimizer states remain in fp32 regardless of model precision
 
 ### Flash Attention Compatibility
-- Flash attention kernels work with both fp16 and fp32
+- Flash attention kernels work with fp16, bf16, and fp32
 - Kernel automatically adapts to input tensor dtype
-- T4-optimized configurations support both precisions
+- T4-optimized configurations support all precisions
+- A100/H100 configurations optimized for bf16 performance
 
 ## Testing
 
