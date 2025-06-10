@@ -2010,11 +2010,13 @@ def flash_attention(
     
     # Use the custom autograd function if incoherent processing is enabled
     if incoherent_processing:
+        print(f"DEBUG: Using IncoherentFlashAttention with incoherent_processing={incoherent_processing}")
         return IncoherentFlashAttention.apply(
             q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
             incoherent_processing, hadamard_signs_q, hadamard_signs_k
         )
     else:
+        print(f"DEBUG: Using standard flash attention")
         # Use standard flash attention for normal case
         return _flash_attention(
             q=q,
