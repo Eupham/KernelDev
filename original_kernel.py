@@ -59,6 +59,44 @@ def hadamard_transform(x: torch.Tensor, signs: torch.Tensor = None) -> torch.Ten
     return result / math.sqrt(head_dim)
 
 
+def hadamard_inverse_transform(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+    """
+    Apply inverse Walsh-Hadamard transform with the same random signs.
+    
+    Args:
+        x: Input tensor that was transformed with hadamard_transform
+        signs: The same random signs tensor used in the forward transform
+        
+    Returns:
+        Recovered original tensor
+    """
+    *batch_dims, head_dim = x.shape
+    
+    # The Hadamard transform is its own inverse, so we apply it again
+    # but we need to handle the normalization and signs correctly
+    
+    # First, undo the normalization
+    result = x * math.sqrt(head_dim)
+    
+    # Apply Walsh-Hadamard Transform (same as forward)
+    stride = 1
+    while stride < head_dim:
+        # Butterfly operations
+        result = result.view(*batch_dims, head_dim // (2 * stride), 2, stride)
+        left, right = result.chunk(2, dim=-2)
+        left, right = left.squeeze(-2), right.squeeze(-2)
+        
+        result = torch.stack([left + right, left - right], dim=-2)
+        result = result.view(*batch_dims, head_dim)
+        stride *= 2
+    
+    # Remove the random signs
+    result = result * signs
+    
+    # Apply final normalization
+    return result / head_dim
+
+
 @triton.jit
 def _hadamard_transform_kernel(
     X: tl.tensor,
@@ -114,6 +152,34 @@ def _hadamard_transform_kernel(
     
     y_ptr = Y + batch_id * stride_yb + head_id * stride_yh + token_id * stride_yt
     tl.store(y_ptr + tl.arange(0, HEAD_DIM), result)
+
+
+def apply_hadamard_triton(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+    """
+    Apply Hadamard transform using Triton kernel for better performance.
+    """
+    B, H, T, D = x.shape
+    
+    # Create output tensor
+    y = torch.empty_like(x)
+    
+    # Ensure signs have the right shape [B, H, D]
+    if signs.ndim == 1:
+        signs = signs.unsqueeze(0).unsqueeze(0).expand(B, H, -1)
+    elif signs.ndim == 2:
+        signs = signs.unsqueeze(0).expand(B, -1, -1)
+    
+    # Launch kernel
+    grid = (B, H, T)
+    _hadamard_transform_kernel[grid](
+        x, signs, y,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        signs.stride(0), signs.stride(1), signs.stride(2),
+        B, H, T, D, TILE_SIZE=min(64, D)
+    )
+    
+    return y
 
 
 logger = logging.getLogger(__name__)
@@ -1800,8 +1866,14 @@ def flash_attention(
             hadamard_signs_k = generate_hadamard_signs(HEAD_DIM, k.device, k.dtype)
         
         # Apply Hadamard transform to Q and K
-        q = hadamard_transform(q, hadamard_signs_q)
-        k = hadamard_transform(k, hadamard_signs_k)
+        # Use Triton kernel for better performance on larger tensors
+        use_triton = q.numel() > 10000  # Threshold for using Triton
+        if use_triton:
+            q = apply_hadamard_triton(q, hadamard_signs_q)
+            k = apply_hadamard_triton(k, hadamard_signs_k)
+        else:
+            q = hadamard_transform(q, hadamard_signs_q)
+            k = hadamard_transform(k, hadamard_signs_k)
     
     return _flash_attention(
         q=q,
@@ -1874,6 +1946,15 @@ if __name__ == "__main__":
         
         print(f"Q transformed - Min: {q_transformed.min():.3f}, Max: {q_transformed.max():.3f}, Std: {q_transformed.std():.3f}")
         print(f"K transformed - Min: {k_transformed.min():.3f}, Max: {k_transformed.max():.3f}, Std: {k_transformed.std():.3f}")
+        
+        # Test Triton-based Hadamard transform for consistency
+        print("Testing Triton-based Hadamard transform...")
+        q_triton = apply_hadamard_triton(q_outliers, hadamard_signs_q)
+        k_triton = apply_hadamard_triton(k_outliers, hadamard_signs_k)
+        
+        triton_error_q = F.mse_loss(q_transformed, q_triton).item()
+        triton_error_k = F.mse_loss(k_transformed, k_triton).item()
+        print(f"Triton vs PyTorch MSE - Q: {triton_error_q:.8f}, K: {triton_error_k:.8f} (should be close to 0)")
         
         # Test quantization error with incoherent processing
         q_error_transformed = quantization_error_test(q_transformed)
@@ -1952,9 +2033,8 @@ if __name__ == "__main__":
         print(f"Transformed energy (mean): {transformed_energy.mean():.6f}")
         print(f"Energy ratio: {energy_ratio:.6f} (should be close to 1.0)")
         
-        # Test inverse property (Hadamard transform is its own inverse up to scaling)
-        x_double_transformed = hadamard_transform(x_transformed, signs)
-        x_recovered = x_double_transformed * D  # Undo the two sqrt(D) normalizations
+        # Test inverse property using the proper inverse transform
+        x_recovered = hadamard_inverse_transform(x_transformed, signs)
         
         reconstruction_error = F.mse_loss(x, x_recovered)
         print(f"Reconstruction error: {reconstruction_error:.8f} (should be close to 0)")
