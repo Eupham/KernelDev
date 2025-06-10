@@ -26,16 +26,17 @@ The training script supports YAML configuration files that define all training p
 
 ### Available Configuration Files
 
-1. **`config.yaml`** - Default balanced configuration (fp32, medium model)
+1. **`config.yaml`** - Default balanced configuration (fp16, medium model)
 2. **`config_fast.yaml`** - Fast training for development (fp16, small model)
 3. **`config_quality.yaml`** - High-quality training (fp32, large model)
+4. **`config_bf16.yaml`** - BF16 training for modern GPUs (bf16, balanced model)
 
 ## Configuration Structure
 
 ### Training Parameters
 ```yaml
 training:
-  precision: 32              # 16 for fp16/mixed precision, 32 for fp32
+  precision: 32              # 16 for fp16/mixed precision, 32 for fp32, "bf16" for bfloat16/mixed precision
   epochs: 3                  # Number of training epochs
   learning_rate: 0.0003      # Learning rate
   batch_size: null           # Batch size (null = auto-estimate)
@@ -97,7 +98,7 @@ python entry.py \
 ### Available Arguments
 
 - `--config`: Path to YAML configuration file (default: config.yaml)
-- `--precision`: Floating point precision (16 or 32)
+- `--precision`: Floating point precision (16, 32, or "bf16")
 - `--batch-size`: Override batch size
 - `--seq-len`: Sequence length for training
 - `--epochs`: Number of training epochs
@@ -125,6 +126,18 @@ training:
 - Faster training on modern GPUs
 - Gradient scaling for numerical stability
 - Recommended for development and large models
+
+### BF16 (Bfloat16 Mixed Precision)
+```yaml
+training:
+  precision: "bf16"
+```
+- Uses bfloat16 with automatic mixed precision
+- Similar memory usage to fp16
+- Better numerical stability than fp16 (wider dynamic range)
+- No gradient scaling typically needed
+- Best for modern GPUs (A100, H100, RTX 30xx/40xx series)
+- Recommended for production training on compatible hardware
 
 ## Memory Optimization
 
@@ -158,10 +171,19 @@ python entry.py --config config_quality.yaml
 - Thorough evaluation
 - 10 epochs
 
+### BF16 Training for Modern GPUs
+```bash
+python entry.py --config config_bf16.yaml
+```
+- BF16 precision
+- Balanced model (1024 dim, 12 layers)
+- Good performance and stability
+- 3 epochs
+
 ### Custom Training
 ```bash
 python entry.py \
-  --precision 16 \
+  --precision bf16 \
   --epochs 5 \
   --batch-size 12 \
   --learning-rate 0.0005
@@ -179,20 +201,21 @@ The training script generates:
 ## Tips
 
 1. **For development**: Use `config_fast.yaml` with FP16 for quick iterations
-2. **For production**: Use `config_quality.yaml` with FP32 for best results
-3. **Memory issues**: Reduce batch size, sequence length, or model dimension
-4. **Speed up training**: Use FP16 precision and smaller models
-5. **Better quality**: Use FP32 precision and larger models
+2. **For production**: Use `config_quality.yaml` with FP32 for best results  
+3. **For modern GPUs**: Use `config_bf16.yaml` with BF16 for balanced performance
+4. **Memory issues**: Reduce batch size, sequence length, or model dimension
+5. **Speed up training**: Use FP16 or BF16 precision and smaller models
+6. **Better quality**: Use FP32 precision and larger models
 
 ## Troubleshooting
 
 ### Out of Memory
 - Reduce `batch_size` in config or via `--batch-size`
-- Use FP16 precision (`--precision 16`)
+- Use FP16 precision (`--precision 16`) or BF16 (`--precision bf16`)
 - Reduce `seq_len` or model `dim`
 
 ### Slow Training
-- Use FP16 precision for speed
+- Use FP16 or BF16 precision for speed
 - Reduce evaluation frequency (`eval_every`)
 - Use smaller model for development
 

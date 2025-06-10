@@ -1,6 +1,6 @@
 # GPT Model Training with Configurable Precision
 
-This project now supports both fp32 (full precision) and fp16 (mixed precision) training modes for improved performance and memory efficiency.
+This project now supports fp32 (full precision), fp16 (mixed precision), and bf16 (bfloat16 mixed precision) training modes for improved performance and memory efficiency.
 
 ## Precision Options
 

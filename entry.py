@@ -77,7 +77,7 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
 
 def setup_precision(model, precision):
     """Setup model precision and return appropriate dtype and scaler."""
-    if precision == 16:
+    if precision == 16 or precision == '16':
         print(f"Setting up mixed precision training (fp16)...")
         # Keep model in fp32 for mixed precision training
         # The model will be automatically cast to fp16 during forward pass
@@ -91,7 +91,23 @@ def setup_precision(model, precision):
         print("✓ Model prepared for mixed precision training")
         print("✓ Gradient scaler initialized for mixed precision")
         
-    else:  # precision == 32
+    elif precision == 'bf16':
+        print(f"Setting up mixed precision training (bf16)...")
+        # Keep model in fp32 for mixed precision training
+        # The model will be automatically cast to bf16 during forward pass
+        model.float()  # Don't convert to bfloat16, let autocast handle it
+        dtype = torch.bfloat16
+        
+        # Setup gradient scaler for mixed precision (using new API)
+        # Note: bf16 typically doesn't need gradient scaling due to wider dynamic range
+        # but we'll keep it for consistency and safety
+        scaler = torch.amp.GradScaler('cuda')
+        use_amp = True
+        
+        print("✓ Model prepared for bf16 mixed precision training")
+        print("✓ Gradient scaler initialized for mixed precision")
+        
+    else:  # precision == 32 or precision == '32'
         print(f"Using full precision training (fp32)...")
         model.float()
         dtype = torch.float32
@@ -171,8 +187,15 @@ def start_actual_training(cli_args):
     # Configuration summary
     precision = training_cfg.get('precision', 32)
     print("=== GPT Model Training with Flash Attention ===")
-    print(f"Precision: fp{precision}")
-    print(f"Mixed Precision Training: {'Enabled' if precision == 16 else 'Disabled'}")
+    if precision == 'bf16':
+        print(f"Precision: bf16 (bfloat16)")
+        print(f"Mixed Precision Training: Enabled (bf16)")
+    elif precision == 16 or precision == '16':
+        print(f"Precision: fp16")
+        print(f"Mixed Precision Training: Enabled (fp16)")
+    else:
+        print(f"Precision: fp32")
+        print(f"Mixed Precision Training: Disabled")
     print("Setting up configuration...")
     
     # Data configuration
@@ -458,8 +481,18 @@ def estimate_optimal_batch_size(model_config, available_memory_gb=15, precision=
     vocab_size = model_config['vocab_size']
     
     # Bytes per parameter based on precision
-    bytes_per_param = 4 if precision == 32 else 2  # fp32 = 4 bytes, fp16 = 2 bytes
-    bytes_per_activation = 4 if precision == 32 else 2  # activation precision
+    if precision == 32 or precision == '32':
+        bytes_per_param = 4  # fp32 = 4 bytes
+        bytes_per_activation = 4
+        precision_str = "fp32"
+    elif precision == 'bf16':
+        bytes_per_param = 2  # bf16 = 2 bytes (same as fp16)
+        bytes_per_activation = 2
+        precision_str = "bf16"
+    else:  # precision == 16 or precision == '16'
+        bytes_per_param = 2  # fp16 = 2 bytes
+        bytes_per_activation = 2
+        precision_str = "fp16"
     
     # Rough parameter count estimation
     param_count = (
@@ -492,7 +525,6 @@ def estimate_optimal_batch_size(model_config, available_memory_gb=15, precision=
     # Estimate batch size
     estimated_batch_size = max(1, int(available_for_activations / activation_memory_per_sample))
     
-    precision_str = f"fp{precision}"
     info = (
         f"Estimated memory usage ({precision_str}):\n"
         f"  Model parameters: {model_memory:.1f}GB\n"
@@ -526,10 +558,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--precision',
-        type=int,
-        choices=[16, 32],
+        type=str,
+        choices=['16', '32', 'bf16'],
         default=None, # Default to None, so config file is source of truth unless overridden
-        help='Floating point precision: 16 for fp16/mixed precision, 32 for fp32 (overrides config)'
+        help='Floating point precision: 16 for fp16/mixed precision, 32 for fp32, bf16 for bfloat16/mixed precision (overrides config)'
     )
     parser.add_argument(
         '--batch-size',
