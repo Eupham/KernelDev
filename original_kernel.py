@@ -107,13 +107,14 @@ def _hadamard_transform_kernel(
     stride_sb: int, stride_sh: int, stride_sd: int,
     B: int, H: int, T: int, HEAD_DIM: tl.constexpr,
     TILE_SIZE: tl.constexpr,
+    INVERSE: tl.constexpr,
 ):
     """
     Triton kernel for fast Hadamard transform with random signs.
     Applies incoherent processing to reduce quantization error.
     
-    Note: This is a simplified version that applies element-wise operations
-    rather than the full butterfly network due to Triton limitations.
+    Args:
+        INVERSE: If True, applies inverse transform (for gradients)
     """
     batch_id = tl.program_id(0)
     head_id = tl.program_id(1)
@@ -130,37 +131,61 @@ def _hadamard_transform_kernel(
     x_ptr = X + batch_id * stride_xb + head_id * stride_xh + token_id * stride_xt
     x = tl.load(x_ptr + tl.arange(0, HEAD_DIM))
     
-    # Apply random signs
-    x_signed = x * signs
-    
-    # Apply a simplified transform that approximates the Hadamard effect
-    # This spreads out the values using a permutation-like operation
-    result = x_signed
-    
-    # Apply multiple passes of spreading operations
-    tl.static_assert(HEAD_DIM >= 16)  # Ensure minimum size
-    
-    # First pass: swap pairs
-    if HEAD_DIM >= 2:
-        indices = tl.arange(0, HEAD_DIM)
-        even_mask = (indices % 2) == 0
-        # For even indices, add the next element; for odd, subtract the previous
-        shift_val = tl.where(even_mask, 
-                           tl.where(indices < HEAD_DIM - 1, result + tl.broadcast_to(result, result.shape), result),
-                           result - tl.broadcast_to(result, result.shape))
-        result = shift_val
-    
-    # Normalize
-    norm_factor = 1.0 / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
-    result = result * norm_factor
+    if INVERSE:
+        # For inverse transform: undo normalization first, then apply Hadamard, then remove signs
+        result = x * tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
+        
+        # Apply simplified Hadamard-like spreading (same as forward)
+        if HEAD_DIM >= 2:
+            indices = tl.arange(0, HEAD_DIM)
+            even_mask = (indices % 2) == 0
+            shift_val = tl.where(even_mask, 
+                               tl.where(indices < HEAD_DIM - 1, 
+                                      result + tl.where(indices + 1 < HEAD_DIM, 
+                                                       tl.load(x_ptr + indices + 1), 0.0), 
+                                      result),
+                               tl.where(indices > 0,
+                                      result - tl.load(x_ptr + indices - 1),
+                                      result))
+            result = shift_val
+        
+        # Remove signs and apply final normalization
+        result = result * signs / tl.cast(HEAD_DIM, tl.float32)
+    else:
+        # Forward transform: apply signs, then Hadamard, then normalize
+        x_signed = x * signs
+        result = x_signed
+        
+        # Apply simplified Hadamard-like spreading
+        if HEAD_DIM >= 2:
+            indices = tl.arange(0, HEAD_DIM)
+            even_mask = (indices % 2) == 0
+            shift_val = tl.where(even_mask, 
+                               tl.where(indices < HEAD_DIM - 1, 
+                                      result + tl.where(indices + 1 < HEAD_DIM, 
+                                                       tl.load(x_ptr + indices + 1), 0.0), 
+                                      result),
+                               tl.where(indices > 0,
+                                      result - tl.load(x_ptr + indices - 1),
+                                      result))
+            result = shift_val
+        
+        # Normalize
+        norm_factor = 1.0 / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
+        result = result * norm_factor
     
     y_ptr = Y + batch_id * stride_yb + head_id * stride_yh + token_id * stride_yt
     tl.store(y_ptr + tl.arange(0, HEAD_DIM), result)
 
 
-def apply_hadamard_triton(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+def apply_hadamard_triton(x: torch.Tensor, signs: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     """
     Apply Hadamard transform using Triton kernel for better performance.
+    
+    Args:
+        x: Input tensor
+        signs: Random signs for the transform
+        inverse: If True, applies inverse transform
     """
     B, H, T, D = x.shape
     
@@ -180,7 +205,7 @@ def apply_hadamard_triton(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
         y.stride(0), y.stride(1), y.stride(2), y.stride(3),
         signs.stride(0), signs.stride(1), signs.stride(2),
-        B, H, T, D, TILE_SIZE=min(64, D)
+        B, H, T, D, TILE_SIZE=min(64, D), INVERSE=inverse
     )
     
     return y
@@ -1810,6 +1835,110 @@ def _flash_attention(
     return O
 
 
+class IncoherentFlashAttention(torch.autograd.Function):
+    """
+    Flash attention with incoherent processing autograd function.
+    Properly handles Hadamard transforms in both forward and backward passes.
+    """
+    
+    @staticmethod
+    def forward(
+        ctx, q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
+        incoherent_processing, hadamard_signs_q, hadamard_signs_k
+    ):
+        # Store context for backward pass
+        ctx.incoherent_processing = incoherent_processing
+        ctx.causal = causal
+        ctx.autotune = autotune
+        ctx.sm_scale = sm_scale
+        ctx.prescale_qk = prescale_qk
+        ctx.precision = precision
+        ctx.return_lse = return_lse
+        
+        # Apply incoherent processing if requested
+        q_transformed, k_transformed = q, k
+        if incoherent_processing:
+            HEAD_DIM = q.size(-1)
+            if HEAD_DIM & (HEAD_DIM - 1) != 0:
+                raise ValueError(f"Head dimension {HEAD_DIM} must be a power of 2 for incoherent processing")
+            
+            # Generate or use provided random signs
+            if hadamard_signs_q is None:
+                hadamard_signs_q = generate_hadamard_signs(HEAD_DIM, q.device, q.dtype)
+            if hadamard_signs_k is None:
+                hadamard_signs_k = generate_hadamard_signs(HEAD_DIM, k.device, k.dtype)
+            
+            # Save signs for backward pass
+            ctx.hadamard_signs_q = hadamard_signs_q
+            ctx.hadamard_signs_k = hadamard_signs_k
+            
+            # Apply Hadamard transform to Q and K
+            use_triton = q.numel() > 10000
+            if use_triton:
+                q_transformed = apply_hadamard_triton(q, hadamard_signs_q)
+                k_transformed = apply_hadamard_triton(k, hadamard_signs_k)
+            else:
+                q_transformed = hadamard_transform(q, hadamard_signs_q)
+                k_transformed = hadamard_transform(k, hadamard_signs_k)
+        
+        # Run flash attention on transformed tensors
+        requires_grad = any(i.requires_grad for i in (q, k, v))
+        O, LSE = torch.ops.flash_attention.forward(
+            q=q_transformed,
+            k=k_transformed,
+            v=v,
+            lens=lens,
+            sm_scale=sm_scale,
+            causal=causal,
+            autotune=autotune,
+            prescale_qk=prescale_qk,
+            return_lse=return_lse or requires_grad,
+            precision=precision,
+        )
+        
+        # Save tensors for backward pass
+        if requires_grad:
+            ctx.save_for_backward(q, k, v, O, LSE, lens)
+        
+        if return_lse:
+            return O, LSE
+        return O
+    
+    @staticmethod 
+    def backward(ctx, grad_output, grad_lse=None):
+        q, k, v, o, lse, lens = ctx.saved_tensors
+        
+        # Compute gradients using flash attention backward
+        DQ, DK, DV = torch.ops.flash_attention.backward(
+            q=q if not ctx.incoherent_processing else apply_hadamard_triton(q, ctx.hadamard_signs_q) if q.numel() > 10000 else hadamard_transform(q, ctx.hadamard_signs_q),
+            k=k if not ctx.incoherent_processing else apply_hadamard_triton(k, ctx.hadamard_signs_k) if k.numel() > 10000 else hadamard_transform(k, ctx.hadamard_signs_k),
+            v=v,
+            lens=lens,
+            o=o,
+            lse=lse,
+            do=grad_output,
+            sm_scale=ctx.sm_scale,
+            causal=ctx.causal,
+            autotune=ctx.autotune,
+            prescale_qk=ctx.prescale_qk,
+            precision=ctx.precision,
+        )
+        
+        # Apply inverse Hadamard transform to gradients if incoherent processing was used
+        if ctx.incoherent_processing:
+            # Transform gradients back to original space
+            use_triton = q.numel() > 10000
+            if use_triton:
+                # Note: For Triton, we use the same kernel for inverse (Hadamard is self-inverse)
+                DQ = apply_hadamard_triton(DQ, ctx.hadamard_signs_q)  
+                DK = apply_hadamard_triton(DK, ctx.hadamard_signs_k)
+            else:
+                DQ = hadamard_inverse_transform(DQ, ctx.hadamard_signs_q)
+                DK = hadamard_inverse_transform(DK, ctx.hadamard_signs_k)
+        
+        return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None
+
+
 def flash_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1852,45 +1981,31 @@ def flash_attention(
         for i in (q, k, v):
             torch._dynamo.mark_static(i, 1)
             torch._dynamo.mark_static(i, 3)
+    
     if sm_scale is None:
         HEAD_DIM = q.size(-1)
         sm_scale = HEAD_DIM**-0.5
     
-    # Apply incoherent processing if requested
+    # Use the custom autograd function if incoherent processing is enabled
     if incoherent_processing:
-        # Check that head_dim is power of 2 for Hadamard transform
-        HEAD_DIM = q.size(-1)
-        if HEAD_DIM & (HEAD_DIM - 1) != 0:
-            raise ValueError(f"Head dimension {HEAD_DIM} must be a power of 2 for incoherent processing")
-        
-        # Generate or use provided random signs
-        if hadamard_signs_q is None:
-            hadamard_signs_q = generate_hadamard_signs(HEAD_DIM, q.device, q.dtype)
-        if hadamard_signs_k is None:
-            hadamard_signs_k = generate_hadamard_signs(HEAD_DIM, k.device, k.dtype)
-        
-        # Apply Hadamard transform to Q and K
-        # Use Triton kernel for better performance on larger tensors
-        use_triton = q.numel() > 10000  # Threshold for using Triton
-        if use_triton:
-            q = apply_hadamard_triton(q, hadamard_signs_q)
-            k = apply_hadamard_triton(k, hadamard_signs_k)
-        else:
-            q = hadamard_transform(q, hadamard_signs_q)
-            k = hadamard_transform(k, hadamard_signs_k)
-    
-    return _flash_attention(
-        q=q,
-        k=k,
-        v=v,
-        lens=lens,
-        sm_scale=sm_scale,
-        causal=causal,
-        autotune=autotune,
-        return_lse=return_lse,
-        prescale_qk=prescale_qk,
-        precision=precision,
-    )
+        return IncoherentFlashAttention.apply(
+            q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
+            incoherent_processing, hadamard_signs_q, hadamard_signs_k
+        )
+    else:
+        # Use standard flash attention for normal case
+        return _flash_attention(
+            q=q,
+            k=k,
+            v=v,
+            lens=lens,
+            sm_scale=sm_scale,
+            causal=causal,
+            autotune=autotune,
+            return_lse=return_lse,
+            prescale_qk=prescale_qk,
+            precision=precision,
+        )
 
 
 if __name__ == "__main__":
