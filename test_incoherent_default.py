@@ -37,20 +37,35 @@ def test_auto_enable_incoherent():
         print("⚠ CUDA not available, skipping test")
         return
     
+    # Import here to avoid import issues
+    from original_kernel import generate_hadamard_signs
+    
     # Create test tensors
     B, H, T, D = 1, 2, 16, 64  # D=64 is power of 2
     q = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32)
     k = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32)
     v = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32)
     
+    # Pre-generate the same random signs to ensure reproducible results
+    signs_q = generate_hadamard_signs(D, q.device, q.dtype)
+    signs_k = generate_hadamard_signs(D, k.device, k.dtype)
+    
     # Test with default (None) incoherent_processing
     print("Testing with incoherent_processing=None (auto-detect)...")
-    out_auto = flash_attention(q, k, v, incoherent_processing=None)
+    is_hopper = is_hopper_gpu()
+    if is_hopper:
+        # On Hopper, auto-detect uses incoherent processing, so provide signs for consistency
+        out_auto = flash_attention(q, k, v, incoherent_processing=None, 
+                                 hadamard_signs_q=signs_q, hadamard_signs_k=signs_k)
+    else:
+        # On non-Hopper, auto-detect uses standard processing
+        out_auto = flash_attention(q, k, v, incoherent_processing=None)
     print(f"Auto-detect output shape: {out_auto.shape}")
     
-    # Test with explicit True
+    # Test with explicit True (use same signs for consistency)
     print("Testing with incoherent_processing=True...")
-    out_explicit_true = flash_attention(q, k, v, incoherent_processing=True)
+    out_explicit_true = flash_attention(q, k, v, incoherent_processing=True,
+                                      hadamard_signs_q=signs_q, hadamard_signs_k=signs_k)
     print(f"Explicit True output shape: {out_explicit_true.shape}")
     
     # Test with explicit False
@@ -59,8 +74,6 @@ def test_auto_enable_incoherent():
     print(f"Explicit False output shape: {out_explicit_false.shape}")
     
     # Check behavior based on GPU type
-    is_hopper = is_hopper_gpu()
-    
     if is_hopper:
         # On Hopper, auto-detect should behave like True
         diff_auto_true = torch.norm(out_auto - out_explicit_true)
@@ -70,7 +83,7 @@ def test_auto_enable_incoherent():
         print(f"Difference auto vs True: {diff_auto_true:.8f}")
         print(f"Difference auto vs False: {diff_auto_false:.8f}")
         
-        # Auto should match True (both use incoherent processing)
+        # Auto should match True (both use incoherent processing with same signs)
         assert diff_auto_true < 1e-6, "Auto-detect should match explicit True on Hopper"
         # Auto should differ from False (different processing)
         assert diff_auto_false > 0.1, "Auto-detect should differ from explicit False on Hopper"
