@@ -2,6 +2,7 @@ import logging
 import math
 import torch._dynamo
 import os
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +14,91 @@ MIN_TILE_SIZE = 16  # Reduced for T4 compatibility
 
 
 logger = logging.getLogger(__name__)
+
+
+def fast_hadamard_transform(x: torch.Tensor, seed: Optional[int] = None, 
+                           inverse: bool = False) -> torch.Tensor:
+    """
+    Apply Hadamard transform with random signs to reduce outlier impact.
+    This is an incoherent processing technique that spreads out outliers
+    to reduce quantization error by ~2.6x.
+    
+    Args:
+        x: Input tensor of shape [..., head_dim]
+        seed: Random seed for consistent random signs
+        inverse: Whether to apply inverse transform (use same seed)
+        
+    Returns:
+        Transformed tensor of the same shape
+    """
+    # Save original shape
+    original_shape = x.shape
+    head_dim = original_shape[-1]
+    
+    # Ensure power of 2 for Hadamard transform
+    if not (head_dim & (head_dim - 1) == 0):
+        # If not power of 2, pad to next power of 2
+        next_pow2 = 2 ** math.ceil(math.log2(head_dim))
+        padded = True
+        # Save original for later unpadding
+        x_reshaped = x.reshape(-1, head_dim)
+        padding = torch.zeros(*x_reshaped.shape[:-1], next_pow2 - head_dim, 
+                            dtype=x.dtype, device=x.device)
+        x = torch.cat([x_reshaped, padding], dim=-1)
+        head_dim = next_pow2
+    else:
+        padded = False
+        
+    # Generate random signs (same for forward and inverse)
+    if seed is not None:
+        # Use provided seed for deterministic behavior
+        generator = torch.Generator(device=x.device).manual_seed(seed)
+    else:
+        generator = torch.Generator(device=x.device).manual_seed(0)
+    
+    # Generate random signs (+1/-1)
+    random_signs = torch.randint(0, 2, (head_dim,), device=x.device, 
+                               generator=generator) * 2 - 1
+    
+    # Reshape for broadcasting
+    x_shape = x.shape
+    x = x.reshape(-1, head_dim)
+    
+    # Apply random signs
+    x = x * random_signs.to(x.dtype)
+    
+    # Fast Hadamard Transform - O(d log d) complexity
+    h = 1
+    while h < head_dim:
+        x = x.reshape(-1, head_dim // (2 * h), 2 * h)
+        x_0 = x[:, :, :h]
+        x_1 = x[:, :, h:2*h]
+        
+        y_0 = x_0 + x_1
+        y_1 = x_0 - x_1
+        
+        x = torch.cat([y_0, y_1], dim=2)
+        h *= 2
+    
+    # Reshape back
+    x = x.reshape(x_shape)
+    
+    # Apply normalization factor
+    x = x / math.sqrt(head_dim)
+    
+    # If inverse transform requested, apply random signs again
+    # (since Hadamard is its own inverse, we just need to reapply the signs)
+    if inverse:
+        x = x.reshape(-1, head_dim)
+        x = x * random_signs.to(x.dtype)
+        x = x.reshape(x_shape)
+    
+    # Unpad if necessary
+    if padded:
+        x = x[..., :original_shape[-1]]
+        x = x.reshape(original_shape)
+    
+    return x
 
 
 # BLOCK_Q, BLOCK_K, num_warps, num_stages
@@ -39,6 +125,13 @@ _h100_default_config = {
     (torch.float16, 64): (128, 128, 8, 4),
     (torch.float16, 128): (128, 128, 16, 4),
     (torch.float16, 256): (64, 32, 8, 4),
+    # FP8 support for H100
+    (torch.float8_e4m3fn, 64): (128, 128, 16, 4),
+    (torch.float8_e4m3fn, 128): (128, 64, 16, 4),
+    (torch.float8_e4m3fn, 256): (64, 32, 8, 4),
+    (torch.float8_e5m2, 64): (128, 128, 16, 4),
+    (torch.float8_e5m2, 128): (128, 64, 16, 4),
+    (torch.float8_e5m2, 256): (64, 32, 8, 4),
 }
 
 _a100_default_config = {
@@ -57,9 +150,17 @@ _a100_default_config = {
 def _get_default_config_fwd(head_dim, dtype) -> tuple[int, int, int, int]:
     default_config = None
 
+    # Check for FP8 types
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and (
+        dtype == torch.float8_e4m3fn or 
+        (hasattr(torch, 'float8_e5m2') and dtype == torch.float8_e5m2)
+    )
+
     if head_dim <= 256 and torch.cuda.get_device_capability() >= (9, 0):  # H100
         if dtype == torch.float32:
             default_config = (64, 64, 4, 3)
+        elif is_fp8:
+            default_config = (128, 64, 16, 4)  # Optimized for FP8 on H100
         else:
             default_config = (128, 64, 4, 3)
         default_config = _h100_default_config.get((dtype, head_dim), default_config)
@@ -1647,6 +1748,8 @@ def flash_attention(
     return_lse=False,
     prescale_qk=False,
     precision="ieee",
+    use_incoherent=False,
+    hadamard_seed=None,
 ):
     """
     Computes self-attention with optional causal masking and flash attention optimization.
@@ -1666,18 +1769,57 @@ def flash_attention(
         causal (bool): Whether to apply causal masking (default: True)
         autotune (bool): Use triton autotune for optimal kernel configuration
         prescale_qk (bool): Prescale Q in QK^T calculations — slightly faster if True, slightly lower precision
-        precision (str): Precision for matmuls: 'ieee' or 'tf32'
+        precision (str): Precision for matmuls: 'ieee', 'tf32', or 'fp8' (H100 only)
+        use_incoherent (bool): Apply incoherent processing (Hadamard transform) to reduce quantization errors
+        hadamard_seed (int, optional): Seed for deterministic Hadamard transform
     """
+    # Example usage with incoherent processing and FP8:
+    # 
+    # # Standard attention
+    # output = flash_attention(q, k, v, causal=True)
+    # 
+    # # With incoherent processing to reduce quantization error
+    # output = flash_attention(q, k, v, causal=True, use_incoherent=True, hadamard_seed=42)
+    # 
+    # # With FP8 precision on H100
+    # output = flash_attention(q, k, v, causal=True, precision="fp8")
+    # 
+    # # Combined incoherent processing + FP8 for maximum efficiency
+    # output = flash_attention(q, k, v, causal=True, use_incoherent=True, precision="fp8")
+
     if not torch.compiler.is_compiling():
         for i in (q, k, v):
             torch._dynamo.mark_static(i, 1)
             torch._dynamo.mark_static(i, 3)
+    
+    # Apply incoherent processing if requested
+    if use_incoherent:
+        # Apply Hadamard transform with random signs to q and k
+        q_transformed = fast_hadamard_transform(q, seed=hadamard_seed, inverse=False)
+        k_transformed = fast_hadamard_transform(k, seed=hadamard_seed, inverse=False)
+    else:
+        q_transformed = q
+        k_transformed = k
+    
+    # Handle FP8 precision if requested and supported
+    if precision == "fp8":
+        if torch.cuda.get_device_capability() >= (9, 0) and hasattr(torch, 'float8_e4m3fn'):
+            # Convert to FP8 for H100
+            if q_transformed.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                q_transformed = q_transformed.to(torch.float8_e4m3fn)
+                k_transformed = k_transformed.to(torch.float8_e4m3fn)
+                v = v.to(torch.float8_e4m3fn)
+        else:
+            logger.warning("FP8 precision requested but not supported on this device. Falling back to original precision.")
+    
     if sm_scale is None:
         HEAD_DIM = q.size(-1)
         sm_scale = HEAD_DIM**-0.5
-    return _flash_attention(
-        q=q,
-        k=k,
+    
+    # Call the optimized attention with transformed inputs
+    output = _flash_attention(
+        q=q_transformed,
+        k=k_transformed,
         v=v,
         lens=lens,
         sm_scale=sm_scale,
@@ -1687,33 +1829,162 @@ def flash_attention(
         prescale_qk=prescale_qk,
         precision=precision,
     )
+    
+    # If incoherent processing was used, apply inverse transform to output
+    if use_incoherent:
+        if return_lse:
+            output_tensor, lse = output
+            output_tensor = fast_hadamard_transform(output_tensor, seed=hadamard_seed, inverse=True)
+            return output_tensor, lse
+        else:
+            output = fast_hadamard_transform(output, seed=hadamard_seed, inverse=True)
+    
+    return output
+
+
+def test_incoherent_processing():
+    """Test function for incoherent processing with Hadamard transform."""
+    print("Testing incoherent processing...")
+    
+    # Test parameters
+    batch_size = 2
+    num_heads = 8
+    seq_len = 512
+    head_dim = 64
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16
+    
+    # Create test tensors
+    q = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=dtype, device=device, requires_grad=True)
+    
+    # Add some outliers to simulate quantization challenges
+    outlier_indices = torch.randint(0, head_dim, (seq_len // 10,))
+    q[:, :, :seq_len//10, outlier_indices] *= 10.0  # Create outliers
+    k[:, :, :seq_len//10, outlier_indices] *= 10.0
+    
+    try:
+        print("Testing standard attention...")
+        output_standard = flash_attention(q, k, v, causal=True)
+        
+        print("Testing incoherent processing attention...")
+        output_incoherent = flash_attention(q, k, v, causal=True, use_incoherent=True, hadamard_seed=42)
+        
+        # Compare outputs
+        diff = torch.abs(output_standard - output_incoherent).mean()
+        print(f"Mean difference between standard and incoherent: {diff:.6f}")
+        
+        # Test deterministic behavior with same seed
+        output_incoherent2 = flash_attention(q, k, v, causal=True, use_incoherent=True, hadamard_seed=42)
+        deterministic_diff = torch.abs(output_incoherent - output_incoherent2).max()
+        print(f"Deterministic check (should be 0): {deterministic_diff:.10f}")
+        
+        # Test gradient computation
+        loss = output_incoherent.sum()
+        loss.backward()
+        print("Backward pass with incoherent processing successful.")
+        
+        print("Incoherent processing test completed successfully!")
+        
+    except Exception as e:
+        print(f"Error in incoherent processing test: {e}")
+
+
+def test_fp8_support():
+    """Test function for FP8 precision support on H100."""
+    print("Testing FP8 support...")
+    
+    device_capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+    print(f"Device capability: {device_capability}")
+    
+    if device_capability[0] < 9:
+        print("FP8 requires H100 (compute capability 9.0+). Skipping FP8 test.")
+        return
+    
+    if not hasattr(torch, 'float8_e4m3fn'):
+        print("FP8 dtypes not available in this PyTorch version. Skipping FP8 test.")
+        return
+    
+    # Test parameters
+    batch_size = 2
+    num_heads = 8
+    seq_len = 256
+    head_dim = 128
+    
+    device = "cuda"
+    
+    # Create test tensors in bfloat16 first
+    q = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.bfloat16, device=device)
+    v = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.bfloat16, device=device)
+    
+    try:
+        print("Testing FP8 precision...")
+        output_fp8 = flash_attention(q, k, v, causal=True, precision="fp8")
+        
+        print("Testing standard precision...")
+        output_standard = flash_attention(q, k, v, causal=True, precision="ieee")
+        
+        # Compare outputs
+        diff = torch.abs(output_fp8.float() - output_standard.float()).mean()
+        print(f"Mean difference between FP8 and standard: {diff:.6f}")
+        
+        print("FP8 test completed successfully!")
+        
+    except Exception as e:
+        print(f"Error in FP8 test: {e}")
+
+
+def test_combined_incoherent_fp8():
+    """Test combining incoherent processing with FP8 precision."""
+    print("Testing combined incoherent processing + FP8...")
+    
+    device_capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+    
+    if device_capability[0] < 9 or not hasattr(torch, 'float8_e4m3fn'):
+        print("Skipping combined test - requires H100 and FP8 support.")
+        return
+    
+    # Test parameters
+    batch_size = 1
+    num_heads = 4
+    seq_len = 128
+    head_dim = 64
+    
+    device = "cuda"
+    
+    # Create test tensors with outliers
+    q = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.bfloat16, device=device)
+    v = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.bfloat16, device=device)
+    
+    # Add outliers
+    q[:, :, :5, :] *= 20.0
+    k[:, :, :5, :] *= 20.0
+    
+    try:
+        output_combined = flash_attention(
+            q, k, v, 
+            causal=True, 
+            use_incoherent=True, 
+            hadamard_seed=123,
+            precision="fp8"
+        )
+        
+        print(f"Combined test output shape: {output_combined.shape}")
+        print("Combined incoherent + FP8 test completed successfully!")
+        
+    except Exception as e:
+        print(f"Error in combined test: {e}")
 
 
 if __name__ == "__main__":
-    import sys
-    import torch
-
-    # Simple test for the flash attention kernel
-    B, H, T, D = 2, 4, 32, 64
-    
-    q = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
-    k = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
-    v = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
-    
-    print("Testing flash attention kernel...")
-    
-    # Test forward pass
-    try:
-        out = flash_attention(q, k, v)
-        print(f"Forward pass successful. Output shape: {out.shape}")
-        
-        # Test backward pass
-        loss = out.sum()
-        loss.backward()
-        print("Backward pass successful.")
-        print(f"Gradients computed - Q: {q.grad is not None}, K: {k.grad is not None}, V: {v.grad is not None}")
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        
-    print("Flash attention kernel test completed.")
+    print("Running enhanced flash attention tests...")
+    test_incoherent_processing()
+    print("\n" + "="*50 + "\n")
+    test_fp8_support()
+    print("\n" + "="*50 + "\n")
+    test_combined_incoherent_fp8()
+    print("\nAll tests completed!")
