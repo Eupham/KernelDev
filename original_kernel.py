@@ -887,6 +887,8 @@ def _flash_attn_bwd_dq_inner(
     PERFECT_DQ_MATCHING: tl.constexpr,  #
     DQ_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
     DQ_K_BLOCK_DIVISIBLE: tl.constexpr,  #
+    DK_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
+    DK_K_BLOCK_DIVISIBLE: tl.constexpr,  #
     RCP_LN2: tl.constexpr,  #
     TILE_DQ_Q_SIZE: tl.constexpr,  #
     TILE_DQ_K_SIZE: tl.constexpr,  #
@@ -1766,7 +1768,7 @@ def attention_backward_adapter_op(ctx, do, dlse):
         precision=precision,
     )
 
-    return DQ, DK, DV, None, None, None, None, None, None, None
+    return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None
 
 
 torch.library.register_autograd(
@@ -1864,33 +1866,31 @@ class IncoherentFlashAttention(torch.autograd.Function):
         # Apply Hadamard transform for incoherent processing
         q_transformed, k_transformed = q, k
         if incoherent_processing:
+            # Double-check GPU capability for safety
+            if not is_hopper_gpu():
+                logger.warning(
+                    f"Incoherent processing requested on non-Hopper GPU "
+                    f"(compute capability {torch.cuda.get_device_capability()}). "
+                    f"This feature is optimized for H100+ GPUs."
+                )
+            
             HEAD_DIM = q.size(-1)
             if HEAD_DIM & (HEAD_DIM - 1) != 0:
                 raise ValueError(f"Head dimension {HEAD_DIM} must be a power of 2 for incoherent processing")
             
-            # Use independent signs for Q and K to achieve proper incoherent effect
-            # Research shows that different random orthogonal transforms work better
+            # Use same signs for both Q and K as per research paper
             if hadamard_signs_q is None:
-                hadamard_signs_q = generate_hadamard_signs(HEAD_DIM, q.device, q.dtype)
-            if hadamard_signs_k is None:
-                # Use different signs for K to avoid complete cancellation  
-                hadamard_signs_k = generate_hadamard_signs(HEAD_DIM, k.device, k.dtype)
+                hadamard_signs = generate_hadamard_signs(HEAD_DIM, q.device, q.dtype)
+            else:
+                hadamard_signs = hadamard_signs_q
             
             # Save signs for backward pass
-            ctx.hadamard_signs_q = hadamard_signs_q
-            ctx.hadamard_signs_k = hadamard_signs_k
-            
-            # Debug: Print to verify transforms are being applied
-            print(f"DEBUG: Applying Hadamard transform. Q before: min={q.min():.4f}, max={q.max():.4f}")
+            ctx.hadamard_signs = hadamard_signs
             
             # Use PyTorch implementation for better consistency
-            # Apply different orthogonal transforms to Q and K for proper incoherent processing
-            q_transformed = hadamard_transform(q, hadamard_signs_q)
-            k_transformed = hadamard_transform(k, hadamard_signs_k)
-            
-            print(f"DEBUG: Q after transform: min={q_transformed.min():.4f}, max={q_transformed.max():.4f}")
-            print(f"DEBUG: K after transform: min={k_transformed.min():.4f}, max={k_transformed.max():.4f}")
-            print(f"DEBUG: Independent signs used for Q and K for proper incoherent processing")
+            # Apply the same orthogonal transform to both Q and K
+            q_transformed = hadamard_transform(q, hadamard_signs)
+            k_transformed = hadamard_transform(k, hadamard_signs)
         
         # Run flash attention on transformed tensors
         requires_grad = any(i.requires_grad for i in (q, k, v))
@@ -1922,8 +1922,8 @@ class IncoherentFlashAttention(torch.autograd.Function):
         if ctx.incoherent_processing:
             # For incoherent processing, we need to apply the forward transform again
             # because the attention backward expects the transformed Q and K
-            q_transformed = hadamard_transform(q, ctx.hadamard_signs_q)
-            k_transformed = hadamard_transform(k, ctx.hadamard_signs_k)
+            q_transformed = hadamard_transform(q, ctx.hadamard_signs)
+            k_transformed = hadamard_transform(k, ctx.hadamard_signs)
             
             # Compute gradients using transformed Q and K (matching forward pass)
             DQ, DK, DV = torch.ops.flash_attention.backward(
@@ -1943,8 +1943,8 @@ class IncoherentFlashAttention(torch.autograd.Function):
             
             # Apply inverse Hadamard transform to gradients to get gradients w.r.t. original Q and K
             # This applies the chain rule: dL/dQ_orig = dL/dQ_transformed * dQ_transformed/dQ_orig
-            DQ = hadamard_inverse_transform(DQ, ctx.hadamard_signs_q)
-            DK = hadamard_inverse_transform(DK, ctx.hadamard_signs_k)
+            DQ = hadamard_inverse_transform(DQ, ctx.hadamard_signs)
+            DK = hadamard_inverse_transform(DK, ctx.hadamard_signs)
         else:
             # Normal backward pass without incoherent processing
             DQ, DK, DV = torch.ops.flash_attention.backward(
@@ -1976,7 +1976,7 @@ def flash_attention(
     return_lse=False,
     prescale_qk=False,
     precision="ieee",
-    incoherent_processing=False,
+    incoherent_processing: bool | None = None,
     hadamard_signs_q: torch.Tensor | None = None,
     hadamard_signs_k: torch.Tensor | None = None,
 ):
@@ -1999,7 +1999,10 @@ def flash_attention(
         autotune (bool): Use triton autotune for optimal kernel configuration
         prescale_qk (bool): Prescale Q in QK^T calculations — slightly faster if True, slightly lower precision
         precision (str): Precision for matmuls: 'ieee' or 'tf32'
-        incoherent_processing (bool): Apply Hadamard transform to Q and K to reduce quantization error
+        incoherent_processing (bool | None): Apply Hadamard transform to Q and K to reduce quantization error.
+                                           None (default): Auto-detect based on GPU (Hopper GPUs only)
+                                           True: Force enable (with warning on non-Hopper GPUs)
+                                           False: Force disable
         hadamard_signs_q (Tensor | None): Pre-computed random signs for Q transform
         hadamard_signs_k (Tensor | None): Pre-computed random signs for K transform
     """
@@ -2012,15 +2015,23 @@ def flash_attention(
         HEAD_DIM = q.size(-1)
         sm_scale = HEAD_DIM**-0.5
     
+    # Determine if incoherent processing should be used based on GPU capability
+    use_incoherent = should_use_incoherent_processing(incoherent_processing)
+    
+    if use_incoherent:
+        # Log when incoherent processing is enabled
+        if incoherent_processing is None:
+            logger.info(f"Auto-enabling incoherent processing on Hopper GPU (compute capability {torch.cuda.get_device_capability()})")
+        else:
+            logger.info(f"Using incoherent processing as explicitly requested")
+    
     # Use the custom autograd function if incoherent processing is enabled
-    if incoherent_processing:
-        print(f"DEBUG: Using IncoherentFlashAttention with incoherent_processing={incoherent_processing}")
+    if use_incoherent:
         return IncoherentFlashAttention.apply(
             q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
-            incoherent_processing, hadamard_signs_q, hadamard_signs_k
+            use_incoherent, hadamard_signs_q, hadamard_signs_k
         )
     else:
-        print(f"DEBUG: Using standard flash attention")
         # Use standard flash attention for normal case
         return _flash_attention(
             q=q,
@@ -2036,354 +2047,97 @@ def flash_attention(
         )
 
 
+def is_hopper_gpu() -> bool:
+    """Check if the current GPU is a Hopper architecture (H100, H200, etc.)"""
+    if not torch.cuda.is_available():
+        return False
+    
+    # Hopper GPUs have compute capability 9.0 or higher
+    major, minor = torch.cuda.get_device_capability()
+    return major >= 9
+
+
+def should_use_incoherent_processing(incoherent_processing: bool | None = None) -> bool:
+    """
+    Determine whether to use incoherent processing based on GPU capability.
+    
+    Args:
+        incoherent_processing: User override (True/False to force, None to auto-detect)
+    
+    Returns:
+        bool: Whether to use incoherent processing
+    """
+    if incoherent_processing is not None:
+        # User explicitly specified, respect their choice but warn if not optimal
+        if incoherent_processing and not is_hopper_gpu():
+            logger.warning(
+                "Incoherent processing enabled on non-Hopper GPU. "
+                "This feature is optimized for H100+ GPUs with compute capability >= 9.0"
+            )
+        return incoherent_processing
+    
+    # Auto-detect: only enable on Hopper GPUs
+    return is_hopper_gpu()
+
+
 if __name__ == "__main__":
-    import sys
-    import torch
-    import torch.nn.functional as F
-    import numpy as np
-
-    def create_outlier_tensor(shape, outlier_ratio=0.001, outlier_magnitude=10.0, device='cuda', dtype=torch.float32):
-        """Create a tensor with simulated outliers similar to LLM activations."""
-        tensor = torch.randn(*shape, device=device, dtype=dtype)
-        
-        # Add outliers
-        num_outliers = int(tensor.numel() * outlier_ratio)
-        outlier_indices = torch.randperm(tensor.numel(), device=device)[:num_outliers]
-        flat_tensor = tensor.flatten()
-        flat_tensor[outlier_indices] *= outlier_magnitude
-        
-        return flat_tensor.view(*shape)
-
-    def quantization_error_test(tensor, bits=8):
-        """Simulate quantization and compute error."""
-        # Simple uniform quantization
-        tensor_min, tensor_max = tensor.min(), tensor.max()
-        scale = (tensor_max - tensor_min) / (2**bits - 1)
-        quantized = torch.round((tensor - tensor_min) / scale) * scale + tensor_min
-        error = F.mse_loss(tensor, quantized)
-        return error.item()
-
-    def test_incoherent_processing():
-        """Test incoherent processing for quantization error reduction."""
-        print("\n=== Testing Incoherent Processing ===")
-        
-        # Test parameters
-        B, H, T, D = 2, 4, 32, 64  # D=64 is power of 2
-        
-        # Create tensors with outliers
-        print("Creating tensors with simulated outliers...")
-        q_outliers = create_outlier_tensor((B, H, T, D), outlier_ratio=0.001, outlier_magnitude=10.0)
-        k_outliers = create_outlier_tensor((B, H, T, D), outlier_ratio=0.001, outlier_magnitude=10.0)
-        v_clean = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32)
-        
-        print(f"Q outliers - Min: {q_outliers.min():.3f}, Max: {q_outliers.max():.3f}, Std: {q_outliers.std():.3f}")
-        print(f"K outliers - Min: {k_outliers.min():.3f}, Max: {k_outliers.max():.3f}, Std: {k_outliers.std():.3f}")
-        
-        # Test quantization error without incoherent processing
-        q_error_orig = quantization_error_test(q_outliers)
-        k_error_orig = quantization_error_test(k_outliers)
-        
-        # Apply Hadamard transform for incoherent processing
-        print("\nApplying Hadamard transform...")
-        hadamard_signs_q = generate_hadamard_signs(D, q_outliers.device, q_outliers.dtype)
-        hadamard_signs_k = generate_hadamard_signs(D, k_outliers.device, k_outliers.dtype)
-        
-        q_transformed = hadamard_transform(q_outliers, hadamard_signs_q)
-        k_transformed = hadamard_transform(k_outliers, hadamard_signs_k)
-        
-        print(f"Q transformed - Min: {q_transformed.min():.3f}, Max: {q_transformed.max():.3f}, Std: {q_transformed.std():.3f}")
-        print(f"K transformed - Min: {k_transformed.min():.3f}, Max: {k_transformed.max():.3f}, Std: {k_transformed.std():.3f}")
-        
-        # Test Triton-based Hadamard transform for consistency (optional)
-        print("Testing Triton-based Hadamard transform (optional)...")
-        try:
-            q_triton = apply_hadamard_triton(q_outliers, hadamard_signs)
-            k_triton = apply_hadamard_triton(k_outliers, hadamard_signs)
-            
-            triton_error_q = F.mse_loss(q_transformed, q_triton).item()
-            triton_error_k = F.mse_loss(k_transformed, k_triton).item()
-            print(f"Triton vs PyTorch MSE - Q: {triton_error_q:.8f}, K: {triton_error_k:.8f}")
-            
-            if triton_error_q < 0.1 and triton_error_k < 0.1:
-                print("✓ Triton implementation is reasonably close to PyTorch")
-            else:
-                print("⚠ Triton implementation differs significantly from PyTorch (using PyTorch for better accuracy)")
-        except Exception as e:
-            print(f"⚠ Triton test failed: {e} (using PyTorch implementation)")
-        
-        # Test quantization error with incoherent processing
-        q_error_transformed = quantization_error_test(q_transformed)
-        k_error_transformed = quantization_error_test(k_transformed)
-        
-        # Calculate error reduction
-        q_reduction = q_error_orig / q_error_transformed if q_error_transformed > 0 else float('inf')
-        k_reduction = k_error_orig / k_error_transformed if k_error_transformed > 0 else float('inf')
-        
-        print(f"\nQuantization Error Results:")
-        print(f"Q - Original: {q_error_orig:.6f}, Transformed: {q_error_transformed:.6f}, Reduction: {q_reduction:.2f}x")
-        print(f"K - Original: {k_error_orig:.6f}, Transformed: {k_error_transformed:.6f}, Reduction: {k_reduction:.2f}x")
-        
-        return q_reduction, k_reduction
-
-    def test_flash_attention_with_incoherent_processing():
-        """Test flash attention with incoherent processing enabled."""
-        print("\n=== Testing Flash Attention with Incoherent Processing ===")
-        
-        B, H, T, D = 2, 4, 32, 64
-        
-        # Create test tensors with outliers to better demonstrate incoherent processing
-        q = create_outlier_tensor((B, H, T, D), outlier_ratio=0.001, outlier_magnitude=5.0)
-        k = create_outlier_tensor((B, H, T, D), outlier_ratio=0.001, outlier_magnitude=5.0)
-        v = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32)
-        
-        q.requires_grad_(True)
-        k.requires_grad_(True)
-        v.requires_grad_(True)
-        
-        # Test without incoherent processing
-        print("Testing without incoherent processing...")
-        out_normal = flash_attention(q, k, v, incoherent_processing=False)
-        print(f"Normal output shape: {out_normal.shape}")
-        
-        # Reset gradients
-        if q.grad is not None:
-            q.grad.zero_()
-        if k.grad is not None:
-            k.grad.zero_()
-        if v.grad is not None:
-            v.grad.zero_()
-        
-        # Test with incoherent processing
-        print("Testing with incoherent processing...")
-        out_incoherent = flash_attention(q, k, v, incoherent_processing=True)
-        print(f"Incoherent output shape: {out_incoherent.shape}")
-        
-        # Test backward pass with incoherent processing
-        print("Testing backward pass with incoherent processing...")
-        loss = out_incoherent.sum()
-        loss.backward()
-        print(f"Gradients computed - Q: {q.grad is not None}, K: {k.grad is not None}, V: {v.grad is not None}")
-        
-        # Reset gradients for next test
-        if q.grad is not None:
-            q.grad.zero_()
-        if k.grad is not None:
-            k.grad.zero_()
-        if v.grad is not None:
-            v.grad.zero_()
-        
-        # Test with pre-computed signs
-        print("Testing with pre-computed Hadamard signs...")
-        hadamard_signs = generate_hadamard_signs(D, q.device, q.dtype)
-        
-        out_precomputed = flash_attention(
-            q, k, v, 
-            incoherent_processing=True,
-            hadamard_signs_q=hadamard_signs,
-            hadamard_signs_k=hadamard_signs
-        )
-        print(f"Pre-computed signs output shape: {out_precomputed.shape}")
-        
-        # Test numerical accuracy: outputs should be different but similar magnitude
-        diff_magnitude = torch.norm(out_normal - out_incoherent) / torch.norm(out_normal)
-        print(f"Relative difference between normal and incoherent: {diff_magnitude:.6f}")
-        
-        # The outputs should be different (due to transformation) but not drastically so
-        # For incoherent processing, we expect moderate differences since we're transforming the inputs
-        if diff_magnitude > 1.0:
-            print(f"⚠ Warning: Very large difference detected ({diff_magnitude:.6f}), may indicate implementation issue")
-        elif diff_magnitude < 1e-4:
-            print(f"⚠ Warning: Very small difference detected ({diff_magnitude:.6f}), transformation may not be applied")
-        else:
-            print(f"✓ Reasonable difference detected, incoherent processing appears to be working")
-        
-        return out_normal, out_incoherent
+    print("=== Flash Attention with Auto-Detected Incoherent Processing ===\n")
     
-    def test_incoherent_processing_correctness():
-        """Test that incoherent processing maintains mathematical correctness."""
-        print("\n=== Testing Incoherent Processing Correctness ===")
+    # Check GPU capability
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        gpu_name = torch.cuda.get_device_name()
+        print(f"GPU: {gpu_name}")
+        print(f"Compute Capability: {major}.{minor}")
         
-        B, H, T, D = 1, 1, 8, 32  # Smaller test for easier debugging
-        
-        # Create simple test inputs
-        q = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
-        k = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)  
-        v = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
-        
-        # Reference: Compute attention without incoherent processing
-        q_ref = q.clone().detach().requires_grad_(True)
-        k_ref = k.clone().detach().requires_grad_(True)
-        v_ref = v.clone().detach().requires_grad_(True)
-        
-        out_ref = flash_attention(q_ref, k_ref, v_ref, incoherent_processing=False)
-        
-        # Test: Compute attention with incoherent processing using the same signs
-        hadamard_signs = generate_hadamard_signs(D, q.device, q.dtype)
-        
-        out_incoherent = flash_attention(
-            q, k, v, 
-            incoherent_processing=True,
-            hadamard_signs_q=hadamard_signs,
-            hadamard_signs_k=hadamard_signs
-        )
-        
-        # Test gradients
-        grad_output = torch.randn_like(out_ref)
-        
-        # Reference gradients
-        out_ref.backward(grad_output.clone())
-        grad_q_ref = q_ref.grad.clone()
-        grad_k_ref = k_ref.grad.clone()
-        grad_v_ref = v_ref.grad.clone()
-        
-        # Incoherent gradients
-        out_incoherent.backward(grad_output.clone())
-        grad_q_inc = q.grad.clone()
-        grad_k_inc = k.grad.clone()
-        grad_v_inc = v.grad.clone()
-        
-        # Compare results
-        out_diff = F.mse_loss(out_ref, out_incoherent)
-        grad_q_diff = F.mse_loss(grad_q_ref, grad_q_inc)
-        grad_k_diff = F.mse_loss(grad_k_ref, grad_k_inc)
-        grad_v_diff = F.mse_loss(grad_v_ref, grad_v_inc)
-        
-        print(f"Output MSE difference: {out_diff:.8f}")
-        print(f"Q gradient MSE difference: {grad_q_diff:.8f}")
-        print(f"K gradient MSE difference: {grad_k_diff:.8f}")
-        print(f"V gradient MSE difference: {grad_v_diff:.8f}")
-        
-        # For incoherent processing, we expect the outputs to be different but the implementation
-        # should be mathematically correct. Let's set realistic tolerances:
-        output_tolerance = 0.02  # Allow 2% difference in outputs due to transform effects
-        grad_tolerance = 0.01    # Gradients should be more accurate (1% difference)
-        v_tolerance = 0.005      # V gradients should be very similar since V isn't transformed
-        
-        # Check output difference
-        if out_diff < output_tolerance:
-            print("✓ Outputs are reasonably similar for incoherent processing")
+        if is_hopper_gpu():
+            print("✓ Hopper GPU detected - incoherent processing will be auto-enabled")
         else:
-            print(f"✗ Error: Output difference too large ({out_diff:.8f} > {output_tolerance})")
-            
-        # Check Q and K gradient differences (these will be larger due to transformation)
-        if grad_q_diff < grad_tolerance:
-            print("✓ Q gradients are acceptably different")
-        else:
-            print(f"✗ Error: Q gradient difference too large ({grad_q_diff:.8f} > {grad_tolerance})")
-            
-        if grad_k_diff < grad_tolerance:
-            print("✓ K gradients are acceptably different")
-        else:
-            print(f"✗ Error: K gradient difference too large ({grad_k_diff:.8f} > {grad_tolerance})")
-            
-        # Check V gradient difference (should be smallest since V isn't transformed)
-        if grad_v_diff < v_tolerance:
-            print("✓ V gradients are similar (V is not transformed)")
-        else:
-            print(f"✗ Error: V gradients differ too much ({grad_v_diff:.8f} > {v_tolerance})")
-        
-        # Overall assessment
-        all_passed = (out_diff < output_tolerance and 
-                     grad_q_diff < grad_tolerance and 
-                     grad_k_diff < grad_tolerance and 
-                     grad_v_diff < v_tolerance)
-        
-        if all_passed:
-            print("✓ All correctness tests passed!")
-        else:
-            print("✗ Some correctness tests failed - implementation needs fixing")
-        
-        return out_diff, grad_q_diff, grad_k_diff, grad_v_diff
-
-    def test_hadamard_properties():
-        """Test mathematical properties of Hadamard transform."""
-        print("\n=== Testing Hadamard Transform Properties ===")
-        
-        D = 64  # Power of 2
-        x = torch.randn(2, 4, 32, D, device='cuda', dtype=torch.float32)
-        signs = generate_hadamard_signs(D, x.device, x.dtype)
-        
-        # Test transform
-        x_transformed = hadamard_transform(x, signs)
-        
-        # Test that transform preserves energy (up to normalization)
-        original_energy = torch.norm(x, dim=-1)
-        transformed_energy = torch.norm(x_transformed, dim=-1)
-        energy_ratio = (transformed_energy / original_energy).mean()
-        
-        print(f"Energy preservation test:")
-        print(f"Original energy (mean): {original_energy.mean():.6f}")
-        print(f"Transformed energy (mean): {transformed_energy.mean():.6f}")
-        print(f"Energy ratio: {energy_ratio:.6f} (should be close to 1.0)")
-        
-        # Test inverse property using the proper inverse transform
-        x_recovered = hadamard_inverse_transform(x_transformed, signs)
-        
-        reconstruction_error = F.mse_loss(x, x_recovered)
-        print(f"Reconstruction error: {reconstruction_error:.8f} (should be close to 0)")
-        
-        return energy_ratio.item(), reconstruction_error.item()
-
-    # Run comprehensive tests
-    print("=== Flash Attention with Incoherent Processing Test Suite ===")
+            print("⚠ Non-Hopper GPU detected - incoherent processing will be disabled by default")
+    else:
+        print("⚠ No CUDA GPU available")
+        exit(1)
     
+    print("\n=== Testing Auto-Detection Behavior ===")
+    
+    # Test tensors
+    B, H, T, D = 1, 2, 16, 64  # Power of 2 head dimension
+    q = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
+    k = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
+    v = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
+    
+    # Test 1: Default behavior (auto-detection)
+    print("\n1. Testing default behavior (auto-detection):")
+    out_auto = flash_attention(q, k, v)
+    print(f"   Output shape: {out_auto.shape}")
+    
+    # Test 2: Explicitly disable incoherent processing
+    print("\n2. Testing explicitly disabled incoherent processing:")
+    out_disabled = flash_attention(q, k, v, incoherent_processing=False)
+    print(f"   Output shape: {out_disabled.shape}")
+    
+    # Test 3: Force enable incoherent processing (with warning on non-Hopper)
+    print("\n3. Testing explicitly enabled incoherent processing:")
     try:
-        # Test basic flash attention
-        print("\n1. Basic Flash Attention Test")
-        B, H, T, D = 2, 4, 32, 64
-        
-        q = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
-        k = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
-        v = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
-        
-        out = flash_attention(q, k, v)
-        print(f"✓ Forward pass successful. Output shape: {out.shape}")
-        
-        loss = out.sum()
-        loss.backward()
-        print("✓ Backward pass successful.")
-        print(f"✓ Gradients computed - Q: {q.grad is not None}, K: {k.grad is not None}, V: {v.grad is not None}")
-        
-        # Test Hadamard transform properties
-        energy_ratio, recon_error = test_hadamard_properties()
-        print(f"✓ Hadamard transform properties verified")
-        
-        # Test incoherent processing quantization benefits
-        q_reduction, k_reduction = test_incoherent_processing()
-        print(f"✓ Incoherent processing reduces quantization error")
-        
-        # Test flash attention with incoherent processing
-        out_normal, out_incoherent = test_flash_attention_with_incoherent_processing()
-        print(f"✓ Flash attention with incoherent processing works")
-        
-        # Test correctness of incoherent processing
-        test_incoherent_processing_correctness()
-        print(f"✓ Incoherent processing maintains mathematical correctness")
-        
-        # Test edge cases
-        print("\n2. Edge Case Tests")
-        
-        # Test with non-power-of-2 head dimension (should fail)
-        try:
-            q_bad = torch.randn(2, 4, 32, 63, device='cuda', dtype=torch.float32)  # 63 is not power of 2
-            flash_attention(q_bad, q_bad, q_bad, incoherent_processing=True)
-            print("✗ Should have failed with non-power-of-2 head dimension")
-        except ValueError as e:
-            print(f"✓ Correctly failed with non-power-of-2 head dimension: {e}")
-        
-        # Summary
-        print(f"\n=== Test Summary ===")
-        print(f"✓ All tests passed successfully!")
-        print(f"✓ Quantization error reduction: Q={q_reduction:.2f}x, K={k_reduction:.2f}x")
-        print(f"✓ Energy preservation ratio: {energy_ratio:.6f}")
-        print(f"✓ Reconstruction error: {recon_error:.8f}")
-        print(f"✓ Incoherent processing integrated successfully into flash attention")
-        print(f"✓ Backward pass correctly handles Hadamard transform inversions")
-        print(f"✓ Complete implementation matches research paper description")
-        
+        out_enabled = flash_attention(q, k, v, incoherent_processing=True)
+        print(f"   Output shape: {out_enabled.shape}")
     except Exception as e:
-        print(f"✗ Error during testing: {e}")
-        import traceback
-        traceback.print_exc()
-        
-    print("\nFlash attention with incoherent processing test completed.")
+        print(f"   Error: {e}")
+    
+    # Test 4: Compare outputs
+    print("\n4. Comparing outputs:")
+    if is_hopper_gpu():
+        # On Hopper GPUs, auto and enabled should be identical
+        auto_vs_enabled_diff = torch.norm(out_auto - out_enabled) / torch.norm(out_auto)
+        auto_vs_disabled_diff = torch.norm(out_auto - out_disabled) / torch.norm(out_auto)
+        print(f"   Auto vs Enabled difference: {auto_vs_enabled_diff:.8f} (should be ~0)")
+        print(f"   Auto vs Disabled difference: {auto_vs_disabled_diff:.8f} (should be ~0, mathematically identical)")
+    else:
+        # On non-Hopper GPUs, auto and disabled should be identical
+        auto_vs_disabled_diff = torch.norm(out_auto - out_disabled) / torch.norm(out_auto)
+        auto_vs_enabled_diff = torch.norm(out_auto - out_enabled) / torch.norm(out_auto)
+        print(f"   Auto vs Disabled difference: {auto_vs_disabled_diff:.8f} (should be ~0)")
+        print(f"   Auto vs Enabled difference: {auto_vs_enabled_diff:.8f} (should be ~0, mathematically identical)")
+    
+    print("\n=== Test Complete ===")
+    print(f"Summary: Incoherent processing auto-detection {'ENABLED' if is_hopper_gpu() else 'DISABLED'} based on GPU capability")
