@@ -21,7 +21,7 @@ def load_config(config_path):
     return config
 
 class LearningRateScalingTest:
-    def __init__(self, config_path='config.yaml', batch_size=16):
+    def __init__(self, config_path='KernelDev/config.yaml', batch_size=16):
         self.config = load_config(config_path)
         self.batch_size = batch_size
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -52,19 +52,29 @@ class LearningRateScalingTest:
     def setup_data(self):
         """Set up data for training."""
         print("Setting up data...")
+        # Calculate max samples needed based on largest batch count test
+        max_batch_count = max(self.batch_counts)
+        # Add a 20% buffer to ensure we have enough samples
+        max_samples_needed = max_batch_count * self.batch_size * 1.2
+        print(f"Setting max_samples to {int(max_samples_needed)} based on largest batch count ({max_batch_count})")
+        
         self.data_builder = create_data_builder(
             dataset_name=self.config['data'].get('dataset_name', 'allenai/c4'),
             dataset_config=self.config['data'].get('dataset_config', 'en'),
             seq_len=self.seq_len,
-            max_samples=self.config['data'].get('max_samples', 1000000),
+            max_samples=int(max_samples_needed),
             max_eval_tokens=self.config['data'].get('max_eval_tokens', 50000)
         )
         
-        train_dataset, _ = self.data_builder.build_datasets()
+        # Create datasets using the proper method
+        datasets = self.data_builder.create_datasets()
+        
+        if 'train' not in datasets or not datasets['train']:
+            raise RuntimeError("Failed to create training dataset")
         
         # Create DataLoader with fixed batch size
         self.train_loader = torch.utils.data.DataLoader(
-            train_dataset,
+            datasets['train'],
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=0
@@ -267,7 +277,7 @@ class LearningRateScalingTest:
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Learning Rate Scaling Law Test')
-    parser.add_argument('--config', type=str, default='config.yaml',
+    parser.add_argument('--config', type=str, default='KernelDev/config.yaml',
                         help='Path to configuration file')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Batch size to use for testing (default: 16)')
