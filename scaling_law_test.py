@@ -118,20 +118,28 @@ class LearningRateScalingTest:
             try:
                 # Get batch data (cycling through dataloader if needed)
                 try:
-                    x, y = next(iter_loader)
+                    batch = next(iter_loader)
                 except StopIteration:
                     iter_loader = iter(self.train_loader)
-                    x, y = next(iter_loader)
+                    batch = next(iter_loader)
+                
+                # Check how many elements are in the batch
+                if isinstance(batch, tuple) and len(batch) == 2:
+                    x, y = batch
+                else:
+                    print(f"Unexpected batch format: {type(batch)}")
+                    continue
                 
                 x, y = x.to(self.device), y.to(self.device)
                 
                 # Forward pass
                 optimizer.zero_grad()
                 logits = model(x)
-                loss = torch.nn.functional.cross_entropy(
-                    logits.view(-1, self.vocab_size),
-                    y.view(-1)
-                )
+                # Ensure dimensions are correct for cross_entropy
+                logits = logits.view(-1, logits.size(-1))  # Reshape to (batch*seq_len, vocab_size)
+                y = y.view(-1)  # Reshape to (batch*seq_len)
+                
+                loss = torch.nn.functional.cross_entropy(logits, y)
                 
                 # Backward pass and optimizer step
                 loss.backward()
