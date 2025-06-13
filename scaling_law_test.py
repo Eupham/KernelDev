@@ -21,7 +21,7 @@ def load_config(config_path):
     return config
 
 class LearningRateScalingTest:
-    def __init__(self, config_path='config.yaml', batch_size=16):
+    def __init__(self, config_path='KernelDev/config.yaml', batch_size=16):
         self.config = load_config(config_path)
         self.batch_size = batch_size
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -134,12 +134,16 @@ class LearningRateScalingTest:
                 
                 # Forward pass
                 optimizer.zero_grad()
-                logits = model(x)
-                # Ensure dimensions are correct for cross_entropy
-                logits = logits.view(-1, logits.size(-1))  # Reshape to (batch*seq_len, vocab_size)
-                y = y.view(-1)  # Reshape to (batch*seq_len)
                 
-                loss = torch.nn.functional.cross_entropy(logits, y)
+                # The model expects x and optionally targets, and returns logits and loss
+                logits, loss = model(x, targets=y)
+                
+                # If loss is None, compute it manually
+                if loss is None:
+                    # Ensure dimensions are correct for cross_entropy
+                    logits_flat = logits.view(-1, logits.size(-1))  # Reshape to (batch*seq_len, vocab_size)
+                    y_flat = y.view(-1)  # Reshape to (batch*seq_len)
+                    loss = torch.nn.functional.cross_entropy(logits_flat, y_flat)
                 
                 # Backward pass and optimizer step
                 loss.backward()
@@ -285,7 +289,7 @@ class LearningRateScalingTest:
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Learning Rate Scaling Law Test')
-    parser.add_argument('--config', type=str, default='config.yaml',
+    parser.add_argument('--config', type=str, default='KernelDev/config.yaml',
                         help='Path to configuration file')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Batch size to use for testing (default: 16)')
