@@ -57,7 +57,6 @@ class LearningRateScalingTest:
             dataset_config=self.config['data'].get('dataset_config', 'en'),
             seq_len=self.seq_len,
             max_samples=self.config['data'].get('max_samples', 1000000),
-            vocab_size=self.vocab_size,
             max_eval_tokens=self.config['data'].get('max_eval_tokens', 50000)
         )
         
