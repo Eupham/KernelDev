@@ -1,333 +1,360 @@
+#!/usr/bin/env python3
+"""
+Scaling Law Test Script for Learning Rate Optimization
+
+This script tests different learning rates with varying batch sizes to find
+the optimal learning rate for a given model size based on the configuration
+in config.yaml.
+"""
+
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import yaml
-import argparse
 import os
-from pathlib import Path
 import time
-import json
-from tqdm import tqdm
+import argparse
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+from collections import defaultdict
 
 # Import our custom modules
 from model import GPTModel
 from data_builder import create_data_builder
-from train_loop import TrainingConfig
+from train_loop import Trainer, TrainingConfig
 
-def load_config(config_path):
+# Set random seeds for reproducibility
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+def load_config(config_path: str) -> Dict[str, Any]:
     """Load configuration from YAML file."""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        print(f"Configuration loaded from: {config_path}")
+        return config
+    except FileNotFoundError:
+        print(f"Configuration file not found: {config_path}")
+        return {}
+    except yaml.YAMLError as e:
+        print(f"Error parsing YAML configuration: {e}")
+        return {}
 
-class LearningRateScalingTest:
-    def __init__(self, config_path='KernelDev/config.yaml', batch_size=16):
-        self.config = load_config(config_path)
-        self.batch_size = batch_size
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # Model parameters from config.yaml
-        self.model_dim = self.config['model']['dim']
-        self.n_layers = self.config['model']['n_layers']
-        self.n_heads = self.config['model']['n_heads']
-        self.vocab_size = self.config['model']['vocab_size']
-        self.seq_len = self.config['data']['seq_len']
-        
-        # Learning rates to test (logarithmic scale)
-        self.learning_rates = [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
-        
-        # Batch counts to test
-        self.batch_counts = [10, 100, 1000]
-        
-        # Setup data (after batch_counts is defined)
-        self.setup_data()
-        
-        # Results storage
-        self.results = {}
-        
-        # Output directory
-        self.output_dir = Path("scaling_law_results")
-        self.output_dir.mkdir(exist_ok=True)
-    
-    def setup_data(self):
-        """Set up data for training."""
-        print("Setting up data...")
-        # Calculate max samples needed based on largest batch count test
-        max_batch_count = max(self.batch_counts)
-        # Add a 20% buffer to ensure we have enough samples
-        max_samples_needed = max_batch_count * self.batch_size * 1.2
-        print(f"Setting max_samples to {int(max_samples_needed)} based on largest batch count ({max_batch_count})")
-        
-        self.data_builder = create_data_builder(
-            dataset_name=self.config['data'].get('dataset_name', 'allenai/c4'),
-            dataset_config=self.config['data'].get('dataset_config', 'en'),
-            seq_len=self.seq_len,
-            max_samples=int(max_samples_needed),
-            max_eval_tokens=self.config['data'].get('max_eval_tokens', 50000)
-        )
-        
-        # Create datasets using the proper method
-        datasets = self.data_builder.create_datasets()
-        
-        if 'train' not in datasets or not datasets['train']:
-            raise RuntimeError("Failed to create training dataset")
-        
-        # Create DataLoader with fixed batch size
-        self.train_loader = torch.utils.data.DataLoader(
-            datasets['train'],
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=0
-        )
-    
-    def setup_model(self):
-        """Create and initialize the model."""
-        print(f"Setting up model with dim={self.model_dim}, layers={self.n_layers}, heads={self.n_heads}...")
-        model = GPTModel(
-            vocab_size=self.vocab_size,
-            dim=self.model_dim,
-            n_layers=self.n_layers,
-            n_heads=self.n_heads,
-            max_seq_len=self.seq_len,
-            mlp_ratio=self.config['model'].get('mlp_ratio', 4),
-            causal=self.config['model'].get('causal', True)
-        ).to(self.device)
-        return model
-    
-    def test_learning_rate(self, model, learning_rate, num_batches):
-        """Test a specific learning rate for a specific number of batches."""
-        print(f"Testing learning_rate={learning_rate}, batches={num_batches}")
-        
-        # Reset model weights to ensure fair comparison
-        model.apply(self._reset_parameters)
-        
-        # Setup optimizer
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            weight_decay=self.config['training'].get('weight_decay', 0.01)
-        )
-        
-        # Training loop
-        model.train()
-        losses = []
-        
-        # Use tqdm for progress tracking
-        iter_loader = iter(self.train_loader)
-        for batch_idx in tqdm(range(num_batches), desc=f"LR={learning_rate}, Batches={num_batches}"):
-            try:
-                # Get batch data (cycling through dataloader if needed)
-                try:
-                    batch = next(iter_loader)
-                except StopIteration:
-                    iter_loader = iter(self.train_loader)
-                    batch = next(iter_loader)
-                
-                # Check how many elements are in the batch
-                if isinstance(batch, tuple) and len(batch) == 2:
-                    x, y = batch
-                else:
-                    print(f"Unexpected batch format: {type(batch)}")
-                    continue
-                
-                x, y = x.to(self.device), y.to(self.device)
-                
-                # Forward pass
-                optimizer.zero_grad()
-                
-                # The model expects x and optionally targets, and returns logits and loss
-                logits, loss = model(x, targets=y)
-                
-                # If loss is None, compute it manually
-                if loss is None:
-                    # Ensure dimensions are correct for cross_entropy
-                    logits_flat = logits.view(-1, logits.size(-1))  # Reshape to (batch*seq_len, vocab_size)
-                    y_flat = y.view(-1)  # Reshape to (batch*seq_len)
-                    loss = torch.nn.functional.cross_entropy(logits_flat, y_flat)
-                
-                # Backward pass and optimizer step
-                loss.backward()
-                optimizer.step()
-                
-                losses.append(loss.item())
-                
-            except Exception as e:
-                print(f"Error during training batch {batch_idx}: {e}")
-                break
-        
-        # Return metrics
-        return {
-            'mean_loss': np.mean(losses),
-            'final_loss': losses[-1] if losses else float('inf'),
-            'min_loss': np.min(losses) if losses else float('inf'),
-            'losses': losses
-        }
-    
-    def _reset_parameters(self, module):
-        """Reset model parameters for fair comparison between runs."""
-        if hasattr(module, 'reset_parameters'):
-            module.reset_parameters()
-    
-    def run_experiments(self):
-        """Run all learning rate scaling experiments."""
-        self.results = {}
-        
-        # For each batch count
-        for batch_count in self.batch_counts:
-            self.results[batch_count] = {}
-            
-            # Create a fresh model
-            model = self.setup_model()
-            
-            # Test each learning rate
-            for lr in self.learning_rates:
-                try:
-                    result = self.test_learning_rate(model, lr, batch_count)
-                    self.results[batch_count][lr] = result
-                except Exception as e:
-                    print(f"Error testing LR={lr}, batches={batch_count}: {e}")
-                    self.results[batch_count][lr] = {"error": str(e)}
-            
-            # Save intermediate results
-            self.save_results(f"intermediate_results_batches_{batch_count}.json")
-        
-        # Save final results
-        self.save_results("final_results.json")
-        
-        # Plot results
-        self.plot_results()
-    
-    def save_results(self, filename):
-        """Save results to a JSON file."""
-        # Convert learning rates from float to strings for JSON serialization
-        serializable_results = {}
-        
-        for batch_count, lr_results in self.results.items():
-            serializable_results[str(batch_count)] = {}
-            for lr, metrics in lr_results.items():
-                serializable_results[str(batch_count)][str(lr)] = {
-                    k: v if not isinstance(v, list) else v[:10]  # Only store first 10 loss values
-                    for k, v in metrics.items()
-                }
-        
-        output_path = self.output_dir / filename
-        with open(output_path, 'w') as f:
-            json.dump(serializable_results, f, indent=2)
-        
-        print(f"Results saved to {output_path}")
-    
-    def plot_results(self):
-        """Plot learning rate scaling results."""
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        
-        # Plot final loss vs learning rate for each batch count
-        for i, batch_count in enumerate(self.batch_counts):
-            lr_values = []
-            final_losses = []
-            
-            for lr, metrics in self.results[batch_count].items():
-                if 'final_loss' in metrics:
-                    lr_values.append(lr)
-                    final_losses.append(metrics['final_loss'])
-            
-            if lr_values:
-                axes[i].semilogx(lr_values, final_losses, '-o', linewidth=2)
-                axes[i].set_xlabel('Learning Rate')
-                axes[i].set_ylabel('Final Loss')
-                axes[i].set_title(f'Batch Count: {batch_count}')
-                axes[i].grid(True, which="both", ls="-")
-        
-        plt.tight_layout()
-        plt.savefig(self.output_dir / "learning_rate_scaling.png")
-        plt.close()
-        
-        # Plot learning curves for each batch count
-        for batch_count in self.batch_counts:
-            plt.figure(figsize=(10, 6))
-            
-            for lr, metrics in self.results[batch_count].items():
-                if 'losses' in metrics and metrics['losses']:
-                    plt.plot(metrics['losses'], label=f'LR: {lr}')
-            
-            plt.xlabel('Batch')
-            plt.ylabel('Loss')
-            plt.title(f'Learning Curves for {batch_count} Batches')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(self.output_dir / f"learning_curves_{batch_count}_batches.png")
-            plt.close()
-    
-    def find_optimal_learning_rate(self):
-        """Find the optimal learning rate based on results."""
-        optimal_lrs = {}
-        
-        for batch_count in self.batch_counts:
-            best_lr = None
-            best_loss = float('inf')
-            
-            for lr, metrics in self.results[batch_count].items():
-                if 'final_loss' in metrics and metrics['final_loss'] < best_loss:
-                    best_loss = metrics['final_loss']
-                    best_lr = lr
-            
-            if best_lr is not None:
-                optimal_lrs[batch_count] = {
-                    'learning_rate': best_lr,
-                    'final_loss': best_loss
-                }
-        
-        # Save optimal learning rates
-        with open(self.output_dir / "optimal_learning_rates.json", 'w') as f:
-            json.dump(optimal_lrs, f, indent=2)
-        
-        print("Optimal Learning Rates:")
-        for batch_count, info in optimal_lrs.items():
-            print(f"Batch Count: {batch_count}, Optimal LR: {info['learning_rate']}, Loss: {info['final_loss']:.6f}")
-        
-        return optimal_lrs
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Learning Rate Scaling Law Test')
-    parser.add_argument('--config', type=str, default='KernelDev/config.yaml',
-                        help='Path to configuration file')
-    parser.add_argument('--batch-size', type=int, default=16,
-                        help='Batch size to use for testing (default: 16)')
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    
-    print(f"Running Learning Rate Scaling Test with:")
-    print(f"- Config file: {args.config}")
-    print(f"- Batch size: {args.batch_size}")
-    print(f"- Will test batch counts: [10, 100, 1000]")
-    print(f"- Learning rates to test: [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]")
-    
-    start_time = time.time()
-    
-    # Run the scaling law test
-    test = LearningRateScalingTest(
-        config_path=args.config,
-        batch_size=args.batch_size
+def evaluate_learning_rate(
+    model: GPTModel,
+    data_builder,
+    batch_size: int,
+    num_batches: int,
+    learning_rate: float,
+    device: str,
+    config: Dict[str, Any]
+) -> float:
+    """
+    Train a model with specified learning rate and evaluate its performance.
+    Returns the average loss over the last 10% of training.
+    """
+    # Create training config with specified learning rate
+    training_config = TrainingConfig(
+        num_epochs=1,  # Just one epoch for quick testing
+        learning_rate=learning_rate,
+        weight_decay=config['training']['weight_decay'],
+        warmup_steps=min(10, num_batches // 10),  # 10% of batches or 10 steps, whichever is smaller
+        max_grad_norm=config['training']['max_grad_norm'],
+        save_every=num_batches + 1,  # Don't save checkpoints during scaling tests
+        eval_every=num_batches + 1,  # Don't evaluate during scaling tests
+        log_every=num_batches // 5,  # Log 5 times during the run
+        checkpoint_dir=None,  # Don't save checkpoints
+        device=device,
     )
-    test.run_experiments()
     
-    # Find optimal learning rates
-    optimal_lrs = test.find_optimal_learning_rate()
+    # Reset model parameters
+    for param in model.parameters():
+        if param.dim() > 1:
+            torch.nn.init.xavier_uniform_(param)
+        else:
+            torch.nn.init.zeros_(param)
+            
+    # Create optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=config['training']['weight_decay']
+    )
     
-    # Print summary
-    print("\n" + "="*50)
-    print("Learning Rate Scaling Test Complete")
-    print(f"Total time: {(time.time() - start_time)/60:.2f} minutes")
+    # Training loop
+    model.train()
+    losses = []
+    
+    for step in range(num_batches):
+        # Get a batch of data
+        batch = next(iter(data_builder.get_train_dataloader(batch_size)))
+        input_ids = batch['input_ids'].to(device)
+        
+        # Forward pass
+        outputs = model(input_ids)
+        logits = outputs.logits
+        
+        # Compute loss (shift logits and labels for next-token prediction)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1)
+        )
+        
+        # Backward pass and optimize
+        loss.backward()
+        if config['training']['max_grad_norm'] > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['max_grad_norm'])
+        optimizer.step()
+        optimizer.zero_grad()
+        
+        losses.append(loss.item())
+        
+        if (step+1) % training_config.log_every == 0:
+            print(f"Batch: {step+1}/{num_batches}, LR: {learning_rate}, Loss: {loss.item():.4f}")
+    
+    # Return average loss over the last 10% of training
+    return np.mean(losses[-max(1, num_batches // 10):])
+
+def run_scaling_law_test(
+    config_path: str = "KernelDev/config.yaml",
+    learning_rates: List[float] = None,
+    batch_sizes: List[int] = None,
+    num_batches_list: List[int] = None,
+    output_dir: str = "scaling_results"
+):
+    """
+    Run scaling law tests to find optimal learning rate for different batch sizes.
+    
+    Args:
+        config_path: Path to the configuration YAML file
+        learning_rates: List of learning rates to test
+        batch_sizes: List of batch sizes to test
+        num_batches_list: List of number of batches to run for each experiment
+        output_dir: Directory to save results
+    """
+    # Load configuration
+    config = load_config(config_path)
+    
+    # Set default values if not provided
+    if learning_rates is None:
+        # Test a reasonable range of learning rates (log scale)
+        learning_rates = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
+    
+    if batch_sizes is None:
+        batch_sizes = [16]  # Default batch size
+    
+    if num_batches_list is None:
+        num_batches_list = [10, 100, 1000]  # Default number of batches to test
+    
+    # Set device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    # Create data builder
+    data_config = config['data']
+    data_builder = create_data_builder(
+        dataset_name=data_config['dataset_name'],
+        dataset_config=data_config['dataset_config'],
+        seq_len=data_config['seq_len'],
+        max_samples=data_config['max_samples'],
+        vocab_size=config['model']['vocab_size']
+    )
+    
+    # Create model
+    model_config = config['model']
+    model = GPTModel(
+        vocab_size=data_builder.vocab_size,  # Use actual vocab size from data builder
+        dim=model_config['dim'],
+        n_layers=model_config['n_layers'],
+        n_heads=model_config['n_heads'],
+        max_seq_len=model_config['max_seq_len'],
+        mlp_ratio=model_config['mlp_ratio'],
+        causal=model_config['causal']
+    ).to(device)
+    
+    print(f"Model size: {sum(p.numel() for p in model.parameters()):,} parameters")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Run tests for each combination of batch size and number of batches
+    results = {}
+    best_configs = {}
+    
+    for batch_size in batch_sizes:
+        print(f"\n{'='*80}\nTesting with batch size: {batch_size}\n{'='*80}")
+        
+        for num_batches in num_batches_list:
+            print(f"\n{'-'*50}\nRunning {num_batches} batches\n{'-'*50}")
+            
+            experiment_losses = []
+            
+            for lr in learning_rates:
+                print(f"\nTesting learning rate: {lr}")
+                start_time = time.time()
+                
+                # Evaluate this learning rate
+                avg_loss = evaluate_learning_rate(
+                    model=model,
+                    data_builder=data_builder,
+                    batch_size=batch_size,
+                    num_batches=num_batches,
+                    learning_rate=lr,
+                    device=device,
+                    config=config
+                )
+                
+                duration = time.time() - start_time
+                experiment_losses.append((lr, avg_loss))
+                
+                print(f"Learning rate: {lr}, Avg Loss: {avg_loss:.6f}, Time: {duration:.2f}s")
+            
+            # Find best learning rate for this configuration
+            best_lr, best_loss = min(experiment_losses, key=lambda x: x[1])
+            print(f"\nBest learning rate for {num_batches} batches of size {batch_size}: {best_lr} (loss: {best_loss:.6f})")
+            
+            # Store results
+            experiment_key = f"batch_size_{batch_size}_num_batches_{num_batches}"
+            results[experiment_key] = experiment_losses
+            best_configs[experiment_key] = (best_lr, best_loss)
+    
+    # Save results
+    results_file = os.path.join(output_dir, "scaling_law_results.npz")
+    np.savez(results_file, 
+             learning_rates=np.array(learning_rates),
+             batch_sizes=np.array(batch_sizes),
+             num_batches_list=np.array(num_batches_list),
+             results=results,
+             best_configs=best_configs)
+    
+    # Create plots
+    create_scaling_plots(results, learning_rates, batch_sizes, num_batches_list, output_dir)
+    
+    # Print summary of optimal learning rates
+    print("\n\n" + "="*50)
+    print("SCALING LAW TEST RESULTS SUMMARY")
     print("="*50)
     
-    # Print model size info
-    print(f"\nModel Configuration:")
-    print(f"- Dimension: {test.model_dim}")
-    print(f"- Layers: {test.n_layers}")
-    print(f"- Heads: {test.n_heads}")
-    print(f"- Total parameters: ~{test.model_dim * test.n_layers * test.model_dim * 4 / 10**6:.2f}M")
+    for batch_size in batch_sizes:
+        for num_batches in num_batches_list:
+            key = f"batch_size_{batch_size}_num_batches_{num_batches}"
+            best_lr, best_loss = best_configs[key]
+            print(f"Batch Size: {batch_size}, Batches: {num_batches}, Best LR: {best_lr}, Loss: {best_loss:.6f}")
     
-    print("\nResults saved in: scaling_law_results/")
+    # Final recommendation based on largest experiment
+    final_key = f"batch_size_{batch_sizes[0]}_num_batches_{max(num_batches_list)}"
+    final_best_lr, _ = best_configs[final_key]
+    
+    print("\n" + "="*50)
+    print(f"RECOMMENDED LEARNING RATE: {final_best_lr}")
+    print("="*50)
+    
+    return results, best_configs
+
+def create_scaling_plots(results, learning_rates, batch_sizes, num_batches_list, output_dir):
+    """Create plots visualizing the scaling law test results."""
+    # Create figure for each batch size
+    for batch_size in batch_sizes:
+        plt.figure(figsize=(12, 8))
+        
+        for num_batches in num_batches_list:
+            key = f"batch_size_{batch_size}_num_batches_{num_batches}"
+            if key in results:
+                lr_values = [item[0] for item in results[key]]
+                loss_values = [item[1] for item in results[key]]
+                
+                plt.plot(lr_values, loss_values, 'o-', label=f"{num_batches} batches")
+                
+        plt.xscale('log')  # Learning rates on log scale
+        plt.xlabel('Learning Rate')
+        plt.ylabel('Loss')
+        plt.title(f'Learning Rate vs. Loss (Batch Size: {batch_size})')
+        plt.legend()
+        plt.grid(True, which="both", ls="--", alpha=0.3)
+        
+        # Find optimal point and mark it
+        best_lr = None
+        best_loss = float('inf')
+        best_num_batches = None
+        
+        for num_batches in num_batches_list:
+            key = f"batch_size_{batch_size}_num_batches_{num_batches}"
+            if key in results:
+                min_loss_idx = np.argmin([item[1] for item in results[key]])
+                lr, loss = results[key][min_loss_idx]
+                
+                if loss < best_loss:
+                    best_loss = loss
+                    best_lr = lr
+                    best_num_batches = num_batches
+                
+                plt.scatter([lr], [loss], marker='*', s=200, 
+                           label=f'Best LR for {num_batches}: {lr}', zorder=5)
+        
+        plt.axvline(x=best_lr, color='r', linestyle='--', alpha=0.3,
+                   label=f'Overall Best LR: {best_lr}')
+        
+        plt.tight_layout()
+        plot_path = os.path.join(output_dir, f'scaling_law_batch_{batch_size}.png')
+        plt.savefig(plot_path)
+        print(f"Plot saved to {plot_path}")
+    
+    # Create 3D surface plot if we have multiple batch sizes
+    if len(batch_sizes) > 1 and len(num_batches_list) > 1:
+        try:
+            from mpl_toolkits.mplot3d import Axes3D
+            
+            fig = plt.figure(figsize=(15, 10))
+            ax = fig.add_subplot(111, projection='3d')
+            
+            # Prepare data for 3D plotting
+            X, Y, Z = [], [], []
+            
+            for batch_size in batch_sizes:
+                for num_batches in num_batches_list:
+                    key = f"batch_size_{batch_size}_num_batches_{num_batches}"
+                    if key in results:
+                        for lr, loss in results[key]:
+                            X.append(np.log10(lr))  # log10 of learning rate
+                            Y.append(np.log10(batch_size * num_batches))  # log10 of total tokens
+                            Z.append(loss)
+            
+            # Create the 3D scatter plot
+            ax.scatter(X, Y, Z, c=Z, cmap='viridis', s=50)
+            
+            ax.set_xlabel('Log10 Learning Rate')
+            ax.set_ylabel('Log10 Total Tokens')
+            ax.set_zlabel('Loss')
+            ax.set_title('Scaling Law: Loss vs Learning Rate and Training Size')
+            
+            plot_path = os.path.join(output_dir, 'scaling_law_3d.png')
+            plt.savefig(plot_path)
+            print(f"3D plot saved to {plot_path}")
+            
+        except ImportError:
+            print("3D plotting requires mpl_toolkits.mplot3d")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run scaling law tests for learning rate optimization")
+    parser.add_argument('--config', default='KernelDev/config.yaml', help='Path to configuration YAML file')
+    parser.add_argument('--output-dir', default='scaling_results', help='Directory to save results')
+    parser.add_argument('--batch-size', default=16, type=int, help='Batch size to use for testing')
+    args = parser.parse_args()
+    
+    # Set default parameters
+    learning_rates = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
+    batch_sizes = [args.batch_size]  # Use the specified batch size
+    num_batches_list = [10, 100, 1000]  # As requested in the task
+    
+    run_scaling_law_test(
+        config_path=args.config,
+        learning_rates=learning_rates,
+        batch_sizes=batch_sizes,
+        num_batches_list=num_batches_list,
+        output_dir=args.output_dir
+    )
