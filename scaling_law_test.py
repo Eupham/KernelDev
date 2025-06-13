@@ -21,7 +21,7 @@ def load_config(config_path):
     return config
 
 class LearningRateScalingTest:
-    def __init__(self, config_path='KernelDev/config.yaml', batch_size=16):
+    def __init__(self, config_path='config.yaml', batch_size=16):
         self.config = load_config(config_path)
         self.batch_size = batch_size
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -33,14 +33,14 @@ class LearningRateScalingTest:
         self.vocab_size = self.config['model']['vocab_size']
         self.seq_len = self.config['data']['seq_len']
         
-        # Setup data
-        self.setup_data()
-        
         # Learning rates to test (logarithmic scale)
         self.learning_rates = [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
         
         # Batch counts to test
         self.batch_counts = [10, 100, 1000]
+        
+        # Setup data (after batch_counts is defined)
+        self.setup_data()
         
         # Results storage
         self.results = {}
@@ -277,7 +277,7 @@ class LearningRateScalingTest:
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Learning Rate Scaling Law Test')
-    parser.add_argument('--config', type=str, default='KernelDev/config.yaml',
+    parser.add_argument('--config', type=str, default='config.yaml',
                         help='Path to configuration file')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Batch size to use for testing (default: 16)')
