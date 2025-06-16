@@ -36,7 +36,15 @@ class TrainingConfig:
         inference_max_length: int = 100,
         inference_temperature: float = 0.8,
         inference_top_k: int = 50,
-        inference_top_p: float = 0.9
+        inference_top_p: float = 0.9,
+        # Plateau detection parameters
+        plateau_monitor_metric: str = 'val_loss',
+        plateau_patience: int = 10,
+        plateau_threshold: float = 1e-4,
+        plateau_mode: str = 'min',
+        # Scheduler parameters
+        scheduler_T0_epoch_fraction: float = 0.1,
+        scheduler_T_mult: int = 1
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -56,6 +64,16 @@ class TrainingConfig:
         self.inference_temperature = inference_temperature
         self.inference_top_k = inference_top_k
         self.inference_top_p = inference_top_p
+
+        # Plateau detection parameters
+        self.plateau_monitor_metric = plateau_monitor_metric
+        self.plateau_patience = plateau_patience
+        self.plateau_threshold = plateau_threshold
+        self.plateau_mode = plateau_mode
+
+        # Scheduler parameters
+        self.scheduler_T0_epoch_fraction = scheduler_T0_epoch_fraction
+        self.scheduler_T_mult = scheduler_T_mult
         
         # Auto-detect device
         if device == "auto":
@@ -195,6 +213,11 @@ class Trainer:
         self.metrics = TrainingMetrics()
         self.is_distributed = False # Will be set by init_distributed
 
+        # Initialize plateau tracking attributes
+        self.plateau_patience_counter: int = 0
+        self.plateau_best_metric_val: float = float('inf') if self.config.plateau_mode == 'min' else float('-inf')
+        self.steps_per_epoch: Optional[int] = None
+
         # Initialize distributed training
         init_distributed(self)
 
@@ -217,10 +240,12 @@ class Trainer:
         )
         
         # Initialize learning rate scheduler
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        self.initial_lr = self.config.learning_rate
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            T_max=config.num_epochs * 1000,  # Approximate steps
-            eta_min=config.learning_rate * 0.1
+            T_0=self.config.warmup_steps, # Placeholder T_0, will be updated
+            T_mult=self.config.scheduler_T_mult,
+            eta_min=self.initial_lr * 0.1 # eta_min based on initial_lr
         )
         
         print(f"Trainer initialized on device: {self.config.device}")
@@ -468,6 +493,46 @@ class Trainer:
                 
                 if is_best: # save_checkpoint itself is rank 0 guarded
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
+
+                # Plateau detection logic
+                current_metric_val = val_loss # Assuming val_loss is the metric for now
+
+                improved = False
+                if self.config.plateau_mode == 'min':
+                    if current_metric_val < self.plateau_best_metric_val - self.config.plateau_threshold:
+                        improved = True
+                elif self.config.plateau_mode == 'max':
+                    if current_metric_val > self.plateau_best_metric_val + self.config.plateau_threshold:
+                        improved = True
+
+                if improved:
+                    self.plateau_best_metric_val = current_metric_val
+                    self.plateau_patience_counter = 0
+                    print(f"Metric improved to {current_metric_val:.4f}. Resetting plateau patience.")
+                else:
+                    self.plateau_patience_counter += 1
+                    print(f"Metric did not improve significantly. Plateau patience: {self.plateau_patience_counter}/{self.config.plateau_patience}")
+
+                if self.plateau_patience_counter >= self.config.plateau_patience:
+                    print(f"Plateau detected! Metric did not improve for {self.config.plateau_patience} evaluations.")
+                    self.plateau_patience_counter = 0 # Reset counter
+
+                    if self.steps_per_epoch is None:
+                        print("Error: self.steps_per_epoch is not set. Cannot re-initialize scheduler correctly.")
+                    else:
+                        new_T0 = math.ceil(self.steps_per_epoch * self.config.scheduler_T0_epoch_fraction)
+                        if new_T0 < 1: new_T0 = 1
+
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = self.initial_lr
+
+                        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                            self.optimizer,
+                            T_0=new_T0,
+                            T_mult=self.config.scheduler_T_mult,
+                            eta_min=self.config.learning_rate * 0.1 # Or a configured value
+                        )
+                        print(f"Scheduler re-initialized due to plateau. New T_0 = {new_T0}. LR reset to {self.initial_lr:.6f}")
             
             # Regular checkpoint saving & inference (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
@@ -545,6 +610,25 @@ class Trainer:
             print(f"Training batches per epoch (Rank 0 view): {len(train_loader)}")
             if val_loader:
                 print(f"Validation batches (Rank 0 view): {len(val_loader)}")
+
+        # Calculate steps_per_epoch and re-initialize scheduler
+        self.steps_per_epoch = len(train_loader)
+        if not self.is_distributed or dist.get_rank() == 0:
+            print(f"Calculated steps_per_epoch: {self.steps_per_epoch}")
+
+        new_T0 = math.ceil(self.steps_per_epoch * self.config.scheduler_T0_epoch_fraction)
+        if new_T0 < 1: # Ensure T_0 is at least 1
+            print(f"Warning: Calculated T_0 ({new_T0}) is less than 1. Setting to 1.")
+            new_T0 = 1
+
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=new_T0,
+            T_mult=self.config.scheduler_T_mult,
+            eta_min=self.config.learning_rate * 0.1 # Assuming 0.1 factor for eta_min
+        )
+        if not self.is_distributed or dist.get_rank() == 0:
+            print(f"Scheduler re-initialized with T_0 = {new_T0} based on steps_per_epoch.")
         
         # Initial evaluation (only on rank 0)
         if val_loader and (not self.is_distributed or dist.get_rank() == 0):
