@@ -379,12 +379,24 @@ def start_actual_training(cli_args):
     
     # Initial evaluation
     print(f"\n=== Initial Evaluation ===")
+    initial_train_combined_loss, initial_val_combined_loss = None, None # Ensure they exist for later comparison
     if 'train' in dataloaders and 'validation' in dataloaders:
         max_eval_batches = eval_cfg.get('max_eval_batches', 10)
-        initial_train_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
-        initial_val_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
-        print(f"Initial training loss: {initial_train_loss:.4f}")
-        print(f"Initial validation loss: {initial_val_loss:.4f}")
+
+        initial_train_combined_loss, initial_train_lm_loss, initial_train_nsp_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
+        initial_val_combined_loss, initial_val_lm_loss, initial_val_nsp_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
+
+        print(f"Initial training loss (combined): {initial_train_combined_loss:.4f}")
+        if initial_train_lm_loss is not None:
+            print(f"  Initial LM training loss: {initial_train_lm_loss:.4f}")
+        if initial_train_nsp_loss is not None:
+            print(f"  Initial NSP training loss: {initial_train_nsp_loss:.4f}")
+
+        print(f"Initial validation loss (combined): {initial_val_combined_loss:.4f}")
+        if initial_val_lm_loss is not None:
+            print(f"  Initial LM validation loss: {initial_val_lm_loss:.4f}")
+        if initial_val_nsp_loss is not None:
+            print(f"  Initial NSP validation loss: {initial_val_nsp_loss:.4f}")
     
     # Test causal vs non-causal attention
     if logging_cfg.get('test_attention_modes', True):
@@ -404,16 +416,27 @@ def start_actual_training(cli_args):
         # Final evaluation
         if 'train' in dataloaders and 'validation' in dataloaders:
             max_eval_batches = eval_cfg.get('max_eval_batches', 10)
-            final_train_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
-            final_val_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
-            print(f"Final training loss: {final_train_loss:.4f}")
-            print(f"Final validation loss: {final_val_loss:.4f}")
+            final_train_combined_loss, final_train_lm_loss, final_train_nsp_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
+            final_val_combined_loss, final_val_lm_loss, final_val_nsp_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
+
+            print(f"Final training loss (combined): {final_train_combined_loss:.4f}")
+            if final_train_lm_loss is not None:
+                print(f"  Final LM training loss: {final_train_lm_loss:.4f}")
+            if final_train_nsp_loss is not None:
+                print(f"  Final NSP training loss: {final_train_nsp_loss:.4f}")
+
+            print(f"Final validation loss (combined): {final_val_combined_loss:.4f}")
+            if final_val_lm_loss is not None:
+                print(f"  Final LM validation loss: {final_val_lm_loss:.4f}")
+            if final_val_nsp_loss is not None:
+                print(f"  Final NSP validation loss: {final_val_nsp_loss:.4f}")
             
             # Show improvement
-            if 'initial_train_loss' in locals():
-                train_improvement = initial_train_loss - final_train_loss
-                val_improvement = initial_val_loss - final_val_loss
+            if initial_train_combined_loss is not None and final_train_combined_loss is not None :
+                train_improvement = initial_train_combined_loss - final_train_combined_loss
                 print(f"Training loss improvement: {train_improvement:.4f}")
+            if initial_val_combined_loss is not None and final_val_combined_loss is not None:
+                val_improvement = initial_val_combined_loss - final_val_combined_loss
                 print(f"Validation loss improvement: {val_improvement:.4f}")
         
         # Plot training curves
