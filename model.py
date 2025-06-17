@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from original_kernel import flash_attention
+from original_kernel import flash_attention as original_flash_attention_wrapper
+from simple_kernel import flash_attention_func as simple_flash_attention_wrapper
+import os
 
 
 class RMSNorm(nn.Module):
@@ -51,13 +53,23 @@ class MultiHeadAttention(nn.Module):
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
         # Use flash attention kernel
-        out = flash_attention(
-            q=q,
-            k=k,
-            v=v,
-            lens=None,
-            causal=self.causal
-        )
+        use_simple_kernel = os.environ.get('USE_SIMPLE_KERNEL', '0') == '1'
+        if use_simple_kernel:
+            # Ensure q, k, v are in the expected shape (batch, heads, seq_len, head_dim)
+            # simple_flash_attention_wrapper expects (q, k, v, causal, sm_scale)
+            # Current q,k,v are (B, H, T, D)
+            out = simple_flash_attention_wrapper(q, k, v, causal=self.causal, sm_scale=None)
+            # print("Using simple_kernel.flash_attention_func (CPU fallback or alternative)") # For debugging
+        else:
+            out = original_flash_attention_wrapper(
+                q=q,
+                k=k,
+                v=v,
+                lens=None, # Original code passes None here
+                causal=self.causal,
+                sm_scale=None # Rely on default scaling in original_kernel
+            )
+            # print("Using original_kernel.flash_attention") # For debugging
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(out)
@@ -92,7 +104,8 @@ class GPTModel(nn.Module):
         n_heads=12,
         max_seq_len=2048,
         mlp_ratio=4,
-        causal=True
+        causal=True,
+        num_nsp_labels=2
     ):
         super().__init__()
         self.dim = dim
@@ -115,7 +128,8 @@ class GPTModel(nn.Module):
         
         # Final norm and output projection
         self.norm_out = RMSNorm(dim)
-        self.head = nn.Linear(dim, vocab_size, bias=False)
+        self.head = nn.Linear(dim, vocab_size, bias=False) # LM head
+        self.nsp_head = nn.Linear(dim, num_nsp_labels) # NSP head
         
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
@@ -125,10 +139,12 @@ class GPTModel(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None: # Initialize bias for Linear layers (like nsp_head)
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None):
+    def forward(self, x, targets=None, nsp_labels=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -141,20 +157,36 @@ class GPTModel(nn.Module):
         for block in self.blocks:
             x = block(x)
         
-        # Final normalization and output projection
+        # Final normalization
         x = self.norm_out(x)
-        logits = self.head(x)
         
-        loss = None
+        # LM logits
+        lm_logits = self.head(x)
+
+        # NSP logits
+        # Use the hidden state of the first token (e.g., [CLS] token equivalent) for NSP
+        pooled_output = x[:, 0]
+        nsp_logits = self.nsp_head(pooled_output)
+
+        lm_loss = None
+        nsp_loss = None
+
         if targets is not None:
-            # Compute cross-entropy loss
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
+            # Compute LM cross-entropy loss
+            lm_loss = F.cross_entropy(
+                lm_logits.view(-1, lm_logits.size(-1)),
                 targets.view(-1),
-                ignore_index=-1
+                ignore_index=-100 # Consistent with data_builder padding for lm_labels
+            )
+
+        if nsp_labels is not None:
+            # Compute NSP cross-entropy loss
+            nsp_loss = F.cross_entropy(
+                nsp_logits.view(-1, self.nsp_head.out_features),
+                nsp_labels.view(-1)
             )
         
-        return logits, loss
+        return lm_logits, nsp_logits, lm_loss, nsp_loss
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """Generate new tokens using the model with top-k and top-p sampling."""
@@ -165,8 +197,10 @@ class GPTModel(nn.Module):
                 idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
                 
                 # Forward pass
-                logits, _ = self(idx_cond)
-                logits = logits[:, -1, :] / temperature
+                # self(idx_cond) now returns: lm_logits, nsp_logits, lm_loss, nsp_loss
+                # We only need lm_logits for generation.
+                lm_logits, _, _, _ = self(idx_cond)
+                logits = lm_logits[:, -1, :] / temperature # Use lm_logits
                 
                 # Apply top-k filtering if specified
                 if top_k is not None:

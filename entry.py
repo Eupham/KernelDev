@@ -68,7 +68,22 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
         config['training']['epochs'] = args.epochs
     if hasattr(args, 'learning_rate') and args.learning_rate is not None:
         config['training']['learning_rate'] = args.learning_rate
+
+    # NSP and Kernel related args
+    if hasattr(args, 'enable_nsp') and args.enable_nsp: # Check if True, as action='store_true'
+        config.setdefault('data', {})['enable_nsp'] = True
+    elif 'enable_nsp' not in config.get('data', {}): # if not set by CLI, and not in YAML
+        config.setdefault('data', {})['enable_nsp'] = False
+
+
+    if hasattr(args, 'nsp_loss_weight') and args.nsp_loss_weight is not None:
+        config.setdefault('training', {})['nsp_loss_weight'] = args.nsp_loss_weight
     
+    if hasattr(args, 'use_simple_kernel') and args.use_simple_kernel: # Check if True
+        config.setdefault('hardware', {})['use_simple_kernel'] = True
+    elif 'use_simple_kernel' not in config.get('hardware', {}):
+        config.setdefault('hardware', {})['use_simple_kernel'] = False
+
     return config
 
 
@@ -166,6 +181,22 @@ def start_actual_training(cli_args):
 
     config = merge_config_with_args(config, cli_args)
     
+    # Kernel Switching Logic
+    # This should be done early, before any module that might use the kernel is imported or initialized.
+    # However, model.py and original_kernel.py are imported at the top.
+    # The environment variable needs to be set *before* those modules try to read it.
+    # For workers in DDP, they inherit env from the main process.
+    # For single process, it's set here.
+    # The most robust way is to set it right at the start of the __main__ block for the main process,
+    # and ensure workers inherit it.
+    # For now, setting it here in start_actual_training. If it's too late, it needs to move earlier.
+    if config.get('hardware', {}).get('use_simple_kernel', False):
+        os.environ['USE_SIMPLE_KERNEL'] = '1'
+        print("USE_SIMPLE_KERNEL environment variable set to '1'.")
+    else:
+        os.environ['USE_SIMPLE_KERNEL'] = '0' # Or could unset it: os.environ.pop('USE_SIMPLE_KERNEL', None)
+        print("USE_SIMPLE_KERNEL environment variable set to '0'.")
+
     # Extract configuration values with defaults
     training_cfg = config.get('training', {})
     data_cfg = config.get('data', {})
@@ -204,7 +235,8 @@ def start_actual_training(cli_args):
         'dataset_config': data_cfg.get('dataset_config', 'en'),
         'seq_len': data_cfg.get('seq_len', 1024),
         'max_samples': data_cfg.get('max_samples', 5000),
-        'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000)
+        'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000),
+        'enable_nsp': data_cfg.get('enable_nsp', False) # Pass enable_nsp to DataBuilder
     }
     
     # Model configuration
@@ -253,7 +285,8 @@ def start_actual_training(cli_args):
         inference_max_length=inference_cfg.get('max_length', 100),
         inference_temperature=inference_cfg.get('temperature', 0.8),
         inference_top_k=inference_cfg.get('top_k', 50),
-        inference_top_p=inference_cfg.get('top_p', 0.9)
+        inference_top_p=inference_cfg.get('top_p', 0.9),
+        nsp_loss_weight=training_cfg.get('nsp_loss_weight', 0.5) # Pass to TrainingConfig
     )
     
     # Estimate optimal batch size with precision consideration
@@ -313,15 +346,29 @@ def start_actual_training(cli_args):
     # Test a batch
     if 'train' in dataloaders:
         print("\n=== Data Sample ===")
-        for x, y in dataloaders['train']:
-            print(f"Batch shape: {x.shape}")
-            print(f"Sample tokens: {x[0][:20].tolist()}")
-            
-            # Decode sample text
-            sample_text = data_builder.decode_tokens(x[0][:50])
-            print(f"Sample text: '{sample_text[:100]}...'")
-            break
-    
+        # Assuming train_loader yields dictionaries if NSP is enabled, or (x,y) tuples otherwise.
+        # The DataBuilder.create_dataloaders should ensure consistent output or
+        # this sample test needs to be aware of the data format.
+        # For now, let's assume it might be a dict, and try to access 'input_ids'
+        # This part of entry.py is for basic LM testing, might need adjustment if NSP is default.
+        try:
+            for batch_sample in dataloaders['train']:
+                if isinstance(batch_sample, dict):
+                    sample_x = batch_sample['input_ids']
+                    print(f"Batch input_ids shape: {sample_x.shape}")
+                    print(f"Sample tokens: {sample_x[0][:20].tolist()}")
+                    sample_text = data_builder.decode_tokens(sample_x[0][:50])
+                    print(f"Sample text: '{sample_text[:100]}...'")
+                else: # Assuming (x,y) tuple for standard LM
+                    x, y = batch_sample
+                    print(f"Batch shape: {x.shape}")
+                    print(f"Sample tokens: {x[0][:20].tolist()}")
+                    sample_text = data_builder.decode_tokens(x[0][:50])
+                    print(f"Sample text: '{sample_text[:100]}...'")
+                break # Only show one sample
+        except Exception as e:
+            print(f"Error displaying data sample: {e}. Batch format might have changed.")
+
     # Create trainer
     print(f"\n=== Setting up Trainer ===")
     trainer = create_trainer(
@@ -400,17 +447,29 @@ def test_causal_attention(model, dataloaders, device, data_builder):
         return
     
     # Get a sample batch
-    for x, y in dataloaders['train']:
-        x = x.to(device)
-        break
-    
+    # This test also needs to be aware of the batch format
+    sample_input_for_attention_test = None
+    if 'train' in dataloaders:
+        for batch_sample in dataloaders['train']:
+            if isinstance(batch_sample, dict):
+                sample_input_for_attention_test = batch_sample['input_ids'].to(device)
+            else: # Assuming (x,y) tuple
+                sample_input_for_attention_test = batch_sample[0].to(device)
+            break
+
+    if sample_input_for_attention_test is None:
+        print("Warning: Could not get a sample batch for causal attention test.")
+        return # Cannot proceed with this test
+
+    x = sample_input_for_attention_test
     model.to(device)
     model.eval()
     
     with torch.no_grad():
         # Test with causal=True (default)
         print("Testing with causal=True...")
-        logits_causal, _ = model(x)
+        # model(x) now returns: lm_logits, nsp_logits, lm_loss, nsp_loss
+        logits_causal, _, _, _ = model(x)
         
         # Test with causal=False by modifying the attention layers
         print("Testing with causal=False...")
@@ -420,7 +479,8 @@ def test_causal_attention(model, dataloaders, device, data_builder):
             original_causal.append(block.attn.causal)
             block.attn.causal = False
         
-        logits_non_causal, _ = model(x)
+        # model(x) now returns: lm_logits, nsp_logits, lm_loss, nsp_loss
+        logits_non_causal, _, _, _ = model(x)
         
         # Restore original causal setting
         for i, block in enumerate(model.blocks):
@@ -587,16 +647,50 @@ if __name__ == "__main__":
         default=None, # Default to None
         help='Learning rate (overrides config)'
     )
-    # Use parse_args() which will capture all defined args.
-    # REMAINDER is not needed here as we explicitly define training args.
+    parser.add_argument(
+        '--enable_nsp',
+        action='store_true',
+        help='Enable Next Sentence Prediction auxiliary task.'
+    )
+    parser.add_argument(
+        '--nsp_loss_weight',
+        type=float,
+        default=None,
+        help='Weight for the NSP loss (overrides config file value if set, TrainingConfig default is 0.5).'
+    )
+    parser.add_argument(
+        '--use_simple_kernel',
+        action='store_true',
+        help='Use simple PyTorch-based attention kernel instead of Triton/CUDA kernel.'
+    )
+
     args = parser.parse_args()
 
+    # Set USE_SIMPLE_KERNEL environment variable here for the main process
+    # This ensures it's set before any imports in worker processes if DDP is used,
+    # and before model initialization in single process mode.
+    if args.use_simple_kernel:
+        os.environ['USE_SIMPLE_KERNEL'] = '1'
+        print("USE_SIMPLE_KERNEL environment variable set to '1' by main process.")
+    else:
+        # Ensure it's '0' if not specified or if the flag isn't present,
+        # assuming the default is to use the original kernel.
+        os.environ['USE_SIMPLE_KERNEL'] = '0'
+        # print("USE_SIMPLE_KERNEL environment variable set to '0' by main process.")
+
+
     if "IS_WORKER_PROCESS" in os.environ:
+        # This means this script instance is a worker.
+        # USE_SIMPLE_KERNEL should already be in os.environ, inherited from the parent.
         print(f"Worker process RANK: {os.environ.get('RANK', 'N/A')}, LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'N/A')} starting.")
-        # Worker processes receive all arguments and proceed to training
+        print(f"Worker USE_SIMPLE_KERNEL: {os.environ.get('USE_SIMPLE_KERNEL')}") # Check if inherited
         start_actual_training(args)
     elif args.nproc_per_node > 1:
+        # This is the main process, about to launch DDP workers.
+        # USE_SIMPLE_KERNEL is already set in this process's environment.
+        # Worker processes launched via subprocess.Popen will inherit this environment.
         print(f"Main process launching {args.nproc_per_node} worker processes.")
+        print(f"Main process USE_SIMPLE_KERNEL: {os.environ.get('USE_SIMPLE_KERNEL')}")
         master_addr = "127.0.0.1"
         master_port = find_free_port()
         world_size = args.nproc_per_node

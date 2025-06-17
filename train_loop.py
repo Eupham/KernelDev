@@ -44,7 +44,8 @@ class TrainingConfig:
         plateau_mode: str = 'min',
         # Scheduler parameters
         scheduler_T0_epoch_fraction: float = 0.1,
-        scheduler_T_mult: int = 1
+        scheduler_T_mult: int = 1,
+        nsp_loss_weight: float = 0.5 # Added NSP loss weight
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -74,6 +75,7 @@ class TrainingConfig:
         # Scheduler parameters
         self.scheduler_T0_epoch_fraction = scheduler_T0_epoch_fraction
         self.scheduler_T_mult = scheduler_T_mult
+        self.nsp_loss_weight = nsp_loss_weight # Store NSP loss weight
         
         # Auto-detect device
         if device == "auto":
@@ -257,24 +259,53 @@ class Trainer:
             return self.config.learning_rate * step / self.config.warmup_steps
         return self.config.learning_rate
     
-    def train_step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> float:
+    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
         """Perform a single training step."""
-        x, y = batch
-        x, y = x.to(self.config.device), y.to(self.config.device)
+        input_ids = batch['input_ids'].to(self.config.device)
+        lm_labels = batch['lm_labels'].to(self.config.device)
+        token_type_ids = batch.get('token_type_ids', None)
+        nsp_label = batch.get('nsp_label', None)
+
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids.to(self.config.device)
+        if nsp_label is not None:
+            nsp_label = nsp_label.to(self.config.device)
         
         # Zero gradients
         self.optimizer.zero_grad()
         
+        total_loss = None
         if self.config.use_amp and self.config.scaler is not None:
             # Mixed precision forward pass
             with torch.amp.autocast('cuda'):
-                logits, loss = self.model(x, y)
-            
-            if loss is None:
+                # model.forward(self, x, targets=None, nsp_labels=None)
+                lm_logits, nsp_logits, lm_loss, nsp_loss = self.model(
+                    input_ids, targets=lm_labels, nsp_labels=nsp_label
+                )
+
+            if lm_loss is None and nsp_loss is None:
+                print("Warning: Both LM and NSP loss are None in train_step (AMP).")
                 return 0.0
             
+            current_batch_loss = 0
+            if lm_loss is not None:
+                current_batch_loss += lm_loss
+            if nsp_loss is not None and self.config.nsp_loss_weight > 0:
+                current_batch_loss += self.config.nsp_loss_weight * nsp_loss
+
+            if isinstance(current_batch_loss, int) and current_batch_loss == 0:
+                if lm_loss is not None: total_loss = lm_loss
+                elif nsp_loss is not None: total_loss = nsp_loss # nsp_loss_weight might be 0
+                else: return 0.0 # Should be caught by the None check
+            else:
+                total_loss = current_batch_loss
+
+            if total_loss is None or (isinstance(total_loss, torch.Tensor) and total_loss.numel() == 0) : # handle cases where total_loss might be an empty tensor or still None
+                print("Warning: total_loss is None or empty before backward pass in AMP mode.")
+                return 0.0
+
             # Mixed precision backward pass
-            self.config.scaler.scale(loss).backward()
+            self.config.scaler.scale(total_loss).backward()
             
             # Gradient clipping with mixed precision
             if self.config.max_grad_norm > 0:
@@ -290,13 +321,34 @@ class Trainer:
             
         else:
             # Standard precision forward pass
-            logits, loss = self.model(x, y)
+            # model.forward(self, x, targets=None, nsp_labels=None)
+            lm_logits, nsp_logits, lm_loss, nsp_loss = self.model(
+                input_ids, targets=lm_labels, nsp_labels=nsp_label
+            )
+
+            if lm_loss is None and nsp_loss is None:
+                print("Warning: Both LM and NSP loss are None in train_step.")
+                return 0.0
+
+            current_batch_loss = 0
+            if lm_loss is not None:
+                current_batch_loss += lm_loss
+            if nsp_loss is not None and self.config.nsp_loss_weight > 0:
+                current_batch_loss += self.config.nsp_loss_weight * nsp_loss
+
+            if isinstance(current_batch_loss, int) and current_batch_loss == 0:
+                if lm_loss is not None: total_loss = lm_loss
+                elif nsp_loss is not None: total_loss = nsp_loss
+                else: return 0.0
+            else:
+                total_loss = current_batch_loss
             
-            if loss is None:
+            if total_loss is None or (isinstance(total_loss, torch.Tensor) and total_loss.numel() == 0) :
+                print("Warning: total_loss is None or empty before backward pass.")
                 return 0.0
             
             # Standard precision backward pass
-            loss.backward()
+            total_loss.backward()
             
             # Gradient clipping
             if self.config.max_grad_norm > 0:
@@ -308,12 +360,12 @@ class Trainer:
             # Optimizer step
             self.optimizer.step()
         
-        return loss.item()
+        return total_loss.item()
     
     def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
         """Evaluate the model on a dataset."""
         self.model.eval()
-        total_loss = 0
+        accumulated_eval_loss = 0.0 # Renamed for clarity
         num_batches = 0
         
         with torch.no_grad():
@@ -321,24 +373,39 @@ class Trainer:
                 if max_batches is not None and batch_idx >= max_batches:
                     print(f"Evaluation limited to {max_batches} batches for speed")
                     break
-                    
-                x, y = batch
-                x, y = x.to(self.config.device), y.to(self.config.device)
                 
+                input_ids = batch['input_ids'].to(self.config.device)
+                lm_labels = batch['lm_labels'].to(self.config.device)
+                token_type_ids = batch.get('token_type_ids', None)
+                nsp_label = batch.get('nsp_label', None)
+
+                if token_type_ids is not None:
+                    token_type_ids = token_type_ids.to(self.config.device)
+                if nsp_label is not None:
+                    nsp_label = nsp_label.to(self.config.device)
+
+                lm_loss, nsp_loss = None, None
                 if self.config.use_amp:
-                    # Use mixed precision for evaluation
                     with torch.amp.autocast('cuda'):
-                        logits, loss = self.model(x, y)
+                        _, _, lm_loss, nsp_loss = self.model(input_ids, targets=lm_labels, nsp_labels=nsp_label)
                 else:
-                    # Standard precision evaluation
-                    logits, loss = self.model(x, y)
+                    _, _, lm_loss, nsp_loss = self.model(input_ids, targets=lm_labels, nsp_labels=nsp_label)
+
+                batch_combined_loss = 0
+                has_loss_term = False
+                if lm_loss is not None:
+                    batch_combined_loss += lm_loss.item()
+                    has_loss_term = True
+                if nsp_loss is not None and self.config.nsp_loss_weight > 0:
+                    batch_combined_loss += self.config.nsp_loss_weight * nsp_loss.item()
+                    has_loss_term = True
                 
-                if loss is not None:
-                    total_loss += loss.item()
+                if has_loss_term:
+                    accumulated_eval_loss += batch_combined_loss
                     num_batches += 1
         
         self.model.train()
-        return total_loss / num_batches if num_batches > 0 else float('inf')
+        return accumulated_eval_loss / num_batches if num_batches > 0 else float('inf')
     
     def save_checkpoint(self, step: int, is_best: bool = False):
         """Save model checkpoint."""
@@ -764,30 +831,34 @@ class Trainer:
     def calculate_perplexity(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
         """Calculate perplexity on a dataset."""
         self.model.eval()
-        total_loss = 0
+        total_lm_loss = 0 # Perplexity should be based on LM loss only
         num_batches = 0
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
                 if max_batches is not None and batch_idx >= max_batches:
                     break
-                    
-                x, y = batch
-                x, y = x.to(self.config.device), y.to(self.config.device)
                 
-                if self.config.use_amp and self.config.scaler is not None:
+                # Assuming batch is a dictionary now
+                input_ids = batch['input_ids'].to(self.config.device)
+                lm_labels = batch['lm_labels'].to(self.config.device)
+                # NSP labels are not needed for perplexity of LM
+
+                lm_loss = None # Initialize lm_loss for the batch
+                if self.config.use_amp and self.config.scaler is not None: # scaler might be None even if use_amp is true
                     with torch.amp.autocast('cuda'):
-                        logits, loss = self.model(x, y)
+                        # model returns: lm_logits, nsp_logits, lm_loss, nsp_loss
+                        _, _, lm_loss, _ = self.model(input_ids, targets=lm_labels, nsp_labels=None)
                 else:
-                    logits, loss = self.model(x, y)
+                    _, _, lm_loss, _ = self.model(input_ids, targets=lm_labels, nsp_labels=None)
                 
-                if loss is not None:
-                    total_loss += loss.item()
+                if lm_loss is not None:
+                    total_lm_loss += lm_loss.item()
                     num_batches += 1
         
         self.model.train()
-        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
-        perplexity = math.exp(avg_loss) if avg_loss != float('inf') else float('inf')
+        avg_lm_loss = total_lm_loss / num_batches if num_batches > 0 else float('inf')
+        perplexity = math.exp(avg_lm_loss) if avg_lm_loss != float('inf') else float('inf')
         return perplexity
     
     def generate_inference_sample(

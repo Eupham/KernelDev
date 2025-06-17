@@ -3,6 +3,9 @@ import math
 import torch._dynamo
 import os
 
+# Added imports for CPU fallback
+from simple_kernel import flash_attention_func as simple_flash_attention_wrapper
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -1982,6 +1985,19 @@ def flash_attention(
     hadamard_signs_q: torch.Tensor | None = None,
     hadamard_signs_k: torch.Tensor | None = None,
 ):
+    # CPU fallback mechanism
+    if os.environ.get('USE_SIMPLE_KERNEL', '0') == '1':
+        # print("original_kernel.py: Intercepted call to flash_attention, redirecting to simple_kernel_wrapper.") # For debugging
+        return simple_flash_attention_wrapper(
+            q=q,
+            k=k,
+            v=v,
+            causal=causal,
+            sm_scale=sm_scale
+            # Other parameters like lens, autotune, return_lse, prescale_qk, precision,
+            # incoherent_processing, hadamard_signs are not used by the simple_kernel's current wrapper.
+        )
+
     """
     Computes self-attention with optional causal masking and flash attention optimization.
     
