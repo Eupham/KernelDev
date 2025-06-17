@@ -153,24 +153,41 @@ class TrainingMetrics:
         self.total_steps = 0
         self.best_val_loss = float('inf')
         self.best_step = 0
+        # For separate LM/NSP loss tracking
+        self.train_lm_losses = []
+        self.train_nsp_losses = []
+        self.val_lm_losses = []
+        self.val_nsp_losses = []
     
     def update(
         self,
         train_loss: Optional[float] = None,
         val_loss: Optional[float] = None,
         learning_rate: Optional[float] = None,
-        step_time: Optional[float] = None
+        step_time: Optional[float] = None,
+        train_lm_loss: Optional[float] = None,
+        train_nsp_loss: Optional[float] = None,
+        val_lm_loss: Optional[float] = None,
+        val_nsp_loss: Optional[float] = None
     ):
         """Update metrics with new values."""
-        if train_loss is not None:
+        if train_loss is not None: # This is combined train loss
             self.train_losses.append(train_loss)
+        if train_lm_loss is not None:
+            self.train_lm_losses.append(train_lm_loss)
+        if train_nsp_loss is not None:
+            self.train_nsp_losses.append(train_nsp_loss)
         
-        if val_loss is not None:
+        if val_loss is not None: # This is combined val loss
             self.val_losses.append(val_loss)
-            if val_loss < self.best_val_loss:
+            if val_loss < self.best_val_loss: # Best loss is based on combined val loss
                 self.best_val_loss = val_loss
                 self.best_step = self.total_steps
-        
+        if val_lm_loss is not None:
+            self.val_lm_losses.append(val_lm_loss)
+        if val_nsp_loss is not None:
+            self.val_nsp_losses.append(val_nsp_loss)
+
         if learning_rate is not None:
             self.learning_rates.append(learning_rate)
         
@@ -195,7 +212,12 @@ class TrainingMetrics:
             'step_times': self.step_times,
             'total_steps': self.total_steps,
             'best_val_loss': self.best_val_loss,
-            'best_step': self.best_step
+            'best_step': self.best_step,
+            # Save new loss lists
+            'train_lm_losses': self.train_lm_losses,
+            'train_nsp_losses': self.train_nsp_losses,
+            'val_lm_losses': self.val_lm_losses,
+            'val_nsp_losses': self.val_nsp_losses,
         }
         torch.save(metrics_dict, filepath)
 
@@ -274,18 +296,21 @@ class Trainer:
         # Zero gradients
         self.optimizer.zero_grad()
         
+        lm_loss, nsp_loss = None, None # Ensure they are defined
         total_loss = None
+
         if self.config.use_amp and self.config.scaler is not None:
             # Mixed precision forward pass
             with torch.amp.autocast('cuda'):
-                # model.forward(self, x, targets=None, nsp_labels=None)
-                lm_logits, nsp_logits, lm_loss, nsp_loss = self.model(
+                lm_logits, nsp_logits, lm_loss_tensor, nsp_loss_tensor = self.model(
                     input_ids, targets=lm_labels, nsp_labels=nsp_label
                 )
+                # Assign to lm_loss, nsp_loss for consistent handling below
+                lm_loss, nsp_loss = lm_loss_tensor, nsp_loss_tensor
 
             if lm_loss is None and nsp_loss is None:
                 print("Warning: Both LM and NSP loss are None in train_step (AMP).")
-                return 0.0
+                return 0.0, None, None # Return structure consistent with new signature
             
             current_batch_loss = 0
             if lm_loss is not None:
@@ -293,10 +318,10 @@ class Trainer:
             if nsp_loss is not None and self.config.nsp_loss_weight > 0:
                 current_batch_loss += self.config.nsp_loss_weight * nsp_loss
 
-            if isinstance(current_batch_loss, int) and current_batch_loss == 0:
+            if isinstance(current_batch_loss, int) and current_batch_loss == 0: # Catches if both losses are None or one is 0 and other is None with nsp_weight=0
                 if lm_loss is not None: total_loss = lm_loss
-                elif nsp_loss is not None: total_loss = nsp_loss # nsp_loss_weight might be 0
-                else: return 0.0 # Should be caught by the None check
+                elif nsp_loss is not None: total_loss = nsp_loss
+                else: return 0.0, None, None
             else:
                 total_loss = current_batch_loss
 
@@ -321,14 +346,15 @@ class Trainer:
             
         else:
             # Standard precision forward pass
-            # model.forward(self, x, targets=None, nsp_labels=None)
-            lm_logits, nsp_logits, lm_loss, nsp_loss = self.model(
+            lm_logits, nsp_logits, lm_loss_tensor, nsp_loss_tensor = self.model(
                 input_ids, targets=lm_labels, nsp_labels=nsp_label
             )
+            # Assign to lm_loss, nsp_loss for consistent handling below
+            lm_loss, nsp_loss = lm_loss_tensor, nsp_loss_tensor
 
             if lm_loss is None and nsp_loss is None:
                 print("Warning: Both LM and NSP loss are None in train_step.")
-                return 0.0
+                return 0.0, None, None # Return structure consistent
 
             current_batch_loss = 0
             if lm_loss is not None:
@@ -339,10 +365,10 @@ class Trainer:
             if isinstance(current_batch_loss, int) and current_batch_loss == 0:
                 if lm_loss is not None: total_loss = lm_loss
                 elif nsp_loss is not None: total_loss = nsp_loss
-                else: return 0.0
+                else: return 0.0, None, None
             else:
                 total_loss = current_batch_loss
-            
+
             if total_loss is None or (isinstance(total_loss, torch.Tensor) and total_loss.numel() == 0) :
                 print("Warning: total_loss is None or empty before backward pass.")
                 return 0.0
@@ -359,14 +385,34 @@ class Trainer:
             
             # Optimizer step
             self.optimizer.step()
+
+        lm_item = lm_loss.item() if lm_loss is not None else None
+        nsp_item = nsp_loss.item() if nsp_loss is not None else None
         
-        return total_loss.item()
+        total_loss_item = 0.0
+        if total_loss is not None:
+            if torch.is_tensor(total_loss):
+                total_loss_item = total_loss.item()
+            else: # if total_loss became a float (e.g. 0.0)
+                total_loss_item = float(total_loss)
+        elif lm_item is not None : # if total_loss was None but lm_item exists
+             total_loss_item = lm_item + (nsp_item if nsp_item is not None and self.config.nsp_loss_weight > 0 else 0.0)
+        elif nsp_item is not None and self.config.nsp_loss_weight > 0: # if only nsp_item exists
+            total_loss_item = nsp_item * self.config.nsp_loss_weight
+
+
+        return total_loss_item, lm_item, nsp_item
     
-    def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
-        """Evaluate the model on a dataset."""
+    def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> Tuple[float, Optional[float], Optional[float]]:
+        """Evaluate the model on a dataset. Returns combined_loss, lm_loss, nsp_loss (all averaged)."""
         self.model.eval()
-        accumulated_eval_loss = 0.0 # Renamed for clarity
-        num_batches = 0
+        accumulated_combined_loss = 0.0
+        accumulated_lm_loss = 0.0
+        accumulated_nsp_loss = 0.0
+
+        num_total_loss_batches = 0 # Batches where any loss was computed
+        num_lm_loss_batches = 0    # Batches where LM loss was computed
+        num_nsp_loss_batches = 0   # Batches where NSP loss was computed (and should be counted)
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
@@ -384,28 +430,45 @@ class Trainer:
                 if nsp_label is not None:
                     nsp_label = nsp_label.to(self.config.device)
 
-                lm_loss, nsp_loss = None, None
-                if self.config.use_amp:
+                lm_loss_tensor, nsp_loss_tensor = None, None
+                if self.config.use_amp: # Assuming scaler is not used in eval, only autocast
                     with torch.amp.autocast('cuda'):
-                        _, _, lm_loss, nsp_loss = self.model(input_ids, targets=lm_labels, nsp_labels=nsp_label)
+                        _, _, lm_loss_tensor, nsp_loss_tensor = self.model(input_ids, targets=lm_labels, nsp_labels=nsp_label)
                 else:
-                    _, _, lm_loss, nsp_loss = self.model(input_ids, targets=lm_labels, nsp_labels=nsp_label)
-
-                batch_combined_loss = 0
-                has_loss_term = False
-                if lm_loss is not None:
-                    batch_combined_loss += lm_loss.item()
-                    has_loss_term = True
-                if nsp_loss is not None and self.config.nsp_loss_weight > 0:
-                    batch_combined_loss += self.config.nsp_loss_weight * nsp_loss.item()
-                    has_loss_term = True
+                    _, _, lm_loss_tensor, nsp_loss_tensor = self.model(input_ids, targets=lm_labels, nsp_labels=nsp_label)
                 
-                if has_loss_term:
-                    accumulated_eval_loss += batch_combined_loss
-                    num_batches += 1
+                batch_combined_loss_value = 0
+                has_any_loss_term_in_batch = False
+
+                if lm_loss_tensor is not None:
+                    lm_loss_item = lm_loss_tensor.item()
+                    accumulated_lm_loss += lm_loss_item
+                    num_lm_loss_batches += 1
+                    batch_combined_loss_value += lm_loss_item
+                    has_any_loss_term_in_batch = True
+
+                if nsp_loss_tensor is not None and self.config.nsp_loss_weight > 0:
+                    nsp_loss_item = nsp_loss_tensor.item()
+                    accumulated_nsp_loss += nsp_loss_item # Accumulate raw NSP loss
+                    num_nsp_loss_batches += 1
+                    batch_combined_loss_value += self.config.nsp_loss_weight * nsp_loss_item
+                    has_any_loss_term_in_batch = True
+                elif nsp_loss_tensor is not None: # NSP loss computed but weight is 0
+                    num_nsp_loss_batches += 1 # Still count it as a batch where NSP was processed
+                    accumulated_nsp_loss += nsp_loss_tensor.item()
+
+
+                if has_any_loss_term_in_batch:
+                    accumulated_combined_loss += batch_combined_loss_value
+                    num_total_loss_batches += 1
         
         self.model.train()
-        return accumulated_eval_loss / num_batches if num_batches > 0 else float('inf')
+
+        avg_combined_eval_loss = accumulated_combined_loss / num_total_loss_batches if num_total_loss_batches > 0 else float('inf')
+        avg_lm_eval_loss = accumulated_lm_loss / num_lm_loss_batches if num_lm_loss_batches > 0 else None
+        avg_nsp_eval_loss = accumulated_nsp_loss / num_nsp_loss_batches if num_nsp_loss_batches > 0 else None
+
+        return avg_combined_eval_loss, avg_lm_eval_loss, avg_nsp_eval_loss
     
     def save_checkpoint(self, step: int, is_best: bool = False):
         """Save model checkpoint."""
@@ -522,8 +585,9 @@ class Trainer:
             step_start = time.time()
             
             # Training step
-            loss = self.train_step(batch)
-            epoch_losses.append(loss)
+            # loss = self.train_step(batch) # Old way
+            combined_loss_val, lm_loss_val, nsp_loss_val = self.train_step(batch)
+            epoch_losses.append(combined_loss_val) # Keep track of combined loss for epoch average
             
             # Update learning rate scheduler
             self.scheduler.step()
@@ -532,37 +596,59 @@ class Trainer:
             # Update metrics
             step_time = time.time() - step_start
             self.metrics.update(
-                train_loss=loss,
+                train_loss=combined_loss_val,
+                train_lm_loss=lm_loss_val,
+                train_nsp_loss=nsp_loss_val,
                 learning_rate=current_lr,
                 step_time=step_time
             )
             
-
             # Logging (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
                self.metrics.total_steps % self.config.log_every == 0:
                 avg_step_time = self.metrics.get_avg_step_time()
-                print(
+
+                log_msg = (
                     f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
-                    f"Loss: {loss:.4f}, LR: {current_lr:.6f}, "
-                    f"Step Time: {avg_step_time:.3f}s"
+                    f"Loss: {combined_loss_val:.4f} "
                 )
+                if lm_loss_val is not None:
+                    log_msg += f"(LM: {lm_loss_val:.4f}) "
+                # For NSP, report raw unweighted loss, and indicate if it's contributing
+                if nsp_loss_val is not None:
+                    if self.config.nsp_loss_weight > 0:
+                        log_msg += f"(NSP: {nsp_loss_val:.4f} weighted) "
+                    else:
+                        log_msg += f"(NSP: {nsp_loss_val:.4f} unweighted) "
+
+                log_msg += f", LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
+                print(log_msg)
             
             # Evaluation (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
                val_loader is not None and \
                self.metrics.total_steps % self.config.eval_every == 0:
-                val_loss = self.evaluate(val_loader)
-                self.metrics.update(val_loss=val_loss) # rank-local metric
+                avg_combined_val_loss, avg_lm_val_loss, avg_nsp_val_loss = self.evaluate(val_loader)
+                self.metrics.update(
+                    val_loss=avg_combined_val_loss,
+                    val_lm_loss=avg_lm_val_loss,
+                    val_nsp_loss=avg_nsp_val_loss
+                )
                 
-                is_best = val_loss < self.metrics.best_val_loss # rank-local best
-                print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
+                is_best = avg_combined_val_loss < self.metrics.best_val_loss # rank-local best based on combined
+                eval_log_msg = f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {avg_combined_val_loss:.4f} "
+                if avg_lm_val_loss is not None:
+                    eval_log_msg += f"(LM: {avg_lm_val_loss:.4f}) "
+                if avg_nsp_val_loss is not None: # nsp_loss_weight check is implicit in accumulation logic
+                    eval_log_msg += f"(NSP: {avg_nsp_val_loss:.4f}) " # This is raw unweighted avg NSP loss
+                eval_log_msg += f"{'(Best!)' if is_best else ''}"
+                print(eval_log_msg)
                 
                 if is_best: # save_checkpoint itself is rank 0 guarded
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
 
                 # Plateau detection logic
-                current_metric_val = val_loss # Assuming val_loss is the metric for now
+                current_metric_val = avg_combined_val_loss # Plateau detection uses combined validation loss
 
                 improved = False
                 if self.config.plateau_mode == 'min':
@@ -611,7 +697,10 @@ class Trainer:
                     print(f"\n=== Generating Inference Sample at Step {self.metrics.total_steps} (Rank 0) ===")
                     perplexity = self.calculate_perplexity(val_loader, max_batches=20)
                     # Use last val_loss from metrics if available, else current val_loss if eval was just run
-                    current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (val_loss if 'val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
+                    # current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (val_loss if 'val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
+                    # The 'val_loss' variable in this scope is avg_combined_val_loss
+                    current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (avg_combined_val_loss if 'avg_combined_val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
+
 
                     prompts = self.config.inference_prompts
                     generated_texts = self.generate_inference_sample(
@@ -699,10 +788,17 @@ class Trainer:
         
         # Initial evaluation (only on rank 0)
         if val_loader and (not self.is_distributed or dist.get_rank() == 0):
-            initial_val_loss = self.evaluate(val_loader)
-            self.metrics.update(val_loss=initial_val_loss) # rank-local metric
-            print(f"Initial validation loss (Rank 0): {initial_val_loss:.4f}")
-        
+            # initial_val_loss = self.evaluate(val_loader) # Old way
+            initial_combined_val_loss, initial_lm_val_loss, initial_nsp_val_loss = self.evaluate(val_loader)
+            self.metrics.update(val_loss=initial_combined_val_loss) # rank-local metric tracks combined
+
+            eval_log_msg = f"Initial Validation Loss (Rank 0): {initial_combined_val_loss:.4f} "
+            if initial_lm_val_loss is not None:
+                eval_log_msg += f"(LM: {initial_lm_val_loss:.4f}) "
+            if initial_nsp_val_loss is not None:
+                eval_log_msg += f"(NSP: {initial_nsp_val_loss:.4f}) "
+            print(eval_log_msg)
+
         try:
             for epoch in range(self.config.num_epochs):
                 if self.is_distributed and train_sampler is not None and dist.get_world_size() > 1:
@@ -735,22 +831,53 @@ class Trainer:
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         
         # Training loss
-        if self.metrics.train_losses:
-            axes[0, 0].plot(self.metrics.train_losses, 'b-', alpha=0.7, label='Train Loss')
-            axes[0, 0].set_title('Training Loss')
-            axes[0, 0].set_xlabel('Step')
-            axes[0, 0].set_ylabel('Loss')
-            axes[0, 0].grid(True, alpha=0.3)
+        if self.metrics.train_losses: # Combined train loss
+            axes[0, 0].plot(self.metrics.train_losses, 'b-', alpha=0.8, label='Total Train Loss')
+        if self.metrics.train_lm_losses:
+            axes[0, 0].plot(self.metrics.train_lm_losses, 'c--', alpha=0.7, label='Train LM Loss')
+        if self.metrics.train_nsp_losses:
+            axes[0, 0].plot(self.metrics.train_nsp_losses, 'm--', alpha=0.7, label='Train NSP Loss')
+        axes[0, 0].set_title('Training Losses')
+        axes[0, 0].set_xlabel('Step')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].grid(True, alpha=0.3)
+        if self.metrics.train_losses or self.metrics.train_lm_losses or self.metrics.train_nsp_losses:
             axes[0, 0].legend()
         
         # Validation loss
-        if self.metrics.val_losses:
-            val_steps = np.linspace(0, len(self.metrics.train_losses), len(self.metrics.val_losses))
-            axes[0, 1].plot(val_steps, self.metrics.val_losses, 'r-', alpha=0.7, label='Val Loss')
-            axes[0, 1].set_title('Validation Loss')
-            axes[0, 1].set_xlabel('Step')
-            axes[0, 1].set_ylabel('Loss')
-            axes[0, 1].grid(True, alpha=0.3)
+        if self.metrics.val_losses: # Combined val loss
+            # Calculate correct x-axis steps for validation losses
+            # val_losses are recorded every eval_every steps.
+            # total_steps for val_loss_i = (i+1) * eval_every (assuming first eval is at eval_every)
+            # Or, more generally, if train_losses has T entries, and val_losses has V entries,
+            # val_steps should map to the global steps where validation occurred.
+            # A simpler way: plot against the number of validation calls (0, 1, 2...) * eval_every
+            num_val_points = len(self.metrics.val_losses)
+            # This assumes metrics.update for val_loss is called once per evaluation.
+            # And that train_loss is updated every step.
+            # The x-axis for val_loss should be the global step number at which it was recorded.
+            # This information is not directly stored per val_loss point, but can be inferred.
+            # For simplicity, let's assume val_losses are recorded at steps:
+            # eval_every, 2*eval_every, ...
+            # This is what val_steps tries to approximate, but can be more precise.
+            # Let's make an x-axis based on when val_loss is recorded.
+            # metrics.total_steps is incremented for each training step.
+            # When val_loss is recorded, self.metrics.total_steps is the current global step.
+            # A better way would be to store (step, val_loss) pairs.
+            # For now, the existing val_steps is a reasonable approximation if eval_every is consistent.
+            val_steps = np.linspace(0, self.metrics.total_steps, num_val_points, endpoint=False) if num_val_points > 0 else []
+
+
+            axes[0, 1].plot(val_steps, self.metrics.val_losses, 'r-', alpha=0.8, label='Total Val Loss')
+        if self.metrics.val_lm_losses and num_val_points == len(self.metrics.val_lm_losses): # ensure same length
+             axes[0, 1].plot(val_steps, self.metrics.val_lm_losses, 'y--', alpha=0.7, label='Val LM Loss')
+        if self.metrics.val_nsp_losses and num_val_points == len(self.metrics.val_nsp_losses): # ensure same length
+             axes[0, 1].plot(val_steps, self.metrics.val_nsp_losses, 'k--', alpha=0.7, label='Val NSP Loss')
+        axes[0, 1].set_title('Validation Losses')
+        axes[0, 1].set_xlabel('Approx. Step') # Or 'Evaluation Iteration' if x-axis is just 0,1,2...
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].grid(True, alpha=0.3)
+        if self.metrics.val_losses or self.metrics.val_lm_losses or self.metrics.val_nsp_losses:
             axes[0, 1].legend()
         
         # Learning rate
