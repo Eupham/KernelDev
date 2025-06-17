@@ -318,7 +318,7 @@ def start_actual_training(cli_args):
     
     # Create data builder
     print("\n=== Loading and Processing Data ===")
-    data_builder = create_data_builder(**data_config)
+    data_builder = create_data_builder(data_config) # Corrected: pass dict directly
     
     # Create dataloaders
     try:
