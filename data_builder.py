@@ -642,3 +642,6 @@ if __name__ == "__main__":
         print("NSP Train dataloader not created or empty.")
 
     print("\nDataBuilder test completed!")
+    else:
+        print("Train dataloader not created or empty.")
+    print("DataBuilder test completed!")
