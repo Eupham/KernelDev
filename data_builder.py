@@ -23,10 +23,13 @@ class TokenizedDataset(Dataset):
 
 
 class NSPDataset(Dataset):
-    def __init__(self, documents: list[dict], tokenizer_fn, seq_len: int, is_eval: bool = False, max_samples_for_eval: int = None):
+    def __init__(self, documents: list[dict], tokenizer_fn, seq_len: int, is_eval: bool = False, max_samples_for_eval: int = None,
+                 enable_word_order_task: bool = False, word_shuffle_probability: float = 0.0):
         self.tokenizer_fn = tokenizer_fn
         self.seq_len = seq_len
         self.is_eval = is_eval
+        self.enable_word_order_task = enable_word_order_task
+        self.word_shuffle_probability = word_shuffle_probability
         self.pad_token_id = 0  # Assuming 0 for padding input_ids
         self.lm_ignore_idx = -100 # For ignoring LM labels
 
@@ -116,48 +119,59 @@ class NSPDataset(Dataset):
             raise IndexError("NSPDataset has no samples.")
 
         is_positive_sample = (idx % 2 == 0 and self.num_positive_samples > 0) or \
-                             (self.num_positive_samples == 0 and len(self.all_sentences) >=2) # if no positives, all are "negative"
+                             (self.num_positive_samples == 0 and len(self.all_sentences) >=2)
 
-        sent_A_text, sent_B_text, nsp_label = "", "", 1
+        original_sent_A_text, sent_B_text, nsp_label = "", "", 1 # Renamed sent_A_text to original_sent_A_text
 
         if is_positive_sample and self.num_positive_samples > 0:
             # Positive Sample
-            _, sent_A_text, sent_B_text = self.positive_candidates[idx // 2 % self.num_positive_samples]
+            _, original_sent_A_text, sent_B_text = self.positive_candidates[idx // 2 % self.num_positive_samples]
             nsp_label = 0
         else:
             # Negative Sample or no positive pairs available
-            if len(self.all_sentences) < 2 and self.num_positive_samples == 0 : # Need at least 2 sentences for a random pair
-                 # This case should ideally be prevented by __len__ being 0 if not enough sentences.
-                 # Fallback: return dummy data or raise error. For now, let's try to make a dummy sample.
-                 # This might happen if max_samples_for_eval is 1 and no positives.
+            if len(self.all_sentences) < 2 and self.num_positive_samples == 0 :
                  print(f"Warning: Trying to create a negative sample but only {len(self.all_sentences)} available.")
-                 if not self.all_sentences: # Should be caught by initial check
-                    # This indicates a logic error if reached.
-                    # For robustness, create a completely dummy sample.
-                    sent_A_text = "Dummy sentence A."
+                 if not self.all_sentences:
+                    original_sent_A_text = "Dummy sentence A."
                     sent_B_text = "Dummy sentence B."
-                 else: # Only one sentence available
-                    sent_A_text = self.all_sentences[0][2]
-                    sent_B_text = self.all_sentences[0][2] # Use the same sentence if only one exists
-                 nsp_label = 1 # Still a "negative" pair as it's not a true next sentence
-
+                 else:
+                    original_sent_A_text = self.all_sentences[0][2]
+                    sent_B_text = self.all_sentences[0][2]
+                 nsp_label = 1
             else: # Standard negative sampling
-                sent_A_doc_idx, sent_A_sent_idx, sent_A_text = random.choice(self.all_sentences)
-
-                # Try to find a B that is not A's true next sentence
-                for _ in range(10): # Max 10 retries to find a different sentence
-                    sent_B_doc_idx, sent_B_sent_idx, sent_B_text = random.choice(self.all_sentences)
+                sent_A_doc_idx, sent_A_sent_idx, original_sent_A_text = random.choice(self.all_sentences)
+                for _ in range(10):
+                    sent_B_doc_idx, sent_B_sent_idx, temp_sent_B_text = random.choice(self.all_sentences)
                     if sent_A_doc_idx != sent_B_doc_idx or \
                        (sent_A_doc_idx == sent_B_doc_idx and sent_B_sent_idx != sent_A_sent_idx + 1):
+                        sent_B_text = temp_sent_B_text
                         break
-                # If loop finishes, sent_B_text is the last choice, which is acceptable.
+                else: # If loop finishes without break, assign the last choice to sent_B_text
+                    sent_B_text = temp_sent_B_text
                 nsp_label = 1
 
-        tokens_A = self.tokenizer_fn(sent_A_text)
-        tokens_B = self.tokenizer_fn(sent_B_text)
+        # Word Order Detection (WOD) Task
+        wod_label = 0
+        input_sent_A = original_sent_A_text
+        lm_labels_for_A_are_gated = False
+
+        if self.enable_word_order_task and random.random() < self.word_shuffle_probability:
+            words = original_sent_A_text.split(' ')
+            if len(words) > 1:
+                shuffled_words = list(words)
+                random.shuffle(shuffled_words)
+                temp_input_sent_A = ' '.join(shuffled_words)
+                if temp_input_sent_A != original_sent_A_text: # Check if shuffling actually changed the sentence
+                    input_sent_A = temp_input_sent_A
+                    wod_label = 1
+                    lm_labels_for_A_are_gated = True
+                # If shuffle resulted in the same sentence, wod_label remains 0, lm_labels not gated
+            # If len(words) <= 1, wod_label remains 0
+
+        tokens_A = self.tokenizer_fn(input_sent_A)
+        tokens_B = self.tokenizer_fn(sent_B_text) # sent_B_text might be empty if not a positive NSP sample and no negative was chosen
 
         # Truncate tokens
-        # Max length for A is roughly half, B takes the rest. B can be shorter.
         # Add 1 for potential CLS token if tokenizer adds it (our byte tokenizer doesn't)
         # Add 1 for potential SEP token if tokenizer adds it (our byte tokenizer doesn't)
         # seq_len includes space for these if they were used. With byte tokenizer, it's just content.
@@ -190,17 +204,21 @@ class NSPDataset(Dataset):
         token_type_ids = [0] * len(tokens_A) + [1] * len(tokens_B)
 
         # Create LM labels: predict next token in A, B is masked.
-        # Shifted A for labels: tokens_A[1:] + [pad/mask_for_last_A_token]
+        # Shifted A for labels: tokens_A[1:] + [pad/mask_for_last_A_token] (or all ignored if WOD gated)
         # B part of labels is all self.lm_ignore_idx
         lm_labels = []
-        if tokens_A:
-            lm_labels.extend(tokens_A[1:])
-            lm_labels.append(self.lm_ignore_idx) # Or a pad_token_id if predicting last token of A is desired. For now, ignore.
+        if lm_labels_for_A_are_gated:
+            lm_labels.extend([self.lm_ignore_idx] * len(tokens_A))
+        else:
+            if tokens_A:
+                lm_labels.extend(tokens_A[1:])
+                lm_labels.append(self.lm_ignore_idx)
 
+        # For sentence B, LM labels are always ignored
         lm_labels.extend([self.lm_ignore_idx] * len(tokens_B))
 
         # Pad to self.seq_len
-        padding_len = self.seq_len - len(input_ids)
+        padding_len = self.seq_len - len(input_ids) # input_ids was created before this block
         input_ids.extend([self.pad_token_id] * padding_len)
         token_type_ids.extend([0] * padding_len) # Pad token_type_ids with 0 (or any other aribtrary type for padding)
         lm_labels.extend([self.lm_ignore_idx] * padding_len)
@@ -214,7 +232,8 @@ class NSPDataset(Dataset):
             'input_ids': torch.tensor(input_ids, dtype=torch.long),
             'token_type_ids': torch.tensor(token_type_ids, dtype=torch.long),
             'lm_labels': torch.tensor(lm_labels, dtype=torch.long),
-            'nsp_label': torch.tensor(nsp_label, dtype=torch.long)
+            'nsp_label': torch.tensor(nsp_label, dtype=torch.long),
+            'wod_label': torch.tensor(wod_label, dtype=torch.long)
         }
 
 
@@ -231,16 +250,20 @@ class DataBuilder:
         if self.max_samples is None: # Handle None for max_samples to mean infinity
             self.max_samples = float('inf')
         self.vocab_size = data_cfg.get("vocab_size", 256) # Default vocab_size for byte tokenizer
-        self.max_eval_tokens = data_cfg.get("max_eval_tokens", 50000) # This might be interpreted as max_eval_samples for NSP
+        self.max_eval_tokens = data_cfg.get("max_eval_tokens", 50000)
         self.enable_nsp = data_cfg.get('enable_nsp', False)
+        self.enable_word_order_task = data_cfg.get('enable_word_order_task', False)
+        self.word_shuffle_probability = data_cfg.get('word_shuffle_probability', 0.15)
 
-        print(f"DataBuilder initialized with enable_nsp: {self.enable_nsp}")
+        print(f"DataBuilder initialized with: enable_nsp={self.enable_nsp}, enable_word_order_task={self.enable_word_order_task}")
+        if self.enable_word_order_task:
+            print(f"  Word shuffle probability: {self.word_shuffle_probability}")
         print(f"Using dataset: {self.dataset_name}/{self.dataset_config}, seq_len: {self.seq_len}")
         print(f"Using UTF-8 byte tokenization with vocabulary size: {self.vocab_size}")
 
-        if self.enable_nsp:
-            print(f"Max evaluation samples per split (for NSP): {self.max_eval_tokens}") # Re-interpreting max_eval_tokens as samples
-        else:
+        if self.enable_nsp or self.enable_word_order_task: # If any auxiliary task is on, max_eval_tokens is samples
+            print(f"Max evaluation samples per split (for NSP/WOD): {self.max_eval_tokens}")
+        else: # Standard LM
             print(f"Max evaluation tokens per split (for LM): {self.max_eval_tokens}")
 
         if self.max_samples != float('inf'):
@@ -499,7 +522,9 @@ class DataBuilder:
                     tokenizer_fn=self._tokenize_text,
                     seq_len=self.seq_len,
                     is_eval=is_eval_split,
-                    max_samples_for_eval=max_s_eval
+                    max_samples_for_eval=max_s_eval,
+                    enable_word_order_task=self.enable_word_order_task,
+                    word_shuffle_probability=self.word_shuffle_probability
                 )
                 if len(nsp_dataset) > 0:
                     datasets[split_name] = nsp_dataset
@@ -616,9 +641,11 @@ if __name__ == "__main__":
         "dataset_name": "allenai/c4", #"wikitext",
         "dataset_config": "en", #"wikitext-2-raw-v1",
         "seq_len": 128,
-        "max_samples": 50, # Number of documents to load
-        "max_eval_tokens": 20, # For NSP, this is max_samples_for_eval
-        "enable_nsp": True
+        "max_samples": 50,
+        "max_eval_tokens": 20,
+        "enable_nsp": True,
+        "enable_word_order_task": True, # Test with WOD enabled
+        "word_shuffle_probability": 0.25
     }
     data_builder_nsp = create_data_builder(data_cfg_nsp)
     dataloaders_nsp = data_builder_nsp.create_dataloaders(batch_size=2)
@@ -633,9 +660,10 @@ if __name__ == "__main__":
                 print(f"  Token Type IDs shape: {batch_data['token_type_ids'].shape}")
                 print(f"  LM Labels shape: {batch_data['lm_labels'].shape}")
                 print(f"  NSP Label: {batch_data['nsp_label']}")
+                print(f"  WOD Label: {batch_data['wod_label']}") # Print WOD label
                 # decoded_sample = data_builder_nsp.decode_tokens(batch_data['input_ids'][0])
                 # print(f"  Decoded sample input: {decoded_sample[:100]}...")
-                if batch_idx >= 0: break # Check first batch
+                if batch_idx >= 0: break
         except Exception as e:
             print(f"Error during NSP dataloader iteration test: {e}")
     else:

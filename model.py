@@ -105,11 +105,13 @@ class GPTModel(nn.Module):
         max_seq_len=2048,
         mlp_ratio=4,
         causal=True,
-        num_nsp_labels=2
+        num_nsp_labels=2,
+        enable_word_order_task: bool = False # Added WOD config
     ):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
+        self.enable_word_order_task = enable_word_order_task
         
         # Token and position embeddings (no bias)
         self.token_emb = nn.Embedding(vocab_size, dim)
@@ -129,7 +131,19 @@ class GPTModel(nn.Module):
         # Final norm and output projection
         self.norm_out = RMSNorm(dim)
         self.head = nn.Linear(dim, vocab_size, bias=False) # LM head
-        self.nsp_head = nn.Linear(dim, num_nsp_labels) # NSP head
+
+        # NSP head (conditional initialization or always init if config drives its usage)
+        # For simplicity in forward, let's assume it's always initialized if num_nsp_labels > 0,
+        # but its output is only used if nsp_labels are provided.
+        # Or, make it None if not used (requires checks in forward).
+        # The current structure has it initialized based on num_nsp_labels.
+        self.nsp_head = nn.Linear(dim, num_nsp_labels) if num_nsp_labels > 0 else None
+
+        # WOD head
+        if self.enable_word_order_task:
+            self.word_order_head = nn.Linear(dim, 2) # Binary: original vs shuffled
+        else:
+            self.word_order_head = None
         
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
@@ -139,12 +153,12 @@ class GPTModel(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None: # Initialize bias for Linear layers (like nsp_head)
+            if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, nsp_labels=None):
+    def forward(self, x, targets=None, nsp_labels=None, wod_labels=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -163,30 +177,39 @@ class GPTModel(nn.Module):
         # LM logits
         lm_logits = self.head(x)
 
-        # NSP logits
-        # Use the hidden state of the first token (e.g., [CLS] token equivalent) for NSP
+        # NSP logits & WOD logits (both can use the first token's hidden state)
         pooled_output = x[:, 0]
-        nsp_logits = self.nsp_head(pooled_output)
 
-        lm_loss = None
-        nsp_loss = None
+        nsp_logits = None
+        if self.nsp_head is not None:
+            nsp_logits = self.nsp_head(pooled_output)
+
+        word_order_logits = None
+        if self.word_order_head is not None:
+            word_order_logits = self.word_order_head(pooled_output)
+
+        lm_loss, nsp_loss, word_order_loss = None, None, None
 
         if targets is not None:
-            # Compute LM cross-entropy loss
             lm_loss = F.cross_entropy(
                 lm_logits.view(-1, lm_logits.size(-1)),
                 targets.view(-1),
-                ignore_index=-100 # Consistent with data_builder padding for lm_labels
+                ignore_index=-100
             )
 
-        if nsp_labels is not None:
-            # Compute NSP cross-entropy loss
+        if nsp_logits is not None and nsp_labels is not None and self.nsp_head is not None:
             nsp_loss = F.cross_entropy(
                 nsp_logits.view(-1, self.nsp_head.out_features),
                 nsp_labels.view(-1)
             )
-        
-        return lm_logits, nsp_logits, lm_loss, nsp_loss
+
+        if word_order_logits is not None and wod_labels is not None and self.word_order_head is not None:
+            word_order_loss = F.cross_entropy(
+                word_order_logits.view(-1, self.word_order_head.out_features), # Should be 2 features
+                wod_labels.view(-1)
+            )
+
+        return lm_logits, nsp_logits, word_order_logits, lm_loss, nsp_loss, word_order_loss
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """Generate new tokens using the model with top-k and top-p sampling."""
@@ -197,9 +220,9 @@ class GPTModel(nn.Module):
                 idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
                 
                 # Forward pass
-                # self(idx_cond) now returns: lm_logits, nsp_logits, lm_loss, nsp_loss
+                # self(idx_cond) now returns: lm_logits, nsp_logits, word_order_logits, lm_loss, nsp_loss, word_order_loss
                 # We only need lm_logits for generation.
-                lm_logits, _, _, _ = self(idx_cond)
+                lm_logits, _, _, _, _, _ = self(idx_cond)
                 logits = lm_logits[:, -1, :] / temperature # Use lm_logits
                 
                 # Apply top-k filtering if specified

@@ -79,10 +79,26 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     if hasattr(args, 'nsp_loss_weight') and args.nsp_loss_weight is not None:
         config.setdefault('training', {})['nsp_loss_weight'] = args.nsp_loss_weight
     
-    if hasattr(args, 'use_simple_kernel') and args.use_simple_kernel: # Check if True
+    if hasattr(args, 'use_simple_kernel') and args.use_simple_kernel:
         config.setdefault('hardware', {})['use_simple_kernel'] = True
-    elif 'use_simple_kernel' not in config.get('hardware', {}):
+    elif not hasattr(args, 'use_simple_kernel') and 'use_simple_kernel' not in config.get('hardware', {}): # Not set by CLI and not in YAML
         config.setdefault('hardware', {})['use_simple_kernel'] = False
+    # If CLI arg --use_simple_kernel is NOT provided (so args.use_simple_kernel is False due to action='store_true')
+    # AND it IS in the YAML, the YAML value should persist. The current logic handles this.
+    # If CLI arg IS provided, it overrides YAML.
+    # If neither CLI nor YAML, it defaults to False.
+
+    # WOD related args
+    if hasattr(args, 'enable_word_order_task') and args.enable_word_order_task:
+        config.setdefault('model', {})['enable_word_order_task'] = True
+    elif 'enable_word_order_task' not in config.get('model', {}): # if not set by CLI, and not in YAML
+        config.setdefault('model', {})['enable_word_order_task'] = False
+
+    if hasattr(args, 'word_shuffle_probability') and args.word_shuffle_probability is not None:
+        config.setdefault('data', {})['word_shuffle_probability'] = args.word_shuffle_probability
+
+    if hasattr(args, 'word_order_loss_weight') and args.word_order_loss_weight is not None:
+        config.setdefault('training', {})['word_order_loss_weight'] = args.word_order_loss_weight
 
     return config
 
@@ -236,18 +252,23 @@ def start_actual_training(cli_args):
         'seq_len': data_cfg.get('seq_len', 1024),
         'max_samples': data_cfg.get('max_samples', 5000),
         'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000),
-        'enable_nsp': data_cfg.get('enable_nsp', False) # Pass enable_nsp to DataBuilder
+        'enable_nsp': data_cfg.get('enable_nsp', False),
+        # WOD specific for DataBuilder config
+        'enable_word_order_task': model_cfg.get('enable_word_order_task', False), # DataBuilder needs this to pass to NSPDataset
+        'word_shuffle_probability': data_cfg.get('word_shuffle_probability', 0.15)
     }
     
     # Model configuration
     model_config = {
-        'vocab_size': model_cfg.get('vocab_size', 256),
+        'vocab_size': model_cfg.get('vocab_size', 256), # vocab_size is updated later by DataBuilder
         'dim': model_cfg.get('dim', 512),
         'n_layers': model_cfg.get('n_layers', 12),
         'n_heads': model_cfg.get('n_heads', 16),
         'max_seq_len': model_cfg.get('max_seq_len', 2048),
         'mlp_ratio': model_cfg.get('mlp_ratio', 4),
-        'causal': model_cfg.get('causal', True)
+        'causal': model_cfg.get('causal', True),
+        'num_nsp_labels': model_cfg.get('num_nsp_labels', 2), # Already there from previous step
+        'enable_word_order_task': model_cfg.get('enable_word_order_task', False) # For GPTModel constructor
     }
     
     # Initialize model
@@ -286,7 +307,8 @@ def start_actual_training(cli_args):
         inference_temperature=inference_cfg.get('temperature', 0.8),
         inference_top_k=inference_cfg.get('top_k', 50),
         inference_top_p=inference_cfg.get('top_p', 0.9),
-        nsp_loss_weight=training_cfg.get('nsp_loss_weight', 0.5) # Pass to TrainingConfig
+        nsp_loss_weight=training_cfg.get('nsp_loss_weight', 0.5),
+        word_order_loss_weight=training_cfg.get('word_order_loss_weight', 0.1) # Pass to TrainingConfig
     )
     
     # Estimate optimal batch size with precision consideration
@@ -383,20 +405,18 @@ def start_actual_training(cli_args):
     if 'train' in dataloaders and 'validation' in dataloaders:
         max_eval_batches = eval_cfg.get('max_eval_batches', 10)
 
-        initial_train_combined_loss, initial_train_lm_loss, initial_train_nsp_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
-        initial_val_combined_loss, initial_val_lm_loss, initial_val_nsp_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
+        initial_train_combined_loss, initial_train_lm_loss, initial_train_nsp_loss, initial_train_wod_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
+        initial_val_combined_loss, initial_val_lm_loss, initial_val_nsp_loss, initial_val_wod_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
 
         print(f"Initial training loss (combined): {initial_train_combined_loss:.4f}")
-        if initial_train_lm_loss is not None:
-            print(f"  Initial LM training loss: {initial_train_lm_loss:.4f}")
-        if initial_train_nsp_loss is not None:
-            print(f"  Initial NSP training loss: {initial_train_nsp_loss:.4f}")
+        if initial_train_lm_loss is not None: print(f"  Initial LM training loss: {initial_train_lm_loss:.4f}")
+        if initial_train_nsp_loss is not None: print(f"  Initial NSP training loss: {initial_train_nsp_loss:.4f}")
+        if initial_train_wod_loss is not None: print(f"  Initial WOD training loss: {initial_train_wod_loss:.4f}")
 
         print(f"Initial validation loss (combined): {initial_val_combined_loss:.4f}")
-        if initial_val_lm_loss is not None:
-            print(f"  Initial LM validation loss: {initial_val_lm_loss:.4f}")
-        if initial_val_nsp_loss is not None:
-            print(f"  Initial NSP validation loss: {initial_val_nsp_loss:.4f}")
+        if initial_val_lm_loss is not None: print(f"  Initial LM validation loss: {initial_val_lm_loss:.4f}")
+        if initial_val_nsp_loss is not None: print(f"  Initial NSP validation loss: {initial_val_nsp_loss:.4f}")
+        if initial_val_wod_loss is not None: print(f"  Initial WOD validation loss: {initial_val_wod_loss:.4f}")
     
     # Test causal vs non-causal attention
     if logging_cfg.get('test_attention_modes', True):
@@ -416,20 +436,18 @@ def start_actual_training(cli_args):
         # Final evaluation
         if 'train' in dataloaders and 'validation' in dataloaders:
             max_eval_batches = eval_cfg.get('max_eval_batches', 10)
-            final_train_combined_loss, final_train_lm_loss, final_train_nsp_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
-            final_val_combined_loss, final_val_lm_loss, final_val_nsp_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
+            final_train_combined_loss, final_train_lm_loss, final_train_nsp_loss, final_train_wod_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
+            final_val_combined_loss, final_val_lm_loss, final_val_nsp_loss, final_val_wod_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
 
             print(f"Final training loss (combined): {final_train_combined_loss:.4f}")
-            if final_train_lm_loss is not None:
-                print(f"  Final LM training loss: {final_train_lm_loss:.4f}")
-            if final_train_nsp_loss is not None:
-                print(f"  Final NSP training loss: {final_train_nsp_loss:.4f}")
+            if final_train_lm_loss is not None: print(f"  Final LM training loss: {final_train_lm_loss:.4f}")
+            if final_train_nsp_loss is not None: print(f"  Final NSP training loss: {final_train_nsp_loss:.4f}")
+            if final_train_wod_loss is not None: print(f"  Final WOD training loss: {final_train_wod_loss:.4f}")
 
             print(f"Final validation loss (combined): {final_val_combined_loss:.4f}")
-            if final_val_lm_loss is not None:
-                print(f"  Final LM validation loss: {final_val_lm_loss:.4f}")
-            if final_val_nsp_loss is not None:
-                print(f"  Final NSP validation loss: {final_val_nsp_loss:.4f}")
+            if final_val_lm_loss is not None: print(f"  Final LM validation loss: {final_val_lm_loss:.4f}")
+            if final_val_nsp_loss is not None: print(f"  Final NSP validation loss: {final_val_nsp_loss:.4f}")
+            if final_val_wod_loss is not None: print(f"  Final WOD validation loss: {final_val_wod_loss:.4f}")
             
             # Show improvement
             if initial_train_combined_loss is not None and final_train_combined_loss is not None :
@@ -491,8 +509,8 @@ def test_causal_attention(model, dataloaders, device, data_builder):
     with torch.no_grad():
         # Test with causal=True (default)
         print("Testing with causal=True...")
-        # model(x) now returns: lm_logits, nsp_logits, lm_loss, nsp_loss
-        logits_causal, _, _, _ = model(x)
+        # model(x) now returns: lm_logits, nsp_logits, wod_logits, lm_loss, nsp_loss, wod_loss
+        logits_causal, _, _, _, _, _ = model(x)
         
         # Test with causal=False by modifying the attention layers
         print("Testing with causal=False...")
@@ -502,8 +520,8 @@ def test_causal_attention(model, dataloaders, device, data_builder):
             original_causal.append(block.attn.causal)
             block.attn.causal = False
         
-        # model(x) now returns: lm_logits, nsp_logits, lm_loss, nsp_loss
-        logits_non_causal, _, _, _ = model(x)
+        # model(x) now returns: lm_logits, nsp_logits, wod_logits, lm_loss, nsp_loss, wod_loss
+        logits_non_causal, _, _, _, _, _ = model(x)
         
         # Restore original causal setting
         for i, block in enumerate(model.blocks):
@@ -685,6 +703,24 @@ if __name__ == "__main__":
         '--use_simple_kernel',
         action='store_true',
         help='Use simple PyTorch-based attention kernel instead of Triton/CUDA kernel.'
+    )
+    # WOD arguments
+    parser.add_argument(
+        '--enable_word_order_task',
+        action='store_true',
+        help='Enable Word Order Detection auxiliary task.'
+    )
+    parser.add_argument(
+        '--word_shuffle_probability',
+        type=float,
+        default=None,
+        help='Probability of shuffling words in a sentence for WOD task (overrides config).'
+    )
+    parser.add_argument(
+        '--word_order_loss_weight',
+        type=float,
+        default=None,
+        help='Weight for the WOD loss (overrides config, TrainingConfig default is 0.1).'
     )
 
     args = parser.parse_args()
