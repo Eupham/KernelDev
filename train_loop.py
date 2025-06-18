@@ -158,10 +158,11 @@ class TrainingMetrics:
         # For separate LM/NSP loss tracking
         self.train_lm_losses = []
         self.train_nsp_losses = []
-        self.train_wod_losses = [] # Added WOD
+        self.train_wod_losses = []
         self.val_lm_losses = []
         self.val_nsp_losses = []
-        self.val_wod_losses = []   # Added WOD
+        self.val_wod_losses = []
+        self.val_nsp_accuracies: List[float] = [] # Added for NSP accuracy
     
     def update(
         self,
@@ -171,10 +172,11 @@ class TrainingMetrics:
         step_time: Optional[float] = None,
         train_lm_loss: Optional[float] = None,
         train_nsp_loss: Optional[float] = None,
-        train_wod_loss: Optional[float] = None, # Added WOD
+        train_wod_loss: Optional[float] = None,
         val_lm_loss: Optional[float] = None,
         val_nsp_loss: Optional[float] = None,
-        val_wod_loss: Optional[float] = None    # Added WOD
+        val_wod_loss: Optional[float] = None,
+        val_nsp_accuracy: Optional[float] = None # Added for NSP accuracy
     ):
         """Update metrics with new values."""
         if train_loss is not None:
@@ -183,7 +185,7 @@ class TrainingMetrics:
             self.train_lm_losses.append(train_lm_loss)
         if train_nsp_loss is not None:
             self.train_nsp_losses.append(train_nsp_loss)
-        if train_wod_loss is not None: # Added WOD
+        if train_wod_loss is not None:
             self.train_wod_losses.append(train_wod_loss)
         
         if val_loss is not None:
@@ -195,8 +197,10 @@ class TrainingMetrics:
             self.val_lm_losses.append(val_lm_loss)
         if val_nsp_loss is not None:
             self.val_nsp_losses.append(val_nsp_loss)
-        if val_wod_loss is not None: # Added WOD
+        if val_wod_loss is not None:
             self.val_wod_losses.append(val_wod_loss)
+        if val_nsp_accuracy is not None: # Added for NSP accuracy
+            self.val_nsp_accuracies.append(val_nsp_accuracy)
 
         if learning_rate is not None:
             self.learning_rates.append(learning_rate)
@@ -226,10 +230,11 @@ class TrainingMetrics:
             # Save new loss lists
             'train_lm_losses': self.train_lm_losses,
             'train_nsp_losses': self.train_nsp_losses,
-            'train_wod_losses': self.train_wod_losses, # Added WOD
+            'train_wod_losses': self.train_wod_losses,
             'val_lm_losses': self.val_lm_losses,
             'val_nsp_losses': self.val_nsp_losses,
-            'val_wod_losses': self.val_wod_losses,     # Added WOD
+            'val_wod_losses': self.val_wod_losses,
+            'val_nsp_accuracies': self.val_nsp_accuracies # Added for NSP accuracy
         }
         torch.save(metrics_dict, filepath)
 
@@ -438,7 +443,9 @@ class Trainer:
         accumulated_combined_loss = 0.0
         accumulated_lm_loss = 0.0
         accumulated_nsp_loss = 0.0
-        accumulated_wod_loss = 0.0 # Added WOD
+        accumulated_wod_loss = 0.0
+        accumulated_correct_nsp_predictions = 0 # For NSP accuracy
+        accumulated_total_nsp_samples = 0       # For NSP accuracy
 
         num_total_loss_batches = 0
         num_lm_loss_batches = 0
@@ -465,14 +472,14 @@ class Trainer:
                     word_order_score_targets = word_order_score_targets.to(self.config.device).float()
 
                 lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = None, None, None
+                nsp_logits_for_acc = None # For NSP accuracy
                 if self.config.use_amp:
                     with torch.amp.autocast('cuda'):
-                        # model.forward now returns: lm_logits, nsp_logits, predicted_wod_score, lm_loss, nsp_loss, wod_loss
-                        _, _, _, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
+                        _, nsp_logits_for_acc, _, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
                             input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
                         )
                 else:
-                    _, _, _, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
+                    _, nsp_logits_for_acc, _, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
                         input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
                     )
                 
@@ -502,6 +509,11 @@ class Trainer:
                         batch_combined_loss_value += self.config.word_order_loss_weight * wod_loss_item
                         has_any_loss_term_in_batch = True
 
+                if nsp_logits_for_acc is not None and nsp_label is not None: # For NSP accuracy
+                    nsp_predictions = torch.argmax(nsp_logits_for_acc, dim=-1)
+                    accumulated_correct_nsp_predictions += (nsp_predictions == nsp_label).sum().item()
+                    accumulated_total_nsp_samples += nsp_label.size(0)
+
 
                 if has_any_loss_term_in_batch:
                     accumulated_combined_loss += batch_combined_loss_value
@@ -513,8 +525,9 @@ class Trainer:
         avg_lm_eval_loss = accumulated_lm_loss / num_lm_loss_batches if num_lm_loss_batches > 0 else None
         avg_nsp_eval_loss = accumulated_nsp_loss / num_nsp_loss_batches if num_nsp_loss_batches > 0 else None
         avg_wod_eval_loss = accumulated_wod_loss / num_wod_loss_batches if num_wod_loss_batches > 0 else None
+        avg_nsp_accuracy = accumulated_correct_nsp_predictions / accumulated_total_nsp_samples if accumulated_total_nsp_samples > 0 else None
 
-        return avg_combined_eval_loss, avg_lm_eval_loss, avg_nsp_eval_loss, avg_wod_eval_loss
+        return avg_combined_eval_loss, avg_lm_eval_loss, avg_nsp_eval_loss, avg_wod_eval_loss, avg_nsp_accuracy
     
     def save_checkpoint(self, step: int, is_best: bool = False):
         """Save model checkpoint."""
@@ -672,12 +685,13 @@ class Trainer:
             if (not self.is_distributed or dist.get_rank() == 0) and \
                val_loader is not None and \
                self.metrics.total_steps % self.config.eval_every == 0:
-                avg_combined_val_loss, avg_lm_val_loss, avg_nsp_val_loss, avg_wod_val_loss = self.evaluate(val_loader)
+                avg_combined_val_loss, avg_lm_val_loss, avg_nsp_val_loss, avg_wod_val_loss, avg_nsp_accuracy = self.evaluate(val_loader)
                 self.metrics.update(
                     val_loss=avg_combined_val_loss,
                     val_lm_loss=avg_lm_val_loss,
                     val_nsp_loss=avg_nsp_val_loss,
-                    val_wod_loss=avg_wod_val_loss
+                    val_wod_loss=avg_wod_val_loss,
+                    val_nsp_accuracy=avg_nsp_accuracy # Update metrics with NSP accuracy
                 )
 
                 is_best = avg_combined_val_loss < self.metrics.best_val_loss
@@ -686,12 +700,14 @@ class Trainer:
                 if avg_lm_val_loss is not None:
                     eval_log_msg += f"(LM: {avg_lm_val_loss:.4f}) "
                 if avg_nsp_val_loss is not None:
-                    eval_log_msg += f"(NSP: {avg_nsp_val_loss:.4f}) "
+                    eval_log_msg += f"(NSP Loss: {avg_nsp_val_loss:.4f}) "
                 if avg_wod_val_loss is not None:
                     eval_log_msg += f"(WOD MSE: {avg_wod_val_loss:.4f}) "
+                if avg_nsp_accuracy is not None:
+                     eval_log_msg += f"(NSP Acc: {avg_nsp_accuracy:.4f}) "
                 eval_log_msg += f"{'(Best!)' if is_best else ''}"
                 print(eval_log_msg)
-                
+
                 if is_best:
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
 
@@ -836,21 +852,24 @@ class Trainer:
         
         # Initial evaluation (only on rank 0)
         if val_loader and (not self.is_distributed or dist.get_rank() == 0):
-            initial_combined_val_loss, initial_lm_val_loss, initial_nsp_val_loss, initial_wod_val_loss = self.evaluate(val_loader)
+            initial_combined_val_loss, initial_lm_val_loss, initial_nsp_val_loss, initial_wod_val_loss, initial_nsp_accuracy = self.evaluate(val_loader)
             self.metrics.update(
                 val_loss=initial_combined_val_loss,
                 val_lm_loss=initial_lm_val_loss,
                 val_nsp_loss=initial_nsp_val_loss,
-                val_wod_loss=initial_wod_val_loss
+                val_wod_loss=initial_wod_val_loss,
+                val_nsp_accuracy=initial_nsp_accuracy
             )
 
             eval_log_msg = f"Initial Validation Loss (Rank 0): {initial_combined_val_loss:.4f} "
             if initial_lm_val_loss is not None:
                 eval_log_msg += f"(LM: {initial_lm_val_loss:.4f}) "
             if initial_nsp_val_loss is not None:
-                eval_log_msg += f"(NSP: {initial_nsp_val_loss:.4f}) "
+                eval_log_msg += f"(NSP Loss: {initial_nsp_val_loss:.4f}) "
             if initial_wod_val_loss is not None:
                 eval_log_msg += f"(WOD MSE: {initial_wod_val_loss:.4f}) "
+            if initial_nsp_accuracy is not None:
+                eval_log_msg += f"(NSP Acc: {initial_nsp_accuracy:.4f}) "
             print(eval_log_msg)
 
         try:
@@ -882,74 +901,83 @@ class Trainer:
     
     def plot_training_curves(self, save_path: Optional[str] = None):
         """Plot training curves."""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        
+        # Adjust layout for a potential new row for NSP accuracy
+        num_rows = 3 if self.metrics.val_nsp_accuracies else 2
+        fig, axes = plt.subplots(num_rows, 2, figsize=(15, 5 * num_rows))
+        if num_rows == 2: # If no NSP accuracy, axes might not be a 2D array if only 1 row was intended before
+             axes_flat = axes.flatten()
+        else:
+             axes_flat = axes.flatten()
+
         # Training loss
-        if self.metrics.train_losses: # Combined train loss
-            axes[0, 0].plot(self.metrics.train_losses, 'b-', alpha=0.8, label='Total Train Loss')
+        ax_train_loss = axes_flat[0]
+        if self.metrics.train_losses:
+            ax_train_loss.plot(self.metrics.train_losses, 'b-', alpha=0.8, label='Total Train Loss')
         if self.metrics.train_lm_losses:
-            axes[0, 0].plot(self.metrics.train_lm_losses, 'c--', alpha=0.7, label='Train LM Loss')
+            ax_train_loss.plot(self.metrics.train_lm_losses, 'c--', alpha=0.7, label='Train LM Loss')
         if self.metrics.train_nsp_losses:
-            axes[0, 0].plot(self.metrics.train_nsp_losses, 'm--', alpha=0.7, label='Train NSP Loss')
-        axes[0, 0].set_title('Training Losses')
-        axes[0, 0].set_xlabel('Step')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].grid(True, alpha=0.3)
-        if self.metrics.train_losses or self.metrics.train_lm_losses or self.metrics.train_nsp_losses:
-            axes[0, 0].legend()
+            ax_train_loss.plot(self.metrics.train_nsp_losses, 'm--', alpha=0.7, label='Train NSP Loss')
+        if self.metrics.train_wod_losses: # Plot WOD train loss
+            ax_train_loss.plot(self.metrics.train_wod_losses, 'g--', alpha=0.7, label='Train WOD Loss')
+        ax_train_loss.set_title('Training Losses')
+        ax_train_loss.set_xlabel('Step')
+        ax_train_loss.set_ylabel('Loss')
+        ax_train_loss.grid(True, alpha=0.3)
+        if self.metrics.train_losses or self.metrics.train_lm_losses or self.metrics.train_nsp_losses or self.metrics.train_wod_losses:
+            ax_train_loss.legend()
         
         # Validation loss
-        if self.metrics.val_losses: # Combined val loss
-            # Calculate correct x-axis steps for validation losses
-            # val_losses are recorded every eval_every steps.
-            # total_steps for val_loss_i = (i+1) * eval_every (assuming first eval is at eval_every)
-            # Or, more generally, if train_losses has T entries, and val_losses has V entries,
-            # val_steps should map to the global steps where validation occurred.
-            # A simpler way: plot against the number of validation calls (0, 1, 2...) * eval_every
-            num_val_points = len(self.metrics.val_losses)
-            # This assumes metrics.update for val_loss is called once per evaluation.
-            # And that train_loss is updated every step.
-            # The x-axis for val_loss should be the global step number at which it was recorded.
-            # This information is not directly stored per val_loss point, but can be inferred.
-            # For simplicity, let's assume val_losses are recorded at steps:
-            # eval_every, 2*eval_every, ...
-            # This is what val_steps tries to approximate, but can be more precise.
-            # Let's make an x-axis based on when val_loss is recorded.
-            # metrics.total_steps is incremented for each training step.
-            # When val_loss is recorded, self.metrics.total_steps is the current global step.
-            # A better way would be to store (step, val_loss) pairs.
-            # For now, the existing val_steps is a reasonable approximation if eval_every is consistent.
-            val_steps = np.linspace(0, self.metrics.total_steps, num_val_points, endpoint=False) if num_val_points > 0 else []
+        ax_val_loss = axes_flat[1]
+        num_val_points = len(self.metrics.val_losses)
+        val_steps = np.linspace(0, self.metrics.total_steps, num_val_points, endpoint=False) if num_val_points > 0 else []
 
-
-            axes[0, 1].plot(val_steps, self.metrics.val_losses, 'r-', alpha=0.8, label='Total Val Loss')
-        if self.metrics.val_lm_losses and num_val_points == len(self.metrics.val_lm_losses): # ensure same length
-             axes[0, 1].plot(val_steps, self.metrics.val_lm_losses, 'y--', alpha=0.7, label='Val LM Loss')
-        if self.metrics.val_nsp_losses and num_val_points == len(self.metrics.val_nsp_losses): # ensure same length
-             axes[0, 1].plot(val_steps, self.metrics.val_nsp_losses, 'k--', alpha=0.7, label='Val NSP Loss')
-        axes[0, 1].set_title('Validation Losses')
-        axes[0, 1].set_xlabel('Approx. Step') # Or 'Evaluation Iteration' if x-axis is just 0,1,2...
-        axes[0, 1].set_ylabel('Loss')
-        axes[0, 1].grid(True, alpha=0.3)
-        if self.metrics.val_losses or self.metrics.val_lm_losses or self.metrics.val_nsp_losses:
-            axes[0, 1].legend()
+        if self.metrics.val_losses:
+            ax_val_loss.plot(val_steps, self.metrics.val_losses, 'r-', alpha=0.8, label='Total Val Loss')
+        if self.metrics.val_lm_losses and num_val_points == len(self.metrics.val_lm_losses):
+             ax_val_loss.plot(val_steps, self.metrics.val_lm_losses, 'y--', alpha=0.7, label='Val LM Loss')
+        if self.metrics.val_nsp_losses and num_val_points == len(self.metrics.val_nsp_losses):
+             ax_val_loss.plot(val_steps, self.metrics.val_nsp_losses, 'k--', alpha=0.7, label='Val NSP Loss')
+        if self.metrics.val_wod_losses and num_val_points == len(self.metrics.val_wod_losses): # Plot WOD val loss
+             ax_val_loss.plot(val_steps, self.metrics.val_wod_losses, 'lime', linestyle='--', alpha=0.7, label='Val WOD Loss')
+        ax_val_loss.set_title('Validation Losses')
+        ax_val_loss.set_xlabel('Approx. Step')
+        ax_val_loss.set_ylabel('Loss')
+        ax_val_loss.grid(True, alpha=0.3)
+        if self.metrics.val_losses or self.metrics.val_lm_losses or self.metrics.val_nsp_losses or self.metrics.val_wod_losses:
+            ax_val_loss.legend()
         
         # Learning rate
+        ax_lr = axes_flat[2]
         if self.metrics.learning_rates:
-            axes[1, 0].plot(self.metrics.learning_rates, 'g-', alpha=0.7)
-            axes[1, 0].set_title('Learning Rate')
-            axes[1, 0].set_xlabel('Step')
-            axes[1, 0].set_ylabel('Learning Rate')
-            axes[1, 0].grid(True, alpha=0.3)
+            ax_lr.plot(self.metrics.learning_rates, 'g-', alpha=0.7)
+            ax_lr.set_title('Learning Rate')
+            ax_lr.set_xlabel('Step')
+            ax_lr.set_ylabel('Learning Rate')
+            ax_lr.grid(True, alpha=0.3)
         
         # Step times
+        ax_step_time = axes_flat[3]
         if self.metrics.step_times:
-            axes[1, 1].plot(self.metrics.step_times, 'orange', alpha=0.7)
-            axes[1, 1].set_title('Step Time')
-            axes[1, 1].set_xlabel('Step')
-            axes[1, 1].set_ylabel('Time (s)')
-            axes[1, 1].grid(True, alpha=0.3)
-        
+            ax_step_time.plot(self.metrics.step_times, 'orange', alpha=0.7)
+            ax_step_time.set_title('Step Time')
+            ax_step_time.set_xlabel('Step')
+            ax_step_time.set_ylabel('Time (s)')
+            ax_step_time.grid(True, alpha=0.3)
+
+        # NSP Accuracy (if applicable)
+        if num_rows == 3:
+            ax_nsp_acc = axes_flat[4]
+            if self.metrics.val_nsp_accuracies and num_val_points == len(self.metrics.val_nsp_accuracies):
+                ax_nsp_acc.plot(val_steps, self.metrics.val_nsp_accuracies, 'purple', alpha=0.7, label='Val NSP Accuracy')
+                ax_nsp_acc.set_title('Validation NSP Accuracy')
+                ax_nsp_acc.set_xlabel('Approx. Step')
+                ax_nsp_acc.set_ylabel('Accuracy')
+                ax_nsp_acc.grid(True, alpha=0.3)
+                ax_nsp_acc.legend()
+            # Remove the 6th subplot if it exists and is unused
+            if len(axes_flat) > 5:
+                 fig.delaxes(axes_flat[5])
+
         plt.tight_layout()
         
         if save_path:
