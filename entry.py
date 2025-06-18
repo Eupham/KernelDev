@@ -405,18 +405,20 @@ def start_actual_training(cli_args):
     if 'train' in dataloaders and 'validation' in dataloaders:
         max_eval_batches = eval_cfg.get('max_eval_batches', 10)
 
-        initial_train_combined_loss, initial_train_lm_loss, initial_train_nsp_loss, initial_train_wod_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
-        initial_val_combined_loss, initial_val_lm_loss, initial_val_nsp_loss, initial_val_wod_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
+        initial_train_combined_loss, initial_train_lm_loss, initial_train_nsp_loss, initial_train_wod_loss, initial_train_nsp_acc = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
+        initial_val_combined_loss, initial_val_lm_loss, initial_val_nsp_loss, initial_val_wod_loss, initial_val_nsp_acc = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
 
         print(f"Initial training loss (combined): {initial_train_combined_loss:.4f}")
         if initial_train_lm_loss is not None: print(f"  Initial LM training loss: {initial_train_lm_loss:.4f}")
         if initial_train_nsp_loss is not None: print(f"  Initial NSP training loss: {initial_train_nsp_loss:.4f}")
         if initial_train_wod_loss is not None: print(f"  Initial WOD training loss: {initial_train_wod_loss:.4f}")
+        if initial_train_nsp_acc is not None: print(f"  Initial NSP training accuracy: {initial_train_nsp_acc:.4f}")
 
         print(f"Initial validation loss (combined): {initial_val_combined_loss:.4f}")
         if initial_val_lm_loss is not None: print(f"  Initial LM validation loss: {initial_val_lm_loss:.4f}")
         if initial_val_nsp_loss is not None: print(f"  Initial NSP validation loss: {initial_val_nsp_loss:.4f}")
         if initial_val_wod_loss is not None: print(f"  Initial WOD validation loss: {initial_val_wod_loss:.4f}")
+        if initial_val_nsp_acc is not None: print(f"  Initial NSP validation accuracy: {initial_val_nsp_acc:.4f}")
     
     # Test causal vs non-causal attention
     if logging_cfg.get('test_attention_modes', True):
@@ -436,18 +438,20 @@ def start_actual_training(cli_args):
         # Final evaluation
         if 'train' in dataloaders and 'validation' in dataloaders:
             max_eval_batches = eval_cfg.get('max_eval_batches', 10)
-            final_train_combined_loss, final_train_lm_loss, final_train_nsp_loss, final_train_wod_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
-            final_val_combined_loss, final_val_lm_loss, final_val_nsp_loss, final_val_wod_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
+            final_train_combined_loss, final_train_lm_loss, final_train_nsp_loss, final_train_wod_loss, final_train_nsp_acc = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
+            final_val_combined_loss, final_val_lm_loss, final_val_nsp_loss, final_val_wod_loss, final_val_nsp_acc = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
 
             print(f"Final training loss (combined): {final_train_combined_loss:.4f}")
             if final_train_lm_loss is not None: print(f"  Final LM training loss: {final_train_lm_loss:.4f}")
             if final_train_nsp_loss is not None: print(f"  Final NSP training loss: {final_train_nsp_loss:.4f}")
             if final_train_wod_loss is not None: print(f"  Final WOD training loss: {final_train_wod_loss:.4f}")
+            if final_train_nsp_acc is not None: print(f"  Final NSP training accuracy: {final_train_nsp_acc:.4f}")
 
             print(f"Final validation loss (combined): {final_val_combined_loss:.4f}")
             if final_val_lm_loss is not None: print(f"  Final LM validation loss: {final_val_lm_loss:.4f}")
             if final_val_nsp_loss is not None: print(f"  Final NSP validation loss: {final_val_nsp_loss:.4f}")
             if final_val_wod_loss is not None: print(f"  Final WOD validation loss: {final_val_wod_loss:.4f}")
+            if final_val_nsp_acc is not None: print(f"  Final NSP validation accuracy: {final_val_nsp_acc:.4f}")
             
             # Show improvement
             if initial_train_combined_loss is not None and final_train_combined_loss is not None :
