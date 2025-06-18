@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from original_kernel import flash_attention as original_flash_attention_wrapper
 from simple_kernel import flash_attention_func as simple_flash_attention_wrapper
 import os
-
+from typing import Optional # Add Optional
 
 class RMSNorm(nn.Module):
     """RMS normalization without learnable weight parameters."""
