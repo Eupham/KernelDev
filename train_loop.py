@@ -299,7 +299,6 @@ class Trainer:
         lm_labels = batch['lm_labels'].to(self.config.device)
         token_type_ids = batch.get('token_type_ids', None)
         nsp_label = batch.get('nsp_label', None)
-        # For WOD regression, the label key from data_builder is 'word_order_score_label'
         word_order_score_targets = batch.get('word_order_score_label', None)
 
         if token_type_ids is not None:
@@ -307,7 +306,7 @@ class Trainer:
         if nsp_label is not None:
             nsp_label = nsp_label.to(self.config.device)
         if word_order_score_targets is not None:
-            word_order_score_targets = word_order_score_targets.to(self.config.device).float() # Ensure float
+            word_order_score_targets = word_order_score_targets.to(self.config.device).float()
         
         # Zero gradients
         self.optimizer.zero_grad()
@@ -318,7 +317,6 @@ class Trainer:
         if self.config.use_amp and self.config.scaler is not None:
             # Mixed precision forward pass
             with torch.amp.autocast('cuda'):
-                # model's forward expects 'word_order_score_targets'
                 lm_logits, nsp_logits, predicted_wod_score, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
                     input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
                 )
@@ -469,6 +467,7 @@ class Trainer:
                 lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = None, None, None
                 if self.config.use_amp:
                     with torch.amp.autocast('cuda'):
+                        # model.forward now returns: lm_logits, nsp_logits, predicted_wod_score, lm_loss, nsp_loss, wod_loss
                         _, _, _, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
                             input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
                         )
@@ -639,14 +638,13 @@ class Trainer:
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
             
-            # Update metrics (Pass WOD loss to metrics if TrainingMetrics is updated for it)
-            # For now, as per plan, TrainingMetrics.update is not changed for WOD yet.
+            # Update metrics
             step_time = time.time() - step_start
             self.metrics.update(
                 train_loss=combined_loss_val,
                 train_lm_loss=lm_loss_val,
                 train_nsp_loss=nsp_loss_val,
-                # train_wod_loss=wod_loss_val, # Would add this if TrainingMetrics handled it
+                train_wod_loss=wod_loss_val,
                 learning_rate=current_lr,
                 step_time=step_time
             )
@@ -664,7 +662,7 @@ class Trainer:
                     log_msg += f"(LM: {lm_loss_val:.4f}) "
                 if nsp_loss_val is not None:
                     log_msg += f"(NSP: {nsp_loss_val:.4f}{'*' if self.config.nsp_loss_weight > 0 else ''}) "
-                if wod_loss_val is not None: # wod_loss_val is the MSE loss here
+                if wod_loss_val is not None:
                     log_msg += f"(WOD MSE: {wod_loss_val:.4f}{'*' if self.config.word_order_loss_weight > 0 else ''}) "
 
                 log_msg += f", LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
@@ -679,7 +677,7 @@ class Trainer:
                     val_loss=avg_combined_val_loss,
                     val_lm_loss=avg_lm_val_loss,
                     val_nsp_loss=avg_nsp_val_loss,
-                    val_wod_loss=avg_wod_val_loss # Pass WOD validation loss to metrics
+                    val_wod_loss=avg_wod_val_loss
                 )
 
                 is_best = avg_combined_val_loss < self.metrics.best_val_loss
@@ -689,7 +687,7 @@ class Trainer:
                     eval_log_msg += f"(LM: {avg_lm_val_loss:.4f}) "
                 if avg_nsp_val_loss is not None:
                     eval_log_msg += f"(NSP: {avg_nsp_val_loss:.4f}) "
-                if avg_wod_val_loss is not None: # avg_wod_val_loss is the avg MSE loss
+                if avg_wod_val_loss is not None:
                     eval_log_msg += f"(WOD MSE: {avg_wod_val_loss:.4f}) "
                 eval_log_msg += f"{'(Best!)' if is_best else ''}"
                 print(eval_log_msg)
@@ -843,7 +841,7 @@ class Trainer:
                 val_loss=initial_combined_val_loss,
                 val_lm_loss=initial_lm_val_loss,
                 val_nsp_loss=initial_nsp_val_loss,
-                val_wod_loss=initial_wod_val_loss # Pass WOD validation loss to metrics
+                val_wod_loss=initial_wod_val_loss
             )
 
             eval_log_msg = f"Initial Validation Loss (Rank 0): {initial_combined_val_loss:.4f} "
@@ -851,7 +849,7 @@ class Trainer:
                 eval_log_msg += f"(LM: {initial_lm_val_loss:.4f}) "
             if initial_nsp_val_loss is not None:
                 eval_log_msg += f"(NSP: {initial_nsp_val_loss:.4f}) "
-            if initial_wod_val_loss is not None: # initial_wod_val_loss is avg MSE loss
+            if initial_wod_val_loss is not None:
                 eval_log_msg += f"(WOD MSE: {initial_wod_val_loss:.4f}) "
             print(eval_log_msg)
 
@@ -1028,12 +1026,11 @@ class Trainer:
                 # NSP labels are not needed for perplexity of LM
 
                 lm_loss = None # Initialize lm_loss for the batch
-                if self.config.use_amp and self.config.scaler is not None: # scaler might be None even if use_amp is true
+                if self.config.use_amp and self.config.scaler is not None:
                     with torch.amp.autocast('cuda'):
-                        # model returns: lm_logits, nsp_logits, wod_logits, lm_loss, nsp_loss, wod_loss
-                        _, _, _, lm_loss, _, _ = self.model(input_ids, targets=lm_labels, nsp_labels=None, wod_labels=None)
+                        _, _, _, lm_loss, _, _ = self.model(input_ids, targets=lm_labels, nsp_labels=None, word_order_score_targets=None)
                 else:
-                    _, _, _, lm_loss, _, _ = self.model(input_ids, targets=lm_labels, nsp_labels=None, wod_labels=None)
+                    _, _, _, lm_loss, _, _ = self.model(input_ids, targets=lm_labels, nsp_labels=None, word_order_score_targets=None)
                 
                 if lm_loss is not None:
                     total_lm_loss += lm_loss.item()
