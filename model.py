@@ -141,7 +141,7 @@ class GPTModel(nn.Module):
 
         # WOD head
         if self.enable_word_order_task:
-            self.word_order_head = nn.Linear(dim, 2) # Binary: original vs shuffled
+            self.word_order_head = nn.Linear(self.dim, 1) # Regression to a score (0-1)
         else:
             self.word_order_head = None
         
@@ -158,7 +158,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, nsp_labels=None, wod_labels=None):
+    def forward(self, x, targets=None, nsp_labels=None, word_order_score_targets: Optional[torch.Tensor] = None): # Renamed wod_labels
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -184,9 +184,10 @@ class GPTModel(nn.Module):
         if self.nsp_head is not None:
             nsp_logits = self.nsp_head(pooled_output)
 
-        word_order_logits = None
+        predicted_word_order_score = None # Changed from word_order_logits
         if self.word_order_head is not None:
-            word_order_logits = self.word_order_head(pooled_output)
+            word_order_logit = self.word_order_head(pooled_output) # Raw output
+            predicted_word_order_score = torch.sigmoid(word_order_logit) # Apply sigmoid
 
         lm_loss, nsp_loss, word_order_loss = None, None, None
 
@@ -203,13 +204,13 @@ class GPTModel(nn.Module):
                 nsp_labels.view(-1)
             )
 
-        if word_order_logits is not None and wod_labels is not None and self.word_order_head is not None:
-            word_order_loss = F.cross_entropy(
-                word_order_logits.view(-1, self.word_order_head.out_features), # Should be 2 features
-                wod_labels.view(-1)
-            )
+        if predicted_word_order_score is not None and word_order_score_targets is not None and self.word_order_head is not None:
+            # Ensure targets are float for MSE loss
+            word_order_score_targets = word_order_score_targets.float()
+            # Squeeze predicted score if it has a trailing dim of 1, to match target shape (batch_size)
+            word_order_loss = F.mse_loss(predicted_word_order_score.squeeze(-1), word_order_score_targets)
 
-        return lm_logits, nsp_logits, word_order_logits, lm_loss, nsp_loss, word_order_loss
+        return lm_logits, nsp_logits, predicted_word_order_score, lm_loss, nsp_loss, word_order_loss
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """Generate new tokens using the model with top-k and top-p sampling."""

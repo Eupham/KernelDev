@@ -299,27 +299,28 @@ class Trainer:
         lm_labels = batch['lm_labels'].to(self.config.device)
         token_type_ids = batch.get('token_type_ids', None)
         nsp_label = batch.get('nsp_label', None)
-        wod_label = batch.get('wod_label', None) # Unpack WOD label
+        # For WOD regression, the label key from data_builder is 'word_order_score_label'
+        word_order_score_targets = batch.get('word_order_score_label', None)
 
         if token_type_ids is not None:
             token_type_ids = token_type_ids.to(self.config.device)
         if nsp_label is not None:
             nsp_label = nsp_label.to(self.config.device)
-        if wod_label is not None:
-            wod_label = wod_label.to(self.config.device)
+        if word_order_score_targets is not None:
+            word_order_score_targets = word_order_score_targets.to(self.config.device).float() # Ensure float
         
         # Zero gradients
         self.optimizer.zero_grad()
         
-        lm_loss, nsp_loss, wod_loss = None, None, None # Ensure they are defined
+        lm_loss, nsp_loss, wod_loss = None, None, None
         total_loss = None
 
         if self.config.use_amp and self.config.scaler is not None:
             # Mixed precision forward pass
             with torch.amp.autocast('cuda'):
-                # model returns: lm_logits, nsp_logits, wod_logits, lm_loss, nsp_loss, wod_loss
-                lm_logits, nsp_logits, wod_logits, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
-                    input_ids, targets=lm_labels, nsp_labels=nsp_label, wod_labels=wod_label
+                # model's forward expects 'word_order_score_targets'
+                lm_logits, nsp_logits, predicted_wod_score, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
+                    input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
                 )
                 lm_loss, nsp_loss, wod_loss = lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor
 
@@ -327,7 +328,7 @@ class Trainer:
                 print("Warning: All LM, NSP, and WOD losses are None in train_step (AMP).")
                 return 0.0, None, None, None
             
-            current_batch_loss = 0.0 # Ensure it's a float
+            current_batch_loss = 0.0
             if lm_loss is not None:
                 current_batch_loss += lm_loss
             if nsp_loss is not None and self.config.nsp_loss_weight > 0:
@@ -335,9 +336,7 @@ class Trainer:
             if wod_loss is not None and self.config.word_order_loss_weight > 0:
                 current_batch_loss += self.config.word_order_loss_weight * wod_loss
 
-            if not isinstance(current_batch_loss, torch.Tensor) and current_batch_loss == 0.0: # If it's still 0.0 and not a tensor
-                # This means all relevant losses were None or their weights were zero.
-                # Fallback to first available loss if any, otherwise return 0.
+            if not isinstance(current_batch_loss, torch.Tensor) and current_batch_loss == 0.0:
                 if lm_loss is not None: total_loss = lm_loss
                 elif nsp_loss is not None: total_loss = nsp_loss
                 elif wod_loss is not None: total_loss = wod_loss
@@ -366,8 +365,8 @@ class Trainer:
             
         else:
             # Standard precision forward pass
-            lm_logits, nsp_logits, wod_logits, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
-                input_ids, targets=lm_labels, nsp_labels=nsp_label, wod_labels=wod_label
+            lm_logits, nsp_logits, predicted_wod_score, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
+                input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
             )
             lm_loss, nsp_loss, wod_loss = lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor
 
@@ -375,7 +374,7 @@ class Trainer:
                 print("Warning: All LM, NSP, and WOD losses are None in train_step.")
                 return 0.0, None, None, None
 
-            current_batch_loss = 0.0 # Ensure it's a float
+            current_batch_loss = 0.0
             if lm_loss is not None:
                 current_batch_loss += lm_loss
             if nsp_loss is not None and self.config.nsp_loss_weight > 0:
@@ -446,7 +445,7 @@ class Trainer:
         num_total_loss_batches = 0
         num_lm_loss_batches = 0
         num_nsp_loss_batches = 0
-        num_wod_loss_batches = 0   # Added WOD
+        num_wod_loss_batches = 0
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
@@ -458,27 +457,27 @@ class Trainer:
                 lm_labels = batch['lm_labels'].to(self.config.device)
                 token_type_ids = batch.get('token_type_ids', None)
                 nsp_label = batch.get('nsp_label', None)
-                wod_label = batch.get('wod_label', None) # Unpack WOD
+                word_order_score_targets = batch.get('word_order_score_label', None)
 
                 if token_type_ids is not None:
                     token_type_ids = token_type_ids.to(self.config.device)
                 if nsp_label is not None:
                     nsp_label = nsp_label.to(self.config.device)
-                if wod_label is not None:
-                    wod_label = wod_label.to(self.config.device)
+                if word_order_score_targets is not None:
+                    word_order_score_targets = word_order_score_targets.to(self.config.device).float()
 
                 lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = None, None, None
                 if self.config.use_amp:
                     with torch.amp.autocast('cuda'):
                         _, _, _, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
-                            input_ids, targets=lm_labels, nsp_labels=nsp_label, wod_labels=wod_label
+                            input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
                         )
                 else:
                     _, _, _, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
-                        input_ids, targets=lm_labels, nsp_labels=nsp_label, wod_labels=wod_label
+                        input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
                     )
                 
-                batch_combined_loss_value = 0.0 # Ensure float
+                batch_combined_loss_value = 0.0
                 has_any_loss_term_in_batch = False
 
                 if lm_loss_tensor is not None:
@@ -488,15 +487,15 @@ class Trainer:
                     batch_combined_loss_value += lm_loss_item
                     has_any_loss_term_in_batch = True
 
-                if nsp_loss_tensor is not None: # Check if NSP loss was computed
+                if nsp_loss_tensor is not None:
                     nsp_loss_item = nsp_loss_tensor.item()
                     accumulated_nsp_loss += nsp_loss_item
                     num_nsp_loss_batches += 1
                     if self.config.nsp_loss_weight > 0:
                         batch_combined_loss_value += self.config.nsp_loss_weight * nsp_loss_item
-                        has_any_loss_term_in_batch = True # Count for combined only if weighted
+                        has_any_loss_term_in_batch = True
 
-                if wod_loss_tensor is not None: # Check if WOD loss was computed
+                if wod_loss_tensor is not None:
                     wod_loss_item = wod_loss_tensor.item()
                     accumulated_wod_loss += wod_loss_item
                     num_wod_loss_batches += 1
@@ -505,18 +504,16 @@ class Trainer:
                         has_any_loss_term_in_batch = True
 
 
-                if has_any_loss_term_in_batch: # Only increment if combined loss actually changed
+                if has_any_loss_term_in_batch:
                     accumulated_combined_loss += batch_combined_loss_value
                     num_total_loss_batches += 1
-                # If only losses with zero weights were present, num_total_loss_batches won't increment for them,
-                # but their individual averages will still be calculated.
         
         self.model.train()
 
         avg_combined_eval_loss = accumulated_combined_loss / num_total_loss_batches if num_total_loss_batches > 0 else float('inf')
         avg_lm_eval_loss = accumulated_lm_loss / num_lm_loss_batches if num_lm_loss_batches > 0 else None
         avg_nsp_eval_loss = accumulated_nsp_loss / num_nsp_loss_batches if num_nsp_loss_batches > 0 else None
-        avg_wod_eval_loss = accumulated_wod_loss / num_wod_loss_batches if num_wod_loss_batches > 0 else None # Added WOD
+        avg_wod_eval_loss = accumulated_wod_loss / num_wod_loss_batches if num_wod_loss_batches > 0 else None
 
         return avg_combined_eval_loss, avg_lm_eval_loss, avg_nsp_eval_loss, avg_wod_eval_loss
     
@@ -666,9 +663,9 @@ class Trainer:
                 if lm_loss_val is not None:
                     log_msg += f"(LM: {lm_loss_val:.4f}) "
                 if nsp_loss_val is not None:
-                    log_msg += f"(NSP: {nsp_loss_val:.4f}{'*' if self.config.nsp_loss_weight > 0 else ''}) " # Indicate if weighted
-                if wod_loss_val is not None:
-                    log_msg += f"(WOD: {wod_loss_val:.4f}{'*' if self.config.word_order_loss_weight > 0 else ''}) " # Indicate if weighted
+                    log_msg += f"(NSP: {nsp_loss_val:.4f}{'*' if self.config.nsp_loss_weight > 0 else ''}) "
+                if wod_loss_val is not None: # wod_loss_val is the MSE loss here
+                    log_msg += f"(WOD MSE: {wod_loss_val:.4f}{'*' if self.config.word_order_loss_weight > 0 else ''}) "
 
                 log_msg += f", LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_msg)
@@ -681,8 +678,8 @@ class Trainer:
                 self.metrics.update(
                     val_loss=avg_combined_val_loss,
                     val_lm_loss=avg_lm_val_loss,
-                    val_nsp_loss=avg_nsp_val_loss
-                    # val_wod_loss=avg_wod_val_loss # Would add this if TrainingMetrics handled it
+                    val_nsp_loss=avg_nsp_val_loss,
+                    val_wod_loss=avg_wod_val_loss # Pass WOD validation loss to metrics
                 )
 
                 is_best = avg_combined_val_loss < self.metrics.best_val_loss
@@ -692,8 +689,8 @@ class Trainer:
                     eval_log_msg += f"(LM: {avg_lm_val_loss:.4f}) "
                 if avg_nsp_val_loss is not None:
                     eval_log_msg += f"(NSP: {avg_nsp_val_loss:.4f}) "
-                if avg_wod_val_loss is not None:
-                    eval_log_msg += f"(WOD: {avg_wod_val_loss:.4f}) "
+                if avg_wod_val_loss is not None: # avg_wod_val_loss is the avg MSE loss
+                    eval_log_msg += f"(WOD MSE: {avg_wod_val_loss:.4f}) "
                 eval_log_msg += f"{'(Best!)' if is_best else ''}"
                 print(eval_log_msg)
                 
@@ -845,8 +842,8 @@ class Trainer:
             self.metrics.update(
                 val_loss=initial_combined_val_loss,
                 val_lm_loss=initial_lm_val_loss,
-                val_nsp_loss=initial_nsp_val_loss
-                # val_wod_loss=initial_wod_val_loss # If TrainingMetrics updated
+                val_nsp_loss=initial_nsp_val_loss,
+                val_wod_loss=initial_wod_val_loss # Pass WOD validation loss to metrics
             )
 
             eval_log_msg = f"Initial Validation Loss (Rank 0): {initial_combined_val_loss:.4f} "
@@ -854,8 +851,8 @@ class Trainer:
                 eval_log_msg += f"(LM: {initial_lm_val_loss:.4f}) "
             if initial_nsp_val_loss is not None:
                 eval_log_msg += f"(NSP: {initial_nsp_val_loss:.4f}) "
-            if initial_wod_val_loss is not None:
-                eval_log_msg += f"(WOD: {initial_wod_val_loss:.4f}) "
+            if initial_wod_val_loss is not None: # initial_wod_val_loss is avg MSE loss
+                eval_log_msg += f"(WOD MSE: {initial_wod_val_loss:.4f}) "
             print(eval_log_msg)
 
         try:

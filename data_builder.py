@@ -30,10 +30,27 @@ class NSPDataset(Dataset):
         self.is_eval = is_eval
         self.enable_word_order_task = enable_word_order_task
         self.word_shuffle_probability = word_shuffle_probability
-        self.pad_token_id = 0  # Assuming 0 for padding input_ids
-        self.lm_ignore_idx = -100 # For ignoring LM labels
+        self.pad_token_id = 0
+        self.lm_ignore_idx = -100
 
         self._prepare_examples(documents, is_eval, max_samples_for_eval)
+
+    @staticmethod
+    def _calculate_levenshtein_word_level(s1: List[str], s2: List[str]) -> int:
+        if len(s1) < len(s2):
+            return NSPDataset._calculate_levenshtein_word_level(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        return previous_row[-1]
 
     def _split_document(self, doc_text: str) -> list[str]:
         if not doc_text:
@@ -121,14 +138,12 @@ class NSPDataset(Dataset):
         is_positive_sample = (idx % 2 == 0 and self.num_positive_samples > 0) or \
                              (self.num_positive_samples == 0 and len(self.all_sentences) >=2)
 
-        original_sent_A_text, sent_B_text, nsp_label = "", "", 1 # Renamed sent_A_text to original_sent_A_text
+        original_sent_A_text, sent_B_text, nsp_label = "", "", 1
 
         if is_positive_sample and self.num_positive_samples > 0:
-            # Positive Sample
             _, original_sent_A_text, sent_B_text = self.positive_candidates[idx // 2 % self.num_positive_samples]
             nsp_label = 0
         else:
-            # Negative Sample or no positive pairs available
             if len(self.all_sentences) < 2 and self.num_positive_samples == 0 :
                  print(f"Warning: Trying to create a negative sample but only {len(self.all_sentences)} available.")
                  if not self.all_sentences:
@@ -138,38 +153,39 @@ class NSPDataset(Dataset):
                     original_sent_A_text = self.all_sentences[0][2]
                     sent_B_text = self.all_sentences[0][2]
                  nsp_label = 1
-            else: # Standard negative sampling
+            else:
                 sent_A_doc_idx, sent_A_sent_idx, original_sent_A_text = random.choice(self.all_sentences)
+                temp_sent_B_text = sent_B_text # Default if no suitable B found
                 for _ in range(10):
-                    sent_B_doc_idx, sent_B_sent_idx, temp_sent_B_text = random.choice(self.all_sentences)
+                    sent_B_doc_idx, sent_B_sent_idx, chosen_B_text = random.choice(self.all_sentences)
                     if sent_A_doc_idx != sent_B_doc_idx or \
                        (sent_A_doc_idx == sent_B_doc_idx and sent_B_sent_idx != sent_A_sent_idx + 1):
-                        sent_B_text = temp_sent_B_text
+                        temp_sent_B_text = chosen_B_text
                         break
-                else: # If loop finishes without break, assign the last choice to sent_B_text
-                    sent_B_text = temp_sent_B_text
+                sent_B_text = temp_sent_B_text
                 nsp_label = 1
 
-        # Word Order Detection (WOD) Task
-        wod_label = 0
-        input_sent_A = original_sent_A_text
-        lm_labels_for_A_are_gated = False
+        # Word Order Detection (WOD) Task implementation with Levenshtein distance
+        original_words = original_sent_A_text.split(' ')
+        input_words = list(original_words) # Start with original
+        gate_lm_loss_for_this_sample = False
+        word_order_score_label = 1.0  # Default to perfect score (1.0 for no shuffle)
 
-        if self.enable_word_order_task and random.random() < self.word_shuffle_probability:
-            words = original_sent_A_text.split(' ')
-            if len(words) > 1:
-                shuffled_words = list(words)
-                random.shuffle(shuffled_words)
-                temp_input_sent_A = ' '.join(shuffled_words)
-                if temp_input_sent_A != original_sent_A_text: # Check if shuffling actually changed the sentence
-                    input_sent_A = temp_input_sent_A
-                    wod_label = 1
-                    lm_labels_for_A_are_gated = True
-                # If shuffle resulted in the same sentence, wod_label remains 0, lm_labels not gated
-            # If len(words) <= 1, wod_label remains 0
+        if self.enable_word_order_task and random.random() < self.word_shuffle_probability and len(original_words) > 1:
+            shuffled_input_words = list(original_words)
+            random.shuffle(shuffled_input_words)
 
-        tokens_A = self.tokenizer_fn(input_sent_A)
-        tokens_B = self.tokenizer_fn(sent_B_text) # sent_B_text might be empty if not a positive NSP sample and no negative was chosen
+            if shuffled_input_words != original_words: # Actual change occurred
+                input_words = shuffled_input_words
+                gate_lm_loss_for_this_sample = True
+                edit_dist = NSPDataset._calculate_levenshtein_word_level(original_words, input_words)
+                normalized_dist = edit_dist / len(original_words) if len(original_words) > 0 else 0.0
+                word_order_score_label = max(0.0, 1.0 - normalized_dist)
+            # If shuffle resulted in the same sequence, score remains 1.0, gate remains False
+
+        input_sentence_for_tokenizer = ' '.join(input_words)
+        tokens_A = self.tokenizer_fn(input_sentence_for_tokenizer)
+        tokens_B = self.tokenizer_fn(sent_B_text)
 
         # Truncate tokens
         # Add 1 for potential CLS token if tokenizer adds it (our byte tokenizer doesn't)
@@ -204,21 +220,20 @@ class NSPDataset(Dataset):
         token_type_ids = [0] * len(tokens_A) + [1] * len(tokens_B)
 
         # Create LM labels: predict next token in A, B is masked.
-        # Shifted A for labels: tokens_A[1:] + [pad/mask_for_last_A_token] (or all ignored if WOD gated)
+        # Shifted A for labels: tokens_A[1:] + [pad/mask_for_last_A_token] (or all ignored if WOD gated via gate_lm_loss_for_this_sample)
         # B part of labels is all self.lm_ignore_idx
         lm_labels = []
-        if lm_labels_for_A_are_gated:
+        if gate_lm_loss_for_this_sample:
             lm_labels.extend([self.lm_ignore_idx] * len(tokens_A))
         else:
             if tokens_A:
                 lm_labels.extend(tokens_A[1:])
                 lm_labels.append(self.lm_ignore_idx)
 
-        # For sentence B, LM labels are always ignored
-        lm_labels.extend([self.lm_ignore_idx] * len(tokens_B))
+        lm_labels.extend([self.lm_ignore_idx] * len(tokens_B)) # For sentence B, LM labels are always ignored
 
         # Pad to self.seq_len
-        padding_len = self.seq_len - len(input_ids) # input_ids was created before this block
+        padding_len = self.seq_len - len(input_ids)
         input_ids.extend([self.pad_token_id] * padding_len)
         token_type_ids.extend([0] * padding_len) # Pad token_type_ids with 0 (or any other aribtrary type for padding)
         lm_labels.extend([self.lm_ignore_idx] * padding_len)
@@ -233,7 +248,7 @@ class NSPDataset(Dataset):
             'token_type_ids': torch.tensor(token_type_ids, dtype=torch.long),
             'lm_labels': torch.tensor(lm_labels, dtype=torch.long),
             'nsp_label': torch.tensor(nsp_label, dtype=torch.long),
-            'wod_label': torch.tensor(wod_label, dtype=torch.long)
+            'word_order_score_label': torch.tensor(word_order_score_label, dtype=torch.float)
         }
 
 
@@ -658,9 +673,12 @@ if __name__ == "__main__":
                 print(f"NSP Batch {batch_idx}:")
                 print(f"  Input IDs shape: {batch_data['input_ids'].shape}")
                 print(f"  Token Type IDs shape: {batch_data['token_type_ids'].shape}")
-                print(f"  LM Labels shape: {batch_data['lm_labels'].shape}")
+                print(f"  LM Labels shape: {batch_data['lm_labels'].shape}") # Check if gated for WOD
                 print(f"  NSP Label: {batch_data['nsp_label']}")
-                print(f"  WOD Label: {batch_data['wod_label']}") # Print WOD label
+                print(f"  WOD Score Label: {batch_data['word_order_score_label']}")
+                # Optionally print a gated lm_label sample
+                # if batch_data['word_order_score_label'][0].item() < 1.0:
+                #    print(f"    LM Labels for shuffled: {batch_data['lm_labels'][0][:20]}...")
                 # decoded_sample = data_builder_nsp.decode_tokens(batch_data['input_ids'][0])
                 # print(f"  Decoded sample input: {decoded_sample[:100]}...")
                 if batch_idx >= 0: break
