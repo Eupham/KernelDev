@@ -47,6 +47,8 @@ training:
   eval_every: 200            # Evaluate every N steps
   log_every: 50              # Log every N steps
   checkpoint_dir: "checkpoints"
+  nsp_task: false          # Enable Next Sentence Prediction auxiliary task (boolean). If true, data processing changes for sentence pairs.
+  nsp_loss_weight: 0.5     # Weight for NSP loss when combined with Language Modeling loss (float).
 ```
 
 ### Data Parameters
@@ -59,12 +61,20 @@ data:
   max_eval_tokens: 50000     # Max tokens for evaluation
   num_workers: 0             # DataLoader workers
   shuffle_train: true        # Shuffle training data
+# Note on NSP: If `training: nsp_task` is true, data processing changes to prepare sentence pairs.
+# The `vocab_size` (defined in model parameters) will be effectively increased by 2 internally
+# by the `DataBuilder` to accommodate special `[CLS]` and `[SEP]` tokens (e.g., a configured
+# `vocab_size` of 256 for byte tokenization will be treated as 258 by the model and DataBuilder if NSP is active).
 ```
 
 ### Model Parameters
 ```yaml
 model:
-  vocab_size: 256            # Vocabulary size (auto-updated)
+  vocab_size: 256            # Base vocabulary size (e.g., 256 for byte-level tokenization).
+                             # This should be set before considering special tokens for tasks like NSP.
+                             # The actual vocabulary size used by the model's embedding layer will be
+                             # adjusted by the `DataBuilder` (e.g., to vocab_size + 2) if `nsp_task` is enabled
+                             # to accommodate `[CLS]` and `[SEP]` tokens.
   dim: 512                   # Model dimension
   n_layers: 12               # Number of transformer layers
   n_heads: 16                # Number of attention heads
@@ -79,6 +89,12 @@ hardware:
   available_memory_gb: 15    # Available GPU memory
   device: "auto"             # Device ("auto", "cuda", "cpu")
   memory_buffer_gb: 2        # Memory buffer reservation
+  cpu_test_attention: false  # Force attention to CPU via fallback, bypassing Triton (boolean).
+# If `cpu_test_attention: true`, all attention computations are forced onto the CPU
+# using a Python-based fallback mechanism, bypassing the CUDA Triton kernels.
+# This is useful for debugging attention logic or for running on systems without a
+# compatible GPU. When true, the `device` will automatically be set to 'cpu' by the entry script.
+# This mode is significantly slower than GPU execution.
 ```
 
 ## Command Line Arguments
@@ -103,6 +119,9 @@ python entry.py \
 - `--seq-len`: Sequence length for training
 - `--epochs`: Number of training epochs
 - `--learning-rate`: Learning rate
+- `--nsp-task`: Enable Next Sentence Prediction task (overrides config).
+- `--nsp-loss-weight FLOAT`: Set the weight for the NSP loss component (e.g., 0.5) (overrides config).
+- `--cpu-test-attention`: Enable CPU attention fallback for testing (overrides config).
 
 ## Precision Modes
 
@@ -224,3 +243,31 @@ The training script generates:
 - Use FP32 precision for stability
 - Increase training data (`max_samples`)
 - Adjust learning rate
+
+## Next Sentence Prediction (NSP) Task
+
+The model supports an auxiliary Next Sentence Prediction (NSP) task.
+- **Objective**: Binary classification – does sentence B logically follow sentence A?
+- **To Enable**: Set `nsp_task: true` in the `training` section of your configuration file or use the `--nsp-task` command-line flag.
+- **Tokens**: Utilizes `[CLS]` and `[SEP]` tokens. Input is formatted as `[CLS] sentence A [SEP] sentence B [SEP]`. The `[CLS]` token's representation is used for the NSP classification.
+- **Attention**: The `[CLS]` token uses a special attention mechanism allowing it to attend to all tokens in the sequence (prefix attention), while other tokens remain autoregressive (if `model: causal` is true and the `[CLS]` token is part of the input sequence being processed by `flash_attention`).
+- **Data Requirement**: For effective NSP training, particularly for positive examples, it's crucial that the source documents from which sentence pairs are extracted contain at least two sentences. The data loader attempts to create valid pairs, but the quality and structure of the input data (e.g., from `dataset_name`) directly impact NSP task performance.
+
+### Example NSP Configuration Snippet
+```yaml
+# In your config.yaml or a custom config file:
+training:
+  # ... other training params ...
+  nsp_task: true
+  nsp_loss_weight: 0.5
+
+data:
+  # ... other data params ...
+  # Ensure your dataset provides documents that can be segmented into multiple sentences.
+  # seq_len should be sufficient to hold [CLS], sentence A, [SEP], sentence B, [SEP], and some content.
+  seq_len: 128 # Example, adjust as needed
+
+model:
+  # ... other model params ...
+  vocab_size: 256 # Base vocab size, will be auto-adjusted to 258 for NSP
+```

@@ -1,10 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from original_kernel import flash_attention as original_flash_attention_wrapper
-from simple_kernel import flash_attention_func as simple_flash_attention_wrapper
-import os
-from typing import Optional # Add Optional
+from original_kernel import flash_attention
+
 
 class RMSNorm(nn.Module):
     """RMS normalization without learnable weight parameters."""
@@ -45,7 +43,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x):
+    def forward(self, x, is_prefix_token_mask: torch.Tensor | None = None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -53,23 +51,14 @@ class MultiHeadAttention(nn.Module):
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
         # Use flash attention kernel
-        use_simple_kernel = os.environ.get('USE_SIMPLE_KERNEL', '0') == '1'
-        if use_simple_kernel:
-            # Ensure q, k, v are in the expected shape (batch, heads, seq_len, head_dim)
-            # simple_flash_attention_wrapper expects (q, k, v, causal, sm_scale)
-            # Current q,k,v are (B, H, T, D)
-            out = simple_flash_attention_wrapper(q, k, v, causal=self.causal, sm_scale=None)
-            # print("Using simple_kernel.flash_attention_func (CPU fallback or alternative)") # For debugging
-        else:
-            out = original_flash_attention_wrapper(
-                q=q,
-                k=k,
-                v=v,
-                lens=None, # Original code passes None here
-                causal=self.causal,
-                sm_scale=None # Rely on default scaling in original_kernel
-            )
-            # print("Using original_kernel.flash_attention") # For debugging
+        out = flash_attention(
+            q=q,
+            k=k,
+            v=v,
+            lens=None,
+            causal=self.causal,
+            is_prefix_token_mask=is_prefix_token_mask # Pass the mask
+        )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(out)
@@ -85,9 +74,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x):
+    def forward(self, x, is_prefix_token_mask: torch.Tensor | None = None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), is_prefix_token_mask=is_prefix_token_mask)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -105,13 +94,14 @@ class GPTModel(nn.Module):
         max_seq_len=2048,
         mlp_ratio=4,
         causal=True,
-        num_nsp_labels=2,
-        enable_word_order_task: bool = False # Added WOD config
+        cls_token_id: int | None = None,
+        nsp_task: bool = False, # Added nsp_task
     ):
         super().__init__()
         self.dim = dim
+        self.cls_token_id = cls_token_id
+        self.nsp_task = nsp_task # Store nsp_task
         self.max_seq_len = max_seq_len
-        self.enable_word_order_task = enable_word_order_task
         
         # Token and position embeddings (no bias)
         self.token_emb = nn.Embedding(vocab_size, dim)
@@ -130,21 +120,11 @@ class GPTModel(nn.Module):
         
         # Final norm and output projection
         self.norm_out = RMSNorm(dim)
-        self.head = nn.Linear(dim, vocab_size, bias=False) # LM head
-
-        # NSP head (conditional initialization or always init if config drives its usage)
-        # For simplicity in forward, let's assume it's always initialized if num_nsp_labels > 0,
-        # but its output is only used if nsp_labels are provided.
-        # Or, make it None if not used (requires checks in forward).
-        # The current structure has it initialized based on num_nsp_labels.
-        self.nsp_head = nn.Linear(dim, num_nsp_labels) if num_nsp_labels > 0 else None
-
-        # WOD head
-        if self.enable_word_order_task:
-            self.word_order_head = nn.Linear(self.dim, 1) # Regression to a score (0-1)
-        else:
-            self.word_order_head = None
+        self.head = nn.Linear(dim, vocab_size, bias=False)
         
+        # NSP head
+        self.nsp_head = nn.Linear(dim, 1) # Binary classification for NSP
+
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
         
@@ -153,64 +133,86 @@ class GPTModel(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
+            if module.bias is not None: # Initialize bias for NSP head if it exists
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, nsp_labels=None, word_order_score_targets: Optional[torch.Tensor] = None): # Renamed wod_labels
-        batch_size, seq_len = x.shape
+    def forward(self, x, targets=None):
+        batch_size, seq_len = x.shape # x is input token IDs (batch_size, seq_len)
         
+        # Initialize loss and nsp_logits
+        loss = None
+        nsp_logits = None
+
+        # Create current_is_prefix_token_mask based on cls_token_id
+        current_is_prefix_token_mask = None
+        if self.cls_token_id is not None:
+            # x here is the input token IDs batch_size, seq_len
+            # The mask should be (batch_size, seq_len) according to flash_attention kernel expectations for (T,) per batch item.
+            # However, flash_attention was modified to take (T,) and apply it across the batch.
+            # Let's make it (seq_len,) by taking the first batch item's mask if CLS is consistent across batch.
+            # Or, more robustly, ensure the kernel can handle (B, T) or we pass (T,) if all items in batch have same prefix structure.
+            # For now, assuming the kernel's PREFIX_TOKEN_MASK is (T,) and applies to all batch items.
+            # This means if different batch items have CLS at different places, this won't work as intended by passing a single (T,) mask.
+            # The previous change to original_kernel.py made PREFIX_TOKEN_MASK (T,).
+            # This implies that the prefix structure must be the same for all elements in a batch.
+            # This is a strong assumption. Let's assume for now the task implies CLS is at a fixed position (e.g. 0) for all items IF used.
+
+            # Create a boolean mask (seq_len,) indicating True for CLS token positions
+            # This will be based on the first item in the batch, assuming consistent CLS usage.
+            prefix_mask_bool_first_item = (x[0] == self.cls_token_id) # Shape (seq_len,)
+            if prefix_mask_bool_first_item.any():
+                current_is_prefix_token_mask = prefix_mask_bool_first_item.to(x.device) # Ensure it's on the right device
+
         # Create position indices
         pos = torch.arange(0, seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
         
         # Token and position embeddings
-        x = self.token_emb(x) + self.pos_emb(pos)
+        # x_emb is (batch_size, seq_len, dim)
+        x_emb = self.token_emb(x) + self.pos_emb(pos)
         
         # Apply transformer blocks
+        # Pass current_is_prefix_token_mask to each block
+        processed_x = x_emb
         for block in self.blocks:
-            x = block(x)
+            processed_x = block(processed_x, is_prefix_token_mask=current_is_prefix_token_mask)
         
         # Final normalization
-        x = self.norm_out(x)
+        # processed_x is hidden states (batch_size, seq_len, dim)
+        processed_x = self.norm_out(processed_x)
         
-        # LM logits
-        lm_logits = self.head(x)
+        # Language model logits
+        logits = self.head(processed_x) # (batch_size, seq_len, vocab_size)
 
-        # NSP logits & WOD logits (both can use the first token's hidden state)
-        pooled_output = x[:, 0]
-
-        nsp_logits = None
-        if self.nsp_head is not None:
-            nsp_logits = self.nsp_head(pooled_output)
-
-        predicted_word_order_score = None # Changed from word_order_logits
-        if self.word_order_head is not None:
-            word_order_logit = self.word_order_head(pooled_output) # Raw output
-            predicted_word_order_score = torch.sigmoid(word_order_logit) # Apply sigmoid
-
-        lm_loss, nsp_loss, word_order_loss = None, None, None
+        # NSP logits calculation
+        # Only compute if nsp_task is enabled and the CLS token was processed (indicated by current_is_prefix_token_mask)
+        if self.nsp_task and current_is_prefix_token_mask is not None:
+            # current_is_prefix_token_mask is (seq_len,)
+            # We need to find where it's True. Assuming it's True for CLS token.
+            # And assuming CLS token is at index 0 for simplicity as per notes.
+            # This implies that if a CLS token is used, it's the first token.
+            # The DataBuilder will need to ensure this setup.
+            if current_is_prefix_token_mask[0]: # Check if the first token is indeed marked as CLS/prefix
+                cls_token_repr = processed_x[:, 0, :] # Get representation of the first token (batch_size, dim)
+                nsp_logits = self.nsp_head(cls_token_repr) # (batch_size, 1)
+            # else:
+                # This case implies cls_token_id was set, but the current batch's first item didn't have it at index 0.
+                # Or current_is_prefix_token_mask was based on x[0] and x[0,0] wasn't CLS.
+                # For robustness, one might iterate through current_is_prefix_token_mask to find the CLS token.
+                # However, the current setup of passing a single (T,) mask to flash_attention implies a fixed prefix structure.
+                # If CLS is intended for NSP, it's typically at a known position (e.g., index 0).
+                # If no CLS token at expected position, nsp_logits remains None or could be zeros.
 
         if targets is not None:
-            lm_loss = F.cross_entropy(
-                lm_logits.view(-1, lm_logits.size(-1)),
+            # Compute cross-entropy loss for language modeling
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=-100
+                ignore_index=-1 # Typically -100 for ignored tokens, but -1 if vocab doesn't collide
             )
 
-        if nsp_logits is not None and nsp_labels is not None and self.nsp_head is not None:
-            nsp_loss = F.cross_entropy(
-                nsp_logits.view(-1, self.nsp_head.out_features),
-                nsp_labels.view(-1)
-            )
-
-        if predicted_word_order_score is not None and word_order_score_targets is not None and self.word_order_head is not None:
-            # Ensure targets are float for MSE loss
-            word_order_score_targets = word_order_score_targets.float()
-            # Squeeze predicted score if it has a trailing dim of 1, to match target shape (batch_size)
-            word_order_loss = F.mse_loss(predicted_word_order_score.squeeze(-1), word_order_score_targets)
-
-        return lm_logits, nsp_logits, predicted_word_order_score, lm_loss, nsp_loss, word_order_loss
+        return logits, loss, nsp_logits
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """Generate new tokens using the model with top-k and top-p sampling."""
@@ -220,11 +222,9 @@ class GPTModel(nn.Module):
                 # Crop sequence if it gets too long
                 idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
                 
-                # Forward pass
-                # self(idx_cond) now returns: lm_logits, nsp_logits, word_order_logits, lm_loss, nsp_loss, word_order_loss
-                # We only need lm_logits for generation.
-                lm_logits, _, _, _, _, _ = self(idx_cond)
-                logits = lm_logits[:, -1, :] / temperature # Use lm_logits
+                # Forward pass - update to expect three return values
+                logits, _, _ = self(idx_cond) # nsp_logits and loss are not used in generation
+                logits = logits[:, -1, :] / temperature
                 
                 # Apply top-k filtering if specified
                 if top_k is not None:

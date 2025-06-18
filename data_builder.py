@@ -2,9 +2,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset # Keep this import
 import numpy as np
-from typing import Optional, Dict, Any, List, Tuple # Added Tuple
-import random
-import re
+from typing import Optional, Dict, Any
+from nsp_dataset import NSPDataset # Import NSPDataset
 
 
 class TokenizedDataset(Dataset):
@@ -21,301 +20,134 @@ class TokenizedDataset(Dataset):
         y = torch.tensor(self.data[idx + 1:idx + self.seq_len + 1], dtype=torch.long)
         return x, y
 
-
-class NSPDataset(Dataset):
-    def __init__(self, documents: list[dict], tokenizer_fn, seq_len: int, is_eval: bool = False, max_samples_for_eval: int = None,
-                 enable_word_order_task: bool = False, word_shuffle_probability: float = 0.0):
-        self.tokenizer_fn = tokenizer_fn
-        self.seq_len = seq_len
-        self.is_eval = is_eval
-        self.enable_word_order_task = enable_word_order_task
-        self.word_shuffle_probability = word_shuffle_probability
-        self.pad_token_id = 0
-        self.lm_ignore_idx = -100
-        self.print_counter = 0 # TEMP DEBUG
-        self.max_prints = 5    # TEMP DEBUG
-
-        self._prepare_examples(documents, is_eval, max_samples_for_eval)
-
-    @staticmethod
-    def _calculate_levenshtein_word_level(s1: List[str], s2: List[str]) -> int:
-        if len(s1) < len(s2):
-            return NSPDataset._calculate_levenshtein_word_level(s2, s1)
-        if len(s2) == 0:
-            return len(s1)
-        previous_row = range(len(s2) + 1)
-        for i, c1_word in enumerate(s1): # Renamed c1 to c1_word for clarity
-            current_row = [i + 1]
-            for j, c2_word in enumerate(s2): # Renamed c2 to c2_word for clarity
-                insertions = previous_row[j + 1] + 1
-                deletions = current_row[j] + 1
-                substitutions = previous_row[j] + (c1_word != c2_word)
-                current_row.append(min(insertions, deletions, substitutions))
-            previous_row = current_row
-        return previous_row[-1]
-
-    def _split_document(self, doc_text: str) -> list[str]:
-        if not doc_text:
-            return []
-        sentences = re.split(r'(?<=[.!?])(?:\s+|\n)', doc_text)
-        processed_sentences = []
-        for s in sentences:
-            s_stripped = s.strip()
-            if not s_stripped:
-                continue
-            if len(s_stripped.split()) >= 3:
-                processed_sentences.append(s_stripped)
-        return processed_sentences
-
-    def _prepare_examples(self, documents: list[dict], is_eval: bool, max_samples_for_eval: int):
-        self.all_sentences = []
-        self.positive_candidates = []
-        self.sentences_by_doc: Dict[int, List[Tuple[int, str]]] = {}
-
-        for doc_idx, doc_dict in enumerate(documents):
-            doc_text = doc_dict.get('text', '')
-            if not doc_text:
-                continue
-
-            sents = self._split_document(doc_text)
-            self.sentences_by_doc[doc_idx] = []
-
-            current_doc_sents_text_only = []
-            for sent_idx, sent_text in enumerate(sents):
-                self.all_sentences.append((doc_idx, sent_idx, sent_text))
-                self.sentences_by_doc[doc_idx].append((sent_idx, sent_text))
-                current_doc_sents_text_only.append(sent_text)
-
-            if len(current_doc_sents_text_only) >= 2:
-                for i in range(len(current_doc_sents_text_only) - 1):
-                    self.positive_candidates.append((doc_idx, current_doc_sents_text_only[i], current_doc_sents_text_only[i+1]))
-
-        if is_eval and max_samples_for_eval is not None:
-            if not isinstance(self.positive_candidates, list):
-                self.positive_candidates = list(self.positive_candidates)
-
-            if len(self.positive_candidates) > max_samples_for_eval // 2:
-                random.shuffle(self.positive_candidates)
-                self.positive_candidates = self.positive_candidates[:max_samples_for_eval // 2]
-
-            if len(self.all_sentences) > max_samples_for_eval * 2:
-                random.shuffle(self.all_sentences)
-                self.all_sentences = self.all_sentences[:max_samples_for_eval * 2]
-
-        self.num_positive_samples = len(self.positive_candidates)
-
-        if not self.all_sentences:
-            print("Warning: No sentences extracted from documents. NSPDataset will be empty.")
-            self.current_epoch_samples = 0
-            return
-
-        if not is_eval:
-            self.current_epoch_samples = self.num_positive_samples * 2 if self.num_positive_samples > 0 else len(self.all_sentences)
-        else:
-            num_potential_samples = self.num_positive_samples * 2 if self.num_positive_samples > 0 else len(self.all_sentences)
-            if max_samples_for_eval is not None:
-                 self.current_epoch_samples = min(max_samples_for_eval, num_potential_samples)
-            else:
-                 self.current_epoch_samples = num_potential_samples
-
-        if self.num_positive_samples == 0 and self.current_epoch_samples > 0:
-            print("Warning: No positive sentence pairs found. NSPDataset will only provide random sentence pairs.")
-
-    def __len__(self):
-        return self.current_epoch_samples
-
-    def __getitem__(self, idx: int):
-        if not self.all_sentences:
-            raise IndexError("NSPDataset has no samples.")
-
-        is_positive_sample = (idx % 2 == 0 and self.num_positive_samples > 0) or \
-                             (self.num_positive_samples == 0 and len(self.all_sentences) >=2)
-
-        original_sent_A_text, sent_B_text, nsp_label = "", "", 1
-
-        if is_positive_sample and self.num_positive_samples > 0:
-            _, original_sent_A_text, sent_B_text = self.positive_candidates[idx // 2 % self.num_positive_samples]
-            nsp_label = 0
-        else: # Negative NSP sample
-            if len(self.all_sentences) < 2 and self.num_positive_samples == 0 :
-                 print(f"Warning: Trying to create a negative sample but only {len(self.all_sentences)} available.")
-                 if not self.all_sentences:
-                    original_sent_A_text = "Dummy sentence A."
-                    sent_B_text = "Dummy sentence B."
-                 else:
-                    original_sent_A_text = self.all_sentences[0][2]
-                    sent_B_text = self.all_sentences[0][2]
-                 nsp_label = 1
-            else:
-                sent_A_doc_idx, sent_A_sent_idx, original_sent_A_text = random.choice(self.all_sentences)
-
-                # Attempt In-Document Negative Sampling
-                doc_sentences_tuples = self.sentences_by_doc.get(sent_A_doc_idx, [])
-                in_doc_negative_candidates = [
-                    s_text for s_idx, s_text in doc_sentences_tuples
-                    if s_idx != sent_A_sent_idx and s_idx != (sent_A_sent_idx + 1)
-                ]
-
-                used_in_doc_negative_flag = False # TEMP DEBUG
-                if in_doc_negative_candidates:
-                    sent_B_text = random.choice(in_doc_negative_candidates)
-                    used_in_doc_negative_flag = True # TEMP DEBUG
-                else:
-                    # Fallback to Global Random Sampling
-                    global_fallback_sent_B_text = "Dummy fallback B sentence."
-                    if self.all_sentences:
-                        if self.all_sentences[0][2] != original_sent_A_text or len(self.all_sentences) == 1:
-                             global_fallback_sent_B_text = self.all_sentences[0][2]
-                        elif len(self.all_sentences) > 1:
-                             global_fallback_sent_B_text = self.all_sentences[1][2]
-
-                    temp_sent_B_text_global = global_fallback_sent_B_text
-                    chosen_B_text_global_assigned = False
-                    for _ in range(10):
-                        sent_B_doc_idx_global, sent_B_sent_idx_global, chosen_B_text_global = random.choice(self.all_sentences)
-                        if sent_A_doc_idx != sent_B_doc_idx_global or \
-                           (sent_A_doc_idx == sent_B_doc_idx_global and sent_B_sent_idx_global != sent_A_sent_idx + 1):
-                            temp_sent_B_text_global = chosen_B_text_global
-                            chosen_B_text_global_assigned = True
-                            break
-                    if not chosen_B_text_global_assigned and 'chosen_B_text_global' in locals(): # if loop finished but a choice was made
-                        temp_sent_B_text_global = chosen_B_text_global
-
-                    sent_B_text = temp_sent_B_text_global
-                nsp_label = 1
-
-        # TEMP DEBUG PRINT for NSP
-        if hasattr(self, 'print_counter') and self.print_counter < self.max_prints and not self.is_eval :
-            print("\n--- Sample NSP Pair ---")
-            print(f"Index: {idx}")
-            print(f"NSP Label: {nsp_label} (0=IsNext, 1=IsNotNext/Random)")
-            print(f"Sentence A (original): {original_sent_A_text}")
-            # We'll print shuffled A later if WOD is active for this sample
-            print(f"Sentence B: {sent_B_text}")
-            if nsp_label == 1 and 'used_in_doc_negative_flag' in locals(): # Check if flag exists (only for negative samples)
-                 print(f"Used In-Doc Negative: {used_in_doc_negative_flag}")
-            # print("------------------------\n") # Delay this print until after WOD info
-        # END TEMP DEBUG PRINT
-
-        original_words = original_sent_A_text.split(' ')
-        input_words = list(original_words)
-        gate_lm_loss_for_this_sample = False
-        word_order_score_label = 1.0
-
-        if self.enable_word_order_task and random.random() < self.word_shuffle_probability and len(original_words) > 1:
-            shuffled_input_words = list(original_words)
-            random.shuffle(shuffled_input_words)
-
-            if shuffled_input_words != original_words:
-                input_words = shuffled_input_words
-                gate_lm_loss_for_this_sample = True
-                edit_dist = NSPDataset._calculate_levenshtein_word_level(original_words, input_words)
-                normalized_dist = edit_dist / len(original_words) if len(original_words) > 0 else 0.0
-                word_order_score_label = max(0.0, 1.0 - normalized_dist)
-
-        input_sentence_for_tokenizer = ' '.join(input_words)
-
-        # TEMP DEBUG PRINT for WOD (continued)
-        if hasattr(self, 'print_counter') and self.print_counter < self.max_prints and not self.is_eval: # Check counter again
-            if input_sentence_for_tokenizer != original_sent_A_text:
-                print(f"Sentence A (shuffled for WOD input): {input_sentence_for_tokenizer}")
-            print(f"WOD Score Label: {word_order_score_label}")
-            print(f"LM Labels Gated for A: {gate_lm_loss_for_this_sample}")
-            print("------------------------\n")
-            if idx % 2 != 0 or nsp_label == 0 : # Increment only once per effective sample pair log
-                self.print_counter += 1
-        # END TEMP DEBUG PRINT
-
-
-        tokens_A = self.tokenizer_fn(input_sentence_for_tokenizer)
-        tokens_B = self.tokenizer_fn(sent_B_text)
-
-        max_tok_A = self.seq_len // 2
-        max_tok_B = self.seq_len - len(tokens_A[:max_tok_A])
-
-        tokens_A = tokens_A[:max_tok_A]
-        tokens_B = tokens_B[:max_tok_B]
-
-        if not tokens_B and sent_B_text:
-            if tokens_A:
-                tokens_B = [tokens_A.pop()] + tokens_B
-            else:
-                  tokens_B = [self.pad_token_id]
-
-        input_ids = tokens_A + tokens_B
-        token_type_ids = [0] * len(tokens_A) + [1] * len(tokens_B)
-
-        lm_labels = []
-        if gate_lm_loss_for_this_sample:
-            lm_labels.extend([self.lm_ignore_idx] * len(tokens_A))
-        else:
-            if tokens_A:
-                lm_labels.extend(tokens_A[1:])
-                lm_labels.append(self.lm_ignore_idx)
-
-        lm_labels.extend([self.lm_ignore_idx] * len(tokens_B))
-
-        padding_len = self.seq_len - len(input_ids)
-        input_ids.extend([self.pad_token_id] * padding_len)
-        token_type_ids.extend([0] * padding_len)
-        lm_labels.extend([self.lm_ignore_idx] * padding_len)
-
-        input_ids = input_ids[:self.seq_len]
-        token_type_ids = token_type_ids[:self.seq_len]
-        lm_labels = lm_labels[:self.seq_len]
-
-        return {
-            'input_ids': torch.tensor(input_ids, dtype=torch.long),
-            'token_type_ids': torch.tensor(token_type_ids, dtype=torch.long),
-            'lm_labels': torch.tensor(lm_labels, dtype=torch.long),
-            'nsp_label': torch.tensor(nsp_label, dtype=torch.long),
-            'word_order_score_label': torch.tensor(word_order_score_label, dtype=torch.float)
-        }
-
-
 class DataBuilder:
+    # ... (constructor and other methods like _tokenize_text, _detokenize_bytes as in original file)
     def __init__(
         self,
-        data_cfg: Dict[str, Any]
+        dataset_name: str = "allenai/c4",
+        dataset_config: str = "en",
+        seq_len: int = 512,
+        max_samples: Optional[int] = 2000,
+        vocab_size: int = 256, # Original vocab size, typically 256 for byte tokenization
+        max_eval_tokens: int = 50000,
+        nsp_task: bool = False, # New parameter for NSP task
     ):
-        self.dataset_name = data_cfg.get("dataset_name", "allenai/c4")
-        self.dataset_config = data_cfg.get("dataset_config", "en")
-        self.seq_len = data_cfg.get("seq_len", 512)
-        self.max_samples = data_cfg.get("max_samples")
-        if self.max_samples is None:
-            self.max_samples = float('inf')
-        self.vocab_size = data_cfg.get("vocab_size", 256)
-        self.max_eval_tokens = data_cfg.get("max_eval_tokens", 50000)
-        self.enable_nsp = data_cfg.get('enable_nsp', False)
-        self.enable_word_order_task = data_cfg.get('enable_word_order_task', False)
-        self.word_shuffle_probability = data_cfg.get('word_shuffle_probability', 0.15)
+        self.dataset_name = dataset_name
+        self.dataset_config = dataset_config
+        self.seq_len = seq_len
+        self.max_samples = max_samples if max_samples is not None else float('inf')
+        self.nsp_task = nsp_task
 
-        print(f"DataBuilder initialized with: enable_nsp={self.enable_nsp}, enable_word_order_task={self.enable_word_order_task}")
-        if self.enable_word_order_task:
-            print(f"  Word shuffle probability: {self.word_shuffle_probability}")
-        print(f"Using dataset: {self.dataset_name}/{self.dataset_config}, seq_len: {self.seq_len}")
-        print(f"Using UTF-8 byte tokenization with vocabulary size: {self.vocab_size}")
+        self.cls_token_id = 256
+        self.sep_token_id = 257
+        # Adjust vocab_size for CLS and SEP tokens
+        if vocab_size == 256: # Default byte tokenizer size
+            self.vocab_size = 258 # Accommodate CLS and SEP
+            print(f"Original vocab_size was 256, updated to {self.vocab_size} for CLS/SEP tokens.")
+        elif vocab_size < 258:
+            print(f"Warning: Original vocab_size {vocab_size} is less than 258. "
+                  f"CLS_TOKEN_ID ({self.cls_token_id}) or SEP_TOKEN_ID ({self.sep_token_id}) might collide or be out of bounds "
+                  f"if not already accounted for. Setting vocab_size to 258.")
+            self.vocab_size = 258
+        else: # vocab_size >= 258
+            self.vocab_size = vocab_size
+            print(f"Using provided vocab_size: {self.vocab_size}. Ensure it accounts for CLS/SEP if NSP is active.")
 
-        if self.enable_nsp or self.enable_word_order_task:
-            print(f"Max evaluation samples per split (for NSP/WOD): {self.max_eval_tokens}")
-        else:
-            print(f"Max evaluation tokens per split (for LM): {self.max_eval_tokens}")
+        self.max_eval_tokens = max_eval_tokens
 
+        print(f"Effective vocabulary size: {self.vocab_size}")
+        print(f"Max evaluation tokens per split: {self.max_eval_tokens}")
         if self.max_samples != float('inf'):
-            print(f"Will attempt to load up to {self.max_samples} documents from the dataset.")
+            print(f"Will attempt to load up to {self.max_samples} samples from the dataset.")
         else:
-            print("Will attempt to load all available documents from the dataset.")
+            print("Will attempt to load all available samples from the dataset.")
 
     def _tokenize_text(self, text: str) -> list:
         return list(text.encode('utf-8'))
     
     def _detokenize_bytes(self, tokens: list) -> str:
         try:
-            byte_data = bytes(tokens)
-            return byte_data.decode('utf-8', errors='replace')
+            # Handle special tokens for decoding if they are in the list
+            processed_tokens = []
+            for t_id in tokens:
+                if self.nsp_task: # Only apply special decoding if NSP task is configured
+                    if t_id == self.cls_token_id:
+                        # This part is tricky as bytes() expects integers 0-255
+                        # We can't directly convert 256/257 to a byte.
+                        # So, for string representation, we map them to text tags.
+                        # This means _detokenize_bytes is now lossy for CLS/SEP if used outside debugging.
+                        # Actual model input should remain integer IDs.
+                        # This function is mostly for inspection.
+                        pass # Will be handled by string joining later
+                    elif t_id == self.sep_token_id:
+                        pass # Will be handled by string joining later
+                    elif t_id < 0 or t_id > 255: # Other special tokens like pad, or out of byte range
+                        pass # Will be handled by string joining later
+                    else:
+                        processed_tokens.append(t_id)
+                else:
+                    if 0 <= t_id <= 255:
+                         processed_tokens.append(t_id)
+
+            byte_data = bytes(processed_tokens)
+            decoded_text = byte_data.decode('utf-8', errors='replace')
+
+            # Re-insert string representations for special tokens if NSP task
+            if self.nsp_task:
+                final_str_parts = []
+                current_byte_idx = 0
+                for t_id in tokens:
+                    if t_id == self.cls_token_id:
+                        final_str_parts.append("[CLS]")
+                    elif t_id == self.sep_token_id:
+                        final_str_parts.append("[SEP]")
+                    elif t_id < 0 or t_id > 255: # e.g. pad_token_id = -1
+                        final_str_parts.append(f"[PAD:{t_id}]")
+                    else:
+                        # This assumes one byte token corresponds to one character after potential multi-byte decoding
+                        # This part is complex due to utf-8 variable byte length.
+                        # A simpler approach for _detokenize_bytes for inspection:
+                        # Just convert byte range and use placeholders for others.
+                        pass # Byte tokens are handled by byte_data.decode above.
+                # This improved version handles byte tokens first, then inserts placeholders.
+                # However, the initial version of just decoding valid bytes is safer.
+                # Let's stick to a simpler version for now: decode valid bytes, and if special tokens were present,
+                # it implies the string output here is mainly for byte-tokens.
+                # A truly accurate detokenization would need to know where byte sequences were interrupted by special tokens.
+
+                # Fallback to simpler detokenization for inspection if NSP tokens are present:
+                if any(t_id in [self.cls_token_id, self.sep_token_id] for t_id in tokens):
+                    return " ".join(
+                        "[CLS]" if t == self.cls_token_id else \
+                        "[SEP]" if t == self.sep_token_id else \
+                        f"[PAD:{t}]" if t < 0 or t > 255 else \
+                        chr(t) if chr(t).isprintable() or chr(t) in ['\n', '\t', ' '] else f"[{t:02x}]"
+                        for t in tokens
+                    )
+            return decoded_text
+
         except Exception as e:
             print(f"Warning: Error decoding tokens: {e}")
             return f"[DECODE_ERROR: {tokens[:10]}...]"
+
+    def _segment_text_to_sentences(self, text: str) -> list[str]:
+        """Segments text into sentences using basic punctuation."""
+        if not text:
+            return []
+        # Use regex for more robust sentence splitting
+        # This pattern splits by '.', '!', '?' followed by space or end of string.
+        # It tries to handle common abbreviations by not splitting if preceded by a single capital letter (e.g., Mr. Smith).
+        import re
+        sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<![A-Z]\.)(?<=\.|\?|!)\s', text)
+
+        # Filter out very short or empty sentences and strip whitespace
+        min_sentence_length = 5 # Minimum number of characters for a sentence
+        processed_sentences = [s.strip() for s in sentences if s and len(s.strip()) >= min_sentence_length]
+
+        # Further cleanup: if a "sentence" ends with an abbreviation that wasn't caught,
+        # and the next "sentence" starts lowercase, they might belong together.
+        # This is complex; for now, the regex handles common cases.
+        return processed_sentences
 
     def _process_iterable_dataset(self, dataset_iterable, dataset_name_logging: str) -> list:
         samples = []
@@ -344,8 +176,14 @@ class DataBuilder:
                         break
 
             if text_content and text_content.strip():
-                samples.append({'text': text_content})
-                processed_count += 1
+                if self.nsp_task:
+                    sentences = self._segment_text_to_sentences(text_content)
+                    if sentences: # Only add if there's at least one sentence
+                        samples.append({'text': text_content, 'sentences': sentences}) # Store original text and sentences
+                        processed_count += 1
+                else:
+                    samples.append({'text': text_content})
+                    processed_count += 1
 
             if (i + 1) % 500 == 0 and (i+1) > 0:
                 print(f"Raw iterated {i+1} items from {dataset_name_logging}, processed {processed_count} valid samples...")
@@ -357,6 +195,7 @@ class DataBuilder:
         print(f"Loading dataset: {self.dataset_name}/{self.dataset_config}")
         loaded_samples = []
 
+        # Attempt 1: C4 'en' (streaming)
         try:
             print("Attempting Method 1: Load C4 'en' (streaming)...")
             dataset_stream = load_dataset(
@@ -369,18 +208,20 @@ class DataBuilder:
                 if len(loaded_samples) == 0 and self.max_samples > 0:
                     raise ValueError(f"Streaming C4 'en' yielded 0 samples when {self.max_samples} were requested.")
                 print(f"Streaming C4 'en' loaded {len(loaded_samples)} samples, less than requested {self.max_samples}. Will try non-streaming.")
-                if len(loaded_samples) == 0 :
+                # Do not reset loaded_samples here, keep what was loaded and attempt non-streaming to supplement or replace
+                if len(loaded_samples) == 0 : # Only raise if completely empty, otherwise proceed to non-streaming to try and get more
                     raise ValueError("Triggering non-streaming C4 'en' due to 0 samples from stream.")
             print(f"Successfully processed {len(loaded_samples)} samples from C4 'en' stream.")
         except Exception as e_c4_en_stream:
             print(f"Method 1 (C4 'en' streaming) failed: {e_c4_en_stream}")
-            loaded_samples = []
+            loaded_samples = [] # Ensure it's empty if this path failed before trying non-streaming
 
+            # Attempt 1.5: C4 'en' (non-streaming, sliced)
             if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
                 try:
                     print("Attempting Method 1.5: Load C4 'en' (non-streaming, sliced)...")
                     fetch_n = int(self.max_samples * 1.5) if self.max_samples != float('inf') else 5000
-                    fetch_n = max(fetch_n, 100)
+                    fetch_n = max(fetch_n, 100) # Ensure a minimum fetch
                     print(f"Will try to fetch up to {fetch_n} records for non-streaming C4 'en'.")
                     dataset_non_stream = load_dataset(
                         self.dataset_name, name=self.dataset_config, split=f'train[:{fetch_n}]', trust_remote_code=True
@@ -392,17 +233,19 @@ class DataBuilder:
                     print(f"Successfully loaded {len(loaded_samples)} samples via C4 'en' non-streaming.")
                 except Exception as e_c4_en_non_stream:
                     print(f"Method 1.5 (C4 'en' non-streaming) failed: {e_c4_en_non_stream}")
-                    loaded_samples = []
+                    loaded_samples = [] # Ensure empty if this also failed
 
         if loaded_samples and (len(loaded_samples) >= self.max_samples or self.max_samples == float('inf')):
             print(f"Successfully loaded {len(loaded_samples)} samples using C4 'en'.")
-        elif loaded_samples:
+        elif loaded_samples: # Loaded some, but less than max_samples
              print(f"Loaded {len(loaded_samples)} (less than {self.max_samples}) from C4 'en'. Proceeding with these or trying other datasets.")
-        else:
+        else: # No samples from C4 'en'
             print("All C4 'en' attempts (streaming/non-streaming) failed or yielded no samples.")
 
+        # If not enough samples from C4 'en', try other methods
         if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
             print(f"Attempting other datasets as C4 'en' yielded {len(loaded_samples)}/{self.max_samples} samples.")
+            # Attempt 2: C4 without 'en' config (streaming)
             try:
                 print("Attempting Method 2: Load C4 (no config) (streaming)...")
                 dataset_m2 = load_dataset(self.dataset_name, streaming=True, split='train', trust_remote_code=True)
@@ -415,8 +258,10 @@ class DataBuilder:
                 print(f"Method 2 (C4 no config, streaming) failed: {e_method2}")
                 loaded_samples = []
 
+        # If still not enough, try wikitext
         if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
             print(f"Attempting wikitext as previous methods yielded {len(loaded_samples)}/{self.max_samples} samples.")
+            # Attempt 3: Wikitext (streaming)
             try:
                 print("Attempting Method 3: Load wikitext (streaming)...")
                 dataset_m3 = load_dataset("wikitext", "wikitext-2-raw-v1", streaming=True, split='train')
@@ -429,17 +274,20 @@ class DataBuilder:
                 print(f"Method 3 (wikitext, streaming) failed: {e_method3}")
                 loaded_samples = []
 
+        # Final check and fallback
         if loaded_samples and (len(loaded_samples) >= self.max_samples or self.max_samples == float('inf')):
             print(f"Final dataset loaded with {len(loaded_samples)} samples.")
-        elif loaded_samples:
+        elif loaded_samples: # Loaded some, but maybe not enough
             print(f"Warning: Final dataset loaded with {len(loaded_samples)} samples, requested {self.max_samples}. Using available data.")
         else:
             print("All primary dataset loading methods failed or yielded no usable samples. Falling back to simple text dataset...")
             return self._create_fallback_dataset()
 
+        # Split data for train/validation/test
         train_split = int(0.8 * len(loaded_samples))
         val_split = int(0.9 * len(loaded_samples))
-        if train_split == len(loaded_samples) and len(loaded_samples) > 0: train_split = len(loaded_samples) -2
+        # Ensure validation and test sets are not empty if train_split is too large
+        if train_split == len(loaded_samples) and len(loaded_samples) > 0: train_split = len(loaded_samples) -2 # min 1 for val, 1 for test
         if val_split <= train_split and val_split < len(loaded_samples) -1 : val_split = train_split + 1
         if val_split >= len(loaded_samples): val_split = len(loaded_samples) -1
         if train_split < 0: train_split = 0
@@ -448,9 +296,10 @@ class DataBuilder:
         final_val_data = loaded_samples[train_split:val_split] if val_split > train_split else []
         final_test_data = loaded_samples[val_split:] if val_split < len(loaded_samples) else []
 
-        if not final_train_data and loaded_samples: final_train_data = loaded_samples
-        if not final_val_data and final_train_data: final_val_data = final_train_data[:max(1, len(final_train_data)//10)]
-        if not final_test_data and final_train_data: final_test_data = final_train_data[:max(1, len(final_train_data)//10)]
+        # Handle cases where splits might be empty due to small loaded_samples size
+        if not final_train_data and loaded_samples: final_train_data = loaded_samples # Use all for train if splits fail
+        if not final_val_data and final_train_data: final_val_data = final_train_data[:max(1, len(final_train_data)//10)] # 10% of train for val
+        if not final_test_data and final_train_data: final_test_data = final_train_data[:max(1, len(final_train_data)//10)] # 10% of train for test
 
         print(f"Returning dataset splits: train={len(final_train_data)}, val={len(final_val_data)}, test={len(final_test_data)}")
         return {
@@ -460,6 +309,7 @@ class DataBuilder:
         }
 
     def _create_fallback_dataset(self):
+        # ... (method content as in original file, ensure it uses self.max_samples correctly)
         sample_texts = [
             "The quick brown fox jumps over the lazy dog. This is a classic pangram used in typing practice.",
             "Machine learning is a subset of artificial intelligence that focuses on algorithms that can learn from data.",
@@ -473,12 +323,14 @@ class DataBuilder:
             "Tokenization is the process of converting text into numerical tokens that models can process.",
         ]
         num_repetitions = (self.max_samples // 10 if self.max_samples != float('inf') and self.max_samples > 10 else 100)
-        num_repetitions = max(num_repetitions, 1)
+        num_repetitions = max(num_repetitions, 1) # Ensure at least one repetition
         full_sample_texts = sample_texts * num_repetitions
         
+        # Ensure fallback provides a reasonable number of texts for splitting
         num_fallback_texts = max(20, len(full_sample_texts))
         text_block = '\n'.join(full_sample_texts[:num_fallback_texts])
 
+        # Ensure splits are somewhat reasonable even for small text_block
         len_block = len(text_block)
         train_end = int(0.8 * len_block)
         val_end = int(0.9 * len_block)
@@ -490,10 +342,10 @@ class DataBuilder:
         }
     
     def tokenize_dataset(self, dataset):
+        # ... (method content as in original file, ensure robust to empty splits)
         tokenized_data = {}
         for split_name, split_data_list in dataset.items():
             print(f"Tokenizing {split_name} split...")
-            all_text = ""
             if not isinstance(split_data_list, list):
                 print(f"Warning: {split_name} data is not a list (type: {type(split_data_list)}), skipping tokenization.")
                 tokenized_data[split_name] = []
@@ -503,85 +355,99 @@ class DataBuilder:
                 tokenized_data[split_name] = []
                 continue
 
-            for item in split_data_list:
-                if isinstance(item, dict) and 'text' in item:
-                    text_content = item['text']
-                    if text_content and text_content.strip():
-                        all_text += text_content + "\n"
-            
-            print(f"Text length for {split_name}: {len(all_text)} characters")
-            if not all_text.strip():
-                print(f"Warning: No text content found for {split_name} split. Resulting tokens will be empty.")
-                tokens = []
+            if self.nsp_task:
+                # For NSP, process list of documents, each with a list of sentences
+                # Output: list[list[list[int]]] (list of docs, each doc is list of tokenized sentences)
+                tokenized_docs_for_split = []
+                num_sentences_total = 0
+                for doc_item in split_data_list:
+                    if isinstance(doc_item, dict) and 'sentences' in doc_item:
+                        doc_sentences_tokenized = []
+                        for sentence_str in doc_item['sentences']:
+                            if sentence_str and sentence_str.strip():
+                                tokenized_sentence = self._tokenize_text(sentence_str)
+                                if tokenized_sentence: # Ensure sentence is not empty after tokenization
+                                    doc_sentences_tokenized.append(tokenized_sentence)
+                                    num_sentences_total +=1
+                        if doc_sentences_tokenized: # Only add doc if it has tokenized sentences
+                             tokenized_docs_for_split.append(doc_sentences_tokenized)
+                tokenized_data[split_name] = tokenized_docs_for_split
+                print(f"Tokenized {split_name} for NSP: {len(tokenized_docs_for_split)} documents, {num_sentences_total} total sentences.")
             else:
-                tokens = self._tokenize_text(all_text)
-            print(f"Tokenized to {len(tokens)} byte tokens")
-            tokenized_data[split_name] = tokens
+                # Standard tokenization: concatenate all text and tokenize once
+                all_text = ""
+                for item in split_data_list:
+                    if isinstance(item, dict) and 'text' in item:
+                        text_content = item['text']
+                        if text_content and text_content.strip():
+                            all_text += text_content + "\n"
+
+                print(f"Text length for {split_name} (standard task): {len(all_text)} characters")
+                if not all_text.strip():
+                    print(f"Warning: No text content found for {split_name} split. Resulting tokens will be empty.")
+                    tokens = []
+                else:
+                    tokens = self._tokenize_text(all_text)
+                print(f"Tokenized to {len(tokens)} byte tokens")
+                tokenized_data[split_name] = tokens
         return tokenized_data
     
     def create_datasets(self):
         raw_dataset = self.load_raw_dataset()
+        # tokenized_data will be list[list[list[int]]] for NSP, or list[int] for standard
+        tokenized_data_for_splits = self.tokenize_dataset(raw_dataset)
+
         datasets = {}
+        for split_name, data_content in tokenized_data_for_splits.items():
+            if not data_content: # data_content can be empty list of docs (for NSP) or empty list of tokens
+                print(f"Warning: {split_name} split has no tokenized content. Skipping dataset creation.")
+                continue
 
-        if self.enable_nsp: # Also implies WOD can be enabled if NSPDataset handles it
-            print("NSP or WOD is enabled. Creating NSPDatasets.")
-            for split_name in ['train', 'validation', 'test']:
-                docs_for_split = raw_dataset.get(split_name, [])
-                if not docs_for_split:
-                    print(f"Warning: No documents found for {split_name} split. Skipping.")
-                    datasets[split_name] = None
+            if self.nsp_task:
+                # data_content is list[list[list[int]]] (list of docs, each doc is list of tokenized sentences)
+                if not any(doc for doc in data_content): # Check if all documents are empty or list itself is empty
+                    print(f"Warning: {split_name} split for NSP has no sentences after tokenization. Skipping dataset.")
                     continue
-
-                is_eval_split = split_name in ['validation', 'test']
-                max_s_eval = self.max_eval_tokens if is_eval_split else None
                 
-                print(f"Creating NSPDataset for {split_name} with {len(docs_for_split)} documents. is_eval={is_eval_split}, max_samples_for_eval={max_s_eval}")
-                dataset_instance = NSPDataset( # Renamed from nsp_dataset to generic dataset_instance
-                    documents=docs_for_split,
-                    tokenizer_fn=self._tokenize_text,
+                # For NSP, max_eval_tokens is not directly applicable here as NSPDataset creates examples internally.
+                # We could limit the number of documents passed to NSPDataset for eval splits if needed.
+                # For now, pass all processed documents.
+                datasets[split_name] = NSPDataset(
+                    documents=data_content,
                     seq_len=self.seq_len,
-                    is_eval=is_eval_split,
-                    max_samples_for_eval=max_s_eval,
-                    enable_word_order_task=self.enable_word_order_task,
-                    word_shuffle_probability=self.word_shuffle_probability
+                    cls_token_id=self.cls_token_id,
+                    sep_token_id=self.sep_token_id,
+                    pad_token_id=-1 # Standard pad_token_id for LM loss
                 )
-                if len(dataset_instance) > 0:
-                    datasets[split_name] = dataset_instance
-                    print(f"NSPDataset for {split_name} created with {len(dataset_instance)} samples.")
-                else:
-                    print(f"Warning: NSPDataset for {split_name} resulted in 0 samples. Skipping.")
-                    datasets[split_name] = None
-        else: # Only standard LM if NSP is off (current logic means WOD also off)
-            print("NSP and WOD are disabled. Creating TokenizedDatasets for standard LM.")
-            tokenized_data = self.tokenize_dataset(raw_dataset)
+                print(f"{split_name} NSP dataset: {len(datasets[split_name])} examples")
 
-            for split_name, tokens in tokenized_data.items():
-                if not tokens:
-                    print(f"Warning: {split_name} split has no tokens. Skipping TokenizedDataset creation.")
-                    datasets[split_name] = None
-                    continue
-
+            else: # Standard TokenizedDataset
+                # data_content is list[int] (concatenated tokens for the split)
+                tokens = data_content
                 current_max_eval_tokens = self.max_eval_tokens
                 if self.max_samples != float('inf') and split_name in ['validation', 'test']:
-                    current_max_eval_tokens = max(current_max_eval_tokens, self.seq_len * 2 + 1)
+                    # Estimate based on 20% of max_samples, ensure it's reasonable
+                    scaled_max_tokens = int(self.max_samples * 0.2 * self.seq_len)
+                    current_max_eval_tokens = min(self.max_eval_tokens, scaled_max_tokens)
+                    # Ensure at least a few full sequences for eval
+                    current_max_eval_tokens = max(current_max_eval_tokens, self.seq_len * 5 + 1)
 
                 if len(tokens) > self.seq_len:
-                    if split_name in ['validation', 'test'] and len(tokens) > current_max_eval_tokens:
-                        tokens_for_dataset = tokens[:current_max_eval_tokens]
-                        print(f"Limited {split_name} (LM) to {len(tokens_for_dataset)} tokens for faster evaluation (target: {current_max_eval_tokens})")
-                    else:
-                        tokens_for_dataset = tokens
+                    if split_name in ['validation', 'test']:
+                        if len(tokens) > current_max_eval_tokens:
+                            tokens = tokens[:current_max_eval_tokens]
+                            print(f"Limited {split_name} to {len(tokens)} tokens for faster evaluation (target: {current_max_eval_tokens})")
 
-                    datasets[split_name] = TokenizedDataset(tokens_for_dataset, self.seq_len)
-                    print(f"TokenizedDataset for {split_name} (LM) created with {len(datasets[split_name])} samples.")
+                    datasets[split_name] = TokenizedDataset(tokens, self.seq_len)
+                    print(f"{split_name} dataset: {len(datasets[split_name])} samples")
                 else:
-                    print(f"Warning: {split_name} split (LM) has insufficient tokens ({len(tokens)}) for seq_len {self.seq_len}. Skipping dataset.")
-                    datasets[split_name] = None
+                    print(f"Warning: {split_name} split has insufficient tokens ({len(tokens)}) for seq_len {self.seq_len}. Skipping dataset.")
         return datasets
 
     def create_dataloaders(
         self, batch_size: int = 8, num_workers: int = 0, shuffle_train: bool = True
     ) -> Dict[str, DataLoader]:
+        # ... (method content as in original file, ensure robust to empty datasets dict)
         datasets = self.create_datasets()
         dataloaders = {}
         if not datasets:
@@ -609,79 +475,70 @@ class DataBuilder:
         return self._detokenize_bytes(tokens)
 
 
-def create_data_builder(data_config: Dict[str, Any]) -> DataBuilder:
-    return DataBuilder(data_cfg=data_config)
+def create_data_builder(
+    dataset_name: str = "allenai/c4", dataset_config: str = "en",
+    seq_len: int = 512, max_samples: Optional[int] = 2000,
+        max_eval_tokens: int = 50000,
+        nsp_task: bool = False, # Added nsp_task
+) -> DataBuilder:
+    return DataBuilder(
+        dataset_name=dataset_name, dataset_config=dataset_config,
+        seq_len=seq_len, max_samples=max_samples,
+        max_eval_tokens=max_eval_tokens,
+        nsp_task=nsp_task # Pass to constructor
+    )
 
 if __name__ == "__main__":
-    print("Testing DataBuilder...")
-
-    print("\n--- Testing with NSP Disabled ---")
-    data_cfg_lm = {
-        "dataset_name": "allenai/c4",
-        "dataset_config": "en",
-        "seq_len": 128,
-        "max_samples": 50,
-        "max_eval_tokens": 10000,
-        "enable_nsp": False,
-        "enable_word_order_task": False # Ensure WOD is off for this test
-    }
-    data_builder_lm = create_data_builder(data_cfg_lm)
-    dataloaders_lm = data_builder_lm.create_dataloaders(batch_size=2)
-
-    if 'train' in dataloaders_lm and dataloaders_lm['train']:
-        train_loader_lm = dataloaders_lm['train']
-        print(f"Number of LM training batches: {len(train_loader_lm)}")
+    # ... (main test block as in original file)
+    print("Testing DataBuilder (Standard Task)...")
+    data_builder_std = create_data_builder(
+        dataset_name="allenai/c4", dataset_config="en", # Using C4 for more text
+        seq_len=128, max_samples=200, # Reduced max_samples for faster test
+        nsp_task=False
+    )
+    dataloaders_std = data_builder_std.create_dataloaders(batch_size=2)
+    if 'train' in dataloaders_std and dataloaders_std['train']:
+        train_loader_std = dataloaders_std['train']
+        print(f"Number of standard training batches: {len(train_loader_std)}")
         try:
-            for batch_idx, (x, y) in enumerate(train_loader_lm):
-                print(f"LM Batch {batch_idx}: Input shape: {x.shape}, Target shape: {y.shape}")
-                if batch_idx >= 0: break
+            for batch_idx, (x, y) in enumerate(train_loader_std):
+                print(f"Std Batch {batch_idx}: Input shape: {x.shape}, Target shape: {y.shape}")
+                if x.numel() > 0: # Check if tensor is not empty
+                    sample_text = data_builder_std.decode_tokens(x[0][:30]) # Shorter sample
+                    print(f"Std Sample text: {sample_text}")
+                if batch_idx >= 0: break # Only show first batch
         except Exception as e:
-            print(f"Error during LM dataloader iteration test: {e}")
+            print(f"Error during standard dataloader iteration test: {e}")
+            raise
     else:
-        print("LM Train dataloader not created or empty.")
+        print("Standard train dataloader not created or empty.")
+    print("DataBuilder standard test completed!")
 
-    print("\n--- Testing with NSP Enabled & WOD Enabled ---")
-    data_cfg_nsp_wod = {
-        "dataset_name": "allenai/c4",
-        "dataset_config": "en",
-        "seq_len": 128,
-        "max_samples": 50,
-        "max_eval_tokens": 20,
-        "enable_nsp": True, # NSPDataset will be used
-        "enable_word_order_task": True,
-        "word_shuffle_probability": 0.50 # Increased for better chance of seeing shuffled samples
-    }
-    data_builder_nsp_wod = create_data_builder(data_cfg_nsp_wod)
-    # Initialize print counter for NSPDataset if it's going to be used
-    # This is a bit of a hack for testing; ideally, the dataset object would be accessed directly
-    # For now, assume the DataBuilder will create it and it will have the counter.
-    # data_builder_nsp_wod.datasets['train'].print_counter = 0 # This won't work as datasets not created yet
+    print("\nTesting DataBuilder (NSP Task)...")
+    data_builder_nsp = create_data_builder(
+        dataset_name="allenai/c4", dataset_config="en", # Using C4 for more text
+        seq_len=64, max_samples=100, # Further reduced for very fast NSP test
+        nsp_task=True
+    )
+    # Ensure model's cls_token_id would be set here in a real scenario
+    # model.cls_token_id = data_builder_nsp.cls_token_id
 
-    dataloaders_nsp_wod = data_builder_nsp_wod.create_dataloaders(batch_size=2)
-
-    if 'train' in dataloaders_nsp_wod and dataloaders_nsp_wod['train']:
-        # Access the dataset object to reset counter for testing, if possible and needed
-        # This assumes 'train' dataset exists and is an NSPDataset instance
-        # For robust testing, this might need a more direct way to access or pass debug flags
-        if hasattr(dataloaders_nsp_wod['train'].dataset, 'print_counter'):
-             dataloaders_nsp_wod['train'].dataset.print_counter = 0
-
-
-        train_loader_nsp_wod = dataloaders_nsp_wod['train']
-        print(f"Number of NSP/WOD training batches: {len(train_loader_nsp_wod)}")
+    dataloaders_nsp = data_builder_nsp.create_dataloaders(batch_size=2)
+    if 'train' in dataloaders_nsp and dataloaders_nsp['train']:
+        train_loader_nsp = dataloaders_nsp['train']
+        print(f"Number of NSP training batches: {len(train_loader_nsp)}")
         try:
-            for batch_idx, batch_data in enumerate(train_loader_nsp_wod):
-                print(f"NSP/WOD Batch {batch_idx}:")
-                print(f"  Input IDs shape: {batch_data['input_ids'].shape}")
-                print(f"  Token Type IDs shape: {batch_data['token_type_ids'].shape}")
-                print(f"  LM Labels shape: {batch_data['lm_labels'].shape}")
-                print(f"  NSP Label: {batch_data['nsp_label']}")
-                print(f"  WOD Score Label: {batch_data['word_order_score_label']}")
-                if batch_idx >= 0: break
+            for batch_idx, (input_ids, lm_target_ids, nsp_label) in enumerate(train_loader_nsp):
+                print(f"NSP Batch {batch_idx}: Inputs: {input_ids.shape}, Targets: {lm_target_ids.shape}, NSP Label: {nsp_label.shape}")
+                if input_ids.numel() > 0:
+                    sample_tokens = input_ids[0][:30].tolist() # Shorter sample
+                    decoded_sample = data_builder_nsp.decode_tokens(sample_tokens)
+                    print(f"NSP Sample tokens: {sample_tokens}")
+                    print(f"NSP Sample decoded: {decoded_sample}")
+                if batch_idx >= 0: break # Only show first batch
         except Exception as e:
-            print(f"Error during NSP/WOD dataloader iteration test: {e}")
+            print(f"Error during NSP dataloader iteration test: {e}")
+            raise
     else:
-        print("NSP/WOD Train dataloader not created or empty.")
-
-    print("\nDataBuilder test completed!")
-[end of data_builder.py]
+        print("NSP train dataloader not created or empty.")
+    print("DataBuilder NSP test completed!")

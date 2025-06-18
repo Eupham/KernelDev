@@ -68,37 +68,14 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
         config['training']['epochs'] = args.epochs
     if hasattr(args, 'learning_rate') and args.learning_rate is not None:
         config['training']['learning_rate'] = args.learning_rate
-
-    # NSP and Kernel related args
-    if hasattr(args, 'enable_nsp') and args.enable_nsp: # Check if True, as action='store_true'
-        config.setdefault('data', {})['enable_nsp'] = True
-    elif 'enable_nsp' not in config.get('data', {}): # if not set by CLI, and not in YAML
-        config.setdefault('data', {})['enable_nsp'] = False
-
-
-    if hasattr(args, 'nsp_loss_weight') and args.nsp_loss_weight is not None:
-        config.setdefault('training', {})['nsp_loss_weight'] = args.nsp_loss_weight
     
-    if hasattr(args, 'use_simple_kernel') and args.use_simple_kernel:
-        config.setdefault('hardware', {})['use_simple_kernel'] = True
-    elif not hasattr(args, 'use_simple_kernel') and 'use_simple_kernel' not in config.get('hardware', {}): # Not set by CLI and not in YAML
-        config.setdefault('hardware', {})['use_simple_kernel'] = False
-    # If CLI arg --use_simple_kernel is NOT provided (so args.use_simple_kernel is False due to action='store_true')
-    # AND it IS in the YAML, the YAML value should persist. The current logic handles this.
-    # If CLI arg IS provided, it overrides YAML.
-    # If neither CLI nor YAML, it defaults to False.
-
-    # WOD related args
-    if hasattr(args, 'enable_word_order_task') and args.enable_word_order_task:
-        config.setdefault('model', {})['enable_word_order_task'] = True
-    elif 'enable_word_order_task' not in config.get('model', {}): # if not set by CLI, and not in YAML
-        config.setdefault('model', {})['enable_word_order_task'] = False
-
-    if hasattr(args, 'word_shuffle_probability') and args.word_shuffle_probability is not None:
-        config.setdefault('data', {})['word_shuffle_probability'] = args.word_shuffle_probability
-
-    if hasattr(args, 'word_order_loss_weight') and args.word_order_loss_weight is not None:
-        config.setdefault('training', {})['word_order_loss_weight'] = args.word_order_loss_weight
+    # NSP and CPU attention fallback arguments
+    if hasattr(args, 'nsp_task') and args.nsp_task is not None:
+        config['training']['nsp_task'] = args.nsp_task
+    if hasattr(args, 'nsp_loss_weight') and args.nsp_loss_weight is not None:
+        config['training']['nsp_loss_weight'] = args.nsp_loss_weight
+    if hasattr(args, 'cpu_test_attention') and args.cpu_test_attention is not None:
+        config['hardware']['cpu_test_attention'] = args.cpu_test_attention
 
     return config
 
@@ -197,22 +174,6 @@ def start_actual_training(cli_args):
 
     config = merge_config_with_args(config, cli_args)
     
-    # Kernel Switching Logic
-    # This should be done early, before any module that might use the kernel is imported or initialized.
-    # However, model.py and original_kernel.py are imported at the top.
-    # The environment variable needs to be set *before* those modules try to read it.
-    # For workers in DDP, they inherit env from the main process.
-    # For single process, it's set here.
-    # The most robust way is to set it right at the start of the __main__ block for the main process,
-    # and ensure workers inherit it.
-    # For now, setting it here in start_actual_training. If it's too late, it needs to move earlier.
-    if config.get('hardware', {}).get('use_simple_kernel', False):
-        os.environ['USE_SIMPLE_KERNEL'] = '1'
-        print("USE_SIMPLE_KERNEL environment variable set to '1'.")
-    else:
-        os.environ['USE_SIMPLE_KERNEL'] = '0' # Or could unset it: os.environ.pop('USE_SIMPLE_KERNEL', None)
-        print("USE_SIMPLE_KERNEL environment variable set to '0'.")
-
     # Extract configuration values with defaults
     training_cfg = config.get('training', {})
     data_cfg = config.get('data', {})
@@ -221,6 +182,11 @@ def start_actual_training(cli_args):
     eval_cfg = config.get('evaluation', {})
     gen_cfg = config.get('generation', {})
     logging_cfg = config.get('logging', {})
+
+    # NSP and CPU attention fallback settings from config
+    nsp_task_enabled = training_cfg.get('nsp_task', False)
+    nsp_lw = training_cfg.get('nsp_loss_weight', 0.5)
+    cpu_test_mode = hardware_cfg.get('cpu_test_attention', False)
     
     # Set random seed for reproducibility
     seed = config.get('random_seed', 42)
@@ -251,29 +217,29 @@ def start_actual_training(cli_args):
         'dataset_config': data_cfg.get('dataset_config', 'en'),
         'seq_len': data_cfg.get('seq_len', 1024),
         'max_samples': data_cfg.get('max_samples', 5000),
-        'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000),
-        'enable_nsp': data_cfg.get('enable_nsp', False),
-        # WOD specific for DataBuilder config
-        'enable_word_order_task': model_cfg.get('enable_word_order_task', False), # DataBuilder needs this to pass to NSPDataset
-        'word_shuffle_probability': data_cfg.get('word_shuffle_probability', 0.15)
+        'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000)
     }
     
     # Model configuration
     model_config = {
-        'vocab_size': model_cfg.get('vocab_size', 256), # vocab_size is updated later by DataBuilder
+        'vocab_size': model_cfg.get('vocab_size', 256),
         'dim': model_cfg.get('dim', 512),
         'n_layers': model_cfg.get('n_layers', 12),
         'n_heads': model_cfg.get('n_heads', 16),
         'max_seq_len': model_cfg.get('max_seq_len', 2048),
         'mlp_ratio': model_cfg.get('mlp_ratio', 4),
-        'causal': model_cfg.get('causal', True),
-        'num_nsp_labels': model_cfg.get('num_nsp_labels', 2), # Already there from previous step
-        'enable_word_order_task': model_cfg.get('enable_word_order_task', False) # For GPTModel constructor
+        'causal': model_cfg.get('causal', True)
     }
     
     # Initialize model
     print(f"\n=== Initializing Model ===")
-    model = GPTModel(**model_config)
+    # Update model_config for NSP if enabled
+    if nsp_task_enabled:
+        # This assumes data_builder is created before model to get cls_token_id
+        # This part will be adjusted after data_builder instantiation
+        pass # model_config will be updated later
+
+    model = GPTModel(**model_config) # Initial model creation, might be re-created or updated
     
     # Setup precision and mixed precision training
     print(f"\n=== Setting up Precision ===")
@@ -307,10 +273,71 @@ def start_actual_training(cli_args):
         inference_temperature=inference_cfg.get('temperature', 0.8),
         inference_top_k=inference_cfg.get('top_k', 50),
         inference_top_p=inference_cfg.get('top_p', 0.9),
-        nsp_loss_weight=training_cfg.get('nsp_loss_weight', 0.5),
-        word_order_loss_weight=training_cfg.get('word_order_loss_weight', 0.1) # Pass to TrainingConfig
+        nsp_task=nsp_task_enabled, # Pass to TrainingConfig
+        nsp_loss_weight=nsp_lw    # Pass to TrainingConfig
     )
     
+    # CPU Attention Fallback Logic
+    if cpu_test_mode:
+        print("CPU Attention Fallback Mode ENABLED")
+        import original_kernel # Ensure it's imported
+
+        def cpu_flash_attention_fallback(q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision, is_prefix_token_mask=None):
+            B, H, T, D = q.shape
+            q_scaled = q * sm_scale # Apply sm_scale to q
+
+            # attn_bias will handle causal masking and prefix masking
+            attn_bias = torch.zeros(B, H, T, T, dtype=q.dtype, device=q.device)
+
+            if causal:
+                causal_mask_values = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1)
+                # Expand causal_mask_values to match attn_bias shape for broadcasting
+                expanded_causal_mask = causal_mask_values.unsqueeze(0).unsqueeze(0) # Shape (1, 1, T, T)
+
+                if is_prefix_token_mask is not None:
+                    # is_prefix_token_mask is (T,), True for prefix tokens
+                    # If query token i is a prefix token, it should attend to all key tokens j.
+                    # This means for a prefix query token i, the row causal_mask_values[i,:] should be all False.
+                    # prefix_mask_for_q has shape (T,)
+                    # We want to modify expanded_causal_mask where query is prefix.
+                    # Create a mask for query dimension: (1, 1, T, 1)
+                    prefix_q_mask = is_prefix_token_mask.view(1, 1, T, 1).expand(B, H, T, T)
+
+                    # Where prefix_q_mask is True, set expanded_causal_mask to False
+                    # This effectively says: if query is prefix, no causal masking for this query.
+                    final_causal_mask = torch.where(prefix_q_mask, torch.zeros_like(expanded_causal_mask), expanded_causal_mask)
+                else:
+                    final_causal_mask = expanded_causal_mask
+
+                attn_bias.masked_fill_(final_causal_mask, float("-inf"))
+
+            # Attention calculation
+            attn_weights = torch.matmul(q_scaled, k.transpose(-2, -1)) + attn_bias
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            output = torch.matmul(attn_weights, v)
+
+            # LSE calculation (logsumexp)
+            # The LSE should be calculated on the scores *before* softmax.
+            # The scores are (q_scaled @ k.transpose) + attn_bias
+            if return_lse:
+                scores_for_lse = torch.matmul(q_scaled, k.transpose(-2, -1)) + attn_bias
+                # Mask out -inf before logsumexp to avoid nan/inf issues where softmax would be 0
+                scores_for_lse = torch.where(attn_bias == float("-inf"), torch.full_like(scores_for_lse, -float("inf")), scores_for_lse)
+                lse = torch.logsumexp(scores_for_lse, dim=-1)
+            else:
+                lse = torch.empty(0, device=q.device, dtype=q.dtype) # Match expected empty tensor
+
+            return output, lse
+
+        original_kernel.flash_attention = cpu_flash_attention_fallback
+        # Force device to CPU in TrainingConfig if cpu_test_mode is on
+        training_config.device = torch.device('cpu')
+        # Also update hardware_cfg for model placement if it's used directly after this
+        hardware_cfg['device'] = 'cpu'
+        # Re-initialize model on CPU if it was already on GPU
+        model.to(training_config.device)
+        print(f"Model and training will run on CPU due to cpu_test_attention=True.")
+
     # Estimate optimal batch size with precision consideration
     if logging_cfg.get('show_memory_estimation', True):
         estimated_batch_size, memory_info = estimate_optimal_batch_size(
@@ -340,8 +367,31 @@ def start_actual_training(cli_args):
     
     # Create data builder
     print("\n=== Loading and Processing Data ===")
-    data_builder = create_data_builder(data_config) # Corrected: pass dict directly
-    
+    # Pass nsp_task to create_data_builder
+    data_config_with_nsp = {**data_config, 'nsp_task': nsp_task_enabled}
+    data_builder = create_data_builder(**data_config_with_nsp)
+
+    # Update model_config with actual vocab_size and cls_token_id if NSP
+    actual_vocab_size = data_builder.get_vocab_size()
+    model_config['vocab_size'] = actual_vocab_size
+    if nsp_task_enabled:
+        model_config['cls_token_id'] = data_builder.cls_token_id
+        # model_config['nsp_task'] = nsp_task_enabled # if GPTModel takes nsp_task directly
+
+    # Re-initialize model if vocab_size or other critical params changed, especially if CPU fallback changed device
+    if model_config['vocab_size'] != model.token_emb.num_embeddings or \
+       (nsp_task_enabled and getattr(model, 'cls_token_id', None) != data_builder.cls_token_id) or \
+       (cpu_test_mode and next(model.parameters()).device != training_config.device) :
+        print("Re-initializing model due to config changes (vocab_size, NSP, or CPU mode)...")
+        # Pass nsp_task to GPTModel constructor if it accepts it.
+        # The current plan is to modify GPTModel to accept cls_token_id.
+        # If GPTModel also needs nsp_task for internal logic, add it here.
+        model = GPTModel(**model_config)
+        model.to(training_config.device) # Ensure model is on the correct device
+        # Re-apply precision setup if model is re-initialized
+        _, _, _ = setup_precision(model, precision)
+
+
     # Create dataloaders
     try:
         dataloaders = data_builder.create_dataloaders(
@@ -349,11 +399,7 @@ def start_actual_training(cli_args):
             num_workers=data_cfg.get('num_workers', 0),
             shuffle_train=data_cfg.get('shuffle_train', True)
         )
-        
-        # Update vocab size based on actual tokenizer
-        actual_vocab_size = data_builder.get_vocab_size()
-        model_config['vocab_size'] = actual_vocab_size
-        print(f"Confirmed vocab_size: {actual_vocab_size} (UTF-8 bytes)")
+        print(f"Vocab size from data_builder: {actual_vocab_size} (UTF-8 bytes potentially extended for NSP)")
         
     except Exception as e:
         print(f"Error creating dataloaders: {e}")
@@ -368,28 +414,21 @@ def start_actual_training(cli_args):
     # Test a batch
     if 'train' in dataloaders:
         print("\n=== Data Sample ===")
-        # Assuming train_loader yields dictionaries if NSP is enabled, or (x,y) tuples otherwise.
-        # The DataBuilder.create_dataloaders should ensure consistent output or
-        # this sample test needs to be aware of the data format.
-        # For now, let's assume it might be a dict, and try to access 'input_ids'
-        # This part of entry.py is for basic LM testing, might need adjustment if NSP is default.
-        try:
-            for batch_sample in dataloaders['train']:
-                if isinstance(batch_sample, dict):
-                    sample_x = batch_sample['input_ids']
-                    print(f"Batch input_ids shape: {sample_x.shape}")
-                    print(f"Sample tokens: {sample_x[0][:20].tolist()}")
-                    sample_text = data_builder.decode_tokens(sample_x[0][:50])
-                    print(f"Sample text: '{sample_text[:100]}...'")
-                else: # Assuming (x,y) tuple for standard LM
-                    x, y = batch_sample
-                    print(f"Batch shape: {x.shape}")
-                    print(f"Sample tokens: {x[0][:20].tolist()}")
-                    sample_text = data_builder.decode_tokens(x[0][:50])
-                    print(f"Sample text: '{sample_text[:100]}...'")
-                break # Only show one sample
-        except Exception as e:
-            print(f"Error displaying data sample: {e}. Batch format might have changed.")
+        # Adjust for NSPDataset output (input_ids, lm_targets, nsp_label)
+        if nsp_task_enabled:
+            for input_ids_sample, _, nsp_label_sample in dataloaders['train']:
+                print(f"NSP Batch shapes: IDs-{input_ids_sample.shape}, NSP Labels-{nsp_label_sample.shape}")
+                print(f"Sample NSP input tokens: {input_ids_sample[0][:20].tolist()}")
+                sample_text = data_builder.decode_tokens(input_ids_sample[0][:50])
+                print(f"Sample NSP text: '{sample_text[:100]}...'")
+                break
+        else:
+            for x, y in dataloaders['train']:
+                print(f"Batch shape: {x.shape}")
+                print(f"Sample tokens: {x[0][:20].tolist()}")
+                sample_text = data_builder.decode_tokens(x[0][:50])
+                print(f"Sample text: '{sample_text[:100]}...'")
+                break
 
     # Create trainer
     print(f"\n=== Setting up Trainer ===")
@@ -401,27 +440,22 @@ def start_actual_training(cli_args):
     
     # Initial evaluation
     print(f"\n=== Initial Evaluation ===")
-    initial_train_combined_loss, initial_val_combined_loss = None, None # Ensure they exist for later comparison
     if 'train' in dataloaders and 'validation' in dataloaders:
         max_eval_batches = eval_cfg.get('max_eval_batches', 10)
+        # Initial evaluation returns combined loss. NSP metrics are updated in trainer.metrics
+        initial_train_loss_combined = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
+        initial_val_loss_combined = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
 
-        initial_train_combined_loss, initial_train_lm_loss, initial_train_nsp_loss, initial_train_wod_loss, initial_train_nsp_acc = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
-        initial_val_combined_loss, initial_val_lm_loss, initial_val_nsp_loss, initial_val_wod_loss, initial_val_nsp_acc = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
+        print(f"Initial training loss (combined): {initial_train_loss_combined:.4f}")
+        if nsp_task_enabled and trainer.metrics.val_nsp_losses: # Check if metrics got populated
+             print(f"  Initial train NSP loss: {trainer.metrics.val_nsp_losses[-2]:.4f}, NSP Acc: {trainer.metrics.val_nsp_accuracies[-2]:.4f}") # Eval on train populates val lists
 
-        print(f"Initial training loss (combined): {initial_train_combined_loss:.4f}")
-        if initial_train_lm_loss is not None: print(f"  Initial LM training loss: {initial_train_lm_loss:.4f}")
-        if initial_train_nsp_loss is not None: print(f"  Initial NSP training loss: {initial_train_nsp_loss:.4f}")
-        if initial_train_wod_loss is not None: print(f"  Initial WOD training loss: {initial_train_wod_loss:.4f}")
-        if initial_train_nsp_acc is not None: print(f"  Initial NSP training accuracy: {initial_train_nsp_acc:.4f}")
-
-        print(f"Initial validation loss (combined): {initial_val_combined_loss:.4f}")
-        if initial_val_lm_loss is not None: print(f"  Initial LM validation loss: {initial_val_lm_loss:.4f}")
-        if initial_val_nsp_loss is not None: print(f"  Initial NSP validation loss: {initial_val_nsp_loss:.4f}")
-        if initial_val_wod_loss is not None: print(f"  Initial WOD validation loss: {initial_val_wod_loss:.4f}")
-        if initial_val_nsp_acc is not None: print(f"  Initial NSP validation accuracy: {initial_val_nsp_acc:.4f}")
+        print(f"Initial validation loss (combined): {initial_val_loss_combined:.4f}")
+        if nsp_task_enabled and trainer.metrics.val_nsp_losses:
+             print(f"  Initial validation NSP loss: {trainer.metrics.val_nsp_losses[-1]:.4f}, NSP Acc: {trainer.metrics.val_nsp_accuracies[-1]:.4f}")
     
     # Test causal vs non-causal attention
-    if logging_cfg.get('test_attention_modes', True):
+    if logging_cfg.get('test_attention_modes', True) and not cpu_test_mode : # Skip if CPU mode as it might be slow or not the point
         print(f"\n=== Testing Causal vs Non-Causal Attention ===")
         test_causal_attention(model, dataloaders, training_config.device, data_builder)
     
@@ -438,28 +472,23 @@ def start_actual_training(cli_args):
         # Final evaluation
         if 'train' in dataloaders and 'validation' in dataloaders:
             max_eval_batches = eval_cfg.get('max_eval_batches', 10)
-            final_train_combined_loss, final_train_lm_loss, final_train_nsp_loss, final_train_wod_loss, final_train_nsp_acc = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
-            final_val_combined_loss, final_val_lm_loss, final_val_nsp_loss, final_val_wod_loss, final_val_nsp_acc = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
+            final_train_loss_combined = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
+            final_val_loss_combined = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
 
-            print(f"Final training loss (combined): {final_train_combined_loss:.4f}")
-            if final_train_lm_loss is not None: print(f"  Final LM training loss: {final_train_lm_loss:.4f}")
-            if final_train_nsp_loss is not None: print(f"  Final NSP training loss: {final_train_nsp_loss:.4f}")
-            if final_train_wod_loss is not None: print(f"  Final WOD training loss: {final_train_wod_loss:.4f}")
-            if final_train_nsp_acc is not None: print(f"  Final NSP training accuracy: {final_train_nsp_acc:.4f}")
-
-            print(f"Final validation loss (combined): {final_val_combined_loss:.4f}")
-            if final_val_lm_loss is not None: print(f"  Final LM validation loss: {final_val_lm_loss:.4f}")
-            if final_val_nsp_loss is not None: print(f"  Final NSP validation loss: {final_val_nsp_loss:.4f}")
-            if final_val_wod_loss is not None: print(f"  Final WOD validation loss: {final_val_wod_loss:.4f}")
-            if final_val_nsp_acc is not None: print(f"  Final NSP validation accuracy: {final_val_nsp_acc:.4f}")
+            print(f"Final training loss (combined): {final_train_loss_combined:.4f}")
+            if nsp_task_enabled and len(trainer.metrics.val_nsp_losses) >= 4: # Assuming at least two evals on train and two on val
+                 print(f"  Final train NSP loss: {trainer.metrics.val_nsp_losses[-2]:.4f}, NSP Acc: {trainer.metrics.val_nsp_accuracies[-2]:.4f}")
             
+            print(f"Final validation loss (combined): {final_val_loss_combined:.4f}")
+            if nsp_task_enabled and len(trainer.metrics.val_nsp_losses) >= 2:
+                 print(f"  Final validation NSP loss: {trainer.metrics.val_nsp_losses[-1]:.4f}, NSP Acc: {trainer.metrics.val_nsp_accuracies[-1]:.4f}")
+
             # Show improvement
-            if initial_train_combined_loss is not None and final_train_combined_loss is not None :
-                train_improvement = initial_train_combined_loss - final_train_combined_loss
-                print(f"Training loss improvement: {train_improvement:.4f}")
-            if initial_val_combined_loss is not None and final_val_combined_loss is not None:
-                val_improvement = initial_val_combined_loss - final_val_combined_loss
-                print(f"Validation loss improvement: {val_improvement:.4f}")
+            if 'initial_train_loss_combined' in locals(): # Check if initial eval was done
+                train_improvement = initial_train_loss_combined - final_train_loss_combined
+                val_improvement = initial_val_loss_combined - final_val_loss_combined
+                print(f"Training loss improvement (combined): {train_improvement:.4f}")
+                print(f"Validation loss improvement (combined): {val_improvement:.4f}")
         
         # Plot training curves
         if logging_cfg.get('save_training_plots', True):
@@ -492,29 +521,17 @@ def test_causal_attention(model, dataloaders, device, data_builder):
         return
     
     # Get a sample batch
-    # This test also needs to be aware of the batch format
-    sample_input_for_attention_test = None
-    if 'train' in dataloaders:
-        for batch_sample in dataloaders['train']:
-            if isinstance(batch_sample, dict):
-                sample_input_for_attention_test = batch_sample['input_ids'].to(device)
-            else: # Assuming (x,y) tuple
-                sample_input_for_attention_test = batch_sample[0].to(device)
-            break
+    for x, y in dataloaders['train']:
+        x = x.to(device)
+        break
 
-    if sample_input_for_attention_test is None:
-        print("Warning: Could not get a sample batch for causal attention test.")
-        return # Cannot proceed with this test
-
-    x = sample_input_for_attention_test
     model.to(device)
     model.eval()
     
     with torch.no_grad():
         # Test with causal=True (default)
         print("Testing with causal=True...")
-        # model(x) now returns: lm_logits, nsp_logits, wod_logits, lm_loss, nsp_loss, wod_loss
-        logits_causal, _, _, _, _, _ = model(x)
+        logits_causal, _ = model(x)
         
         # Test with causal=False by modifying the attention layers
         print("Testing with causal=False...")
@@ -524,8 +541,7 @@ def test_causal_attention(model, dataloaders, device, data_builder):
             original_causal.append(block.attn.causal)
             block.attn.causal = False
         
-        # model(x) now returns: lm_logits, nsp_logits, wod_logits, lm_loss, nsp_loss, wod_loss
-        logits_non_causal, _, _, _, _, _ = model(x)
+        logits_non_causal, _ = model(x)
         
         # Restore original causal setting
         for i, block in enumerate(model.blocks):
@@ -692,68 +708,20 @@ if __name__ == "__main__":
         default=None, # Default to None
         help='Learning rate (overrides config)'
     )
-    parser.add_argument(
-        '--enable_nsp',
-        action='store_true',
-        help='Enable Next Sentence Prediction auxiliary task.'
-    )
-    parser.add_argument(
-        '--nsp_loss_weight',
-        type=float,
-        default=None,
-        help='Weight for the NSP loss (overrides config file value if set, TrainingConfig default is 0.5).'
-    )
-    parser.add_argument(
-        '--use_simple_kernel',
-        action='store_true',
-        help='Use simple PyTorch-based attention kernel instead of Triton/CUDA kernel.'
-    )
-    # WOD arguments
-    parser.add_argument(
-        '--enable_word_order_task',
-        action='store_true',
-        help='Enable Word Order Detection auxiliary task.'
-    )
-    parser.add_argument(
-        '--word_shuffle_probability',
-        type=float,
-        default=None,
-        help='Probability of shuffling words in a sentence for WOD task (overrides config).'
-    )
-    parser.add_argument(
-        '--word_order_loss_weight',
-        type=float,
-        default=None,
-        help='Weight for the WOD loss (overrides config, TrainingConfig default is 0.1).'
-    )
+    parser.add_argument('--nsp-task', action='store_true', help='Enable Next Sentence Prediction task.')
+    parser.add_argument('--nsp-loss-weight', type=float, default=0.5, help='Weight for NSP loss component.')
+    parser.add_argument('--cpu-test-attention', action='store_true', help='Use CPU fallback for attention mechanism (for testing).')
 
+    # Use parse_args() which will capture all defined args.
+    # REMAINDER is not needed here as we explicitly define training args.
     args = parser.parse_args()
 
-    # Set USE_SIMPLE_KERNEL environment variable here for the main process
-    # This ensures it's set before any imports in worker processes if DDP is used,
-    # and before model initialization in single process mode.
-    if args.use_simple_kernel:
-        os.environ['USE_SIMPLE_KERNEL'] = '1'
-        print("USE_SIMPLE_KERNEL environment variable set to '1' by main process.")
-    else:
-        # Ensure it's '0' if not specified or if the flag isn't present,
-        # assuming the default is to use the original kernel.
-        os.environ['USE_SIMPLE_KERNEL'] = '0'
-        # print("USE_SIMPLE_KERNEL environment variable set to '0' by main process.")
-
-
     if "IS_WORKER_PROCESS" in os.environ:
-        # This means this script instance is a worker.
-        # USE_SIMPLE_KERNEL should already be in os.environ, inherited from the parent.
         print(f"Worker process RANK: {os.environ.get('RANK', 'N/A')}, LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'N/A')} starting.")
-        print(f"Worker USE_SIMPLE_KERNEL: {os.environ.get('USE_SIMPLE_KERNEL')}") # Check if inherited
+        # Worker processes receive all arguments and proceed to training
         start_actual_training(args)
     elif args.nproc_per_node > 1:
-        # This is the main process, about to launch DDP workers.
-        # USE_SIMPLE_KERNEL is already set in this process's environment.
-        # Worker processes launched via subprocess.Popen will inherit this environment.
         print(f"Main process launching {args.nproc_per_node} worker processes.")
-        print(f"Main process USE_SIMPLE_KERNEL: {os.environ.get('USE_SIMPLE_KERNEL')}")
         master_addr = "127.0.0.1"
         master_port = find_free_port()
         world_size = args.nproc_per_node

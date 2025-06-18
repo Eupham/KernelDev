@@ -45,8 +45,8 @@ class TrainingConfig:
         # Scheduler parameters
         scheduler_T0_epoch_fraction: float = 0.1,
         scheduler_T_mult: int = 1,
-        nsp_loss_weight: float = 0.5,
-        word_order_loss_weight: float = 0.1 # Added WOD loss weight
+        nsp_task: bool = False, # New NSP parameter
+        nsp_loss_weight: float = 0.5, # New NSP parameter
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -76,8 +76,9 @@ class TrainingConfig:
         # Scheduler parameters
         self.scheduler_T0_epoch_fraction = scheduler_T0_epoch_fraction
         self.scheduler_T_mult = scheduler_T_mult
-        self.nsp_loss_weight = nsp_loss_weight
-        self.word_order_loss_weight = word_order_loss_weight # Store WOD loss weight
+
+        self.nsp_task = nsp_task # Store NSP task flag
+        self.nsp_loss_weight = nsp_loss_weight # Store NSP loss weight
         
         # Auto-detect device
         if device == "auto":
@@ -155,14 +156,11 @@ class TrainingMetrics:
         self.total_steps = 0
         self.best_val_loss = float('inf')
         self.best_step = 0
-        # For separate LM/NSP loss tracking
-        self.train_lm_losses = []
-        self.train_nsp_losses = []
-        self.train_wod_losses = []
-        self.val_lm_losses = []
+        # NSP metrics
+        self.nsp_losses = []
+        self.nsp_accuracies = [] # For training, if calculated per step
         self.val_nsp_losses = []
-        self.val_wod_losses = []
-        self.val_nsp_accuracies: List[float] = [] # Added for NSP accuracy
+        self.val_nsp_accuracies = []
     
     def update(
         self,
@@ -170,43 +168,37 @@ class TrainingMetrics:
         val_loss: Optional[float] = None,
         learning_rate: Optional[float] = None,
         step_time: Optional[float] = None,
-        train_lm_loss: Optional[float] = None,
-        train_nsp_loss: Optional[float] = None,
-        train_wod_loss: Optional[float] = None,
-        val_lm_loss: Optional[float] = None,
-        val_nsp_loss: Optional[float] = None,
-        val_wod_loss: Optional[float] = None,
-        val_nsp_accuracy: Optional[float] = None # Added for NSP accuracy
+        nsp_loss: Optional[float] = None, # New NSP metric
+        nsp_accuracy: Optional[float] = None, # New NSP metric (training)
+        val_nsp_loss: Optional[float] = None, # New NSP metric (validation)
+        val_nsp_accuracy: Optional[float] = None # New NSP metric (validation)
     ):
         """Update metrics with new values."""
         if train_loss is not None:
             self.train_losses.append(train_loss)
-        if train_lm_loss is not None:
-            self.train_lm_losses.append(train_lm_loss)
-        if train_nsp_loss is not None:
-            self.train_nsp_losses.append(train_nsp_loss)
-        if train_wod_loss is not None:
-            self.train_wod_losses.append(train_wod_loss)
         
         if val_loss is not None:
             self.val_losses.append(val_loss)
-            if val_loss < self.best_val_loss:
+            # Note: best_val_loss logic might need adjustment if primary metric changes due to NSP
+            if val_loss < self.best_val_loss: # Assuming val_loss (combined) is still the primary metric for checkpointing best
                 self.best_val_loss = val_loss
                 self.best_step = self.total_steps
-        if val_lm_loss is not None:
-            self.val_lm_losses.append(val_lm_loss)
-        if val_nsp_loss is not None:
-            self.val_nsp_losses.append(val_nsp_loss)
-        if val_wod_loss is not None:
-            self.val_wod_losses.append(val_wod_loss)
-        if val_nsp_accuracy is not None: # Added for NSP accuracy
-            self.val_nsp_accuracies.append(val_nsp_accuracy)
 
         if learning_rate is not None:
             self.learning_rates.append(learning_rate)
         
         if step_time is not None:
             self.step_times.append(step_time)
+
+        # Update NSP metrics
+        if nsp_loss is not None:
+            self.nsp_losses.append(nsp_loss)
+        if nsp_accuracy is not None:
+            self.nsp_accuracies.append(nsp_accuracy) # Currently not calculated per training step, but placeholder
+        if val_nsp_loss is not None:
+            self.val_nsp_losses.append(val_nsp_loss)
+        if val_nsp_accuracy is not None:
+            self.val_nsp_accuracies.append(val_nsp_accuracy)
         
         self.total_steps += 1
     
@@ -227,14 +219,11 @@ class TrainingMetrics:
             'total_steps': self.total_steps,
             'best_val_loss': self.best_val_loss,
             'best_step': self.best_step,
-            # Save new loss lists
-            'train_lm_losses': self.train_lm_losses,
-            'train_nsp_losses': self.train_nsp_losses,
-            'train_wod_losses': self.train_wod_losses,
-            'val_lm_losses': self.val_lm_losses,
+            # Add NSP metrics
+            'nsp_losses': self.nsp_losses,
+            'nsp_accuracies': self.nsp_accuracies,
             'val_nsp_losses': self.val_nsp_losses,
-            'val_wod_losses': self.val_wod_losses,
-            'val_nsp_accuracies': self.val_nsp_accuracies # Added for NSP accuracy
+            'val_nsp_accuracies': self.val_nsp_accuracies,
         }
         torch.save(metrics_dict, filepath)
 
@@ -298,159 +287,87 @@ class Trainer:
             return self.config.learning_rate * step / self.config.warmup_steps
         return self.config.learning_rate
     
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
+    def train_step(self, batch: Tuple[torch.Tensor, ...]) -> float:
         """Perform a single training step."""
-        input_ids = batch['input_ids'].to(self.config.device)
-        lm_labels = batch['lm_labels'].to(self.config.device)
-        token_type_ids = batch.get('token_type_ids', None)
-        nsp_label = batch.get('nsp_label', None)
-        word_order_score_targets = batch.get('word_order_score_label', None)
+        if self.config.nsp_task:
+            input_ids, lm_targets, nsp_labels = batch
+            nsp_labels = nsp_labels.to(self.config.device)
+        else:
+            input_ids, lm_targets = batch
+            nsp_labels = None
 
-        if token_type_ids is not None:
-            token_type_ids = token_type_ids.to(self.config.device)
-        if nsp_label is not None:
-            nsp_label = nsp_label.to(self.config.device)
-        if word_order_score_targets is not None:
-            word_order_score_targets = word_order_score_targets.to(self.config.device).float()
+        input_ids = input_ids.to(self.config.device)
+        lm_targets = lm_targets.to(self.config.device)
         
         # Zero gradients
         self.optimizer.zero_grad()
         
-        lm_loss, nsp_loss, wod_loss = None, None, None
-        total_loss = None
+        # Initialize combined_loss to a default value or tensor
+        combined_loss_val = 0.0
 
         if self.config.use_amp and self.config.scaler is not None:
-            # Mixed precision forward pass
             with torch.amp.autocast('cuda'):
-                lm_logits, nsp_logits, predicted_wod_score, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
-                    input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
-                )
-                lm_loss, nsp_loss, wod_loss = lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor
+                lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
 
-            if lm_loss is None and nsp_loss is None and wod_loss is None:
-                print("Warning: All LM, NSP, and WOD losses are None in train_step (AMP).")
-                return 0.0, None, None, None
-            
-            current_batch_loss = 0.0
-            if lm_loss is not None:
-                current_batch_loss += lm_loss
-            if nsp_loss is not None and self.config.nsp_loss_weight > 0:
-                current_batch_loss += self.config.nsp_loss_weight * nsp_loss
-            if wod_loss is not None and self.config.word_order_loss_weight > 0:
-                current_batch_loss += self.config.word_order_loss_weight * wod_loss
+                combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+                if lm_loss_from_model is not None:
+                    combined_loss += lm_loss_from_model
 
-            if not isinstance(current_batch_loss, torch.Tensor) and current_batch_loss == 0.0:
-                if lm_loss is not None: total_loss = lm_loss
-                elif nsp_loss is not None: total_loss = nsp_loss
-                elif wod_loss is not None: total_loss = wod_loss
-                else: return 0.0, None, None, None
-            else:
-                total_loss = current_batch_loss
+                current_nsp_loss_item = None
+                if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
+                    current_nsp_loss = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
+                    combined_loss += self.config.nsp_loss_weight * current_nsp_loss
+                    current_nsp_loss_item = current_nsp_loss.item()
 
-            if total_loss is None or (isinstance(total_loss, torch.Tensor) and total_loss.numel() == 0) : # handle cases where total_loss might be an empty tensor or still None
-                print("Warning: total_loss is None or empty before backward pass in AMP mode.")
+            if lm_loss_from_model is None and (nsp_logits is None or not self.config.nsp_task): # No loss computed
                 return 0.0
 
-            # Mixed precision backward pass
-            self.config.scaler.scale(total_loss).backward()
-            
-            # Gradient clipping with mixed precision
+            self.config.scaler.scale(combined_loss).backward()
             if self.config.max_grad_norm > 0:
                 self.config.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.max_grad_norm
-                )
-            
-            # Optimizer step with mixed precision
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.config.scaler.step(self.optimizer)
             self.config.scaler.update()
+            combined_loss_val = combined_loss.item()
+            if current_nsp_loss_item is not None and self.metrics.total_steps % self.config.log_every == 0 :
+                 self.metrics.update(nsp_loss=current_nsp_loss_item) # Log NSP loss if calculated
             
-        else:
-            # Standard precision forward pass
-            lm_logits, nsp_logits, predicted_wod_score, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
-                input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
-            )
-            lm_loss, nsp_loss, wod_loss = lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor
+        else: # Standard precision
+            lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
 
-            if lm_loss is None and nsp_loss is None and wod_loss is None:
-                print("Warning: All LM, NSP, and WOD losses are None in train_step.")
-                return 0.0, None, None, None
+            combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+            if lm_loss_from_model is not None:
+                combined_loss += lm_loss_from_model
 
-            current_batch_loss = 0.0
-            if lm_loss is not None:
-                current_batch_loss += lm_loss
-            if nsp_loss is not None and self.config.nsp_loss_weight > 0:
-                current_batch_loss += self.config.nsp_loss_weight * nsp_loss
-            if wod_loss is not None and self.config.word_order_loss_weight > 0:
-                current_batch_loss += self.config.word_order_loss_weight * wod_loss
+            current_nsp_loss_item = None
+            if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
+                current_nsp_loss = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
+                combined_loss += self.config.nsp_loss_weight * current_nsp_loss
+                current_nsp_loss_item = current_nsp_loss.item()
 
-            if not isinstance(current_batch_loss, torch.Tensor) and current_batch_loss == 0.0:
-                if lm_loss is not None: total_loss = lm_loss
-                elif nsp_loss is not None: total_loss = nsp_loss
-                elif wod_loss is not None: total_loss = wod_loss
-                else: return 0.0, None, None, None
-            else:
-                total_loss = current_batch_loss
-
-            if total_loss is None or (isinstance(total_loss, torch.Tensor) and total_loss.numel() == 0) :
-                print("Warning: total_loss is None or empty before backward pass.")
-                return 0.0
+            if lm_loss_from_model is None and (nsp_logits is None or not self.config.nsp_task): # No loss computed
+                 return 0.0
             
-            # Standard precision backward pass
-            total_loss.backward()
-            
-            # Gradient clipping
+            combined_loss.backward()
             if self.config.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.max_grad_norm
-                )
-            
-            # Optimizer step
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
+            combined_loss_val = combined_loss.item()
+            if current_nsp_loss_item is not None and self.metrics.total_steps % self.config.log_every == 0:
+                 self.metrics.update(nsp_loss=current_nsp_loss_item) # Log NSP loss
 
-        lm_item = lm_loss.item() if lm_loss is not None else None
-        nsp_item = nsp_loss.item() if nsp_loss is not None else None
-        wod_item = wod_loss.item() if wod_loss is not None else None
-
-        total_loss_item = 0.0
-        # Recalculate total_loss_item from components to ensure consistency if total_loss was a fallback
-        # This ensures that total_loss_item accurately reflects the sum of weighted components that were computed.
-        if lm_item is not None:
-            total_loss_item += lm_item
-        if nsp_item is not None and self.config.nsp_loss_weight > 0:
-            total_loss_item += self.config.nsp_loss_weight * nsp_item
-        if wod_item is not None and self.config.word_order_loss_weight > 0:
-            total_loss_item += self.config.word_order_loss_weight * wod_item
-
-        # If all individual losses were None, total_loss_item remains 0.0 as initialized.
-        # If total_loss was a tensor, its .item() would be the source.
-        # This recalculation is safer if total_loss might have been a fallback to one of the raw losses.
-        # However, the logic for `total_loss = current_batch_loss` should already produce the correct weighted sum.
-        # So, if total_loss is a tensor, its .item() is preferred.
-        if torch.is_tensor(total_loss):
-             total_loss_item = total_loss.item()
-        elif total_loss is not None : # if total_loss was a float (e.g. one of the losses if others were None)
-             total_loss_item = float(total_loss)
-        # else total_loss_item remains 0.0 if all were None.
-
-        return total_loss_item, lm_item, nsp_item, wod_item
+        return combined_loss_val
     
-    def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> Tuple[float, Optional[float], Optional[float], Optional[float]]:
-        """Evaluate the model on a dataset. Returns combined_loss, lm_loss, nsp_loss, wod_loss (all averaged)."""
+    def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
+        """Evaluate the model on a dataset."""
         self.model.eval()
-        accumulated_combined_loss = 0.0
-        accumulated_lm_loss = 0.0
-        accumulated_nsp_loss = 0.0
-        accumulated_wod_loss = 0.0
-        accumulated_correct_nsp_predictions = 0 # For NSP accuracy
-        accumulated_total_nsp_samples = 0       # For NSP accuracy
+        total_combined_loss = 0
+        total_lm_loss = 0
+        num_lm_batches = 0
 
-        num_total_loss_batches = 0
-        num_lm_loss_batches = 0
-        num_nsp_loss_batches = 0
-        num_wod_loss_batches = 0
+        current_nsp_loss_val_accum = 0.0
+        current_nsp_acc_val_accum = 0.0
+        nsp_batches = 0
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
@@ -458,76 +375,54 @@ class Trainer:
                     print(f"Evaluation limited to {max_batches} batches for speed")
                     break
                 
-                input_ids = batch['input_ids'].to(self.config.device)
-                lm_labels = batch['lm_labels'].to(self.config.device)
-                token_type_ids = batch.get('token_type_ids', None)
-                nsp_label = batch.get('nsp_label', None)
-                word_order_score_targets = batch.get('word_order_score_label', None)
+                if self.config.nsp_task:
+                    input_ids, lm_targets, nsp_labels = batch
+                    nsp_labels = nsp_labels.to(self.config.device)
+                else:
+                    input_ids, lm_targets = batch
+                    nsp_labels = None
 
-                if token_type_ids is not None:
-                    token_type_ids = token_type_ids.to(self.config.device)
-                if nsp_label is not None:
-                    nsp_label = nsp_label.to(self.config.device)
-                if word_order_score_targets is not None:
-                    word_order_score_targets = word_order_score_targets.to(self.config.device).float()
+                input_ids = input_ids.to(self.config.device)
+                lm_targets = lm_targets.to(self.config.device)
 
-                lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = None, None, None
-                nsp_logits_for_acc = None # For NSP accuracy
+                batch_combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+
                 if self.config.use_amp:
                     with torch.amp.autocast('cuda'):
-                        _, nsp_logits_for_acc, _, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
-                            input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
-                        )
+                        lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
                 else:
-                    _, nsp_logits_for_acc, _, lm_loss_tensor, nsp_loss_tensor, wod_loss_tensor = self.model(
-                        input_ids, targets=lm_labels, nsp_labels=nsp_label, word_order_score_targets=word_order_score_targets
-                    )
+                    lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
                 
-                batch_combined_loss_value = 0.0
-                has_any_loss_term_in_batch = False
+                if lm_loss_from_model is not None:
+                    batch_combined_loss += lm_loss_from_model
+                    total_lm_loss += lm_loss_from_model.item()
+                    num_lm_batches +=1
 
-                if lm_loss_tensor is not None:
-                    lm_loss_item = lm_loss_tensor.item()
-                    accumulated_lm_loss += lm_loss_item
-                    num_lm_loss_batches += 1
-                    batch_combined_loss_value += lm_loss_item
-                    has_any_loss_term_in_batch = True
+                if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
+                    nsp_loss_eval = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
+                    batch_combined_loss += self.config.nsp_loss_weight * nsp_loss_eval
 
-                if nsp_loss_tensor is not None:
-                    nsp_loss_item = nsp_loss_tensor.item()
-                    accumulated_nsp_loss += nsp_loss_item
-                    num_nsp_loss_batches += 1
-                    if self.config.nsp_loss_weight > 0:
-                        batch_combined_loss_value += self.config.nsp_loss_weight * nsp_loss_item
-                        has_any_loss_term_in_batch = True
+                    preds = torch.sigmoid(nsp_logits.squeeze(-1)) > 0.5
+                    correct = (preds == nsp_labels).sum().item()
+                    total_nsp_in_batch = nsp_labels.size(0)
 
-                if wod_loss_tensor is not None:
-                    wod_loss_item = wod_loss_tensor.item()
-                    accumulated_wod_loss += wod_loss_item
-                    num_wod_loss_batches += 1
-                    if self.config.word_order_loss_weight > 0:
-                        batch_combined_loss_value += self.config.word_order_loss_weight * wod_loss_item
-                        has_any_loss_term_in_batch = True
+                    current_nsp_loss_val_accum += nsp_loss_eval.item()
+                    current_nsp_acc_val_accum += correct / total_nsp_in_batch if total_nsp_in_batch > 0 else 0
+                    nsp_batches += 1
 
-                if nsp_logits_for_acc is not None and nsp_label is not None: # For NSP accuracy
-                    nsp_predictions = torch.argmax(nsp_logits_for_acc, dim=-1)
-                    accumulated_correct_nsp_predictions += (nsp_predictions == nsp_label).sum().item()
-                    accumulated_total_nsp_samples += nsp_label.size(0)
+                total_combined_loss += batch_combined_loss.item()
 
-
-                if has_any_loss_term_in_batch:
-                    accumulated_combined_loss += batch_combined_loss_value
-                    num_total_loss_batches += 1
-        
         self.model.train()
 
-        avg_combined_eval_loss = accumulated_combined_loss / num_total_loss_batches if num_total_loss_batches > 0 else float('inf')
-        avg_lm_eval_loss = accumulated_lm_loss / num_lm_loss_batches if num_lm_loss_batches > 0 else None
-        avg_nsp_eval_loss = accumulated_nsp_loss / num_nsp_loss_batches if num_nsp_loss_batches > 0 else None
-        avg_wod_eval_loss = accumulated_wod_loss / num_wod_loss_batches if num_wod_loss_batches > 0 else None
-        avg_nsp_accuracy = accumulated_correct_nsp_predictions / accumulated_total_nsp_samples if accumulated_total_nsp_samples > 0 else None
+        avg_combined_loss = total_combined_loss / (num_lm_batches if num_lm_batches > 0 else (nsp_batches if nsp_batches > 0 else 1))
+        avg_nsp_loss = current_nsp_loss_val_accum / nsp_batches if nsp_batches > 0 else 0.0
+        avg_nsp_acc = current_nsp_acc_val_accum / nsp_batches if nsp_batches > 0 else 0.0
 
-        return avg_combined_eval_loss, avg_lm_eval_loss, avg_nsp_eval_loss, avg_wod_eval_loss, avg_nsp_accuracy
+        # Update metrics - these are for the entire validation run
+        # The val_loss stored in metrics should be the combined loss used for primary checkpointing
+        self.metrics.update(val_loss=avg_combined_loss, val_nsp_loss=avg_nsp_loss, val_nsp_accuracy=avg_nsp_acc)
+
+        return avg_combined_loss # Return combined loss, individual components are in metrics
     
     def save_checkpoint(self, step: int, is_best: bool = False):
         """Save model checkpoint."""
@@ -644,8 +539,8 @@ class Trainer:
             step_start = time.time()
             
             # Training step
-            combined_loss_val, lm_loss_val, nsp_loss_val, wod_loss_val = self.train_step(batch)
-            epoch_losses.append(combined_loss_val)
+            loss = self.train_step(batch)
+            epoch_losses.append(loss)
             
             # Update learning rate scheduler
             self.scheduler.step()
@@ -654,65 +549,39 @@ class Trainer:
             # Update metrics
             step_time = time.time() - step_start
             self.metrics.update(
-                train_loss=combined_loss_val,
-                train_lm_loss=lm_loss_val,
-                train_nsp_loss=nsp_loss_val,
-                train_wod_loss=wod_loss_val,
+                train_loss=loss,
                 learning_rate=current_lr,
                 step_time=step_time
             )
             
+
             # Logging (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
                self.metrics.total_steps % self.config.log_every == 0:
                 avg_step_time = self.metrics.get_avg_step_time()
-
-                log_msg = (
+                print(
                     f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
-                    f"Loss: {combined_loss_val:.4f} "
+                    f"Loss: {loss:.4f}, LR: {current_lr:.6f}, "
+                    f"Step Time: {avg_step_time:.3f}s"
                 )
-                if lm_loss_val is not None:
-                    log_msg += f"(LM: {lm_loss_val:.4f}) "
-                if nsp_loss_val is not None:
-                    log_msg += f"(NSP: {nsp_loss_val:.4f}{'*' if self.config.nsp_loss_weight > 0 else ''}) "
-                if wod_loss_val is not None:
-                    log_msg += f"(WOD MSE: {wod_loss_val:.4f}{'*' if self.config.word_order_loss_weight > 0 else ''}) "
-
-                log_msg += f", LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
-                print(log_msg)
             
             # Evaluation (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
                val_loader is not None and \
                self.metrics.total_steps % self.config.eval_every == 0:
-                avg_combined_val_loss, avg_lm_val_loss, avg_nsp_val_loss, avg_wod_val_loss, avg_nsp_accuracy = self.evaluate(val_loader)
-                self.metrics.update(
-                    val_loss=avg_combined_val_loss,
-                    val_lm_loss=avg_lm_val_loss,
-                    val_nsp_loss=avg_nsp_val_loss,
-                    val_wod_loss=avg_wod_val_loss,
-                    val_nsp_accuracy=avg_nsp_accuracy # Update metrics with NSP accuracy
-                )
-
-                is_best = avg_combined_val_loss < self.metrics.best_val_loss
+                val_loss = self.evaluate(val_loader) # This now updates NSP metrics internally and returns combined val_loss
+                # self.metrics.update(val_loss=val_loss) # No longer needed here, evaluate does it.
                 
-                eval_log_msg = f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {avg_combined_val_loss:.4f} "
-                if avg_lm_val_loss is not None:
-                    eval_log_msg += f"(LM: {avg_lm_val_loss:.4f}) "
-                if avg_nsp_val_loss is not None:
-                    eval_log_msg += f"(NSP Loss: {avg_nsp_val_loss:.4f}) "
-                if avg_wod_val_loss is not None:
-                    eval_log_msg += f"(WOD MSE: {avg_wod_val_loss:.4f}) "
-                if avg_nsp_accuracy is not None:
-                     eval_log_msg += f"(NSP Acc: {avg_nsp_accuracy:.4f}) "
-                eval_log_msg += f"{'(Best!)' if is_best else ''}"
-                print(eval_log_msg)
+                is_best = val_loss < self.metrics.best_val_loss # rank-local best, based on combined val_loss
+                print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
+                if self.config.nsp_task:
+                    print(f"  NSP Val Loss: {self.metrics.val_nsp_losses[-1]:.4f}, NSP Val Acc: {self.metrics.val_nsp_accuracies[-1]:.4f}")
 
-                if is_best:
+                if is_best: # save_checkpoint itself is rank 0 guarded
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
 
                 # Plateau detection logic
-                current_metric_val = avg_combined_val_loss # Plateau detection uses combined validation loss
+                current_metric_val = val_loss # Assuming val_loss is the metric for now
 
                 improved = False
                 if self.config.plateau_mode == 'min':
@@ -761,10 +630,7 @@ class Trainer:
                     print(f"\n=== Generating Inference Sample at Step {self.metrics.total_steps} (Rank 0) ===")
                     perplexity = self.calculate_perplexity(val_loader, max_batches=20)
                     # Use last val_loss from metrics if available, else current val_loss if eval was just run
-                    # current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (val_loss if 'val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
-                    # The 'val_loss' variable in this scope is avg_combined_val_loss
-                    current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (avg_combined_val_loss if 'avg_combined_val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
-
+                    current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (val_loss if 'val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
 
                     prompts = self.config.inference_prompts
                     generated_texts = self.generate_inference_sample(
@@ -852,25 +718,9 @@ class Trainer:
         
         # Initial evaluation (only on rank 0)
         if val_loader and (not self.is_distributed or dist.get_rank() == 0):
-            initial_combined_val_loss, initial_lm_val_loss, initial_nsp_val_loss, initial_wod_val_loss, initial_nsp_accuracy = self.evaluate(val_loader)
-            self.metrics.update(
-                val_loss=initial_combined_val_loss,
-                val_lm_loss=initial_lm_val_loss,
-                val_nsp_loss=initial_nsp_val_loss,
-                val_wod_loss=initial_wod_val_loss,
-                val_nsp_accuracy=initial_nsp_accuracy
-            )
-
-            eval_log_msg = f"Initial Validation Loss (Rank 0): {initial_combined_val_loss:.4f} "
-            if initial_lm_val_loss is not None:
-                eval_log_msg += f"(LM: {initial_lm_val_loss:.4f}) "
-            if initial_nsp_val_loss is not None:
-                eval_log_msg += f"(NSP Loss: {initial_nsp_val_loss:.4f}) "
-            if initial_wod_val_loss is not None:
-                eval_log_msg += f"(WOD MSE: {initial_wod_val_loss:.4f}) "
-            if initial_nsp_accuracy is not None:
-                eval_log_msg += f"(NSP Acc: {initial_nsp_accuracy:.4f}) "
-            print(eval_log_msg)
+            initial_val_loss = self.evaluate(val_loader)
+            self.metrics.update(val_loss=initial_val_loss) # rank-local metric
+            print(f"Initial validation loss (Rank 0): {initial_val_loss:.4f}")
 
         try:
             for epoch in range(self.config.num_epochs):
@@ -901,82 +751,97 @@ class Trainer:
     
     def plot_training_curves(self, save_path: Optional[str] = None):
         """Plot training curves."""
-        # Adjust layout for a potential new row for NSP accuracy
-        num_rows = 3 if self.metrics.val_nsp_accuracies else 2
-        fig, axes = plt.subplots(num_rows, 2, figsize=(15, 5 * num_rows))
-        if num_rows == 2: # If no NSP accuracy, axes might not be a 2D array if only 1 row was intended before
-             axes_flat = axes.flatten()
-        else:
-             axes_flat = axes.flatten()
-
-        # Training loss
-        ax_train_loss = axes_flat[0]
-        if self.metrics.train_losses:
-            ax_train_loss.plot(self.metrics.train_losses, 'b-', alpha=0.8, label='Total Train Loss')
-        if self.metrics.train_lm_losses:
-            ax_train_loss.plot(self.metrics.train_lm_losses, 'c--', alpha=0.7, label='Train LM Loss')
-        if self.metrics.train_nsp_losses:
-            ax_train_loss.plot(self.metrics.train_nsp_losses, 'm--', alpha=0.7, label='Train NSP Loss')
-        if self.metrics.train_wod_losses: # Plot WOD train loss
-            ax_train_loss.plot(self.metrics.train_wod_losses, 'g--', alpha=0.7, label='Train WOD Loss')
-        ax_train_loss.set_title('Training Losses')
-        ax_train_loss.set_xlabel('Step')
-        ax_train_loss.set_ylabel('Loss')
-        ax_train_loss.grid(True, alpha=0.3)
-        if self.metrics.train_losses or self.metrics.train_lm_losses or self.metrics.train_nsp_losses or self.metrics.train_wod_losses:
-            ax_train_loss.legend()
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         
-        # Validation loss
-        ax_val_loss = axes_flat[1]
-        num_val_points = len(self.metrics.val_losses)
-        val_steps = np.linspace(0, self.metrics.total_steps, num_val_points, endpoint=False) if num_val_points > 0 else []
+        # Determine number of subplots needed
+        num_metrics_to_plot = 2 # LM losses (train/val)
+        if self.config.nsp_task and (self.metrics.nsp_losses or self.metrics.val_nsp_losses or self.metrics.val_nsp_accuracies):
+            num_metrics_to_plot += 2 # NSP losses (train/val) and NSP accuracy (val)
+        # Add LR and Step Times
+        num_metrics_to_plot += 2
 
+        # Adjust layout: 3 rows, 2 cols for up to 6 plots
+        fig, axes = plt.subplots(3, 2, figsize=(15, 15)) # Increased height for 3 rows
+        ax_flat = axes.flatten() # Flatten for easy indexing
+        plot_idx = 0
+
+        # Training loss (LM part or combined if not NSP)
+        if self.metrics.train_losses:
+            ax_flat[plot_idx].plot(self.metrics.train_losses, 'b-', alpha=0.7, label='Train Loss (Combined)')
+            ax_flat[plot_idx].set_title('Training Loss (Combined)')
+            ax_flat[plot_idx].set_xlabel('Step')
+            ax_flat[plot_idx].set_ylabel('Loss')
+            ax_flat[plot_idx].grid(True, alpha=0.3)
+            ax_flat[plot_idx].legend()
+        plot_idx += 1
+
+        # Validation loss (Combined)
         if self.metrics.val_losses:
-            ax_val_loss.plot(val_steps, self.metrics.val_losses, 'r-', alpha=0.8, label='Total Val Loss')
-        if self.metrics.val_lm_losses and num_val_points == len(self.metrics.val_lm_losses):
-             ax_val_loss.plot(val_steps, self.metrics.val_lm_losses, 'y--', alpha=0.7, label='Val LM Loss')
-        if self.metrics.val_nsp_losses and num_val_points == len(self.metrics.val_nsp_losses):
-             ax_val_loss.plot(val_steps, self.metrics.val_nsp_losses, 'k--', alpha=0.7, label='Val NSP Loss')
-        if self.metrics.val_wod_losses and num_val_points == len(self.metrics.val_wod_losses): # Plot WOD val loss
-             ax_val_loss.plot(val_steps, self.metrics.val_wod_losses, 'lime', linestyle='--', alpha=0.7, label='Val WOD Loss')
-        ax_val_loss.set_title('Validation Losses')
-        ax_val_loss.set_xlabel('Approx. Step')
-        ax_val_loss.set_ylabel('Loss')
-        ax_val_loss.grid(True, alpha=0.3)
-        if self.metrics.val_losses or self.metrics.val_lm_losses or self.metrics.val_nsp_losses or self.metrics.val_wod_losses:
-            ax_val_loss.legend()
+            # Assuming eval_every steps for val_losses
+            val_loss_steps = np.arange(len(self.metrics.val_losses)) * self.config.eval_every
+            ax_flat[plot_idx].plot(val_loss_steps, self.metrics.val_losses, 'r-', alpha=0.7, label='Val Loss (Combined)')
+            ax_flat[plot_idx].set_title('Validation Loss (Combined)')
+            ax_flat[plot_idx].set_xlabel('Step')
+            ax_flat[plot_idx].set_ylabel('Loss')
+            ax_flat[plot_idx].grid(True, alpha=0.3)
+            ax_flat[plot_idx].legend()
+        plot_idx += 1
+
+        # NSP Training Loss
+        if self.config.nsp_task and self.metrics.nsp_losses:
+            # nsp_losses are logged every log_every step
+            nsp_train_loss_steps = np.arange(len(self.metrics.nsp_losses)) * self.config.log_every
+            ax_flat[plot_idx].plot(nsp_train_loss_steps, self.metrics.nsp_losses, 'c-', alpha=0.7, label='NSP Train Loss')
+            ax_flat[plot_idx].set_title('NSP Training Loss')
+            ax_flat[plot_idx].set_xlabel('Step')
+            ax_flat[plot_idx].set_ylabel('NSP Loss')
+            ax_flat[plot_idx].grid(True, alpha=0.3)
+            ax_flat[plot_idx].legend()
+        plot_idx += 1
+
+        # NSP Validation Loss and Accuracy
+        if self.config.nsp_task and (self.metrics.val_nsp_losses or self.metrics.val_nsp_accuracies):
+            val_nsp_steps = np.arange(len(self.metrics.val_nsp_losses)) * self.config.eval_every
+            if self.metrics.val_nsp_losses:
+                ax_flat[plot_idx].plot(val_nsp_steps, self.metrics.val_nsp_losses, 'm-', alpha=0.7, label='NSP Val Loss')
+            if self.metrics.val_nsp_accuracies:
+                ax_nsp_acc = ax_flat[plot_idx].twinx() # Share x-axis
+                ax_nsp_acc.plot(val_nsp_steps, self.metrics.val_nsp_accuracies, 'y-', alpha=0.7, label='NSP Val Accuracy')
+                ax_nsp_acc.set_ylabel('NSP Accuracy', color='y')
+                ax_nsp_acc.tick_params(axis='y', labelcolor='y')
+                # Get legends from both axes
+                lines, labels = ax_flat[plot_idx].get_legend_handles_labels()
+                lines2, labels2 = ax_nsp_acc.get_legend_handles_labels()
+                ax_flat[plot_idx].legend(lines + lines2, labels + labels2, loc='best')
+
+            ax_flat[plot_idx].set_title('NSP Validation Metrics')
+            ax_flat[plot_idx].set_xlabel('Step')
+            ax_flat[plot_idx].set_ylabel('NSP Val Loss', color='m')
+            ax_flat[plot_idx].tick_params(axis='y', labelcolor='m')
+            ax_flat[plot_idx].grid(True, alpha=0.3)
+        plot_idx += 1
         
         # Learning rate
-        ax_lr = axes_flat[2]
         if self.metrics.learning_rates:
-            ax_lr.plot(self.metrics.learning_rates, 'g-', alpha=0.7)
-            ax_lr.set_title('Learning Rate')
-            ax_lr.set_xlabel('Step')
-            ax_lr.set_ylabel('Learning Rate')
-            ax_lr.grid(True, alpha=0.3)
+            ax_flat[plot_idx].plot(self.metrics.learning_rates, 'g-', alpha=0.7)
+            ax_flat[plot_idx].set_title('Learning Rate')
+            ax_flat[plot_idx].set_xlabel('Step')
+            ax_flat[plot_idx].set_ylabel('Learning Rate')
+            ax_flat[plot_idx].grid(True, alpha=0.3)
+        plot_idx += 1
         
         # Step times
-        ax_step_time = axes_flat[3]
         if self.metrics.step_times:
-            ax_step_time.plot(self.metrics.step_times, 'orange', alpha=0.7)
-            ax_step_time.set_title('Step Time')
-            ax_step_time.set_xlabel('Step')
-            ax_step_time.set_ylabel('Time (s)')
-            ax_step_time.grid(True, alpha=0.3)
+            ax_flat[plot_idx].plot(self.metrics.step_times, 'orange', alpha=0.7)
+            ax_flat[plot_idx].set_title('Step Time')
+            ax_flat[plot_idx].set_xlabel('Step')
+            ax_flat[plot_idx].set_ylabel('Time (s)')
+            ax_flat[plot_idx].grid(True, alpha=0.3)
+        plot_idx += 1
 
-        # NSP Accuracy (if applicable)
-        if num_rows == 3:
-            ax_nsp_acc = axes_flat[4]
-            if self.metrics.val_nsp_accuracies and num_val_points == len(self.metrics.val_nsp_accuracies):
-                ax_nsp_acc.plot(val_steps, self.metrics.val_nsp_accuracies, 'purple', alpha=0.7, label='Val NSP Accuracy')
-                ax_nsp_acc.set_title('Validation NSP Accuracy')
-                ax_nsp_acc.set_xlabel('Approx. Step')
-                ax_nsp_acc.set_ylabel('Accuracy')
-                ax_nsp_acc.grid(True, alpha=0.3)
-                ax_nsp_acc.legend()
-            # Remove the 6th subplot if it exists and is unused
-            if len(axes_flat) > 5:
-                 fig.delaxes(axes_flat[5])
+        # Hide any unused subplots
+        for i in range(plot_idx, len(ax_flat)):
+            fig.delaxes(ax_flat[i])
 
         plt.tight_layout()
         
@@ -1040,33 +905,30 @@ class Trainer:
     def calculate_perplexity(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
         """Calculate perplexity on a dataset."""
         self.model.eval()
-        total_lm_loss = 0 # Perplexity should be based on LM loss only
+        total_loss = 0
         num_batches = 0
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
                 if max_batches is not None and batch_idx >= max_batches:
                     break
-                
-                # Assuming batch is a dictionary now
-                input_ids = batch['input_ids'].to(self.config.device)
-                lm_labels = batch['lm_labels'].to(self.config.device)
-                # NSP labels are not needed for perplexity of LM
 
-                lm_loss = None # Initialize lm_loss for the batch
+                x, y = batch
+                x, y = x.to(self.config.device), y.to(self.config.device)
+                
                 if self.config.use_amp and self.config.scaler is not None:
                     with torch.amp.autocast('cuda'):
-                        _, _, _, lm_loss, _, _ = self.model(input_ids, targets=lm_labels, nsp_labels=None, word_order_score_targets=None)
+                        logits, loss = self.model(x, y)
                 else:
-                    _, _, _, lm_loss, _, _ = self.model(input_ids, targets=lm_labels, nsp_labels=None, word_order_score_targets=None)
+                    logits, loss = self.model(x, y)
                 
-                if lm_loss is not None:
-                    total_lm_loss += lm_loss.item()
+                if loss is not None:
+                    total_loss += loss.item()
                     num_batches += 1
         
         self.model.train()
-        avg_lm_loss = total_lm_loss / num_batches if num_batches > 0 else float('inf')
-        perplexity = math.exp(avg_lm_loss) if avg_lm_loss != float('inf') else float('inf')
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+        perplexity = math.exp(avg_loss) if avg_loss != float('inf') else float('inf')
         return perplexity
     
     def generate_inference_sample(
