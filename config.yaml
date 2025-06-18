@@ -32,6 +32,10 @@ training:
   # Directory to save checkpoints and logs
   checkpoint_dir: "checkpoints"
 
+  # NSP task parameters
+  nsp_task: true             # Enable Next Sentence Prediction auxiliary task
+  nsp_loss_weight: 0.5     # Weight for NSP loss when combined with Language Modeling loss
+
   # Plateau detection parameters
   plateau_monitor_metric: 'val_loss'
   plateau_patience: 10

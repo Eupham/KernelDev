@@ -45,8 +45,8 @@ class TrainingConfig:
         # Scheduler parameters
         scheduler_T0_epoch_fraction: float = 0.1,
         scheduler_T_mult: int = 1,
-        nsp_task: bool = False, # New NSP parameter
-        nsp_loss_weight: float = 0.5, # New NSP parameter
+        nsp_task: bool = True, # Default NSP task to True
+        nsp_loss_weight: float = 0.5,
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -287,8 +287,8 @@ class Trainer:
             return self.config.learning_rate * step / self.config.warmup_steps
         return self.config.learning_rate
     
-    def train_step(self, batch: Tuple[torch.Tensor, ...]) -> float:
-        """Perform a single training step."""
+    def train_step(self, batch: Tuple[torch.Tensor, ...]) -> Tuple[float, Optional[float], Optional[float]]:
+        """Perform a single training step. Returns (combined_loss, nsp_loss, nsp_accuracy)."""
         if self.config.nsp_task:
             input_ids, lm_targets, nsp_labels = batch
             nsp_labels = nsp_labels.to(self.config.device)
@@ -299,11 +299,11 @@ class Trainer:
         input_ids = input_ids.to(self.config.device)
         lm_targets = lm_targets.to(self.config.device)
         
-        # Zero gradients
         self.optimizer.zero_grad()
         
-        # Initialize combined_loss to a default value or tensor
         combined_loss_val = 0.0
+        current_nsp_loss_item = None
+        current_nsp_accuracy_item = None
 
         if self.config.use_amp and self.config.scaler is not None:
             with torch.amp.autocast('cuda'):
@@ -313,14 +313,18 @@ class Trainer:
                 if lm_loss_from_model is not None:
                     combined_loss += lm_loss_from_model
 
-                current_nsp_loss_item = None
                 if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
                     current_nsp_loss = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
                     combined_loss += self.config.nsp_loss_weight * current_nsp_loss
                     current_nsp_loss_item = current_nsp_loss.item()
+                    with torch.no_grad():
+                        nsp_preds = torch.sigmoid(nsp_logits.squeeze(-1)) > 0.5
+                        nsp_correct = (nsp_preds == nsp_labels).sum().item()
+                        nsp_total_in_batch = nsp_labels.size(0)
+                        current_nsp_accuracy_item = nsp_correct / nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0
 
-            if lm_loss_from_model is None and (nsp_logits is None or not self.config.nsp_task): # No loss computed
-                return 0.0
+            if lm_loss_from_model is None and (nsp_logits is None or not self.config.nsp_task):
+                return 0.0, None, None
 
             self.config.scaler.scale(combined_loss).backward()
             if self.config.max_grad_norm > 0:
@@ -329,8 +333,6 @@ class Trainer:
             self.config.scaler.step(self.optimizer)
             self.config.scaler.update()
             combined_loss_val = combined_loss.item()
-            if current_nsp_loss_item is not None and self.metrics.total_steps % self.config.log_every == 0 :
-                 self.metrics.update(nsp_loss=current_nsp_loss_item) # Log NSP loss if calculated
             
         else: # Standard precision
             lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
@@ -339,24 +341,26 @@ class Trainer:
             if lm_loss_from_model is not None:
                 combined_loss += lm_loss_from_model
 
-            current_nsp_loss_item = None
             if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
                 current_nsp_loss = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
                 combined_loss += self.config.nsp_loss_weight * current_nsp_loss
                 current_nsp_loss_item = current_nsp_loss.item()
+                with torch.no_grad():
+                    nsp_preds = torch.sigmoid(nsp_logits.squeeze(-1)) > 0.5
+                    nsp_correct = (nsp_preds == nsp_labels).sum().item()
+                    nsp_total_in_batch = nsp_labels.size(0)
+                    current_nsp_accuracy_item = nsp_correct / nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0
 
-            if lm_loss_from_model is None and (nsp_logits is None or not self.config.nsp_task): # No loss computed
-                 return 0.0
+            if lm_loss_from_model is None and (nsp_logits is None or not self.config.nsp_task):
+                 return 0.0, None, None
             
             combined_loss.backward()
             if self.config.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
             combined_loss_val = combined_loss.item()
-            if current_nsp_loss_item is not None and self.metrics.total_steps % self.config.log_every == 0:
-                 self.metrics.update(nsp_loss=current_nsp_loss_item) # Log NSP loss
 
-        return combined_loss_val
+        return combined_loss_val, current_nsp_loss_item, current_nsp_accuracy_item
     
     def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
         """Evaluate the model on a dataset."""
@@ -539,8 +543,8 @@ class Trainer:
             step_start = time.time()
             
             # Training step
-            loss = self.train_step(batch)
-            epoch_losses.append(loss)
+            combined_loss_item, current_nsp_loss_item, current_nsp_accuracy_item = self.train_step(batch)
+            epoch_losses.append(combined_loss_item) # Store combined loss for epoch average
             
             # Update learning rate scheduler
             self.scheduler.step()
@@ -549,21 +553,26 @@ class Trainer:
             # Update metrics
             step_time = time.time() - step_start
             self.metrics.update(
-                train_loss=loss,
+                train_loss=combined_loss_item, # This is the combined loss
                 learning_rate=current_lr,
-                step_time=step_time
+                step_time=step_time,
+                nsp_loss=current_nsp_loss_item, # This is per-step training NSP loss
+                nsp_accuracy=current_nsp_accuracy_item # This is per-step training NSP accuracy
             )
             
-
             # Logging (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
                self.metrics.total_steps % self.config.log_every == 0:
                 avg_step_time = self.metrics.get_avg_step_time()
-                print(
-                    f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
-                    f"Loss: {loss:.4f}, LR: {current_lr:.6f}, "
-                    f"Step Time: {avg_step_time:.3f}s"
-                )
+
+                log_msg = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, Loss: {combined_loss_item:.4f}"
+                if self.config.nsp_task:
+                    if current_nsp_loss_item is not None:
+                        log_msg += f", NSP Loss (train): {current_nsp_loss_item:.4f}"
+                    if current_nsp_accuracy_item is not None:
+                        log_msg += f", NSP Acc (train): {current_nsp_accuracy_item:.4f}"
+                log_msg += f", LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
+                print(log_msg)
             
             # Evaluation (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
@@ -913,17 +922,24 @@ class Trainer:
                 if max_batches is not None and batch_idx >= max_batches:
                     break
 
-                x, y = batch
-                x, y = x.to(self.config.device), y.to(self.config.device)
+                if self.config.nsp_task:
+                    input_ids, lm_targets, _ = batch # Third element is nsp_label, not used here
+                else:
+                    input_ids, lm_targets = batch
+
+                input_ids = input_ids.to(self.config.device)
+                lm_targets = lm_targets.to(self.config.device)
                 
+                lm_loss = None
                 if self.config.use_amp and self.config.scaler is not None:
                     with torch.amp.autocast('cuda'):
-                        logits, loss = self.model(x, y)
+                        # model returns lm_logits, lm_loss_from_model, nsp_logits
+                        _, lm_loss, _ = self.model(input_ids, lm_targets)
                 else:
-                    logits, loss = self.model(x, y)
+                    _, lm_loss, _ = self.model(input_ids, lm_targets)
                 
-                if loss is not None:
-                    total_loss += loss.item()
+                if lm_loss is not None:
+                    total_loss += lm_loss.item()
                     num_batches += 1
         
         self.model.train()

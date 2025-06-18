@@ -13,6 +13,8 @@ training:
   eval_every: 200            # Regular evaluation
   log_every: 50              # Regular logging
   checkpoint_dir: "checkpoints_bf16"
+  nsp_task: true             # Enable Next Sentence Prediction auxiliary task
+  nsp_loss_weight: 0.5     # Weight for NSP loss
 
 data:
   dataset_name: "allenai/c4"

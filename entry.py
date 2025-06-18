@@ -70,10 +70,15 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
         config['training']['learning_rate'] = args.learning_rate
     
     # NSP and CPU attention fallback arguments
-    if hasattr(args, 'nsp_task') and args.nsp_task is not None:
-        config['training']['nsp_task'] = args.nsp_task
+    # training_config = config.setdefault('training', {}) # Ensure 'training' key exists
+    if hasattr(args, 'nsp_task') and args.nsp_task is not None: # args.nsp_task can be True or False if flag is used
+        config.setdefault('training', {})['nsp_task'] = args.nsp_task
+    # If args.nsp_task is None (flag not used), we don't set it here.
+    # The default of True will be handled by config.get('training', {}).get('nsp_task', True)
+    # in start_actual_training or by TrainingConfig default.
+
     if hasattr(args, 'nsp_loss_weight') and args.nsp_loss_weight is not None:
-        config['training']['nsp_loss_weight'] = args.nsp_loss_weight
+        config.setdefault('training', {})['nsp_loss_weight'] = args.nsp_loss_weight
     if hasattr(args, 'cpu_test_attention') and args.cpu_test_attention is not None:
         config['hardware']['cpu_test_attention'] = args.cpu_test_attention
 
@@ -184,7 +189,8 @@ def start_actual_training(cli_args):
     logging_cfg = config.get('logging', {})
 
     # NSP and CPU attention fallback settings from config
-    nsp_task_enabled = training_cfg.get('nsp_task', False)
+    # Default nsp_task to True if not specified in YAML or by CLI
+    nsp_task_enabled = training_cfg.get('nsp_task', True)
     nsp_lw = training_cfg.get('nsp_loss_weight', 0.5)
     cpu_test_mode = hardware_cfg.get('cpu_test_attention', False)
     
@@ -478,7 +484,7 @@ def start_actual_training(cli_args):
             print(f"Final training loss (combined): {final_train_loss_combined:.4f}")
             if nsp_task_enabled and len(trainer.metrics.val_nsp_losses) >= 4: # Assuming at least two evals on train and two on val
                  print(f"  Final train NSP loss: {trainer.metrics.val_nsp_losses[-2]:.4f}, NSP Acc: {trainer.metrics.val_nsp_accuracies[-2]:.4f}")
-            
+
             print(f"Final validation loss (combined): {final_val_loss_combined:.4f}")
             if nsp_task_enabled and len(trainer.metrics.val_nsp_losses) >= 2:
                  print(f"  Final validation NSP loss: {trainer.metrics.val_nsp_losses[-1]:.4f}, NSP Acc: {trainer.metrics.val_nsp_accuracies[-1]:.4f}")
@@ -710,8 +716,14 @@ if __name__ == "__main__":
         default=None, # Default to None
         help='Learning rate (overrides config)'
     )
-    parser.add_argument('--nsp-task', action='store_true', help='Enable Next Sentence Prediction task.')
-    parser.add_argument('--nsp-loss-weight', type=float, default=0.5, help='Weight for NSP loss component.')
+    # Changed --nsp-task to allow True/False, defaulting to None if not specified by user
+    parser.add_argument(
+        '--nsp-task',
+        type=lambda x: (str(x).lower() == 'true'),
+        default=None,  # If not used, arg is None. Config/code default will be True.
+        help='Set NSP task status (True/False). If not specified, defaults to True.'
+    )
+    parser.add_argument('--nsp-loss-weight', type=float, default=None, help='Weight for NSP loss component (overrides config, e.g., 0.5).')
     parser.add_argument('--cpu-test-attention', action='store_true', help='Use CPU fallback for attention mechanism (for testing).')
 
     # Use parse_args() which will capture all defined args.
