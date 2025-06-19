@@ -314,46 +314,7 @@ class Trainer:
         else: # Standard precision
             lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
 
-        # Debug prints (after model call, using potentially mixed-precision outputs)
-        if self.metrics.total_steps < 3: # Debug for first 3 training steps
-            print(f"--- DEBUG NSP (train_step, global_step: {self.metrics.total_steps}) ---")
-            print(f"  self.config.nsp_task: {self.config.nsp_task}")
-            if hasattr(lm_loss_from_model, 'item'):
-                print(f"  LM Loss from model: {lm_loss_from_model.item() if lm_loss_from_model is not None else 'None'}")
-            elif lm_loss_from_model is not None:
-                print(f"  LM Loss from model: {lm_loss_from_model}")
-            else:
-                print(f"  LM Loss from model: None")
-
-            if self.config.nsp_task:
-                print(f"  NSP Logits is None: {nsp_logits is None}")
-                if nsp_logits is not None:
-                    print(f"  NSP Logits: shape={nsp_logits.shape}, dtype={nsp_logits.dtype}, device={nsp_logits.device}, values[:5]={nsp_logits.detach().float().cpu().squeeze().flatten()[:5].tolist()}")
-                if nsp_labels is not None:
-                    print(f"  NSP Labels: shape={nsp_labels.shape}, dtype={nsp_labels.dtype}, device={nsp_labels.device}, values[:5]={nsp_labels.detach().cpu().flatten()[:5].tolist()}")
-                else:
-                    print("  NSP Labels: None (unexpected if nsp_task is True)")
-
-                if nsp_logits is not None and nsp_labels is not None:
-                    squeezed_nsp_logits = nsp_logits.squeeze(-1)
-                    print(f"  Squeezed NSP Logits: shape={squeezed_nsp_logits.shape}, values[:5]={squeezed_nsp_logits.detach().float().cpu().flatten()[:5].tolist()}")
-                    float_nsp_labels = nsp_labels.float()
-                    print(f"  Float NSP Labels: shape={float_nsp_labels.shape}, values[:5]={float_nsp_labels.detach().cpu().flatten()[:5].tolist()}")
-
-                    current_nsp_loss_tensor = F.binary_cross_entropy_with_logits(squeezed_nsp_logits, float_nsp_labels, reduction='none')
-                    print(f"  NSP Loss (unreduced, per item, :5): {current_nsp_loss_tensor.detach().float().cpu().flatten()[:5].tolist()}")
-                    print(f"  NSP Loss (mean): {current_nsp_loss_tensor.mean().item()}")
-
-                    with torch.no_grad():
-                        nsp_probs = torch.sigmoid(squeezed_nsp_logits)
-                        print(f"  NSP Probs (sigmoid, :5): {nsp_probs.detach().float().cpu().flatten()[:5].tolist()}")
-                        nsp_preds = nsp_probs > 0.5
-                        print(f"  NSP Preds (>0.5, :5): {nsp_preds.detach().cpu().flatten()[:5].tolist()}")
-                        if nsp_labels.numel() > 0:
-                            nsp_correct = (nsp_preds == nsp_labels).sum().item()
-                            nsp_total_in_batch = nsp_labels.size(0)
-                            print(f"  NSP Correct: {nsp_correct}, Total: {nsp_total_in_batch}, Acc: {nsp_correct/nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0}")
-            print(f"--- END DEBUG NSP (train_step) ---")
+        # Debug prints were here, now removed.
 
         if self.config.use_amp and self.config.scaler is not None:
             # Loss calculation and NSP accuracy calculation within autocast
@@ -452,45 +413,7 @@ class Trainer:
                 else: # Standard precision for evaluation
                     lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
 
-                if batch_idx < 2: # Debug for first 2 validation batches
-                    print(f"--- DEBUG NSP (evaluate, batch_idx: {batch_idx}) ---")
-                    print(f"  self.config.nsp_task: {self.config.nsp_task}")
-                    if hasattr(lm_loss_from_model, 'item'):
-                        print(f"  LM Loss from model: {lm_loss_from_model.item() if lm_loss_from_model is not None else 'None'}")
-                    elif lm_loss_from_model is not None:
-                        print(f"  LM Loss from model: {lm_loss_from_model}")
-                    else:
-                        print(f"  LM Loss from model: None")
-
-                    if self.config.nsp_task:
-                        print(f"  NSP Logits is None: {nsp_logits is None}")
-                        if nsp_logits is not None:
-                            print(f"  NSP Logits: shape={nsp_logits.shape}, dtype={nsp_logits.dtype}, device={nsp_logits.device}, values[:5]={nsp_logits.detach().float().cpu().squeeze().flatten()[:5].tolist()}")
-                        if nsp_labels is not None: # nsp_labels from batch unpacking
-                            print(f"  NSP Labels: shape={nsp_labels.shape}, dtype={nsp_labels.dtype}, device={nsp_labels.device}, values[:5]={nsp_labels.detach().cpu().flatten()[:5].tolist()}")
-                        else:
-                            print("  NSP Labels: None (unexpected if nsp_task is True during eval)")
-
-                        if nsp_logits is not None and nsp_labels is not None:
-                            squeezed_nsp_logits_eval = nsp_logits.squeeze(-1)
-                            print(f"  Squeezed NSP Logits: shape={squeezed_nsp_logits_eval.shape}, values[:5]={squeezed_nsp_logits_eval.detach().float().cpu().flatten()[:5].tolist()}")
-                            float_nsp_labels_eval = nsp_labels.float()
-                            print(f"  Float NSP Labels: shape={float_nsp_labels_eval.shape}, values[:5]={float_nsp_labels_eval.detach().cpu().flatten()[:5].tolist()}")
-
-                            nsp_loss_eval_tensor = F.binary_cross_entropy_with_logits(squeezed_nsp_logits_eval, float_nsp_labels_eval, reduction='none')
-                            print(f"  NSP Loss (unreduced, per item, :5): {nsp_loss_eval_tensor.detach().float().cpu().flatten()[:5].tolist()}")
-                            print(f"  NSP Loss (mean): {nsp_loss_eval_tensor.mean().item()}")
-
-                            with torch.no_grad():
-                                nsp_probs_eval = torch.sigmoid(squeezed_nsp_logits_eval)
-                                print(f"  NSP Probs (sigmoid, :5): {nsp_probs_eval.detach().float().cpu().flatten()[:5].tolist()}")
-                                nsp_preds_eval = nsp_probs_eval > 0.5
-                                print(f"  NSP Preds (>0.5, :5): {nsp_preds_eval.detach().cpu().flatten()[:5].tolist()}")
-                                if nsp_labels.numel() > 0:
-                                    nsp_correct_eval = (nsp_preds_eval == nsp_labels).sum().item()
-                                    nsp_total_in_batch_eval = nsp_labels.size(0)
-                                    print(f"  NSP Correct: {nsp_correct_eval}, Total: {nsp_total_in_batch_eval}, Acc: {nsp_correct_eval/nsp_total_in_batch_eval if nsp_total_in_batch_eval > 0 else 0.0}")
-                    print(f"--- END DEBUG NSP (evaluate) ---")
+                # Debug prints were here, now removed.
 
                 if lm_loss_from_model is not None:
                     batch_combined_loss += lm_loss_from_model

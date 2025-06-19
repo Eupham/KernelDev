@@ -101,7 +101,6 @@ class GPTModel(nn.Module):
         self.dim = dim
         self.cls_token_id = cls_token_id
         self.nsp_task = nsp_task # Store nsp_task
-        print(f"GPTModel.__init__: nsp_task={self.nsp_task} (type: {type(self.nsp_task)}), cls_token_id={self.cls_token_id} (type: {type(self.cls_token_id)})")
         self.max_seq_len = max_seq_len
         
         # Token and position embeddings (no bias)
@@ -140,9 +139,6 @@ class GPTModel(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, x, targets=None):
-        if self.nsp_task: # Only print if NSP is relevant for this model instance
-            print(f"GPTModel.forward: Instance configured with self.nsp_task={self.nsp_task}, self.cls_token_id={self.cls_token_id}. Input seq_len: {x.shape[1]}")
-
         batch_size, seq_len = x.shape # x is input token IDs (batch_size, seq_len)
         
         # Initialize loss and nsp_logits

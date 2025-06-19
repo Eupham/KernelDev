@@ -257,12 +257,12 @@ def start_actual_training(cli_args):
 
     # Now instantiate the model with the fully defined model_config
     print(f"\n=== Initializing Model ===")
-    print(f"Instantiating GPTModel with final model_config: {model_config}")
+    # print(f"Instantiating GPTModel with final model_config: {model_config}") # Removed debug print
     model = GPTModel(**model_config)
     
     # Setup precision and mixed precision training now that model is instantiated
     print(f"\n=== Setting up Precision ===")
-    print(f"Setting up precision for the model (Precision: {precision})...")
+    # print(f"Setting up precision for the model (Precision: {precision})...") # Removed debug print
     dtype, scaler, use_amp = setup_precision(model, precision) # Now model exists
 
     # Determine effective device *before* TrainingConfig instantiation
@@ -355,59 +355,47 @@ def start_actual_training(cli_args):
 
         def cpu_flash_attention_fallback(q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision, is_prefix_token_mask=None):
             B, H, T, D = q.shape
-            q_scaled = q * sm_scale # Apply sm_scale to q
+            # Ensure all inputs are on the same device as q. device for new tensors.
+            target_device = q.device
+            k = k.to(target_device)
+            v = v.to(target_device)
+            if is_prefix_token_mask is not None:
+                is_prefix_token_mask = is_prefix_token_mask.to(target_device)
 
-            # attn_bias will handle causal masking and prefix masking
-            attn_bias = torch.zeros(B, H, T, T, dtype=q.dtype, device=q.device)
+            q_scaled = q * sm_scale
+
+            attn_bias = torch.zeros(B, H, T, T, dtype=q.dtype, device=target_device)
 
             if causal:
-                causal_mask_values = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1)
-                # Expand causal_mask_values to match attn_bias shape for broadcasting
-                expanded_causal_mask = causal_mask_values.unsqueeze(0).unsqueeze(0) # Shape (1, 1, T, T)
+                causal_mask_values = torch.triu(torch.ones(T, T, device=target_device, dtype=torch.bool), diagonal=1)
+                expanded_causal_mask = causal_mask_values.unsqueeze(0).unsqueeze(0)
 
                 if is_prefix_token_mask is not None:
-                    # is_prefix_token_mask is (T,), True for prefix tokens
-                    # If query token i is a prefix token, it should attend to all key tokens j.
-                    # This means for a prefix query token i, the row causal_mask_values[i,:] should be all False.
-                    # prefix_mask_for_q has shape (T,)
-                    # We want to modify expanded_causal_mask where query is prefix.
-                    # Create a mask for query dimension: (1, 1, T, 1)
                     prefix_q_mask = is_prefix_token_mask.view(1, 1, T, 1).expand(B, H, T, T)
-
-                    # Where prefix_q_mask is True, set expanded_causal_mask to False
-                    # This effectively says: if query is prefix, no causal masking for this query.
                     final_causal_mask = torch.where(prefix_q_mask, torch.zeros_like(expanded_causal_mask), expanded_causal_mask)
                 else:
                     final_causal_mask = expanded_causal_mask
 
                 attn_bias.masked_fill_(final_causal_mask, float("-inf"))
 
-            # Attention calculation
             attn_weights = torch.matmul(q_scaled, k.transpose(-2, -1)) + attn_bias
             attn_weights = F.softmax(attn_weights, dim=-1)
             output = torch.matmul(attn_weights, v)
 
-            # LSE calculation (logsumexp)
-            # The LSE should be calculated on the scores *before* softmax.
-            # The scores are (q_scaled @ k.transpose) + attn_bias
             if return_lse:
                 scores_for_lse = torch.matmul(q_scaled, k.transpose(-2, -1)) + attn_bias
-                # Mask out -inf before logsumexp to avoid nan/inf issues where softmax would be 0
                 scores_for_lse = torch.where(attn_bias == float("-inf"), torch.full_like(scores_for_lse, -float("inf")), scores_for_lse)
                 lse = torch.logsumexp(scores_for_lse, dim=-1)
             else:
-                lse = torch.empty(0, device=q.device, dtype=q.dtype) # Match expected empty tensor
+                lse = torch.empty(0, device=target_device, dtype=q.dtype)
 
             return output, lse
 
         original_kernel.flash_attention = cpu_flash_attention_fallback
-        # Force device to CPU in TrainingConfig if cpu_test_mode is on
-        training_config.device = torch.device('cpu')
-        # Also update hardware_cfg for model placement if it's used directly after this
-        hardware_cfg['device'] = 'cpu'
-        # Re-initialize model on CPU if it was already on GPU
-        model.to(training_config.device)
-        print(f"Model and training will run on CPU due to cpu_test_attention=True.")
+        # effective_device will be 'cpu' due to cpu_test_mode=True,
+        # training_config will get this device, and model will be moved to it.
+        # No need for model.to('cpu') here.
+        print(f"Flash attention overridden with CPU fallback.")
 
     # Estimate optimal batch size with precision consideration
     if logging_cfg.get('show_memory_estimation', True):
