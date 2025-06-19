@@ -67,68 +67,54 @@ class DataBuilder:
     
     def _detokenize_bytes(self, tokens: list) -> str:
         try:
-            # Handle special tokens for decoding if they are in the list
-            processed_tokens = []
-            for t_id in tokens:
-                if self.nsp_task: # Only apply special decoding if NSP task is configured
-                    if t_id == self.cls_token_id:
-                        # This part is tricky as bytes() expects integers 0-255
-                        # We can't directly convert 256/257 to a byte.
-                        # So, for string representation, we map them to text tags.
-                        # This means _detokenize_bytes is now lossy for CLS/SEP if used outside debugging.
-                        # Actual model input should remain integer IDs.
-                        # This function is mostly for inspection.
-                        pass # Will be handled by string joining later
-                    elif t_id == self.sep_token_id:
-                        pass # Will be handled by string joining later
-                    elif t_id < 0 or t_id > 255: # Other special tokens like pad, or out of byte range
-                        pass # Will be handled by string joining later
+            string_parts = []
+            current_byte_sequence = []
+
+            for token in tokens:
+                if self.nsp_task and token == self.cls_token_id:
+                    if current_byte_sequence:
+                        string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
+                        current_byte_sequence = []
+                    string_parts.append("[CLS]")
+                elif self.nsp_task and token == self.sep_token_id:
+                    if current_byte_sequence:
+                        string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
+                        current_byte_sequence = []
+                    string_parts.append("[SEP]")
+                elif 0 <= token <= 255:
+                    current_byte_sequence.append(token)
+                else: # Special tokens other than CLS/SEP (e.g., padding -1) or unknown tokens
+                    if current_byte_sequence:
+                        string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
+                        current_byte_sequence = []
+                    # Represent other special tokens (like pad_token_id = -1 from NSPDataset)
+                    # or any unexpected token.
+                    if token == -1: # Common padding value for LM targets
+                        string_parts.append("[PAD]")
                     else:
-                        processed_tokens.append(t_id)
-                else:
-                    if 0 <= t_id <= 255:
-                         processed_tokens.append(t_id)
+                        string_parts.append(f"[UNK_TOKEN:{token}]")
 
-            byte_data = bytes(processed_tokens)
-            decoded_text = byte_data.decode('utf-8', errors='replace')
+            # After the loop, decode any remaining byte sequence
+            if current_byte_sequence:
+                string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
 
-            # Re-insert string representations for special tokens if NSP task
-            if self.nsp_task:
-                final_str_parts = []
-                current_byte_idx = 0
-                for t_id in tokens:
-                    if t_id == self.cls_token_id:
-                        final_str_parts.append("[CLS]")
-                    elif t_id == self.sep_token_id:
-                        final_str_parts.append("[SEP]")
-                    elif t_id < 0 or t_id > 255: # e.g. pad_token_id = -1
-                        final_str_parts.append(f"[PAD:{t_id}]")
-                    else:
-                        # This assumes one byte token corresponds to one character after potential multi-byte decoding
-                        # This part is complex due to utf-8 variable byte length.
-                        # A simpler approach for _detokenize_bytes for inspection:
-                        # Just convert byte range and use placeholders for others.
-                        pass # Byte tokens are handled by byte_data.decode above.
-                # This improved version handles byte tokens first, then inserts placeholders.
-                # However, the initial version of just decoding valid bytes is safer.
-                # Let's stick to a simpler version for now: decode valid bytes, and if special tokens were present,
-                # it implies the string output here is mainly for byte-tokens.
-                # A truly accurate detokenization would need to know where byte sequences were interrupted by special tokens.
-
-                # Fallback to simpler detokenization for inspection if NSP tokens are present:
-                if any(t_id in [self.cls_token_id, self.sep_token_id] for t_id in tokens):
-                    return " ".join(
-                        "[CLS]" if t == self.cls_token_id else \
-                        "[SEP]" if t == self.sep_token_id else \
-                        f"[PAD:{t}]" if t < 0 or t > 255 else \
-                        chr(t) if chr(t).isprintable() or chr(t) in ['\n', '\t', ' '] else f"[{t:02x}]"
-                        for t in tokens
-                    )
-            return decoded_text
+            return "".join(string_parts)
 
         except Exception as e:
             print(f"Warning: Error decoding tokens: {e}")
-            return f"[DECODE_ERROR: {tokens[:10]}...]"
+            # Provide more context in the error if possible
+            problematic_part = []
+            for t in tokens[:20]: # Show first 20 tokens that might be causing issues
+                if isinstance(t, int):
+                    if 0 <= t <=255:
+                        problematic_part.append(hex(t))
+                    else:
+                        problematic_part.append(str(t))
+                else:
+                    problematic_part.append(str(type(t)))
+
+
+            return f"[DECODE_ERROR for tokens: {problematic_part} ... (Total: {len(tokens)})]"
 
     def _segment_text_to_sentences(self, text: str) -> list[str]:
         """Segments text into sentences using basic punctuation."""

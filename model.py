@@ -177,32 +177,22 @@ class GPTModel(nn.Module):
         processed_x = x_emb
         for block in self.blocks:
             processed_x = block(processed_x, is_prefix_token_mask=current_is_prefix_token_mask)
-        
+
         # Final normalization
         # processed_x is hidden states (batch_size, seq_len, dim)
         processed_x = self.norm_out(processed_x)
-        
+
         # Language model logits
         logits = self.head(processed_x) # (batch_size, seq_len, vocab_size)
 
         # NSP logits calculation
-        # Only compute if nsp_task is enabled and the CLS token was processed (indicated by current_is_prefix_token_mask)
-        if self.nsp_task and current_is_prefix_token_mask is not None:
-            # current_is_prefix_token_mask is (seq_len,)
-            # We need to find where it's True. Assuming it's True for CLS token.
-            # And assuming CLS token is at index 0 for simplicity as per notes.
-            # This implies that if a CLS token is used, it's the first token.
-            # The DataBuilder will need to ensure this setup.
-            if current_is_prefix_token_mask[0]: # Check if the first token is indeed marked as CLS/prefix
-                cls_token_repr = processed_x[:, 0, :] # Get representation of the first token (batch_size, dim)
-                nsp_logits = self.nsp_head(cls_token_repr) # (batch_size, 1)
-            # else:
-                # This case implies cls_token_id was set, but the current batch's first item didn't have it at index 0.
-                # Or current_is_prefix_token_mask was based on x[0] and x[0,0] wasn't CLS.
-                # For robustness, one might iterate through current_is_prefix_token_mask to find the CLS token.
-                # However, the current setup of passing a single (T,) mask to flash_attention implies a fixed prefix structure.
-                # If CLS is intended for NSP, it's typically at a known position (e.g., index 0).
-                # If no CLS token at expected position, nsp_logits remains None or could be zeros.
+        # processed_x is the output of self.norm_out(x), shape (batch_size, seq_len, dim)
+        # nsp_logits = None # Already initialized at the beginning of the method
+        if self.nsp_task:
+            # Assuming NSPDataset places the CLS token at index 0
+            # And its representation is taken from the output hidden states.
+            cls_token_representation = processed_x[:, 0, :]
+            nsp_logits = self.nsp_head(cls_token_representation)
 
         if targets is not None:
             # Compute cross-entropy loss for language modeling
