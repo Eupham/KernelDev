@@ -308,21 +308,65 @@ class Trainer:
         if self.config.use_amp and self.config.scaler is not None:
             with torch.amp.autocast('cuda'):
                 lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
+            # Moved debug block after autocast but before loss usage for AMP
+        else: # Standard precision
+            lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
 
-                combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+        if self.metrics.total_steps < 3: # Debug for first 3 training steps
+            print(f"--- DEBUG NSP (train_step, global_step: {self.metrics.total_steps}) ---")
+            print(f"  self.config.nsp_task: {self.config.nsp_task}")
+            if hasattr(lm_loss_from_model, 'item'):
+                print(f"  LM Loss from model: {lm_loss_from_model.item() if lm_loss_from_model is not None else 'None'}")
+            elif lm_loss_from_model is not None:
+                print(f"  LM Loss from model: {lm_loss_from_model}")
+            else:
+                print(f"  LM Loss from model: None")
+
+            if self.config.nsp_task:
+                print(f"  NSP Logits is None: {nsp_logits is None}")
+                if nsp_logits is not None:
+                    print(f"  NSP Logits: shape={nsp_logits.shape}, dtype={nsp_logits.dtype}, device={nsp_logits.device}, values[:5]={nsp_logits.detach().float().cpu().squeeze().flatten()[:5].tolist()}")
+                if nsp_labels is not None:
+                    print(f"  NSP Labels: shape={nsp_labels.shape}, dtype={nsp_labels.dtype}, device={nsp_labels.device}, values[:5]={nsp_labels.detach().cpu().flatten()[:5].tolist()}")
+                else:
+                    print("  NSP Labels: None (unexpected if nsp_task is True)")
+
+                if nsp_logits is not None and nsp_labels is not None:
+                    squeezed_nsp_logits = nsp_logits.squeeze(-1)
+                    print(f"  Squeezed NSP Logits: shape={squeezed_nsp_logits.shape}, values[:5]={squeezed_nsp_logits.detach().float().cpu().flatten()[:5].tolist()}")
+                    float_nsp_labels = nsp_labels.float()
+                    print(f"  Float NSP Labels: shape={float_nsp_labels.shape}, values[:5]={float_nsp_labels.detach().cpu().flatten()[:5].tolist()}")
+
+                    current_nsp_loss_tensor = F.binary_cross_entropy_with_logits(squeezed_nsp_logits, float_nsp_labels, reduction='none')
+                    print(f"  NSP Loss (unreduced, per item, :5): {current_nsp_loss_tensor.detach().float().cpu().flatten()[:5].tolist()}")
+                    print(f"  NSP Loss (mean): {current_nsp_loss_tensor.mean().item()}")
+
+                    with torch.no_grad():
+                        nsp_probs = torch.sigmoid(squeezed_nsp_logits)
+                        print(f"  NSP Probs (sigmoid, :5): {nsp_probs.detach().float().cpu().flatten()[:5].tolist()}")
+                        nsp_preds = nsp_probs > 0.5
+                        print(f"  NSP Preds (>0.5, :5): {nsp_preds.detach().cpu().flatten()[:5].tolist()}")
+                        if nsp_labels.numel() > 0:
+                            nsp_correct = (nsp_preds == nsp_labels).sum().item()
+                            nsp_total_in_batch = nsp_labels.size(0)
+                            print(f"  NSP Correct: {nsp_correct}, Total: {nsp_total_in_batch}, Acc: {nsp_correct/nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0}")
+            print(f"--- END DEBUG NSP (train_step) ---")
+
+        if self.config.use_amp and self.config.scaler is not None:
+            # This block now assumes lm_loss_from_model and nsp_logits are already computed above
+            with torch.amp.autocast('cuda'): # Re-enter autocast for loss calculation if needed, though values are from outside
+                combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32) # Ensure combined_loss is float32 for accumulation
                 if lm_loss_from_model is not None:
-                    combined_loss += lm_loss_from_model
+                    combined_loss += lm_loss_from_model.float() # Ensure it's float before adding
 
                 if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
-                    current_nsp_loss = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
-                    combined_loss += self.config.nsp_loss_weight * current_nsp_loss
-                    current_nsp_loss_item = current_nsp_loss.item()
-                    with torch.no_grad():
-                        nsp_preds = torch.sigmoid(nsp_logits.squeeze(-1)) > 0.5
-                        nsp_correct = (nsp_preds == nsp_labels).sum().item()
-                        nsp_total_in_batch = nsp_labels.size(0)
-                        current_nsp_accuracy_item = nsp_correct / nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0
+                    # nsp_logits and nsp_labels are from outside autocast context here if model call was outside or before
+                    # For safety, ensure they are float for BCE
+                    current_nsp_loss = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1).float(), nsp_labels.float())
+                    combined_loss += (self.config.nsp_loss_weight * current_nsp_loss).float()
+                    # current_nsp_loss_item and current_nsp_accuracy_item are calculated later from these potentially re-casted tensors
 
+            # The rest of the AMP logic for train_step
             if lm_loss_from_model is None and (nsp_logits is None or not self.config.nsp_task):
                 return 0.0, None, None
 
@@ -335,26 +379,27 @@ class Trainer:
             combined_loss_val = combined_loss.item()
             
         else: # Standard precision
-            lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
-
+            # lm_logits, lm_loss_from_model, nsp_logits are already computed above (outside debug block)
             combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
             if lm_loss_from_model is not None:
-                combined_loss += lm_loss_from_model
+                    combined_loss += lm_loss_from_model
 
-            if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
-                current_nsp_loss = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
-                combined_loss += self.config.nsp_loss_weight * current_nsp_loss
-                current_nsp_loss_item = current_nsp_loss.item()
-                with torch.no_grad():
-                    nsp_preds = torch.sigmoid(nsp_logits.squeeze(-1)) > 0.5
-                    nsp_correct = (nsp_preds == nsp_labels).sum().item()
-                    nsp_total_in_batch = nsp_labels.size(0)
-                    current_nsp_accuracy_item = nsp_correct / nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0
+                if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
+                    # This part is now outside the autocast context for AMP, ensure dtype consistency if needed
+                    # However, current_nsp_loss and combined_loss are correctly calculated within autocast for AMP.
+                    # The items for return are derived from potentially mixed-precision tensors.
+                    current_nsp_loss_for_return = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1).float(), nsp_labels.float())
+                    current_nsp_loss_item = current_nsp_loss_for_return.item() # This is the one to return
+                    with torch.no_grad(): # Accuracy calculation
+                        nsp_preds = torch.sigmoid(nsp_logits.squeeze(-1).float()) > 0.5
+                        nsp_correct = (nsp_preds == nsp_labels).sum().item()
+                        nsp_total_in_batch = nsp_labels.size(0)
+                        current_nsp_accuracy_item = nsp_correct / nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0
 
             if lm_loss_from_model is None and (nsp_logits is None or not self.config.nsp_task):
-                 return 0.0, None, None
+                 return 0.0, None, None # No loss to backpropagate
             
-            combined_loss.backward()
+            combined_loss.backward() # combined_loss was calculated using standard precision tensors
             if self.config.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
@@ -391,27 +436,69 @@ class Trainer:
 
                 batch_combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
 
-                if self.config.use_amp:
+                if self.config.use_amp: # AMP path for evaluation
                     with torch.amp.autocast('cuda'):
                         lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
-                else:
+                else: # Standard precision for evaluation
                     lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
-                
+
+                if batch_idx < 2: # Debug for first 2 validation batches
+                    print(f"--- DEBUG NSP (evaluate, batch_idx: {batch_idx}) ---")
+                    print(f"  self.config.nsp_task: {self.config.nsp_task}")
+                    if hasattr(lm_loss_from_model, 'item'):
+                        print(f"  LM Loss from model: {lm_loss_from_model.item() if lm_loss_from_model is not None else 'None'}")
+                    elif lm_loss_from_model is not None:
+                        print(f"  LM Loss from model: {lm_loss_from_model}")
+                    else:
+                        print(f"  LM Loss from model: None")
+
+                    if self.config.nsp_task:
+                        print(f"  NSP Logits is None: {nsp_logits is None}")
+                        if nsp_logits is not None:
+                            print(f"  NSP Logits: shape={nsp_logits.shape}, dtype={nsp_logits.dtype}, device={nsp_logits.device}, values[:5]={nsp_logits.detach().float().cpu().squeeze().flatten()[:5].tolist()}")
+                        if nsp_labels is not None: # nsp_labels from batch unpacking
+                            print(f"  NSP Labels: shape={nsp_labels.shape}, dtype={nsp_labels.dtype}, device={nsp_labels.device}, values[:5]={nsp_labels.detach().cpu().flatten()[:5].tolist()}")
+                        else:
+                            print("  NSP Labels: None (unexpected if nsp_task is True during eval)")
+
+                        if nsp_logits is not None and nsp_labels is not None:
+                            squeezed_nsp_logits_eval = nsp_logits.squeeze(-1)
+                            print(f"  Squeezed NSP Logits: shape={squeezed_nsp_logits_eval.shape}, values[:5]={squeezed_nsp_logits_eval.detach().float().cpu().flatten()[:5].tolist()}")
+                            float_nsp_labels_eval = nsp_labels.float()
+                            print(f"  Float NSP Labels: shape={float_nsp_labels_eval.shape}, values[:5]={float_nsp_labels_eval.detach().cpu().flatten()[:5].tolist()}")
+
+                            nsp_loss_eval_tensor = F.binary_cross_entropy_with_logits(squeezed_nsp_logits_eval, float_nsp_labels_eval, reduction='none')
+                            print(f"  NSP Loss (unreduced, per item, :5): {nsp_loss_eval_tensor.detach().float().cpu().flatten()[:5].tolist()}")
+                            print(f"  NSP Loss (mean): {nsp_loss_eval_tensor.mean().item()}")
+
+                            with torch.no_grad():
+                                nsp_probs_eval = torch.sigmoid(squeezed_nsp_logits_eval)
+                                print(f"  NSP Probs (sigmoid, :5): {nsp_probs_eval.detach().float().cpu().flatten()[:5].tolist()}")
+                                nsp_preds_eval = nsp_probs_eval > 0.5
+                                print(f"  NSP Preds (>0.5, :5): {nsp_preds_eval.detach().cpu().flatten()[:5].tolist()}")
+                                if nsp_labels.numel() > 0:
+                                    nsp_correct_eval = (nsp_preds_eval == nsp_labels).sum().item()
+                                    nsp_total_in_batch_eval = nsp_labels.size(0)
+                                    print(f"  NSP Correct: {nsp_correct_eval}, Total: {nsp_total_in_batch_eval}, Acc: {nsp_correct_eval/nsp_total_in_batch_eval if nsp_total_in_batch_eval > 0 else 0.0}")
+                    print(f"--- END DEBUG NSP (evaluate) ---")
+
                 if lm_loss_from_model is not None:
                     batch_combined_loss += lm_loss_from_model
                     total_lm_loss += lm_loss_from_model.item()
                     num_lm_batches +=1
 
                 if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
-                    nsp_loss_eval = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
-                    batch_combined_loss += self.config.nsp_loss_weight * nsp_loss_eval
+                    # Ensure nsp_loss_eval is calculated on the correct dtype if coming from AMP context
+                    nsp_loss_eval = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1).float(), nsp_labels.float())
+                    batch_combined_loss += self.config.nsp_loss_weight * nsp_loss_eval.float() # ensure it's float for accumulation
 
-                    preds = torch.sigmoid(nsp_logits.squeeze(-1)) > 0.5
-                    correct = (preds == nsp_labels).sum().item()
-                    total_nsp_in_batch = nsp_labels.size(0)
+                    with torch.no_grad(): # Accuracy calculation should be no_grad
+                        preds = torch.sigmoid(nsp_logits.squeeze(-1).float()) > 0.5
+                        correct = (preds == nsp_labels).sum().item()
+                        total_nsp_in_batch = nsp_labels.size(0)
 
                     current_nsp_loss_val_accum += nsp_loss_eval.item()
-                    current_nsp_acc_val_accum += correct / total_nsp_in_batch if total_nsp_in_batch > 0 else 0
+                    current_nsp_acc_val_accum += correct / total_nsp_in_batch if total_nsp_in_batch > 0 else 0.0
                     nsp_batches += 1
 
                 total_combined_loss += batch_combined_loss.item()
