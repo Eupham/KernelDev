@@ -265,15 +265,56 @@ def start_actual_training(cli_args):
     print(f"Setting up precision for the model (Precision: {precision})...")
     dtype, scaler, use_amp = setup_precision(model, precision) # Now model exists
 
-    # Update TrainingConfig with the scaler and use_amp status (as it might have changed)
-    training_config.scaler = scaler
-    training_config.use_amp = use_amp
+    # Determine effective device *before* TrainingConfig instantiation
+    device_from_cfg = hardware_cfg.get('device', 'auto')
+    if cpu_test_mode: # cpu_test_mode is defined earlier
+        effective_device = 'cpu'
+        print(f"CPU test mode active. Overriding device to CPU.")
+    elif device_from_cfg == 'auto':
+        effective_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        effective_device = device_from_cfg
+    print(f"Effective device determined as: {effective_device}")
+
+    # Instantiate TrainingConfig *after* model, setup_precision, and device determination
+    print(f"\n=== Initializing Training Configuration ===")
+    training_config_params = {
+        'num_epochs': training_cfg.get('epochs', 1),
+        'learning_rate': training_cfg.get('learning_rate', 3e-4),
+        'weight_decay': training_cfg.get('weight_decay', 0.01),
+        'warmup_steps': training_cfg.get('warmup_steps', 100),
+        'max_grad_norm': training_cfg.get('max_grad_norm', 1.0),
+        'save_every': training_cfg.get('save_every', 500),
+        'eval_every': training_cfg.get('eval_every', 200),
+        'log_every': training_cfg.get('log_every', 50),
+        'checkpoint_dir': training_cfg.get('checkpoint_dir', "checkpoints"),
+        'device': effective_device,  # Pass the determined effective_device
+        'nsp_task': nsp_task_enabled, # nsp_task_enabled defined earlier
+        'nsp_loss_weight': nsp_lw,    # nsp_lw defined earlier
+        'scaler': scaler,             # Pass scaler from setup_precision
+        'use_amp': use_amp,           # Pass use_amp from setup_precision
+        # Inference params from gen_cfg (defined earlier)
+        'inference_prompts': gen_cfg.get('prompts', ["", "The", "In", "Once upon a time"]),
+        'inference_max_length': gen_cfg.get('max_length', 100),
+        'inference_temperature': gen_cfg.get('temperature', 0.8),
+        'inference_top_k': gen_cfg.get('top_k', 50),
+        'inference_top_p': gen_cfg.get('top_p', 0.9),
+        # Plateau params from training_cfg
+        'plateau_monitor_metric': training_cfg.get('plateau_monitor_metric', 'val_loss'),
+        'plateau_patience': training_cfg.get('plateau_patience', 10),
+        'plateau_threshold': training_cfg.get('plateau_threshold', 1e-4),
+        'plateau_mode': training_cfg.get('plateau_mode', 'min'),
+        # Scheduler params from training_cfg
+        'scheduler_T0_epoch_fraction': training_cfg.get('scheduler_T0_epoch_fraction', 0.1),
+        'scheduler_T_mult': training_cfg.get('scheduler_T_mult', 1)
+    }
+    training_config = TrainingConfig(**training_config_params)
+    print(f"TrainingConfig initialized with device: {training_config.device}")
 
     # Ensure model is on the correct device (especially after CPU fallback or re-initialization)
-    # This should happen AFTER setup_precision, as setup_precision might change model's dtype
-    # and .to(device) should be called on the correctly typed model.
-    model.to(training_config.device)
-    print(f"Model moved to device: {training_config.device} after DataBuilder and final config.")
+    # This should happen AFTER setup_precision and TrainingConfig instantiation (which sets the target device)
+    model.to(training_config.device) # training_config.device is now the single source of truth for device
+    print(f"Model explicitly moved to device: {training_config.device} after TrainingConfig initialization.")
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
