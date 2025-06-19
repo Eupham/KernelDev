@@ -661,9 +661,10 @@ class Trainer:
                     # Use last val_loss from metrics if available, else current val_loss if eval was just run
                     current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (val_loss if 'val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
 
-                    prompts = self.config.inference_prompts
-                    generated_texts = self.generate_inference_sample(
-                        prompts=prompts,
+                    # Prompts are now handled internally by generate_inference_sample or can be passed if needed
+                    # The main thing is that generate_inference_sample returns a list of dicts
+                    generated_outputs = self.generate_inference_sample(
+                        prompts=self.config.inference_prompts, # Pass configured prompts
                         max_length=self.config.inference_max_length,
                         temperature=self.config.inference_temperature,
                         top_k=self.config.inference_top_k,
@@ -673,8 +674,8 @@ class Trainer:
                         step=self.metrics.total_steps,
                         val_loss=current_val_loss_for_sample,
                         perplexity=perplexity,
-                        generated_texts=generated_texts,
-                        prompts=prompts
+                        generated_outputs=generated_outputs
+                        # prompts argument is removed from save_inference_sample as generated_outputs contains prompt info
                     )
         
         # Epoch summary (only on rank 0 if distributed)
