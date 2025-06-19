@@ -95,12 +95,16 @@ class GPTModel(nn.Module):
         mlp_ratio=4,
         causal=True,
         cls_token_id: int | None = None,
-        nsp_task: bool = False, # Added nsp_task
+        nsp_task: bool = False,
+        use_cls_prefix_attention: bool = True, # New parameter
     ):
         super().__init__()
         self.dim = dim
         self.cls_token_id = cls_token_id
-        self.nsp_task = nsp_task # Store nsp_task
+        self.nsp_task = nsp_task
+        self.use_cls_prefix_attention = use_cls_prefix_attention # Store it
+        # Updated print to include the new parameter
+        print(f"GPTModel.__init__: nsp_task={self.nsp_task}, cls_token_id={self.cls_token_id}, use_cls_prefix_attention={self.use_cls_prefix_attention}")
         self.max_seq_len = max_seq_len
         
         # Token and position embeddings (no bias)
@@ -138,19 +142,26 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None):
+    def forward(self, x, targets=None, force_disable_prefix_attention: bool = False):
+        if self.nsp_task: # Only print if NSP is relevant for this model instance
+            # Updated print to include use_cls_prefix_attention and force_disable_prefix_attention
+            print(f"GPTModel.forward: Instance: nsp_task={self.nsp_task}, cls_id={self.cls_token_id}, use_cls_prefix_attn={self.use_cls_prefix_attention}, force_disable_prefix_attn={force_disable_prefix_attention}. Input seq_len: {x.shape[1]}")
+
         batch_size, seq_len = x.shape # x is input token IDs (batch_size, seq_len)
         
         # Initialize loss and nsp_logits
         loss = None
         nsp_logits = None
 
-        # Create current_is_prefix_token_mask based on cls_token_id
+        # Create current_is_prefix_token_mask based on cls_token_id and use_cls_prefix_attention
         current_is_prefix_token_mask = None
-        if self.cls_token_id is not None: # This implies a CLS token is defined for the model
-            # The mask is (seq_len,) indicating True for CLS token positions.
-            # This is based on the first item in the batch, assuming consistent CLS usage / fixed position for the prefix.
-            # The flash_attention kernel expects a (T,) mask that applies to all batch items.
+        # Only create prefix mask if NSP task is on, CLS token is defined, specific prefix attention for CLS is enabled, AND not forcibly disabled
+        if self.nsp_task and \
+           self.use_cls_prefix_attention and \
+           self.cls_token_id is not None and \
+           not force_disable_prefix_attention: # Check the new flag
+            # The mask is (seq_len,) indicating True for CLS token positions based on the first batch item.
+            # This is because original_kernel.flash_attention expects a (T,) mask.
             prefix_mask_bool_first_item = (x[0] == self.cls_token_id)
             if prefix_mask_bool_first_item.any():
                 current_is_prefix_token_mask = prefix_mask_bool_first_item.to(x.device)
@@ -194,8 +205,25 @@ class GPTModel(nn.Module):
 
         return logits, loss, nsp_logits
     
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
-        """Generate new tokens using the model with top-k and top-p sampling."""
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_prefix_attention_in_prompt: bool = False):
+        """
+        Generate new tokens using the model with top-k and top-p sampling.
+
+        Args:
+            idx (torch.Tensor): Input sequence of token IDs (batch_size, seq_len).
+            max_new_tokens (int): Maximum number of new tokens to generate.
+            temperature (float, optional): Sampling temperature. Higher values make output more random. Defaults to 1.0.
+            top_k (int, optional): If set, only sample from the top k most likely next tokens. Defaults to None.
+            top_p (float, optional): If set, sample from the smallest set of tokens whose cumulative probability exceeds top_p (nucleus sampling). Defaults to None.
+            use_prefix_attention_in_prompt (bool, optional): If True and the model is configured for NSP
+                with CLS prefix attention (`self.nsp_task=True` and `self.use_cls_prefix_attention=True`),
+                CLS tokens in the input `idx` (prompt) will use their special prefix attention mechanism.
+                Defaults to False, meaning CLS tokens in the prompt are treated with standard causal attention
+                during this generation call, regardless of model's training configuration for NSP prefix attention.
+
+        Returns:
+            torch.Tensor: Output sequence of token IDs (batch_size, seq_len + generated_tokens).
+        """
         self.eval()
         with torch.no_grad():
             for _ in range(max_new_tokens):
@@ -203,7 +231,8 @@ class GPTModel(nn.Module):
                 idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
                 
                 # Forward pass - update to expect three return values
-                logits, _, _ = self(idx_cond) # nsp_logits and loss are not used in generation
+                # Pass force_disable_prefix_attention based on not use_prefix_attention_in_prompt
+                logits, _, _ = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
                 logits = logits[:, -1, :] / temperature
                 
                 # Apply top-k filtering if specified

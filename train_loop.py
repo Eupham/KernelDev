@@ -310,9 +310,9 @@ class Trainer:
         # Outputs will be used inside AMP context for loss calculation if AMP is enabled
         if self.config.use_amp and self.config.scaler is not None:
              with torch.amp.autocast('cuda'): # Autocast the model's forward pass
-                lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
+                lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
         else: # Standard precision
-            lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
+            lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
 
         # Debug prints were here, now removed.
 
@@ -409,9 +409,9 @@ class Trainer:
 
                 if self.config.use_amp: # AMP path for evaluation
                     with torch.amp.autocast('cuda'):
-                        lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
+                        lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
                 else: # Standard precision for evaluation
-                    lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets)
+                    lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
 
                 # Debug prints were here, now removed.
 

@@ -80,7 +80,11 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     if hasattr(args, 'nsp_loss_weight') and args.nsp_loss_weight is not None:
         config.setdefault('training', {})['nsp_loss_weight'] = args.nsp_loss_weight
     if hasattr(args, 'cpu_test_attention') and args.cpu_test_attention is not None:
-        config['hardware']['cpu_test_attention'] = args.cpu_test_attention
+        config.setdefault('hardware', {})['cpu_test_attention'] = args.cpu_test_attention # Ensure hardware key exists
+
+    # Handle use_cls_prefix_attention
+    if hasattr(args, 'use_cls_prefix_attention') and args.use_cls_prefix_attention is not None:
+        config.setdefault('model', {})['use_cls_prefix_attention'] = args.use_cls_prefix_attention
 
     return config
 
@@ -249,11 +253,19 @@ def start_actual_training(cli_args):
     # Update model_config with actual vocab_size and cls_token_id if NSP
     actual_vocab_size = data_builder.get_vocab_size()
     model_config['vocab_size'] = actual_vocab_size # This must be set for the model
-    model_config['nsp_task'] = nsp_task_enabled   # Pass nsp_task status to model
+    model_config['nsp_task'] = nsp_task_enabled
     if nsp_task_enabled:
         model_config['cls_token_id'] = data_builder.cls_token_id
+        # Determine use_cls_prefix_attention based on config or default to True if NSP is on
+        use_cls_prefix_attention_from_config = model_cfg.get('use_cls_prefix_attention', None) # model_cfg is from loaded config
+        if use_cls_prefix_attention_from_config is None:
+            model_config['use_cls_prefix_attention'] = True # Default to True if NSP is on and not specified
+        else:
+            model_config['use_cls_prefix_attention'] = use_cls_prefix_attention_from_config
     else:
         model_config['cls_token_id'] = None # Explicitly None if NSP is off
+        model_config['use_cls_prefix_attention'] = False # Not relevant if NSP is off
+
 
     # Now instantiate the model with the fully defined model_config
     print(f"\n=== Initializing Model ===")
@@ -777,6 +789,12 @@ if __name__ == "__main__":
         help='Set NSP task status (True/False). If not specified, defaults to True.'
     )
     parser.add_argument('--nsp-loss-weight', type=float, default=None, help='Weight for NSP loss component (overrides config, e.g., 0.5).')
+    parser.add_argument(
+        '--use-cls-prefix-attention',
+        type=lambda x: (str(x).lower() == 'true'),
+        default=None,
+        help='Enable/disable special prefix attention for CLS token when NSP task is active. (e.g., True or False, overrides config)'
+    )
     parser.add_argument('--cpu-test-attention', action='store_true', help='Use CPU fallback for attention mechanism (for testing).')
 
     # Use parse_args() which will capture all defined args.

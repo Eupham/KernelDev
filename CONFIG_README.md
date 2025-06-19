@@ -81,6 +81,7 @@ model:
   max_seq_len: 2048          # Maximum sequence length
   mlp_ratio: 4               # MLP expansion ratio
   causal: true               # Use causal attention
+  use_cls_prefix_attention: true  # If `training: nsp_task` is true, this determines if the CLS token gets special prefix attention during training and standard evaluation loops. Defaults to `true` if `nsp_task` is active and this option is not specified in the config. Note: For text generation via `GPTModel.generate`, this model's setting is overridden by the `use_prefix_attention_in_prompt` parameter of the `generate` method.
 ```
 
 ### Hardware Parameters
@@ -119,8 +120,9 @@ python entry.py \
 - `--seq-len`: Sequence length for training
 - `--epochs`: Number of training epochs
 - `--learning-rate`: Learning rate
-- `--nsp-task`: Enable Next Sentence Prediction task (overrides config).
+- `--nsp-task <True/False>`: Enable or disable the Next Sentence Prediction task. Overrides config. Defaults to `true` if not specified and not set in config. (Note: use True/False, e.g. `--nsp-task False`)
 - `--nsp-loss-weight FLOAT`: Set the weight for the NSP loss component (e.g., 0.5) (overrides config).
+- `--use-cls-prefix-attention <True/False>`: Enable or disable special prefix attention for the CLS token during NSP training and evaluation. Overrides the `model:use_cls_prefix_attention` config. If not provided, behavior follows the model config (which defaults to true if NSP is active). (Note: use True/False)
 - `--cpu-test-attention`: Enable CPU attention fallback for testing (overrides config).
 
 ## Precision Modes
@@ -270,4 +272,10 @@ data:
 model:
   # ... other model params ...
   vocab_size: 256 # Base vocab size, will be auto-adjusted to 258 for NSP
+  use_cls_prefix_attention: true # Default for training if nsp_task is true
 ```
+
+**Note on Inference with CLS Tokens (Text Generation):**
+When using text generation capabilities (e.g., via `GPTModel.generate`):
+- By default (i.e., when `use_prefix_attention_in_prompt=False` is passed to the `generate` method, which is its default), any `[CLS]` token included in a generation prompt will be treated with standard causal attention. This occurs even if the model was trained with NSP and `use_cls_prefix_attention: true` was set in the model configuration.
+- To enable prefix attention for `[CLS]` tokens *within a prompt* during a specific `generate` call, you must explicitly pass `use_prefix_attention_in_prompt=True` to the `GPTModel.generate` method. This allows the CLS token in the prompt to utilize its special prefix attention mechanism, if the model was configured with `use_cls_prefix_attention: true` during its initialization.
