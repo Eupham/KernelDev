@@ -974,60 +974,89 @@ class Trainer:
         temperature: float = 0.8,
         top_k: int = 50,
         top_p: float = 0.9
-    ) -> List[str]:
-        """Generate inference samples with top-k, top-p, and temperature sampling."""
+    ) -> List[Dict[str, str]]: # Return type changed
+        """Generate inference samples, including tests for CLS prefix attention."""
         if not self.data_builder:
-            return ["No data_builder provided for text generation."]
+            return [{"type": "error", "prompt": "N/A", "text": "No data_builder provided for text generation."}]
         
-        if prompts is None:
-            prompts = ["", "The", "In", "Once upon a time"]
+        standard_prompts = prompts or ["", "The", "In", "Once upon a time"]
+        cls_test_prompts_text = ["What is the capital of France?", "Tell me a short story about a robot."]
         
         self.model.eval()
         model_to_generate_from = self.model.module if isinstance(self.model, DDP) else self.model
-        generated_texts = []
+        all_generated_outputs = [] # Changed from generated_texts to store dicts
         
         with torch.no_grad():
-            for prompt in prompts:
+            # 1. Standard Prompts (prefix attention typically off by default in generate)
+            for prompt_text in standard_prompts:
                 try:
-                    if prompt:
-                        # Tokenize prompt using DataBuilder's method
-                        tokens = self.data_builder._tokenize_text(prompt)
+                    if prompt_text:
+                        tokens = self.data_builder._tokenize_text(prompt_text)
                         x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device)
                     else:
-                        # Start with a random token
                         x = torch.randint(0, self.data_builder.vocab_size, (1, 1)).to(self.config.device)
                     
-                    # Generate tokens with top-k, top-p sampling
-                    generated = model_to_generate_from.generate(
+                    generated_ids = model_to_generate_from.generate(
                         x,
                         max_new_tokens=max_length,
                         temperature=temperature,
                         top_k=top_k,
-                        top_p=top_p
+                        top_p=top_p,
+                        use_prefix_attention_in_prompt=False # Explicitly off for standard prompts
                     )
-                    
-                    # Decode to text
-                    generated_text = self.data_builder.decode_tokens(generated[0])
-                    generated_texts.append(generated_text)
-                    
+                    decoded_text = self.data_builder.decode_tokens(generated_ids[0])
+                    all_generated_outputs.append({'type': 'standard', 'prompt': prompt_text, 'text': decoded_text})
                 except Exception as e:
-                    generated_texts.append(f"Generation failed: {str(e)}")
-        
+                    all_generated_outputs.append({'type': 'error', 'prompt': prompt_text, 'text': f"Generation failed: {str(e)}"})
+
+            # 2. CLS Test Prompts (with and without prefix attention enabled for the prompt)
+            model_is_nsp_configured = model_to_generate_from.nsp_task and \
+                                      hasattr(self.data_builder, 'cls_token_id') and \
+                                      self.data_builder.cls_token_id is not None
+
+            if model_is_nsp_configured and model_to_generate_from.use_cls_prefix_attention:
+                print(f"  Running CLS prefix attention inference tests (cls_id: {self.data_builder.cls_token_id})...")
+                for prompt_text in cls_test_prompts_text:
+                    try:
+                        text_tokens = self.data_builder._tokenize_text(prompt_text)
+                        input_tokens_with_cls = [self.data_builder.cls_token_id] + text_tokens
+                        x_cls = torch.tensor(input_tokens_with_cls, dtype=torch.long).unsqueeze(0).to(self.config.device)
+
+                        # Generate with Prefix Attention ON for the CLS in prompt
+                        generated_on_ids = model_to_generate_from.generate(
+                            x_cls.clone(), max_new_tokens=max_length, temperature=temperature,
+                            top_k=top_k, top_p=top_p, use_prefix_attention_in_prompt=True
+                        )
+                        decoded_text_on = self.data_builder.decode_tokens(generated_on_ids[0])
+                        all_generated_outputs.append({'type': 'CLS_Prefix_ON', 'prompt': f"[CLS] {prompt_text}", 'text': decoded_text_on})
+
+                        # Generate with Prefix Attention OFF for the CLS in prompt
+                        generated_off_ids = model_to_generate_from.generate(
+                            x_cls.clone(), max_new_tokens=max_length, temperature=temperature,
+                            top_k=top_k, top_p=top_p, use_prefix_attention_in_prompt=False
+                        )
+                        decoded_text_off = self.data_builder.decode_tokens(generated_off_ids[0])
+                        all_generated_outputs.append({'type': 'CLS_Prefix_OFF', 'prompt': f"[CLS] {prompt_text}", 'text': decoded_text_off})
+
+                    except Exception as e:
+                        all_generated_outputs.append({'type': 'error', 'prompt': f"[CLS] {prompt_text}", 'text': f"CLS Generation failed: {str(e)}"})
+            elif model_is_nsp_configured and not model_to_generate_from.use_cls_prefix_attention:
+                 print(f"  Skipping CLS prefix attention inference tests as model.use_cls_prefix_attention is False.")
+            else:
+                print(f"  Skipping CLS prefix attention inference tests as model is not NSP configured or CLS token ID is missing.")
+
         self.model.train()
-        return generated_texts
+        return all_generated_outputs
     
     def save_inference_sample(
         self, 
         step: int, 
         val_loss: float, 
         perplexity: float,
-        generated_texts: List[str],
-        prompts: List[str] = None
+        generated_outputs: List[Dict[str,str]], # Changed from generated_texts
+        prompts: List[str] = None # Prompts list might not be directly used if generated_outputs contains all info
     ):
         """Save inference sample to JSON file with metadata."""
-        if prompts is None:
-            prompts = ["", "The", "In", "Once upon a time"]
-        
         # Create inference samples directory
         inference_dir = Path(self.config.checkpoint_dir) / "inference_samples"
         inference_dir.mkdir(exist_ok=True)
@@ -1038,14 +1067,15 @@ class Trainer:
             "validation_loss": val_loss,
             "perplexity": perplexity,
             "timestamp": time.time(),
-            "samples": []
+            "samples": generated_outputs # Directly use the list of dicts
         }
         
-        for prompt, generated_text in zip(prompts, generated_texts):
-            sample_entry["samples"].append({
-                "prompt": prompt,
-                "generated_text": generated_text
-            })
+        # No longer zipping prompts and generated_texts, as generated_outputs has it all.
+        # for prompt, generated_text in zip(prompts, generated_texts):
+        #     sample_entry["samples"].append({
+        #         "prompt": prompt,
+        #         "generated_text": generated_text
+        #     })
         
         # Load existing samples or create new list
         samples_file = inference_dir / "inference_samples.json"
@@ -1069,11 +1099,8 @@ class Trainer:
         print(f"\n=== Inference Sample at Step {step} ===")
         print(f"Validation Loss: {val_loss:.4f}")
         print(f"Perplexity: {perplexity:.2f}")
-        for prompt, generated_text in zip(prompts, generated_texts):
-            if prompt:
-                print(f"Prompt: '{prompt}' → '{generated_text}'")
-            else:
-                print(f"No prompt → '{generated_text}'")
+        for item in generated_outputs: # Iterate through the list of dicts
+            print(f"Type: {item.get('type', 'N/A')}, Prompt: '{item.get('prompt', 'N/A')}' → '{item.get('text', 'Error')}'")
         print("=" * 50)
 
 
