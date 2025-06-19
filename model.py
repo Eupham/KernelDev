@@ -143,10 +143,6 @@ class GPTModel(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, x, targets=None, force_disable_prefix_attention: bool = False):
-        if self.nsp_task: # Only print if NSP is relevant for this model instance
-            # Updated print to include use_cls_prefix_attention and force_disable_prefix_attention
-            print(f"GPTModel.forward: Instance: nsp_task={self.nsp_task}, cls_id={self.cls_token_id}, use_cls_prefix_attn={self.use_cls_prefix_attention}, force_disable_prefix_attn={force_disable_prefix_attention}. Input seq_len: {x.shape[1]}")
-
         batch_size, seq_len = x.shape # x is input token IDs (batch_size, seq_len)
         
         # Initialize loss and nsp_logits
