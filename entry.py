@@ -463,7 +463,7 @@ def start_actual_training(cli_args):
     # Test causal vs non-causal attention
     if logging_cfg.get('test_attention_modes', True) and not cpu_test_mode : # Skip if CPU mode as it might be slow or not the point
         print(f"\n=== Testing Causal vs Non-Causal Attention ===")
-        test_causal_attention(model, dataloaders, training_config.device, data_builder)
+        test_causal_attention(model, dataloaders, training_config.device, data_builder, nsp_task_enabled)
     
     # Start training
     print(f"\n=== Starting Training ===")
@@ -521,15 +521,36 @@ def start_actual_training(cli_args):
 
 # --- End of original main logic, now in start_actual_training ---
 
-def test_causal_attention(model, dataloaders, device, data_builder):
+def test_causal_attention(model, dataloaders, device, data_builder, nsp_task_enabled: bool):
     """Test the difference between causal and non-causal attention."""
-    if 'train' not in dataloaders:
+    if 'train' not in dataloaders or not dataloaders['train']:
+        print("Warning: Train dataloader is empty or not found in test_causal_attention. Skipping test.")
         return
-    
-    # Get a sample batch
-    for x, y in dataloaders['train']:
-        x = x.to(device)
-        break
+
+    batch_iter = iter(dataloaders['train'])
+    try:
+        first_batch = next(batch_iter)
+    except StopIteration:
+        print("Warning: Train dataloader is empty in test_causal_attention. Skipping test.")
+        return
+
+    if nsp_task_enabled:
+        # Expecting (input_ids, lm_targets, nsp_label)
+        if len(first_batch) == 3:
+            x, _, _ = first_batch
+        else:
+            print(f"Warning: Expected 3 items in NSP batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            return
+    else:
+        # Expecting (input_ids, lm_targets)
+        if len(first_batch) == 2:
+            x, _ = first_batch # y (lm_targets) is not used in this function
+        else:
+            print(f"Warning: Expected 2 items in non-NSP batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            return
+
+    x = x.to(device)
+    # The rest of the function uses 'x'
 
     model.to(device)
     model.eval()
