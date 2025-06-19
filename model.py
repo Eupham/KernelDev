@@ -101,6 +101,7 @@ class GPTModel(nn.Module):
         self.dim = dim
         self.cls_token_id = cls_token_id
         self.nsp_task = nsp_task # Store nsp_task
+        print(f"GPTModel.__init__: nsp_task={self.nsp_task} (type: {type(self.nsp_task)}), cls_token_id={self.cls_token_id} (type: {type(self.cls_token_id)})")
         self.max_seq_len = max_seq_len
         
         # Token and position embeddings (no bias)
@@ -139,6 +140,9 @@ class GPTModel(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, x, targets=None):
+        if self.nsp_task: # Only print if NSP is relevant for this model instance
+            print(f"GPTModel.forward: Instance configured with self.nsp_task={self.nsp_task}, self.cls_token_id={self.cls_token_id}. Input seq_len: {x.shape[1]}")
+
         batch_size, seq_len = x.shape # x is input token IDs (batch_size, seq_len)
         
         # Initialize loss and nsp_logits
@@ -147,23 +151,13 @@ class GPTModel(nn.Module):
 
         # Create current_is_prefix_token_mask based on cls_token_id
         current_is_prefix_token_mask = None
-        if self.cls_token_id is not None:
-            # x here is the input token IDs batch_size, seq_len
-            # The mask should be (batch_size, seq_len) according to flash_attention kernel expectations for (T,) per batch item.
-            # However, flash_attention was modified to take (T,) and apply it across the batch.
-            # Let's make it (seq_len,) by taking the first batch item's mask if CLS is consistent across batch.
-            # Or, more robustly, ensure the kernel can handle (B, T) or we pass (T,) if all items in batch have same prefix structure.
-            # For now, assuming the kernel's PREFIX_TOKEN_MASK is (T,) and applies to all batch items.
-            # This means if different batch items have CLS at different places, this won't work as intended by passing a single (T,) mask.
-            # The previous change to original_kernel.py made PREFIX_TOKEN_MASK (T,).
-            # This implies that the prefix structure must be the same for all elements in a batch.
-            # This is a strong assumption. Let's assume for now the task implies CLS is at a fixed position (e.g. 0) for all items IF used.
-
-            # Create a boolean mask (seq_len,) indicating True for CLS token positions
-            # This will be based on the first item in the batch, assuming consistent CLS usage.
-            prefix_mask_bool_first_item = (x[0] == self.cls_token_id) # Shape (seq_len,)
+        if self.cls_token_id is not None: # This implies a CLS token is defined for the model
+            # The mask is (seq_len,) indicating True for CLS token positions.
+            # This is based on the first item in the batch, assuming consistent CLS usage / fixed position for the prefix.
+            # The flash_attention kernel expects a (T,) mask that applies to all batch items.
+            prefix_mask_bool_first_item = (x[0] == self.cls_token_id)
             if prefix_mask_bool_first_item.any():
-                current_is_prefix_token_mask = prefix_mask_bool_first_item.to(x.device) # Ensure it's on the right device
+                current_is_prefix_token_mask = prefix_mask_bool_first_item.to(x.device)
 
         # Create position indices
         pos = torch.arange(0, seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
