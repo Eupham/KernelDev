@@ -237,22 +237,44 @@ def start_actual_training(cli_args):
         'causal': model_cfg.get('causal', True)
     }
     
-    # Initialize model
-    print(f"\n=== Initializing Model (Initial Placeholder - Will be updated after DataBuilder) ===")
-    # model_config will be fully defined/updated after DataBuilder is initialized.
-    # For now, it's a dictionary derived from the main config.
-    # GPTModel(**model_config) # Actual instantiation moved after DataBuilder and model_config refinement.
+    # Model configuration is prepared (model_cfg)
+    # DataBuilder is needed next to finalize vocab_size and special tokens for model_config
 
-    # Setup precision and mixed precision training - This needs a model instance.
-    # This section will be problematic if model is not instantiated yet.
-    # Let's defer model instantiation and precision setup until after DataBuilder.
-    # print(f"\n=== Setting up Precision (Deferred until after DataBuilder) ===")
-    # dtype, scaler, use_amp = setup_precision(model, precision) # Cannot do this yet
-    dtype = None # Placeholder
-    scaler = None # Placeholder
-    use_amp = False # Placeholder
-    dtype, scaler, use_amp = setup_precision(model, precision)
+    # Create data builder
+    print("\n=== Loading and Processing Data ===")
+    # Pass nsp_task to create_data_builder
+    data_config_with_nsp = {**data_config, 'nsp_task': nsp_task_enabled}
+    data_builder = create_data_builder(**data_config_with_nsp)
+
+    # Update model_config with actual vocab_size and cls_token_id if NSP
+    actual_vocab_size = data_builder.get_vocab_size()
+    model_config['vocab_size'] = actual_vocab_size # This must be set for the model
+    model_config['nsp_task'] = nsp_task_enabled   # Pass nsp_task status to model
+    if nsp_task_enabled:
+        model_config['cls_token_id'] = data_builder.cls_token_id
+    else:
+        model_config['cls_token_id'] = None # Explicitly None if NSP is off
+
+    # Now instantiate the model with the fully defined model_config
+    print(f"\n=== Initializing Model ===")
+    print(f"Instantiating GPTModel with final model_config: {model_config}")
+    model = GPTModel(**model_config)
     
+    # Setup precision and mixed precision training now that model is instantiated
+    print(f"\n=== Setting up Precision ===")
+    print(f"Setting up precision for the model (Precision: {precision})...")
+    dtype, scaler, use_amp = setup_precision(model, precision) # Now model exists
+
+    # Update TrainingConfig with the scaler and use_amp status (as it might have changed)
+    training_config.scaler = scaler
+    training_config.use_amp = use_amp
+
+    # Ensure model is on the correct device (especially after CPU fallback or re-initialization)
+    # This should happen AFTER setup_precision, as setup_precision might change model's dtype
+    # and .to(device) should be called on the correctly typed model.
+    model.to(training_config.device)
+    print(f"Model moved to device: {training_config.device} after DataBuilder and final config.")
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -378,32 +400,6 @@ def start_actual_training(cli_args):
     # Pass nsp_task to create_data_builder
     data_config_with_nsp = {**data_config, 'nsp_task': nsp_task_enabled}
     data_builder = create_data_builder(**data_config_with_nsp)
-
-    # Update model_config with actual vocab_size and cls_token_id if NSP
-    actual_vocab_size = data_builder.get_vocab_size()
-    model_config['vocab_size'] = actual_vocab_size # This must be set for the model
-    model_config['nsp_task'] = nsp_task_enabled   # Pass nsp_task status to model
-    if nsp_task_enabled:
-        model_config['cls_token_id'] = data_builder.cls_token_id
-    else:
-        model_config['cls_token_id'] = None # Explicitly None if NSP is off
-
-    # Now instantiate the model with the fully defined model_config
-    print(f"Instantiating GPTModel with final model_config: {model_config}")
-    model = GPTModel(**model_config)
-
-    # Setup precision and mixed precision training now that model is instantiated
-    print(f"\n=== Setting up Precision ===")
-    dtype, scaler, use_amp = setup_precision(model, precision) # Now model exists
-
-    # Update TrainingConfig with the scaler and use_amp status (as it might have changed)
-    training_config.scaler = scaler
-    training_config.use_amp = use_amp
-
-    # Ensure model is on the correct device (especially after CPU fallback or re-initialization)
-    model.to(training_config.device)
-    print(f"Model moved to device: {training_config.device} after DataBuilder and final config.")
-
 
     # Create dataloaders
     try:
