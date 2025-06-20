@@ -421,15 +421,16 @@ class Trainer:
 
                 if self.config.use_amp: # AMP path for evaluation
                     with torch.amp.autocast('cuda'):
-                        lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
+                        lm_logits, per_item_lm_loss, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
                 else: # Standard precision for evaluation
-                    lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
+                    lm_logits, per_item_lm_loss, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
 
                 # Debug prints were here, now removed.
 
-                if lm_loss_from_model is not None:
-                    batch_combined_loss += lm_loss_from_model
-                    total_lm_loss += lm_loss_from_model.item()
+                if per_item_lm_loss is not None:
+                    mean_lm_loss_for_batch = per_item_lm_loss.mean() # Calculate mean for this batch
+                    batch_combined_loss += mean_lm_loss_for_batch      # Add scalar mean
+                    total_lm_loss += mean_lm_loss_for_batch.item() # Accumulate scalar for avg LM loss
                     num_lm_batches +=1
 
                 if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
