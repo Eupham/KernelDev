@@ -192,12 +192,41 @@ class GPTModel(nn.Module):
             nsp_logits = self.nsp_head(cls_token_representation)
 
         if targets is not None:
-            # Compute cross-entropy loss for language modeling
-            loss = F.cross_entropy(
+            # Calculate raw per-token loss, without reduction
+            raw_lm_loss_per_token = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=-1 # Typically -100 for ignored tokens, but -1 if vocab doesn't collide
+                ignore_index=-1, # Assuming -1 is used for padding/ignored LM targets
+                reduction='none'
             )
+            # Reshape per-token loss to (batch_size, seq_len)
+            lm_loss_per_token_unmasked = raw_lm_loss_per_token.view(batch_size, seq_len)
+
+            # Create a mask for valid (non-ignored) target tokens
+            # targets has shape (batch_size, seq_len)
+            valid_targets_mask = (targets != -1).float() # Convert to float for multiplication
+
+            # Sum loss only for valid tokens across seq_len for each batch item
+            per_item_lm_loss_sum = (lm_loss_per_token_unmasked * valid_targets_mask).sum(dim=1)
+
+            # Count valid (non-ignored) tokens per batch item
+            per_item_valid_token_count = valid_targets_mask.sum(dim=1)
+
+            # Avoid division by zero if a sequence has no valid targets
+            # Replace count of 0 with 1 to avoid NaN; loss for that item will be 0 if sum is 0.
+            per_item_valid_token_count = torch.where(
+                per_item_valid_token_count == 0,
+                torch.ones_like(per_item_valid_token_count),
+                per_item_valid_token_count
+            )
+
+            # Calculate mean loss per batch item
+            lm_loss_per_item = per_item_lm_loss_sum / per_item_valid_token_count # Shape: (batch_size,)
+
+            # The 'loss' variable returned by this method should now be this per-item loss tensor
+            loss = lm_loss_per_item
+        else:
+            loss = None # Keep as None if targets are not provided
 
         return logits, loss, nsp_logits
     

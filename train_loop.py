@@ -310,36 +310,45 @@ class Trainer:
         # Outputs will be used inside AMP context for loss calculation if AMP is enabled
         if self.config.use_amp and self.config.scaler is not None:
              with torch.amp.autocast('cuda'): # Autocast the model's forward pass
-                lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
+                lm_logits, per_item_lm_loss, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
         else: # Standard precision
-            lm_logits, lm_loss_from_model, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
+            lm_logits, per_item_lm_loss, nsp_logits = self.model(input_ids, lm_targets, force_disable_prefix_attention=False)
 
         # Debug prints were here, now removed.
 
+        final_batch_lm_loss_component = None
+        if per_item_lm_loss is not None:
+            if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
+                with torch.no_grad(): # NSP correctness check should not have gradients
+                    squeezed_nsp_logits = nsp_logits.squeeze(-1)
+                    nsp_preds = (torch.sigmoid(squeezed_nsp_logits.float()) > 0.5)
+                    nsp_correct_mask = (nsp_preds == nsp_labels.bool()).float() # (batch_size,)
+
+                scaling_factors = torch.ones_like(nsp_correct_mask, device=per_item_lm_loss.device)
+                scaling_factors[nsp_correct_mask == 1.0] = 0.8  # Correct NSP: scale down LM loss
+                scaling_factors[nsp_correct_mask == 0.0] = 1.2  # Incorrect NSP: scale up LM loss
+
+                scaled_per_item_lm_loss = per_item_lm_loss.float() * scaling_factors
+                final_batch_lm_loss_component = scaled_per_item_lm_loss.mean()
+            else:
+                final_batch_lm_loss_component = per_item_lm_loss.float().mean()
+
+        # Now calculate combined_loss using final_batch_lm_loss_component
+        # This needs to be done within AMP context if AMP is enabled for the actual loss that's scaled
+
         if self.config.use_amp and self.config.scaler is not None:
-            # Loss calculation and NSP accuracy calculation within autocast
             with torch.amp.autocast('cuda'):
-                # lm_loss_from_model and nsp_logits are from the autocasted model call
                 combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-                if lm_loss_from_model is not None:
-                    combined_loss += lm_loss_from_model.float()
+                if final_batch_lm_loss_component is not None:
+                    combined_loss += final_batch_lm_loss_component.float() # Ensure it's float
 
                 if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
-                    # nsp_logits might be float16 here. BCEWithLogitsLoss handles mixed precision.
-                    current_nsp_loss_for_calc = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
+                    # nsp_logits from model call might be float16. Ensure float for BCE.
+                    current_nsp_loss_for_calc = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1).float(), nsp_labels.float())
                     combined_loss += (self.config.nsp_loss_weight * current_nsp_loss_for_calc).float()
-                    current_nsp_loss_item = current_nsp_loss_for_calc.item() # Store item before autocast exits for this var
-                    with torch.no_grad(): # Accuracy calculation
-                        # Ensure logits are float for sigmoid if they are not already
-                        nsp_preds = torch.sigmoid(nsp_logits.squeeze(-1).float()) > 0.5
-                        nsp_correct = (nsp_preds == nsp_labels).sum().item()
-                        nsp_total_in_batch = nsp_labels.size(0)
-                        current_nsp_accuracy_item = nsp_correct / nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0
+                    # current_nsp_loss_item and current_nsp_accuracy_item are calculated for return later, outside autocast
 
-            # Check if any loss component was actually computed
-            # combined_loss would be 0.0 if no lm_loss and no nsp_loss contributed.
-            # A more robust check is if requires_grad is set, or if components were None.
-            if lm_loss_from_model is None and (not self.config.nsp_task or nsp_logits is None):
+            if final_batch_lm_loss_component is None and (not self.config.nsp_task or nsp_logits is None):
                  return 0.0, None, None
 
             self.config.scaler.scale(combined_loss).backward()
@@ -351,23 +360,16 @@ class Trainer:
             combined_loss_val = combined_loss.item()
             
         else: # Standard precision
-            # lm_logits, lm_loss_from_model, nsp_logits are already computed (standard precision)
             combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-            if lm_loss_from_model is not None:
-                combined_loss += lm_loss_from_model # Already float32
+            if final_batch_lm_loss_component is not None:
+                combined_loss += final_batch_lm_loss_component # Already float32 if per_item_lm_loss was
             
-            # Corrected indentation for this block:
             if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
                 current_nsp_loss_for_calc = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
                 combined_loss += self.config.nsp_loss_weight * current_nsp_loss_for_calc
-                current_nsp_loss_item = current_nsp_loss_for_calc.item()
-                with torch.no_grad():
-                    nsp_preds = torch.sigmoid(nsp_logits.squeeze(-1)) > 0.5
-                    nsp_correct = (nsp_preds == nsp_labels).sum().item()
-                    nsp_total_in_batch = nsp_labels.size(0)
-                    current_nsp_accuracy_item = nsp_correct / nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0
+                # current_nsp_loss_item and current_nsp_accuracy_item calculated later for return
 
-            if lm_loss_from_model is None and (not self.config.nsp_task or nsp_logits is None):
+            if final_batch_lm_loss_component is None and (not self.config.nsp_task or nsp_logits is None):
                  return 0.0, None, None
 
             combined_loss.backward()
@@ -375,6 +377,16 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
             combined_loss_val = combined_loss.item()
+
+        # Calculate NSP loss and accuracy for returning, outside of gradient computation and AMP scaling
+        if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
+            # Use .float() for nsp_logits before sigmoid/BCE if they came from AMP context and might be fp16
+            current_nsp_loss_item = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1).float(), nsp_labels.float()).item()
+            with torch.no_grad():
+                nsp_preds = torch.sigmoid(nsp_logits.squeeze(-1).float()) > 0.5
+                nsp_correct = (nsp_preds == nsp_labels.bool()).sum().item() # Ensure nsp_labels is bool for comparison if not already
+                nsp_total_in_batch = nsp_labels.size(0)
+                current_nsp_accuracy_item = nsp_correct / nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0
 
         return combined_loss_val, current_nsp_loss_item, current_nsp_accuracy_item
     
