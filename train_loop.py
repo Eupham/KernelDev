@@ -970,10 +970,11 @@ class Trainer:
                         # model returns lm_logits, lm_loss_from_model, nsp_logits
                         _, lm_loss, _ = self.model(input_ids, lm_targets)
                 else:
-                    _, lm_loss, _ = self.model(input_ids, lm_targets)
+                    _, lm_loss, _ = self.model(input_ids, lm_targets) # lm_loss is per-item (batch_size,)
                 
                 if lm_loss is not None:
-                    total_loss += lm_loss.item()
+                    mean_lm_loss_for_batch = lm_loss.mean() # Calculate scalar mean for the batch
+                    total_loss += mean_lm_loss_for_batch.item() # Add scalar item to total_loss
                     num_batches += 1
         
         self.model.train()
