@@ -319,18 +319,29 @@ class Trainer:
         final_batch_lm_loss_component = None
         if per_item_lm_loss is not None:
             if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
+                # Stage 1: Scaling based on NSP correctness
                 with torch.no_grad(): # NSP correctness check should not have gradients
                     squeezed_nsp_logits = nsp_logits.squeeze(-1)
                     nsp_preds = (torch.sigmoid(squeezed_nsp_logits.float()) > 0.5)
-                    nsp_correct_mask = (nsp_preds == nsp_labels.bool()).float() # (batch_size,)
+                    nsp_correct_mask = (nsp_preds == nsp_labels.bool()).float()  # 1.0 for correct, 0.0 for incorrect
 
-                scaling_factors = torch.ones_like(nsp_correct_mask, device=per_item_lm_loss.device)
-                scaling_factors[nsp_correct_mask == 1.0] = 0.8  # Correct NSP: scale down LM loss
-                scaling_factors[nsp_correct_mask == 0.0] = 1.2  # Incorrect NSP: scale up LM loss
+                correctness_scaling_factors = torch.ones_like(nsp_correct_mask, device=per_item_lm_loss.device)
+                correctness_scaling_factors[nsp_correct_mask == 1.0] = 0.8
+                correctness_scaling_factors[nsp_correct_mask == 0.0] = 1.2
 
-                scaled_per_item_lm_loss = per_item_lm_loss.float() * scaling_factors
-                final_batch_lm_loss_component = scaled_per_item_lm_loss.mean()
+                lm_loss_after_correctness_scaling = per_item_lm_loss.float() * correctness_scaling_factors
+
+                # Stage 2: Scaling based on true NSP label (prioritization)
+                # Ensure nsp_labels is on the same device for creating label_scaling_factors
+                # and for the indexing operation.
+                label_scaling_factors = torch.ones_like(nsp_labels, device=per_item_lm_loss.device, dtype=torch.float32)
+                label_scaling_factors[nsp_labels == 0] = 1.1  # Penalty for 'out of order' (actual negative)
+                label_scaling_factors[nsp_labels == 1] = 1.0  # No change for 'in order' (actual positive)
+
+                final_scaled_per_item_lm_loss = lm_loss_after_correctness_scaling * label_scaling_factors
+                final_batch_lm_loss_component = final_scaled_per_item_lm_loss.mean()
             else:
+                # No NSP for scaling, just take the mean of per-item LM losses
                 final_batch_lm_loss_component = per_item_lm_loss.float().mean()
 
         # Now calculate combined_loss using final_batch_lm_loss_component
