@@ -152,11 +152,10 @@ class GPTModel(nn.Module):
 
         # Create current_is_prefix_token_mask based on cls_token_id and use_cls_prefix_attention
         current_is_prefix_token_mask = None
-        # Only create prefix mask if NSP task is on, CLS token is defined, specific prefix attention for CLS is enabled, AND not forcibly disabled
-        if self.nsp_task and \
+        # Only create prefix mask if CLS token is defined, specific prefix attention for CLS is enabled, AND not forcibly disabled
+        if self.cls_token_id is not None and \
            self.use_cls_prefix_attention and \
-           self.cls_token_id is not None and \
-           not force_disable_prefix_attention: # Check the new flag
+           not force_disable_prefix_attention:
             # The mask is (seq_len,) indicating True for CLS token positions based on the first batch item.
             # This is because original_kernel.flash_attention expects a (T,) mask.
             prefix_mask_bool_first_item = (x[0] == self.cls_token_id)
