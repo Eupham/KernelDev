@@ -12,7 +12,7 @@ import os
 import json
 import math
 from pathlib import Path
-
+import contextlib
 
 class TrainingConfig:
     """Configuration class for training parameters."""
@@ -122,13 +122,15 @@ class TrainingMetrics:
         self.total_steps = 0
         self.best_val_loss = float('inf')
         self.best_step = 0
+
         self.lm_losses = []
         self.lev_aux_losses = []
         self.pred_dist_orig_means = []
+
         self.val_lm_losses = []
         self.val_lev_aux_losses = []
         self.val_pred_dist_orig_means = []
-        # Self-critique monitoring metrics
+
         self.d_self_critique_means = []
         self.d_self_critique_moving_avg = []
         self.d_self_critique_deltas = []
@@ -137,7 +139,7 @@ class TrainingMetrics:
 
     def update(self, train_loss=None, val_loss=None, learning_rate=None, step_time=None,
                  lm_loss_component=None, lev_aux_loss=None, pred_dist_orig_mean=None,
-                 d_self_critique_mean=None, # New metric
+                 d_self_critique_mean=None,
                  val_lm_loss_component=None, val_lev_aux_loss=None, val_pred_dist_orig_mean=None):
         if train_loss is not None: self.train_losses.append(train_loss)
         if val_loss is not None:
@@ -198,14 +200,16 @@ class Trainer:
         )
         print(f"Trainer initialized on device: {self.config.device}. Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
-    def train_step(self, batch: Tuple[torch.Tensor, ...]) -> Tuple[float, Optional[float], Optional[float], Optional[float]]:
+    def train_step(self, batch: Tuple[torch.Tensor, ...]) -> Tuple[float, Optional[float], Optional[float], Optional[float], Optional[float]]:
         mean_lm_loss_component_item = None
         mean_lev_aux_loss_item = None
         mean_pred_dist_orig_item = None
         mean_d_self_critique_for_batch_item = None
 
         if self.config.use_levenshtein_task:
-            original_tokens_cls, lm_targets, shuffled_tokens_cls, target_lev_distance_for_shuffled, target_coherence_score_for_original = batch
+            original_tokens_cls, lm_targets, shuffled_tokens_cls, \
+            target_lev_distance_for_shuffled, target_coherence_score_for_original = batch
+
             original_tokens_cls = original_tokens_cls.to(self.config.device)
             lm_targets = lm_targets.to(self.config.device)
             shuffled_tokens_cls = shuffled_tokens_cls.to(self.config.device)
@@ -220,13 +224,14 @@ class Trainer:
         self.optimizer.zero_grad()
         
         final_batch_lm_loss_component = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-        mean_aux_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+        aux_loss_components_sum = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+        num_aux_losses_calculated = 0
 
         lm_logits_orig, per_item_lm_loss, pred_dist_original, pred_dist_shuffled, d_self_critique_batch = None, None, None, None, None
 
-        autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else torch.no_grad() # Fallback to no_grad for non-AMP standard precision
+        autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
 
-        with autocast_context if self.config.use_amp else contextlib.suppress(): # Allow no-op for non-AMP
+        with autocast_context:
             # Pass 1: Original Data
             if original_tokens_cls is not None:
                 lm_logits_orig, per_item_lm_loss, pred_dist_original = self.model(
@@ -239,76 +244,70 @@ class Trainer:
                 )
             # Pass 3: Self-Critique
             if self.config.use_levenshtein_task and lm_logits_orig is not None:
-                with torch.no_grad(): # Generation part is no_grad
+                with torch.no_grad():
                     s_model_output_tokens = torch.argmax(lm_logits_orig.float(), dim=-1)
                     if hasattr(self.data_builder, 'cls_token_id') and self.data_builder.cls_token_id is not None:
                         cls_id = self.data_builder.cls_token_id
                         cls_tensor = torch.full((s_model_output_tokens.shape[0], 1), cls_id,
                                                 device=s_model_output_tokens.device, dtype=torch.long)
-                        input_for_critique_model = torch.cat([cls_tensor, s_model_output_tokens[:, :-1]], dim=1)
-                        # Model call for critique score needs to be in autocast if AMP is active for outer scope
-                        # If not AMP, this autocast is a no-op.
-                        with autocast_context if self.config.use_amp else contextlib.suppress():
-                             _, _, d_self_critique_batch = self.model(
-                                input_for_critique_model, targets=None, force_disable_prefix_attention=False
-                            )
+                        current_seq_len = s_model_output_tokens.shape[1]
+                        input_for_critique_model = torch.cat([cls_tensor, s_model_output_tokens[:, :current_seq_len-1]], dim=1)
+
+                        # Inner model call for critique score also needs autocast if outer AMP is active.
+                        with autocast_context: # Ensures this model call is also under autocast if AMP enabled
+                            _, _, d_self_critique_batch = self.model(
+                                    input_for_critique_model, targets=None, force_disable_prefix_attention=False
+                                )
                         if d_self_critique_batch is not None:
                              mean_d_self_critique_for_batch_item = d_self_critique_batch.mean().item()
+                    # else: Warning about cls_token_id missing can be added if necessary
+
+            # --- LM Loss Component Calculation (with Self-Critique Scaling) ---
+            if per_item_lm_loss is not None:
+                if self.config.use_levenshtein_task and d_self_critique_batch is not None:
+                    per_item_lm_loss_float = per_item_lm_loss.float()
+                    d_self_critique_float = d_self_critique_batch.float().to(per_item_lm_loss_float.device)
+                    l_lm_item_adjusted = per_item_lm_loss_float + 0.3
+                    d_min_batch = d_self_critique_float.min()
+                    d_max_batch = d_self_critique_float.max()
+                    denominator = d_max_batch - d_min_batch
+                    if denominator.abs() < 1e-6:
+                        norm_d_item_batch = torch.zeros_like(d_self_critique_float)
                     else:
-                        print("Warning: cls_token_id not available for self-critique in train_step.")
-
-        # --- LM Loss Component Calculation (with Self-Critique Scaling) ---
-        if per_item_lm_loss is not None:
-            if self.config.use_levenshtein_task and d_self_critique_batch is not None:
-                per_item_lm_loss_float = per_item_lm_loss.float()
-                d_self_critique_float = d_self_critique_batch.float().to(per_item_lm_loss_float.device)
-                l_lm_item_adjusted = per_item_lm_loss_float + 0.3
-                d_min_batch = d_self_critique_float.min()
-                d_max_batch = d_self_critique_float.max()
-                denominator = d_max_batch - d_min_batch
-                if denominator.abs() < 1e-6:
-                    norm_d_item_batch = torch.zeros_like(d_self_critique_float)
+                        norm_d_item_batch = (d_self_critique_float - d_min_batch) / denominator
+                    reward_scalar_r_batch = (1.0 - norm_d_item_batch) * 0.3
+                    final_scaled_lm_loss_item_batch = l_lm_item_adjusted - reward_scalar_r_batch
+                    final_batch_lm_loss_component = final_scaled_lm_loss_item_batch.mean()
                 else:
-                    norm_d_item_batch = (d_self_critique_float - d_min_batch) / denominator
-                reward_scalar_r_batch = (1.0 - norm_d_item_batch) * 0.3
-                final_scaled_lm_loss_item_batch = l_lm_item_adjusted - reward_scalar_r_batch
-                final_batch_lm_loss_component = final_scaled_lm_loss_item_batch.mean()
-            else:
-                final_batch_lm_loss_component = per_item_lm_loss.float().mean()
-            mean_lm_loss_component_item = final_batch_lm_loss_component.item()
+                    final_batch_lm_loss_component = per_item_lm_loss.float().mean()
+            # If per_item_lm_loss was None, final_batch_lm_loss_component remains 0.0 tensor.
+            mean_lm_loss_component_item = final_batch_lm_loss_component.item() if per_item_lm_loss is not None else None
 
-        # --- Auxiliary Losses Calculation ---
-        loss_fn_dist = torch.nn.MSELoss()
-        num_aux_losses_calculated = 0
-        if self.config.use_levenshtein_task:
-            if pred_dist_original is not None and target_coherence_score_for_original is not None:
-                loss_orig_dist = loss_fn_dist(pred_dist_original.float(), target_coherence_score_for_original.float())
-                mean_aux_loss_tensor += loss_orig_dist
-                num_aux_losses_calculated += 1
-                mean_pred_dist_orig_item = pred_dist_original.mean().item()
-            if pred_dist_shuffled is not None and target_lev_distance_for_shuffled is not None:
-                loss_shuf_dist = loss_fn_dist(pred_dist_shuffled.float(), target_lev_distance_for_shuffled.float())
-                mean_aux_loss_tensor += loss_shuf_dist
-                num_aux_losses_calculated += 1
-                mean_lev_aux_loss_item = loss_shuf_dist.item()
-            if num_aux_losses_calculated > 0:
-                mean_aux_loss_tensor /= num_aux_losses_calculated
 
-        # --- Assemble Combined Loss & Backpropagate ---
-        combined_loss = final_batch_lm_loss_component.float()
-        if self.config.use_levenshtein_task and (mean_aux_loss_tensor.item() != 0.0 or mean_aux_loss_tensor.requires_grad):
-             # Ensure adding float to float for combined_loss under AMP
-             if self.config.use_amp and self.config.scaler is not None:
-                 with torch.amp.autocast('cuda'):
-                     combined_loss = combined_loss + (self.config.levenshtein_loss_weight * mean_aux_loss_tensor).float()
-             else:
-                 combined_loss = combined_loss + (self.config.levenshtein_loss_weight * mean_aux_loss_tensor)
+            # --- Auxiliary Losses Calculation ---
+            loss_fn_dist = torch.nn.MSELoss()
+            if self.config.use_levenshtein_task:
+                if pred_dist_original is not None and target_coherence_score_for_original is not None:
+                    loss_orig_dist = loss_fn_dist(pred_dist_original.float(), target_coherence_score_for_original.float())
+                    aux_loss_components_sum += loss_orig_dist
+                    num_aux_losses_calculated +=1
+                    mean_pred_dist_orig_item = pred_dist_original.mean().item()
+                if pred_dist_shuffled is not None and target_lev_distance_for_shuffled is not None:
+                    loss_shuf_dist = loss_fn_dist(pred_dist_shuffled.float(), target_lev_distance_for_shuffled.float())
+                    aux_loss_components_sum += loss_shuf_dist
+                    num_aux_losses_calculated +=1
+                    mean_lev_aux_loss_item = loss_shuf_dist.item()
 
-        # Early exit
-        no_lm_loss = final_batch_lm_loss_component.abs().item() < 1e-9 and not final_batch_lm_loss_component.requires_grad
-        no_aux_loss = not self.config.use_levenshtein_task or (mean_aux_loss_tensor.abs().item() < 1e-9 and not mean_aux_loss_tensor.requires_grad)
-        if no_lm_loss and no_aux_loss:
-             return 0.0, None, None, None
+            # --- Assemble Combined Loss ---
+            combined_loss = final_batch_lm_loss_component.float()
+            if self.config.use_levenshtein_task and num_aux_losses_calculated > 0:
+                mean_aux_loss_tensor_for_combined = (aux_loss_components_sum / num_aux_losses_calculated).float()
+                combined_loss = combined_loss + (self.config.levenshtein_loss_weight * mean_aux_loss_tensor_for_combined)
+
+        # --- End of autocast_context for AMP ---
+
+        if not combined_loss.requires_grad and combined_loss.abs().item() < 1e-9:
+             return 0.0, None, None, None, None
 
         if self.config.use_amp and self.config.scaler is not None:
             self.config.scaler.scale(combined_loss).backward()
@@ -324,17 +323,14 @@ class Trainer:
             self.optimizer.step()
 
         combined_loss_val = combined_loss.item()
-        return combined_loss_val, mean_lm_loss_component_item, mean_lev_aux_loss_item, mean_pred_dist_orig_item
+        return combined_loss_val, mean_lm_loss_component_item, mean_lev_aux_loss_item, mean_pred_dist_orig_item, mean_d_self_critique_for_batch_item
     
     def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
-        """Evaluate the model on a dataset. Returns combined loss."""
         self.model.eval()
         total_combined_loss_epoch = 0
-
         accum_lm_loss_component = 0.0
         accum_lev_aux_loss = 0.0
         accum_pred_dist_orig_mean = 0.0
-
         num_batches_processed = 0
         num_lm_batches = 0
         num_lev_batches = 0
@@ -363,7 +359,6 @@ class Trainer:
                 current_batch_aux_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
 
                 per_item_lm_loss, pred_dist_original, pred_dist_shuffled = None, None, None
-
                 autocast_context_eval = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
                 with autocast_context_eval:
                     if original_tokens_cls is not None:
@@ -391,35 +386,29 @@ class Trainer:
                         num_aux_losses_in_batch_eval +=1
                         accum_lev_aux_loss += loss_shuf_dist.item()
                         num_lev_batches +=1
-
                     if num_aux_losses_in_batch_eval > 0 :
                          current_batch_aux_loss_tensor /= num_aux_losses_in_batch_eval
 
                 batch_total_loss = current_batch_lm_loss_tensor
                 if self.config.use_levenshtein_task:
                     batch_total_loss += self.config.levenshtein_loss_weight * current_batch_aux_loss_tensor
-
                 total_combined_loss_epoch += batch_total_loss.item()
                 num_batches_processed +=1
 
         self.model.train()
-
         avg_combined_loss = total_combined_loss_epoch / num_batches_processed if num_batches_processed > 0 else float('inf')
         avg_lm_loss_component = accum_lm_loss_component / num_lm_batches if num_lm_batches > 0 else 0.0
         avg_lev_aux_loss = accum_lev_aux_loss / num_lev_batches if num_lev_batches > 0 else 0.0
         avg_pred_dist_orig_mean = accum_pred_dist_orig_mean / num_pred_dist_orig_batches if num_pred_dist_orig_batches > 0 else 0.0
-
         self.metrics.update(
             val_loss=avg_combined_loss,
             val_lm_loss_component=avg_lm_loss_component,
             val_lev_aux_loss=avg_lev_aux_loss,
             val_pred_dist_orig_mean=avg_pred_dist_orig_mean
         )
-
         return avg_combined_loss
     
     def save_checkpoint(self, step: int, is_best: bool = False):
-        """Save model checkpoint."""
         if not self.is_distributed or dist.get_rank() == 0:
             model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
             checkpoint = {
@@ -444,24 +433,18 @@ class Trainer:
         checkpoint = torch.load(checkpoint_path, map_location=map_location)
         state_dict = checkpoint['model_state_dict']
         model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
-
         current_keys_have_module = all(k.startswith('module.') for k in model_to_load.state_dict().keys())
         checkpoint_keys_have_module = all(k.startswith('module.') for k in state_dict.keys())
-
-        if isinstance(self.model, DDP) and not checkpoint_keys_have_module:
-            pass # DDP model, non-DDP checkpoint: load directly into module
+        if isinstance(self.model, DDP) and not checkpoint_keys_have_module: pass
         elif not isinstance(self.model, DDP) and checkpoint_keys_have_module:
             state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
-        # Other cases (DDP to DDP, non-DDP to non-DDP with matching prefixes) are fine
-
         model_to_load.load_state_dict(state_dict)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         for key, value in checkpoint['metrics'].items():
-            if hasattr(self.metrics, key): # Only restore known metric attributes
-                 setattr(self.metrics, key, value)
+            if hasattr(self.metrics, key): setattr(self.metrics, key, value)
         print(f"Checkpoint loaded: {checkpoint_path}")
-        return checkpoint.get('step', 0) # Return step, default to 0 if not found
+        return checkpoint.get('step', 0)
     
     def train_epoch(
         self,
@@ -477,19 +460,19 @@ class Trainer:
         
         for batch_idx, batch in enumerate(train_loader):
             step_start = time.time()
-            combined_loss_item, current_lm_loss_item, current_lev_loss_item, current_pred_dist_orig_item = self.train_step(batch)
+            combined_loss_item, current_lm_loss_item, current_lev_loss_item, \
+                current_pred_dist_orig_item, current_d_self_critique_item = self.train_step(batch)
             epoch_losses.append(combined_loss_item)
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
-            step_time = time.time() - step_start
             self.metrics.update(
                 train_loss=combined_loss_item,
                 learning_rate=current_lr,
-                step_time=step_time,
+                step_time=time.time() - step_start,
                 lm_loss_component=current_lm_loss_item,
                 lev_aux_loss=current_lev_loss_item,
                 pred_dist_orig_mean=current_pred_dist_orig_item,
-                d_self_critique_mean=self.metrics.d_self_critique_means[-1] if self.metrics.d_self_critique_means else None # Pass last recorded critique mean
+                d_self_critique_mean=current_d_self_critique_item
             )
             
             if (not self.is_distributed or dist.get_rank() == 0) and \
@@ -500,7 +483,7 @@ class Trainer:
                     if current_lm_loss_item is not None: log_msg += f", LM Comp: {current_lm_loss_item:.4f}"
                     if current_lev_loss_item is not None: log_msg += f", Lev Aux (shuf): {current_lev_loss_item:.4f}"
                     if current_pred_dist_orig_item is not None: log_msg += f", Pred Dist (orig): {current_pred_dist_orig_item:.4f}"
-                    if self.metrics.d_self_critique_means and self.metrics.d_self_critique_means[-1] is not None : log_msg += f", AvgCritiqueD: {self.metrics.d_self_critique_means[-1]:.4f}"
+                    if current_d_self_critique_item is not None : log_msg += f", AvgCritiqueD: {current_d_self_critique_item:.4f}"
                     if self.metrics.d_self_critique_moving_avg and self.metrics.d_self_critique_moving_avg[-1] is not None: log_msg += f", EMA_CritiqueD: {self.metrics.d_self_critique_moving_avg[-1]:.4f}"
                     if self.metrics.d_self_critique_deltas and self.metrics.d_self_critique_deltas[-1] is not None: log_msg += f", DeltaCritiqueD: {self.metrics.d_self_critique_deltas[-1]:.4f}"
                 log_msg += f", LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
@@ -607,7 +590,7 @@ class Trainer:
                 print(f"Training metrics saved (Rank 0): {metrics_path}")
     
     def plot_training_curves(self, save_path: Optional[str] = None):
-        import contextlib # Import here if not already global
+        import contextlib
         fig, axes = plt.subplots(3, 2, figsize=(15, 15))
         ax_flat = axes.flatten()
         plot_idx = 0
@@ -631,16 +614,15 @@ class Trainer:
             ax_flat[plot_idx].set_xlabel('Step'); ax_flat[plot_idx].set_ylabel('Loss'); ax_flat[plot_idx].grid(True, alpha=0.3); ax_flat[plot_idx].legend()
         plot_idx += 1
 
-        if self.config.use_levenshtein_task and self.metrics.lev_aux_losses: # Shuffled loss
-            ax_flat[plot_idx].plot(self.metrics.lev_aux_losses, 'c-', alpha=0.7, label='Lev Aux Loss (Shuf, Train)')
-            # Plot EMA of self-critique distance on the same axis if available
+        if self.config.use_levenshtein_task:
+            if self.metrics.lev_aux_losses:
+                 ax_flat[plot_idx].plot(self.metrics.lev_aux_losses, 'c-', alpha=0.7, label='Lev Aux Loss (Shuf, Train)')
             if self.metrics.d_self_critique_moving_avg:
                  ax_flat[plot_idx].plot(self.metrics.d_self_critique_moving_avg, 'purple', linestyle=':', alpha=0.6, label='EMA Self-Critique Dist')
-            ax_flat[plot_idx].set_title('Lev. Aux Loss (Shuf) & EMA Critique (Train)')
+            ax_flat[plot_idx].set_title('Aux Losses & Critique (Train)')
             ax_flat[plot_idx].set_xlabel('Step'); ax_flat[plot_idx].set_ylabel('Loss / Distance'); ax_flat[plot_idx].grid(True, alpha=0.3); ax_flat[plot_idx].legend()
         plot_idx += 1
 
-        # Validation metrics plot
         if self.config.use_levenshtein_task and \
            (self.metrics.val_lm_losses or self.metrics.val_lev_aux_losses or self.metrics.val_pred_dist_orig_means):
             val_steps = np.arange(len(self.metrics.val_losses)) * self.config.eval_every
@@ -652,13 +634,11 @@ class Trainer:
             ax_val_main.set_title('Validation Loss Components')
             ax_val_main.set_xlabel('Step'); ax_val_main.set_ylabel('Loss'); ax_val_main.grid(True, alpha=0.3)
 
-            # Overlay mean predicted distance for original if available, on a secondary y-axis
             if self.metrics.val_pred_dist_orig_means:
                 ax_val_sec = ax_val_main.twinx()
                 ax_val_sec.plot(val_steps[:len(self.metrics.val_pred_dist_orig_means)], self.metrics.val_pred_dist_orig_means, 'k:', alpha=0.6, label='Mean Pred Dist (Orig, Val)')
                 ax_val_sec.set_ylabel('Mean Pred Dist (Val)', color='k')
                 ax_val_sec.tick_params(axis='y', labelcolor='k')
-                # Combine legends
                 lines, labels = ax_val_main.get_legend_handles_labels()
                 lines2, labels2 = ax_val_sec.get_legend_handles_labels()
                 ax_val_main.legend(lines + lines2, labels + labels2, loc='best')
@@ -667,7 +647,7 @@ class Trainer:
         plot_idx += 1
         
         if self.metrics.learning_rates:
-            ax_flat[plot_idx].plot(self.metrics.learning_rates, 'darkorange', alpha=0.7, label='Learning Rate') # Changed color
+            ax_flat[plot_idx].plot(self.metrics.learning_rates, 'darkorange', alpha=0.7, label='Learning Rate')
             ax_flat[plot_idx].set_title('Learning Rate')
             ax_flat[plot_idx].set_xlabel('Step'); ax_flat[plot_idx].set_ylabel('LR'); ax_flat[plot_idx].grid(True, alpha=0.3); ax_flat[plot_idx].legend()
         plot_idx += 1
@@ -698,19 +678,22 @@ class Trainer:
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
                 if max_batches is not None and batch_idx >= max_batches: break
-                # Adjusted batch unpacking for calculate_perplexity
-                if self.config.use_levenshtein_task : # Levenshtein yields 5 items
-                    input_ids, lm_targets, _, _, _ = batch
-                elif self.config.nsp_task: # NSP (old, but for safety if config is mixed) yields 3
+
+                # Updated batch unpacking for perplexity
+                if self.config.use_levenshtein_task :
+                    input_ids, lm_targets, _, _, _ = batch # Original text and its LM targets
+                elif hasattr(self.config, 'nsp_task') and self.config.nsp_task: # old check, for safety
                     input_ids, lm_targets, _ = batch
-                else: # Standard LM yields 2
+                else:
                     input_ids, lm_targets = batch
                 input_ids, lm_targets = input_ids.to(self.config.device), lm_targets.to(self.config.device)
                 
                 lm_loss = None
                 autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
                 with autocast_context:
-                    _, lm_loss, _ = self.model(input_ids, lm_targets) # lm_loss is per-item (batch_size,)
+                    # Model's forward for perplexity should focus on LM loss from original_tokens_cls
+                    # The third output (aux_score) is not used for perplexity.
+                    _, lm_loss, _ = self.model(input_ids, lm_targets, force_disable_prefix_attention=True) # Force disable prefix for pure LM perplexity
                 if lm_loss is not None:
                     total_loss += lm_loss.mean().item()
                     num_batches += 1
@@ -725,14 +708,13 @@ class Trainer:
         self.model.eval()
         model_to_generate_from = self.model.module if isinstance(self.model, DDP) else self.model
         all_generated_outputs = []
+        autocast_context = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
         with torch.no_grad():
             for prompt_text in standard_prompts:
                 try:
                     tokens = self.data_builder._tokenize_text(prompt_text) if prompt_text else []
                     x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device) if tokens else \
                         torch.randint(0, self.data_builder.vocab_size, (1,1)).to(self.config.device)
-                    
-                    autocast_context = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
                     with autocast_context:
                         generated_ids = model_to_generate_from.generate(x, max_new_tokens=max_length, temperature=temperature, top_k=top_k, top_p=top_p, use_prefix_attention_in_prompt=False)
                     decoded_text = self.data_builder.decode_tokens(generated_ids[0])
@@ -740,12 +722,14 @@ class Trainer:
                 except Exception as e:
                     all_generated_outputs.append({'type': 'error', 'prompt': prompt_text, 'text': f"Generation failed: {str(e)}"})
 
-            model_can_do_cls_prefix_attn = self.config.use_levenshtein_task and \
-                                        hasattr(model_to_generate_from, 'use_cls_prefix_attention') and \
-                                        model_to_generate_from.use_cls_prefix_attention and \
-                                        hasattr(self.data_builder, 'cls_token_id') and \
-                                        self.data_builder.cls_token_id is not None
-            if model_can_do_cls_prefix_attn:
+            model_is_lev_task_and_configured_for_cls_prefix = \
+                self.config.use_levenshtein_task and \
+                hasattr(model_to_generate_from, 'use_cls_prefix_attention') and \
+                model_to_generate_from.use_cls_prefix_attention and \
+                hasattr(self.data_builder, 'cls_token_id') and \
+                self.data_builder.cls_token_id is not None
+
+            if model_is_lev_task_and_configured_for_cls_prefix: # Check if model is configured for this
                 print(f"  Running CLS prefix attention inference tests (cls_id: {self.data_builder.cls_token_id})...")
                 for prompt_text in cls_test_prompts_text:
                     try:
@@ -762,7 +746,7 @@ class Trainer:
                     except Exception as e:
                         all_generated_outputs.append({'type': 'error', 'prompt': f"[CLS] {prompt_text}", 'text': f"CLS Generation failed: {str(e)}"})
             else:
-                 print(f"  Skipping CLS prefix attention inference tests based on model/data_builder configuration.")
+                 print(f"  Skipping CLS prefix attention inference tests based on model/data_builder configuration for Levenshtein task.")
         self.model.train()
         return all_generated_outputs
     
@@ -782,5 +766,3 @@ class Trainer:
 
 def create_trainer(model, config, data_builder=None): return Trainer(model, config, data_builder)
 if __name__ == "__main__": print("Trainer module loaded successfully!")
-
-[end of train_loop.py]

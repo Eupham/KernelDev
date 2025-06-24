@@ -336,32 +336,11 @@ def start_actual_training(cli_args):
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Parameter dtype: {next(model.parameters()).dtype}")
     
-    # Training configuration
-    inference_cfg = config.get('inference', {})
-    training_config = TrainingConfig(
-        num_epochs=training_cfg.get('epochs', 3),
-        learning_rate=training_cfg.get('learning_rate', 3e-4),
-        weight_decay=training_cfg.get('weight_decay', 0.01),
-        warmup_steps=training_cfg.get('warmup_steps', 100),
-        max_grad_norm=training_cfg.get('max_grad_norm', 1.0),
-        save_every=training_cfg.get('save_every', 500),
-        eval_every=training_cfg.get('eval_every', 200),
-        log_every=training_cfg.get('log_every', 50),
-        checkpoint_dir=training_cfg.get('checkpoint_dir', "checkpoints"),
-        device=hardware_cfg.get('device', 'auto'),
-        use_amp=use_amp,
-        scaler=scaler,
-        # Inference sampling parameters
-        inference_prompts=inference_cfg.get('prompts', ["", "The", "In", "Once upon a time"]),
-        inference_max_length=inference_cfg.get('max_length', 100),
-        inference_temperature=inference_cfg.get('temperature', 0.8),
-        inference_top_k=inference_cfg.get('top_k', 50),
-        inference_top_p=inference_cfg.get('top_p', 0.9),
-        # 'nsp_task': nsp_task_enabled, # Removed
-        # 'nsp_loss_weight': nsp_lw     # Removed
-        'use_levenshtein_task': lev_task_enabled,
-        'levenshtein_loss_weight': lev_lw
-    )
+    # The TrainingConfig object 'training_config' is already correctly instantiated
+    # earlier using 'training_config_params' which includes 'effective_device',
+    # 'scaler', 'use_amp', 'lev_task_enabled', 'lev_lw', and all other necessary parameters.
+    # The following block that re-instantiates TrainingConfig is redundant and was causing issues.
+    # It has been removed.
     
     # CPU Attention Fallback Logic
     if cpu_test_mode:
