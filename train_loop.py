@@ -316,51 +316,56 @@ class Trainer:
 
         # Debug prints were here, now removed.
 
+        # Initialize components for combined loss and metrics
         final_batch_lm_loss_component = None
+        current_nsp_loss_for_combined_loss = None # This will hold the tensor for NSP loss component
+
+        # 1. Calculate LM loss component (conditional on nsp_label == 1 if NSP is active)
         if per_item_lm_loss is not None:
-            if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
-                # Stage 1: Scaling based on NSP correctness
-                with torch.no_grad(): # NSP correctness check should not have gradients
-                    squeezed_nsp_logits = nsp_logits.squeeze(-1)
-                    nsp_preds = (torch.sigmoid(squeezed_nsp_logits.float()) > 0.5)
-                    nsp_correct_mask = (nsp_preds == nsp_labels.bool()).float()  # 1.0 for correct, 0.0 for incorrect
+            if self.config.nsp_task and nsp_labels is not None:
+                # LM loss only for 'in order' samples (nsp_label == 1)
+                in_order_mask = (nsp_labels == 1).float() # Shape: (batch_size,)
+                lm_loss_for_in_order_items_only = per_item_lm_loss.float() * in_order_mask
+                num_in_order_samples = in_order_mask.sum()
 
-                correctness_scaling_factors = torch.ones_like(nsp_correct_mask, device=per_item_lm_loss.device)
-                correctness_scaling_factors[nsp_correct_mask == 1.0] = 0.8
-                correctness_scaling_factors[nsp_correct_mask == 0.0] = 1.2
-
-                lm_loss_after_correctness_scaling = per_item_lm_loss.float() * correctness_scaling_factors
-
-                # Stage 2: Scaling based on true NSP label (prioritization)
-                # Ensure nsp_labels is on the same device for creating label_scaling_factors
-                # and for the indexing operation.
-                label_scaling_factors = torch.ones_like(nsp_labels, device=per_item_lm_loss.device, dtype=torch.float32)
-                label_scaling_factors[nsp_labels == 0] = 1.1  # Penalty for 'out of order' (actual negative)
-                label_scaling_factors[nsp_labels == 1] = 1.0  # No change for 'in order' (actual positive)
-
-                final_scaled_per_item_lm_loss = lm_loss_after_correctness_scaling * label_scaling_factors
-                final_batch_lm_loss_component = final_scaled_per_item_lm_loss.mean()
-            else:
-                # No NSP for scaling, just take the mean of per-item LM losses
+                if num_in_order_samples > 0:
+                    final_batch_lm_loss_component = lm_loss_for_in_order_items_only.sum() / num_in_order_samples
+                else:
+                    # If no 'in order' samples, LM component is 0 for this batch to avoid NaN
+                    final_batch_lm_loss_component = torch.tensor(0.0, device=per_item_lm_loss.device, dtype=torch.float32)
+            else: # Not NSP task, or nsp_labels unavailable, but have per_item_lm_loss
                 final_batch_lm_loss_component = per_item_lm_loss.float().mean()
 
-        # Now calculate combined_loss using final_batch_lm_loss_component
-        # This needs to be done within AMP context if AMP is enabled for the actual loss that's scaled
+        # 2. Calculate NSP loss component (for ALL samples if NSP active)
+        # This is also used for metrics current_nsp_loss_item and current_nsp_accuracy_item
+        if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
+            # Calculate mean NSP loss for the whole batch for combined_loss and metrics
+            # Ensure inputs to BCE are float, especially nsp_logits if from AMP model call
+            current_nsp_loss_for_combined_loss = F.binary_cross_entropy_with_logits(
+                nsp_logits.squeeze(-1).float(),
+                nsp_labels.float()
+            )
+            current_nsp_loss_item = current_nsp_loss_for_combined_loss.item() # For return
+            with torch.no_grad(): # For accuracy calculation
+                nsp_preds = torch.sigmoid(nsp_logits.squeeze(-1).float()) > 0.5
+                nsp_correct = (nsp_preds == nsp_labels.bool()).sum().item()
+                nsp_total_in_batch = nsp_labels.size(0)
+                current_nsp_accuracy_item = nsp_correct / nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0
 
+        # 3. Assemble combined_loss and perform backpropagation
         if self.config.use_amp and self.config.scaler is not None:
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda'): # Autocast for combining losses if components are from autocasted model
                 combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
                 if final_batch_lm_loss_component is not None:
-                    combined_loss += final_batch_lm_loss_component.float() # Ensure it's float
+                    combined_loss += final_batch_lm_loss_component.float()
+                if current_nsp_loss_for_combined_loss is not None:
+                    combined_loss += (self.config.nsp_loss_weight * current_nsp_loss_for_combined_loss).float()
 
-                if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
-                    # nsp_logits from model call might be float16. Ensure float for BCE.
-                    current_nsp_loss_for_calc = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1).float(), nsp_labels.float())
-                    combined_loss += (self.config.nsp_loss_weight * current_nsp_loss_for_calc).float()
-                    # current_nsp_loss_item and current_nsp_accuracy_item are calculated for return later, outside autocast
-
-            if final_batch_lm_loss_component is None and (not self.config.nsp_task or nsp_logits is None):
-                 return 0.0, None, None
+            if not combined_loss.requires_grad and combined_loss == 0.0: # Check if any actual loss was added
+                 # This condition might be too strict if one component is legitimately zero.
+                 # A better check: if final_batch_lm_loss_component is None and current_nsp_loss_for_combined_loss is None
+                if final_batch_lm_loss_component is None and current_nsp_loss_for_combined_loss is None:
+                    return 0.0, None, None
 
             self.config.scaler.scale(combined_loss).backward()
             if self.config.max_grad_norm > 0:
@@ -373,14 +378,11 @@ class Trainer:
         else: # Standard precision
             combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
             if final_batch_lm_loss_component is not None:
-                combined_loss += final_batch_lm_loss_component # Already float32 if per_item_lm_loss was
+                combined_loss += final_batch_lm_loss_component
+            if current_nsp_loss_for_combined_loss is not None:
+                combined_loss += self.config.nsp_loss_weight * current_nsp_loss_for_combined_loss
             
-            if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
-                current_nsp_loss_for_calc = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1), nsp_labels.float())
-                combined_loss += self.config.nsp_loss_weight * current_nsp_loss_for_calc
-                # current_nsp_loss_item and current_nsp_accuracy_item calculated later for return
-
-            if final_batch_lm_loss_component is None and (not self.config.nsp_task or nsp_logits is None):
+            if final_batch_lm_loss_component is None and current_nsp_loss_for_combined_loss is None:
                  return 0.0, None, None
 
             combined_loss.backward()
@@ -388,16 +390,6 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
             combined_loss_val = combined_loss.item()
-
-        # Calculate NSP loss and accuracy for returning, outside of gradient computation and AMP scaling
-        if self.config.nsp_task and nsp_logits is not None and nsp_labels is not None:
-            # Use .float() for nsp_logits before sigmoid/BCE if they came from AMP context and might be fp16
-            current_nsp_loss_item = F.binary_cross_entropy_with_logits(nsp_logits.squeeze(-1).float(), nsp_labels.float()).item()
-            with torch.no_grad():
-                nsp_preds = torch.sigmoid(nsp_logits.squeeze(-1).float()) > 0.5
-                nsp_correct = (nsp_preds == nsp_labels.bool()).sum().item() # Ensure nsp_labels is bool for comparison if not already
-                nsp_total_in_batch = nsp_labels.size(0)
-                current_nsp_accuracy_item = nsp_correct / nsp_total_in_batch if nsp_total_in_batch > 0 else 0.0
 
         return combined_loss_val, current_nsp_loss_item, current_nsp_accuracy_item
     
