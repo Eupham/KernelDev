@@ -420,9 +420,9 @@ def start_actual_training(cli_args):
     
     # Create data builder
     print("\n=== Loading and Processing Data ===")
-    # Pass nsp_task to create_data_builder
-    data_config_with_nsp = {**data_config, 'nsp_task': nsp_task_enabled}
-    data_builder = create_data_builder(**data_config_with_nsp)
+    # Pass use_levenshtein_task to create_data_builder
+    data_config_for_builder = {**data_config, 'use_levenshtein_task': lev_task_enabled}
+    data_builder = create_data_builder(**data_config_for_builder)
 
     # Create dataloaders
     try:
