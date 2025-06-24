@@ -3,7 +3,7 @@ from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset # Keep this import
 import numpy as np
 from typing import Optional, Dict, Any
-from nsp_dataset import NSPDataset # Import NSPDataset
+from levenshtein_dataset import LevenshteinDataset
 
 
 class TokenizedDataset(Dataset):
