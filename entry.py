@@ -83,6 +83,12 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     if hasattr(args, 'levenshtein_loss_weight') and args.levenshtein_loss_weight is not None:
         config.setdefault('training', {})['levenshtein_loss_weight'] = args.levenshtein_loss_weight
 
+    # Handle self-critique LM loss scaling arguments
+    if hasattr(args, 'lm_self_critique_base_penalty') and args.lm_self_critique_base_penalty is not None:
+        config.setdefault('model', {})['lm_self_critique_base_penalty'] = args.lm_self_critique_base_penalty
+    if hasattr(args, 'lm_self_critique_reward_max') and args.lm_self_critique_reward_max is not None:
+        config.setdefault('model', {})['lm_self_critique_reward_max'] = args.lm_self_critique_reward_max
+
     return config
 
 
@@ -190,8 +196,13 @@ def start_actual_training(cli_args):
     logging_cfg = config.get('logging', {})
 
     # Levenshtein and CPU attention fallback settings from config
-    lev_task_enabled = training_cfg.get('use_levenshtein_task', False) # Default to False if not specified
+    lev_task_enabled = training_cfg.get('use_levenshtein_task', True) # Default to True, as YAMLs will set it
     lev_lw = training_cfg.get('levenshtein_loss_weight', 0.1) # Default weight if not specified
+
+    # Self-critique parameters from model_cfg (after merge_config_with_args)
+    critique_base_penalty = model_cfg.get('lm_self_critique_base_penalty', 0.3)
+    critique_reward_max = model_cfg.get('lm_self_critique_reward_max', 0.3)
+
     cpu_test_mode = hardware_cfg.get('cpu_test_attention', False)
     
     # Set random seed for reproducibility
@@ -302,8 +313,10 @@ def start_actual_training(cli_args):
         'log_every': training_cfg.get('log_every', 50),
         'checkpoint_dir': training_cfg.get('checkpoint_dir', "checkpoints"),
         'device': effective_device,
-        'use_levenshtein_task': lev_task_enabled, # Changed from nsp_task
-        'levenshtein_loss_weight': lev_lw,       # Changed from nsp_loss_weight
+        'use_levenshtein_task': lev_task_enabled,
+        'levenshtein_loss_weight': lev_lw,
+        'lm_self_critique_base_penalty': critique_base_penalty,
+        'lm_self_critique_reward_max': critique_reward_max,
         'scaler': scaler,
         'use_amp': use_amp,
         # Inference params from gen_cfg (defined earlier)
@@ -552,7 +565,7 @@ def start_actual_training(cli_args):
 
 # --- End of original main logic, now in start_actual_training ---
 
-def test_causal_attention(model, dataloaders, device, data_builder, nsp_task_enabled: bool):
+def test_causal_attention(model, dataloaders, device, data_builder, lev_task_enabled: bool):
     """Test the difference between causal and non-causal attention."""
     if 'train' not in dataloaders or not dataloaders['train']:
         print("Warning: Train dataloader is empty or not found in test_causal_attention. Skipping test.")
@@ -565,19 +578,19 @@ def test_causal_attention(model, dataloaders, device, data_builder, nsp_task_ena
         print("Warning: Train dataloader is empty in test_causal_attention. Skipping test.")
         return
 
-    if nsp_task_enabled:
-        # Expecting (input_ids, lm_targets, nsp_label)
-        if len(first_batch) == 3:
-            x, _, _ = first_batch
+    if lev_task_enabled:
+        # Expecting (orig_tok, lm_tgt, shuf_tok, lev_dist, coh_score)
+        if len(first_batch) == 5:
+            x, _, _, _, _ = first_batch # Use the first item (original_tokens_cls)
         else:
-            print(f"Warning: Expected 3 items in NSP batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            print(f"Warning: Expected 5 items in Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
     else:
         # Expecting (input_ids, lm_targets)
         if len(first_batch) == 2:
             x, _ = first_batch # y (lm_targets) is not used in this function
         else:
-            print(f"Warning: Expected 2 items in non-NSP batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            print(f"Warning: Expected 2 items in non-Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
 
     x = x.to(device)
@@ -768,18 +781,30 @@ if __name__ == "__main__":
         default=None, # Default to None
         help='Learning rate (overrides config)'
     )
-    # Changed --nsp-task to allow True/False, defaulting to None if not specified by user
+    # Use --use-levenshtein-task, nsp-task is removed
     parser.add_argument(
-        '--nsp-task',
+        '--use-levenshtein-task',
         type=lambda x: (str(x).lower() == 'true'),
-        default=None,
-        help='Set Levenshtein task status (True/False).'
+        default=None, # YAMLs default to true, CLI can override to false
+        help='Enable/disable Levenshtein auxiliary task (True/False). Overrides config.'
     )
     parser.add_argument(
         '--levenshtein-loss-weight',
         type=float,
         default=None, # Default handled by TrainingConfig or YAML
         help='Weight for Levenshtein auxiliary loss component (overrides config, e.g., 0.1).'
+    )
+    parser.add_argument(
+        '--lm-self-critique-base-penalty',
+        type=float,
+        default=None,
+        help='Base value added to LM loss before self-critique reward subtraction (overrides config default: 0.3).'
+    )
+    parser.add_argument(
+        '--lm-self-critique-reward-max',
+        type=float,
+        default=None,
+        help='Max value for the self-critique reward scalar (0 to this value) (overrides config default: 0.3).'
     )
     parser.add_argument(
         '--use-cls-prefix-attention', # This can still be relevant if CLS is used in Levenshtein task

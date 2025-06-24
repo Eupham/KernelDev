@@ -44,6 +44,8 @@ class TrainingConfig:
         scheduler_T_mult: int = 1,
         use_levenshtein_task: bool = False,
         levenshtein_loss_weight: float = 0.1,
+        lm_self_critique_base_penalty: float = 0.3,
+        lm_self_critique_reward_max: float = 0.3,
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -69,6 +71,8 @@ class TrainingConfig:
         self.scheduler_T_mult = scheduler_T_mult
         self.use_levenshtein_task = use_levenshtein_task
         self.levenshtein_loss_weight = levenshtein_loss_weight
+        self.lm_self_critique_base_penalty = lm_self_critique_base_penalty
+        self.lm_self_critique_reward_max = lm_self_critique_reward_max
         
         if device == "auto":
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -267,7 +271,7 @@ class Trainer:
                 if self.config.use_levenshtein_task and d_self_critique_batch is not None:
                     per_item_lm_loss_float = per_item_lm_loss.float()
                     d_self_critique_float = d_self_critique_batch.float().to(per_item_lm_loss_float.device)
-                    l_lm_item_adjusted = per_item_lm_loss_float + 0.3
+                    l_lm_item_adjusted = per_item_lm_loss_float + self.config.lm_self_critique_base_penalty
                     d_min_batch = d_self_critique_float.min()
                     d_max_batch = d_self_critique_float.max()
                     denominator = d_max_batch - d_min_batch
@@ -275,7 +279,7 @@ class Trainer:
                         norm_d_item_batch = torch.zeros_like(d_self_critique_float)
                     else:
                         norm_d_item_batch = (d_self_critique_float - d_min_batch) / denominator
-                    reward_scalar_r_batch = (1.0 - norm_d_item_batch) * 0.3
+                    reward_scalar_r_batch = (1.0 - norm_d_item_batch) * self.config.lm_self_critique_reward_max
                     final_scaled_lm_loss_item_batch = l_lm_item_adjusted - reward_scalar_r_batch
                     final_batch_lm_loss_component = final_scaled_lm_loss_item_batch.mean()
                 else:

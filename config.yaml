@@ -32,9 +32,9 @@ training:
   # Directory to save checkpoints and logs
   checkpoint_dir: "checkpoints"
 
-  # NSP task parameters
-  nsp_task: true             # Enable Next Sentence Prediction auxiliary task
-  nsp_loss_weight: 0.5     # Weight for NSP loss when combined with Language Modeling loss
+  # Levenshtein task parameters
+  use_levenshtein_task: true # Enable Levenshtein distance auxiliary task
+  levenshtein_loss_weight: 0.1 # Weight for Levenshtein loss
 
   # Plateau detection parameters
   plateau_monitor_metric: 'val_loss'
@@ -89,6 +89,13 @@ model:
   
   # Use causal attention masking
   causal: true
+
+  # Whether to use prefix attention for CLS token (if CLS token is used)
+  use_cls_prefix_attention: true
+
+  # Self-critique LM loss scaling parameters
+  lm_self_critique_base_penalty: 0.3
+  lm_self_critique_reward_max: 0.3
 
 # GPU/Memory Configuration
 hardware:

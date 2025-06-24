@@ -47,8 +47,8 @@ training:
   eval_every: 200            # Evaluate every N steps
   log_every: 50              # Log every N steps
   checkpoint_dir: "checkpoints"
-  nsp_task: false          # Enable Next Sentence Prediction auxiliary task (boolean). If true, data processing changes for sentence pairs.
-  nsp_loss_weight: 0.5     # Weight for NSP loss when combined with Language Modeling loss (float).
+  use_levenshtein_task: true       # Enable Levenshtein distance auxiliary task (default: true in provided configs).
+  levenshtein_loss_weight: 0.1     # Weight for the Levenshtein auxiliary task loss (float).
 ```
 
 ### Data Parameters
@@ -61,27 +61,27 @@ data:
   max_eval_tokens: 50000     # Max tokens for evaluation
   num_workers: 0             # DataLoader workers
   shuffle_train: true        # Shuffle training data
-# Note on NSP: If `training: nsp_task` is true, data processing changes to prepare sentence pairs.
-# The `vocab_size` (defined in model parameters) will be effectively increased by 2 internally
-# by the `DataBuilder` to accommodate special `[CLS]` and `[SEP]` tokens (e.g., a configured
-# `vocab_size` of 256 for byte tokenization will be treated as 258 by the model and DataBuilder if NSP is active).
+# Note: When `use_levenshtein_task` is true, data is processed as individual sequences/sentences.
+# Original and word-shuffled versions are created. `[CLS]` is prepended to sequences for the Levenshtein head.
+# `[SEP]` tokens are generally not used for this task.
 ```
 
 ### Model Parameters
 ```yaml
 model:
-  vocab_size: 256            # Base vocabulary size (e.g., 256 for byte-level tokenization).
-                             # This should be set before considering special tokens for tasks like NSP.
-                             # The actual vocabulary size used by the model's embedding layer will be
-                             # adjusted by the `DataBuilder` (e.g., to vocab_size + 2) if `nsp_task` is enabled
-                             # to accommodate `[CLS]` and `[SEP]` tokens.
+  vocab_size: 256            # Base vocabulary size. If `use_levenshtein_task` is true, `DataBuilder`
+                             # effectively increases this by 1 for a special `[CLS]` token if `cls_token_id`
+                             # (e.g. 256) is at or above this base size.
   dim: 512                   # Model dimension
   n_layers: 12               # Number of transformer layers
   n_heads: 16                # Number of attention heads
   max_seq_len: 2048          # Maximum sequence length
   mlp_ratio: 4               # MLP expansion ratio
   causal: true               # Use causal attention
-  use_cls_prefix_attention: true  # If `training: nsp_task` is true, this determines if the CLS token gets special prefix attention during training and standard evaluation loops. Defaults to `true` if `nsp_task` is active and this option is not specified in the config. Note: For text generation via `GPTModel.generate`, this model's setting is overridden by the `use_prefix_attention_in_prompt` parameter of the `generate` method.
+  use_cls_prefix_attention: true   # For Levenshtein task, if CLS token's representation is used by the head,
+                                 # enable its prefix attention (boolean).
+  lm_self_critique_base_penalty: 0.3 # Base value added to LM loss before self-critique reward.
+  lm_self_critique_reward_max: 0.3   # Max value for the self-critique reward scalar (0 to this value).
 ```
 
 ### Hardware Parameters
@@ -120,10 +120,38 @@ python entry.py \
 - `--seq-len`: Sequence length for training
 - `--epochs`: Number of training epochs
 - `--learning-rate`: Learning rate
-- `--nsp-task <True/False>`: Enable or disable the Next Sentence Prediction task. Overrides config. Defaults to `true` if not specified and not set in config. (Note: use True/False, e.g. `--nsp-task False`)
-- `--nsp-loss-weight FLOAT`: Set the weight for the NSP loss component (e.g., 0.5) (overrides config).
-- `--use-cls-prefix-attention <True/False>`: Enable or disable special prefix attention for the CLS token during NSP training and evaluation. Overrides the `model:use_cls_prefix_attention` config. If not provided, behavior follows the model config (which defaults to true if NSP is active). (Note: use True/False)
+- `--use-levenshtein-task <True/False>`: Enable/disable Levenshtein auxiliary task. Overrides config.
+- `--levenshtein-loss-weight FLOAT`: Weight for Levenshtein auxiliary task loss component (e.g., 0.1). Overrides config.
+- `--use-cls-prefix-attention <True/False>`: Enable/disable special prefix attention for CLS token if used by Levenshtein head. Overrides config.
+- `--lm-self-critique-base-penalty FLOAT`: Base value added to LM loss before self-critique reward subtraction (e.g., 0.3). Overrides config.
+- `--lm-self-critique-reward-max FLOAT`: Max value for the self-critique reward scalar (e.g., 0.3). Overrides config.
 - `--cpu-test-attention`: Enable CPU attention fallback for testing (overrides config).
+
+## Levenshtein Distance Auxiliary Task & Self-Critique LM Scaling
+
+This section details the Levenshtein distance prediction auxiliary task and how it's used for a self-critique mechanism to scale the primary Language Modeling (LM) loss.
+
+### Levenshtein Distance Task
+- **Objective**: Train a model head (specifically, `model.levenshtein_head`) to predict the word-level Levenshtein distance.
+- **Inputs to this head**: The head typically processes the representation of the `[CLS]` token, which is prepended to input sequences.
+    - For original (unshuffled) sentences/sequences, the target Levenshtein distance is 0 (representing perfect coherence).
+    - For word-shuffled versions of sentences/sequences, the target is the actual word-level Levenshtein distance between the original and shuffled word lists.
+- **CLS Token Attention**: If `model: use_cls_prefix_attention: true` is set, the `[CLS]` token (when processed by the main transformer blocks, not just the head) receives prefix attention, allowing it to attend to all other tokens in its sequence, bypassing standard causal masking for this specific token. This helps it gather a global representation of the sequence for the Levenshtein head.
+- **Loss Contribution**: The auxiliary task's loss is calculated as the Mean Squared Error (MSE) between the predicted distances and the target distances. This auxiliary loss is then weighted by `training: levenshtein_loss_weight` and added to the main LM loss.
+
+### Self-Critique LM Loss Scaling
+- **Objective**: Modulate the main LM loss for a given training item based on the Levenshtein head's assessment of the coherence of the LM's *own generated output* for that item. The intuition is to penalize the LM less if its own generation is coherent, and more if it's incoherent.
+- **Process**:
+    1. The standard per-item Cross-Entropy loss for Language Modeling (`per_item_lm_ce_loss`) is calculated based on the original, unshuffled input sequences.
+    2. The model's own likely generated sequence (derived from `torch.argmax` of the LM logits from the original sentence) is created. This sequence is then prepended with a `[CLS]` token.
+    3. This `[CLS]`-prepended, model-generated sequence is passed to the Levenshtein head to obtain a `d_self_critique` score. A lower score indicates better coherence (closer to 0, which is the ideal for an original sentence).
+    4. The `d_self_critique` scores are normalized across the batch (`norm_d_item_batch`) so that the best (lowest distance) item in the batch gets a normalized score of 0, and the worst (highest distance) gets 1.
+    5. A reward `r` is calculated: `r = (1.0 - norm_d_item_batch) * model: lm_self_critique_reward_max`. This reward is higher for more coherent generations (lower `norm_d_item_batch`).
+    6. The final scaled LM loss for that training item is computed as: `scaled_lm_loss = (per_item_lm_ce_loss + model: lm_self_critique_base_penalty) - r`.
+       - `lm_self_critique_base_penalty`: A base value added to the LM loss. This ensures that even with maximum reward, the LM loss doesn't become too small or negative, maintaining a learning signal.
+       - `lm_self_critique_reward_max`: Scales the maximum possible reward.
+- **Total Loss**: The mean of this `scaled_lm_loss` across the batch forms the LM component of the final combined loss, to which the weighted Levenshtein auxiliary loss is added.
+- **Monitoring**: Training logs will include metrics such as the average `d_self_critique` score, its Exponential Moving Average (EMA), and the delta between the current score and its EMA. These help monitor the model's self-assessed coherence.
 
 ## Precision Modes
 
@@ -245,37 +273,3 @@ The training script generates:
 - Use FP32 precision for stability
 - Increase training data (`max_samples`)
 - Adjust learning rate
-
-## Next Sentence Prediction (NSP) Task
-
-The model supports an auxiliary Next Sentence Prediction (NSP) task.
-- **Objective**: Binary classification – does sentence B logically follow sentence A?
-- **To Enable**: Set `nsp_task: true` in the `training` section of your configuration file or use the `--nsp-task` command-line flag.
-- **Tokens**: Utilizes `[CLS]` and `[SEP]` tokens. Input is formatted as `[CLS] sentence A [SEP] sentence B [SEP]`. The `[CLS]` token's representation is used for the NSP classification.
-- **Attention**: The `[CLS]` token uses a special attention mechanism allowing it to attend to all tokens in the sequence (prefix attention), while other tokens remain autoregressive (if `model: causal` is true and the `[CLS]` token is part of the input sequence being processed by `flash_attention`).
-- **Data Requirement**: For effective NSP training, particularly for positive examples, it's crucial that the source documents from which sentence pairs are extracted contain at least two sentences. The data loader attempts to create valid pairs, but the quality and structure of the input data (e.g., from `dataset_name`) directly impact NSP task performance.
-
-### Example NSP Configuration Snippet
-```yaml
-# In your config.yaml or a custom config file:
-training:
-  # ... other training params ...
-  nsp_task: true
-  nsp_loss_weight: 0.5
-
-data:
-  # ... other data params ...
-  # Ensure your dataset provides documents that can be segmented into multiple sentences.
-  # seq_len should be sufficient to hold [CLS], sentence A, [SEP], sentence B, [SEP], and some content.
-  seq_len: 128 # Example, adjust as needed
-
-model:
-  # ... other model params ...
-  vocab_size: 256 # Base vocab size, will be auto-adjusted to 258 for NSP
-  use_cls_prefix_attention: true # Default for training if nsp_task is true
-```
-
-**Note on Inference with CLS Tokens (Text Generation):**
-When using text generation capabilities (e.g., via `GPTModel.generate`):
-- By default (i.e., when `use_prefix_attention_in_prompt=False` is passed to the `generate` method, which is its default), any `[CLS]` token included in a generation prompt will be treated with standard causal attention. This occurs even if the model was trained with NSP and `use_cls_prefix_attention: true` was set in the model configuration.
-- To enable prefix attention for `[CLS]` tokens *within a prompt* during a specific `generate` call, you must explicitly pass `use_prefix_attention_in_prompt=True` to the `GPTModel.generate` method. This allows the CLS token in the prompt to utilize its special prefix attention mechanism, if the model was configured with `use_cls_prefix_attention: true` during its initialization.
