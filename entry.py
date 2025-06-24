@@ -70,21 +70,18 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
         config['training']['learning_rate'] = args.learning_rate
     
     # NSP and CPU attention fallback arguments
-    # training_config = config.setdefault('training', {}) # Ensure 'training' key exists
-    if hasattr(args, 'nsp_task') and args.nsp_task is not None: # args.nsp_task can be True or False if flag is used
-        config.setdefault('training', {})['nsp_task'] = args.nsp_task
-    # If args.nsp_task is None (flag not used), we don't set it here.
-    # The default of True will be handled by config.get('training', {}).get('nsp_task', True)
-    # in start_actual_training or by TrainingConfig default.
-
-    if hasattr(args, 'nsp_loss_weight') and args.nsp_loss_weight is not None:
-        config.setdefault('training', {})['nsp_loss_weight'] = args.nsp_loss_weight
     if hasattr(args, 'cpu_test_attention') and args.cpu_test_attention is not None:
-        config.setdefault('hardware', {})['cpu_test_attention'] = args.cpu_test_attention # Ensure hardware key exists
+        config.setdefault('hardware', {})['cpu_test_attention'] = args.cpu_test_attention
 
-    # Handle use_cls_prefix_attention
+    # Handle use_cls_prefix_attention (still relevant for Levenshtein if CLS is used)
     if hasattr(args, 'use_cls_prefix_attention') and args.use_cls_prefix_attention is not None:
         config.setdefault('model', {})['use_cls_prefix_attention'] = args.use_cls_prefix_attention
+
+    # Handle Levenshtein task arguments
+    if hasattr(args, 'use_levenshtein_task') and args.use_levenshtein_task is not None:
+        config.setdefault('training', {})['use_levenshtein_task'] = args.use_levenshtein_task
+    if hasattr(args, 'levenshtein_loss_weight') and args.levenshtein_loss_weight is not None:
+        config.setdefault('training', {})['levenshtein_loss_weight'] = args.levenshtein_loss_weight
 
     return config
 
@@ -192,10 +189,9 @@ def start_actual_training(cli_args):
     gen_cfg = config.get('generation', {})
     logging_cfg = config.get('logging', {})
 
-    # NSP and CPU attention fallback settings from config
-    # Default nsp_task to True if not specified in YAML or by CLI
-    nsp_task_enabled = training_cfg.get('nsp_task', True)
-    nsp_lw = training_cfg.get('nsp_loss_weight', 0.5)
+    # Levenshtein and CPU attention fallback settings from config
+    lev_task_enabled = training_cfg.get('use_levenshtein_task', False) # Default to False if not specified
+    lev_lw = training_cfg.get('levenshtein_loss_weight', 0.1) # Default weight if not specified
     cpu_test_mode = hardware_cfg.get('cpu_test_attention', False)
     
     # Set random seed for reproducibility
@@ -246,26 +242,31 @@ def start_actual_training(cli_args):
 
     # Create data builder
     print("\n=== Loading and Processing Data ===")
-    # Pass nsp_task to create_data_builder
-    data_config_with_nsp = {**data_config, 'nsp_task': nsp_task_enabled}
-    data_builder = create_data_builder(**data_config_with_nsp)
+    # Pass use_levenshtein_task to create_data_builder
+    data_config_with_lev = {**data_config, 'use_levenshtein_task': lev_task_enabled}
+    data_builder = create_data_builder(**data_config_with_lev)
 
-    # Update model_config with actual vocab_size and cls_token_id if NSP
+    # Update model_config with actual vocab_size and cls_token_id if Levenshtein task is enabled
     actual_vocab_size = data_builder.get_vocab_size()
-    model_config['vocab_size'] = actual_vocab_size # This must be set for the model
-    model_config['nsp_task'] = nsp_task_enabled
-    if nsp_task_enabled:
-        model_config['cls_token_id'] = data_builder.cls_token_id
-        # Determine use_cls_prefix_attention based on config or default to True if NSP is on
-        use_cls_prefix_attention_from_config = model_cfg.get('use_cls_prefix_attention', None) # model_cfg is from loaded config
+    model_config['vocab_size'] = actual_vocab_size
+
+    # Pass lev_task_enabled to model_config (renamed from nsp_task)
+    # The model's __init__ will need to accept 'use_levenshtein_task' or similar.
+    # For now, let's assume GPTModel will be updated to look for this or a generic 'aux_task_enabled'.
+    # For this step, we ensure model_config has the necessary info.
+    # model_config['use_levenshtein_task'] = lev_task_enabled # This will be used by GPTModel
+
+    if lev_task_enabled:
+        model_config['cls_token_id'] = data_builder.cls_token_id # Set by DataBuilder if lev task is on
+        # use_cls_prefix_attention is still a model_cfg parameter, potentially overridden by CLI
+        use_cls_prefix_attention_from_config = model_cfg.get('use_cls_prefix_attention', None)
         if use_cls_prefix_attention_from_config is None:
-            model_config['use_cls_prefix_attention'] = True # Default to True if NSP is on and not specified
+            model_config['use_cls_prefix_attention'] = True # Default to True if Levenshtein task is on and not specified
         else:
             model_config['use_cls_prefix_attention'] = use_cls_prefix_attention_from_config
     else:
-        model_config['cls_token_id'] = None # Explicitly None if NSP is off
-        model_config['use_cls_prefix_attention'] = False # Not relevant if NSP is off
-
+        model_config['cls_token_id'] = None
+        model_config['use_cls_prefix_attention'] = False
 
     # Now instantiate the model with the fully defined model_config
     print(f"\n=== Initializing Model ===")
@@ -300,11 +301,11 @@ def start_actual_training(cli_args):
         'eval_every': training_cfg.get('eval_every', 200),
         'log_every': training_cfg.get('log_every', 50),
         'checkpoint_dir': training_cfg.get('checkpoint_dir', "checkpoints"),
-        'device': effective_device,  # Pass the determined effective_device
-        'nsp_task': nsp_task_enabled, # nsp_task_enabled defined earlier
-        'nsp_loss_weight': nsp_lw,    # nsp_lw defined earlier
-        'scaler': scaler,             # Pass scaler from setup_precision
-        'use_amp': use_amp,           # Pass use_amp from setup_precision
+        'device': effective_device,
+        'use_levenshtein_task': lev_task_enabled, # Changed from nsp_task
+        'levenshtein_loss_weight': lev_lw,       # Changed from nsp_loss_weight
+        'scaler': scaler,
+        'use_amp': use_amp,
         # Inference params from gen_cfg (defined earlier)
         'inference_prompts': gen_cfg.get('prompts', ["", "The", "In", "Once upon a time"]),
         'inference_max_length': gen_cfg.get('max_length', 100),
@@ -356,8 +357,10 @@ def start_actual_training(cli_args):
         inference_temperature=inference_cfg.get('temperature', 0.8),
         inference_top_k=inference_cfg.get('top_k', 50),
         inference_top_p=inference_cfg.get('top_p', 0.9),
-        nsp_task=nsp_task_enabled, # Pass to TrainingConfig
-        nsp_loss_weight=nsp_lw    # Pass to TrainingConfig
+        # 'nsp_task': nsp_task_enabled, # Removed
+        # 'nsp_loss_weight': nsp_lw     # Removed
+        'use_levenshtein_task': lev_task_enabled,
+        'levenshtein_loss_weight': lev_lw
     )
     
     # CPU Attention Fallback Logic
@@ -464,15 +467,16 @@ def start_actual_training(cli_args):
     # Test a batch
     if 'train' in dataloaders:
         print("\n=== Data Sample ===")
-        # Adjust for NSPDataset output (input_ids, lm_targets, nsp_label)
-        if nsp_task_enabled:
-            for input_ids_sample, _, nsp_label_sample in dataloaders['train']:
-                print(f"NSP Batch shapes: IDs-{input_ids_sample.shape}, NSP Labels-{nsp_label_sample.shape}")
-                print(f"Sample NSP input tokens: {input_ids_sample[0][:20].tolist()}")
-                sample_text = data_builder.decode_tokens(input_ids_sample[0][:50])
-                print(f"Sample NSP text: '{sample_text[:100]}...'")
+        # Adjust for LevenshteinDataset or standard output
+        if lev_task_enabled:
+            # LevenshteinDataset yields: orig_tok, lm_tgt, shuf_tok, lev_dist, coh_score
+            for orig_tok_sample, lm_tgt_sample, _, _, _ in dataloaders['train']:
+                print(f"Levenshtein Batch shapes: Orig Toks-{orig_tok_sample.shape}, LM Targets-{lm_tgt_sample.shape}")
+                print(f"Sample Levenshtein input tokens (original): {orig_tok_sample[0][:20].tolist()}")
+                sample_text = data_builder.decode_tokens(orig_tok_sample[0][:50])
+                print(f"Sample Levenshtein text (original): '{sample_text[:100]}...'")
                 break
-        else:
+        else: # Standard LM task
             for x, y in dataloaders['train']:
                 print(f"Batch shape: {x.shape}")
                 print(f"Sample tokens: {x[0][:20].tolist()}")
@@ -492,22 +496,26 @@ def start_actual_training(cli_args):
     print(f"\n=== Initial Evaluation ===")
     if 'train' in dataloaders and 'validation' in dataloaders:
         max_eval_batches = eval_cfg.get('max_eval_batches', 10)
-        # Initial evaluation returns combined loss. NSP metrics are updated in trainer.metrics
+        # Initial evaluation returns combined loss. Levenshtein metrics will be updated in trainer.metrics
         initial_train_loss_combined = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
         initial_val_loss_combined = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
 
         print(f"Initial training loss (combined): {initial_train_loss_combined:.4f}")
-        if nsp_task_enabled and trainer.metrics.val_nsp_losses: # Check if metrics got populated
-             print(f"  Initial train NSP loss: {trainer.metrics.val_nsp_losses[-2]:.4f}, NSP Acc: {trainer.metrics.val_nsp_accuracies[-2]:.4f}") # Eval on train populates val lists
+        if lev_task_enabled and hasattr(trainer.metrics, 'val_lev_aux_losses') and trainer.metrics.val_lev_aux_losses:
+             # Assuming evaluate on train populates val_lev_aux_losses first, then on val.
+             # This indexing might need adjustment based on how metrics are stored/updated.
+             if len(trainer.metrics.val_lev_aux_losses) >=2:
+                 print(f"  Initial train Levenshtein Aux loss: {trainer.metrics.val_lev_aux_losses[-2]:.4f}")
 
         print(f"Initial validation loss (combined): {initial_val_loss_combined:.4f}")
-        if nsp_task_enabled and trainer.metrics.val_nsp_losses:
-             print(f"  Initial validation NSP loss: {trainer.metrics.val_nsp_losses[-1]:.4f}, NSP Acc: {trainer.metrics.val_nsp_accuracies[-1]:.4f}")
+        if lev_task_enabled and hasattr(trainer.metrics, 'val_lev_aux_losses') and trainer.metrics.val_lev_aux_losses:
+             print(f"  Initial validation Levenshtein Aux loss: {trainer.metrics.val_lev_aux_losses[-1]:.4f}")
     
     # Test causal vs non-causal attention
-    if logging_cfg.get('test_attention_modes', True) and not cpu_test_mode : # Skip if CPU mode as it might be slow or not the point
+    if logging_cfg.get('test_attention_modes', True) and not cpu_test_mode :
         print(f"\n=== Testing Causal vs Non-Causal Attention ===")
-        test_causal_attention(model, dataloaders, training_config.device, data_builder, nsp_task_enabled)
+        # test_causal_attention needs to know if CLS token logic is active (from lev_task_enabled)
+        test_causal_attention(model, dataloaders, training_config.device, data_builder, lev_task_enabled)
     
     # Start training
     print(f"\n=== Starting Training ===")
@@ -526,15 +534,15 @@ def start_actual_training(cli_args):
             final_val_loss_combined = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
 
             print(f"Final training loss (combined): {final_train_loss_combined:.4f}")
-            if nsp_task_enabled and len(trainer.metrics.val_nsp_losses) >= 4: # Assuming at least two evals on train and two on val
-                 print(f"  Final train NSP loss: {trainer.metrics.val_nsp_losses[-2]:.4f}, NSP Acc: {trainer.metrics.val_nsp_accuracies[-2]:.4f}")
+            if lev_task_enabled and hasattr(trainer.metrics, 'val_lev_aux_losses') and len(trainer.metrics.val_lev_aux_losses) >= 4:
+                 print(f"  Final train Levenshtein Aux loss: {trainer.metrics.val_lev_aux_losses[-2]:.4f}") # Example, adjust index as needed
 
             print(f"Final validation loss (combined): {final_val_loss_combined:.4f}")
-            if nsp_task_enabled and len(trainer.metrics.val_nsp_losses) >= 2:
-                 print(f"  Final validation NSP loss: {trainer.metrics.val_nsp_losses[-1]:.4f}, NSP Acc: {trainer.metrics.val_nsp_accuracies[-1]:.4f}")
+            if lev_task_enabled and hasattr(trainer.metrics, 'val_lev_aux_losses') and len(trainer.metrics.val_lev_aux_losses) >= 2:
+                 print(f"  Final validation Levenshtein Aux loss: {trainer.metrics.val_lev_aux_losses[-1]:.4f}")
 
             # Show improvement
-            if 'initial_train_loss_combined' in locals(): # Check if initial eval was done
+            if 'initial_train_loss_combined' in locals():
                 train_improvement = initial_train_loss_combined - final_train_loss_combined
                 val_improvement = initial_val_loss_combined - final_val_loss_combined
                 print(f"Training loss improvement (combined): {train_improvement:.4f}")
@@ -785,15 +793,20 @@ if __name__ == "__main__":
     parser.add_argument(
         '--nsp-task',
         type=lambda x: (str(x).lower() == 'true'),
-        default=None,  # If not used, arg is None. Config/code default will be True.
-        help='Set NSP task status (True/False). If not specified, defaults to True.'
+        default=None,
+        help='Set Levenshtein task status (True/False).'
     )
-    parser.add_argument('--nsp-loss-weight', type=float, default=None, help='Weight for NSP loss component (overrides config, e.g., 0.5).')
     parser.add_argument(
-        '--use-cls-prefix-attention',
+        '--levenshtein-loss-weight',
+        type=float,
+        default=None, # Default handled by TrainingConfig or YAML
+        help='Weight for Levenshtein auxiliary loss component (overrides config, e.g., 0.1).'
+    )
+    parser.add_argument(
+        '--use-cls-prefix-attention', # This can still be relevant if CLS is used in Levenshtein task
         type=lambda x: (str(x).lower() == 'true'),
         default=None,
-        help='Enable/disable special prefix attention for CLS token when NSP task is active. (e.g., True or False, overrides config)'
+        help='Enable/disable special prefix attention for CLS token if used. (e.g., True or False, overrides config)'
     )
     parser.add_argument('--cpu-test-attention', action='store_true', help='Use CPU fallback for attention mechanism (for testing).')
 

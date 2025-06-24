@@ -28,30 +28,30 @@ class DataBuilder:
         dataset_config: str = "en",
         seq_len: int = 512,
         max_samples: Optional[int] = 2000,
-        vocab_size: int = 256, # Original vocab size, typically 256 for byte tokenization
+        vocab_size: int = 256,
         max_eval_tokens: int = 50000,
-        nsp_task: bool = False, # New parameter for NSP task
+        use_levenshtein_task: bool = False, # Changed from nsp_task
     ):
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
         self.seq_len = seq_len
         self.max_samples = max_samples if max_samples is not None else float('inf')
-        self.nsp_task = nsp_task
+        self.use_levenshtein_task = use_levenshtein_task
 
-        self.cls_token_id = 256
-        self.sep_token_id = 257
-        # Adjust vocab_size for CLS and SEP tokens
-        if vocab_size == 256: # Default byte tokenizer size
-            self.vocab_size = 258 # Accommodate CLS and SEP
-            print(f"Original vocab_size was 256, updated to {self.vocab_size} for CLS/SEP tokens.")
-        elif vocab_size < 258:
-            print(f"Warning: Original vocab_size {vocab_size} is less than 258. "
-                  f"CLS_TOKEN_ID ({self.cls_token_id}) or SEP_TOKEN_ID ({self.sep_token_id}) might collide or be out of bounds "
-                  f"if not already accounted for. Setting vocab_size to 258.")
-            self.vocab_size = 258
-        else: # vocab_size >= 258
-            self.vocab_size = vocab_size
-            print(f"Using provided vocab_size: {self.vocab_size}. Ensure it accounts for CLS/SEP if NSP is active.")
+        self.cls_token_id = None # Default to None
+        if self.use_levenshtein_task:
+            self.cls_token_id = 256 # Fixed ID for Levenshtein task's CLS
+            original_vocab_size_param = vocab_size
+            if original_vocab_size_param == 256: # Default byte vocab size
+                self.vocab_size = 257 # Accommodate CLS (256 is index, so size is 256+1)
+            elif self.cls_token_id >= original_vocab_size_param: # If CLS ID is outside original range
+                print(f"Warning: vocab_size {original_vocab_size_param} from config might be too small for cls_token_id {self.cls_token_id}. Adjusting vocab_size.")
+                self.vocab_size = self.cls_token_id + 1
+            else: # cls_token_id is within original vocab, assume it's accounted for (user configured)
+                self.vocab_size = original_vocab_size_param
+            print(f"Levenshtein task active: cls_token_id={self.cls_token_id}, effective vocab_size={self.vocab_size}")
+        else: # Not using Levenshtein task
+            self.vocab_size = vocab_size # Use vocab_size as passed
 
         self.max_eval_tokens = max_eval_tokens
 
@@ -71,19 +71,15 @@ class DataBuilder:
             current_byte_sequence = []
 
             for token in tokens:
-                if self.nsp_task and token == self.cls_token_id:
+                if self.cls_token_id is not None and token == self.cls_token_id: # Check if cls_token_id is defined
                     if current_byte_sequence:
                         string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
                         current_byte_sequence = []
                     string_parts.append("[CLS]")
-                elif self.nsp_task and token == self.sep_token_id:
-                    if current_byte_sequence:
-                        string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
-                        current_byte_sequence = []
-                    string_parts.append("[SEP]")
+                # Removed SEP token logic
                 elif 0 <= token <= 255:
                     current_byte_sequence.append(token)
-                else: # Special tokens other than CLS/SEP (e.g., padding -1) or unknown tokens
+                else: # Special tokens other than CLS (e.g., padding -1) or unknown tokens
                     if current_byte_sequence:
                         string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
                         current_byte_sequence = []
@@ -162,14 +158,11 @@ class DataBuilder:
                         break
 
             if text_content and text_content.strip():
-                if self.nsp_task:
-                    sentences = self._segment_text_to_sentences(text_content)
-                    if sentences: # Only add if there's at least one sentence
-                        samples.append({'text': text_content, 'sentences': sentences}) # Store original text and sentences
-                        processed_count += 1
-                else:
-                    samples.append({'text': text_content})
-                    processed_count += 1
+                # For Levenshtein task, we don't need to pre-segment sentences here.
+                # The LevenshteinDataset will treat each 'text' field as a unit for shuffling.
+                # If NSP task specific sentence storage was here, it's removed or made generic.
+                samples.append({'text': text_content})
+                processed_count += 1
 
             if (i + 1) % 500 == 0 and (i+1) > 0:
                 print(f"Raw iterated {i+1} items from {dataset_name_logging}, processed {processed_count} valid samples...")
@@ -341,24 +334,16 @@ class DataBuilder:
                 tokenized_data[split_name] = []
                 continue
 
-            if self.nsp_task:
-                # For NSP, process list of documents, each with a list of sentences
-                # Output: list[list[list[int]]] (list of docs, each doc is list of tokenized sentences)
-                tokenized_docs_for_split = []
-                num_sentences_total = 0
-                for doc_item in split_data_list:
-                    if isinstance(doc_item, dict) and 'sentences' in doc_item:
-                        doc_sentences_tokenized = []
-                        for sentence_str in doc_item['sentences']:
-                            if sentence_str and sentence_str.strip():
-                                tokenized_sentence = self._tokenize_text(sentence_str)
-                                if tokenized_sentence: # Ensure sentence is not empty after tokenization
-                                    doc_sentences_tokenized.append(tokenized_sentence)
-                                    num_sentences_total +=1
-                        if doc_sentences_tokenized: # Only add doc if it has tokenized sentences
-                             tokenized_docs_for_split.append(doc_sentences_tokenized)
-                tokenized_data[split_name] = tokenized_docs_for_split
-                print(f"Tokenized {split_name} for NSP: {len(tokenized_docs_for_split)} documents, {num_sentences_total} total sentences.")
+            if self.use_levenshtein_task:
+                # For Levenshtein, we need a list of text strings for each split.
+                # The raw_dataset (output of load_raw_dataset) is Dict[str, List[Dict[str, str]]],
+                # where each inner dict has a 'text' key.
+                current_split_texts = []
+                for item_dict in split_data_list: # split_data_list is List[Dict[str, str]]
+                    if isinstance(item_dict, dict) and 'text' in item_dict and item_dict['text'].strip():
+                        current_split_texts.append(item_dict['text'])
+                tokenized_data[split_name] = current_split_texts # This is List[str]
+                print(f"Processed {split_name} for Levenshtein: {len(current_split_texts)} text items.")
             else:
                 # Standard tokenization: concatenate all text and tokenize once
                 all_text = ""
@@ -381,35 +366,48 @@ class DataBuilder:
     def create_datasets(self):
         raw_dataset = self.load_raw_dataset()
         # tokenized_data will be list[list[list[int]]] for NSP, or list[int] for standard
-        tokenized_data_for_splits = self.tokenize_dataset(raw_dataset)
+        tokenized_or_raw_data = self.tokenize_dataset(raw_dataset) # This is now Dict[str, List[str]] if Levenshtein
 
         datasets = {}
-        for split_name, data_content in tokenized_data_for_splits.items():
-            if not data_content: # data_content can be empty list of docs (for NSP) or empty list of tokens
-                print(f"Warning: {split_name} split has no tokenized content. Skipping dataset creation.")
+        for split_name, data_for_split in tokenized_or_raw_data.items():
+            if not data_for_split:
+                print(f"Warning: {split_name} split has no data after tokenization/processing. Skipping dataset creation.")
                 continue
 
-            if self.nsp_task:
-                # data_content is list[list[list[int]]] (list of docs, each doc is list of tokenized sentences)
-                if not any(doc for doc in data_content): # Check if all documents are empty or list itself is empty
-                    print(f"Warning: {split_name} split for NSP has no sentences after tokenization. Skipping dataset.")
-                    continue
+            if self.use_levenshtein_task:
+                # data_for_split is List[str] here
+                if self.cls_token_id is None: # cls_token_id must be set for LevenshteinDataset
+                    raise ValueError("cls_token_id not set in DataBuilder for Levenshtein task, but use_levenshtein_task is True.")
                 
-                # For NSP, max_eval_tokens is not directly applicable here as NSPDataset creates examples internally.
-                # We could limit the number of documents passed to NSPDataset for eval splits if needed.
-                # For now, pass all processed documents.
-                datasets[split_name] = NSPDataset(
-                    documents=data_content,
+                # Limit number of raw sentences for eval splits if max_eval_tokens is a concern
+                # LevenshteinDataset will generate one example per sentence/document.
+                # This is a rough way to limit; actual token count depends on seq_len.
+                # Note: This logic was copied from previous attempt, might need review based on actual dataset structure
+                if split_name in ['validation', 'test'] and len(data_for_split) * self.seq_len > self.max_eval_tokens:
+                    approx_docs_to_keep = self.max_eval_tokens // self.seq_len
+                    if approx_docs_to_keep == 0 and self.max_eval_tokens > 0 : approx_docs_to_keep = 1
+                    if approx_docs_to_keep < len(data_for_split):
+                         print(f"Limiting {split_name} for Levenshtein to approx {approx_docs_to_keep} documents from {len(data_for_split)} for faster evaluation.")
+                         data_for_split = data_for_split[:approx_docs_to_keep]
+                    if not data_for_split and len(tokenized_or_raw_data[split_name]) > 0 :
+                         data_for_split = tokenized_or_raw_data[split_name][:1]
+
+                if not data_for_split:
+                    print(f"Warning: {split_name} split became empty after limiting for Levenshtein eval. Skipping.")
+                    continue
+
+                datasets[split_name] = LevenshteinDataset(
+                    raw_documents_or_sentences=data_for_split,
+                    tokenizer_fn=self._tokenize_text,
                     seq_len=self.seq_len,
                     cls_token_id=self.cls_token_id,
-                    sep_token_id=self.sep_token_id,
-                    pad_token_id=-1 # Standard pad_token_id for LM loss
+                    lm_ignore_idx=-1,
+                    input_pad_id=0    # Assuming 0 is a safe padding ID not overlapping with CLS
                 )
-                print(f"{split_name} NSP dataset: {len(datasets[split_name])} examples")
-
-            else: # Standard TokenizedDataset
-                # data_content is list[int] (concatenated tokens for the split)
-                tokens = data_content
+                print(f"{split_name} Levenshtein dataset: {len(datasets[split_name])} examples")
+            else: # Standard TokenizedDataset for LM
+                # data_for_split is list[int] (concatenated tokens)
+                tokens = data_for_split
                 current_max_eval_tokens = self.max_eval_tokens
                 if self.max_samples != float('inf') and split_name in ['validation', 'test']:
                     # Estimate based on 20% of max_samples, ensure it's reasonable
@@ -464,14 +462,14 @@ class DataBuilder:
 def create_data_builder(
     dataset_name: str = "allenai/c4", dataset_config: str = "en",
     seq_len: int = 512, max_samples: Optional[int] = 2000,
-        max_eval_tokens: int = 50000,
-        nsp_task: bool = False, # Added nsp_task
+    max_eval_tokens: int = 50000,
+    use_levenshtein_task: bool = False, # Changed from nsp_task
 ) -> DataBuilder:
     return DataBuilder(
         dataset_name=dataset_name, dataset_config=dataset_config,
         seq_len=seq_len, max_samples=max_samples,
         max_eval_tokens=max_eval_tokens,
-        nsp_task=nsp_task # Pass to constructor
+        use_levenshtein_task=use_levenshtein_task # Pass to constructor
     )
 
 if __name__ == "__main__":
@@ -500,31 +498,38 @@ if __name__ == "__main__":
         print("Standard train dataloader not created or empty.")
     print("DataBuilder standard test completed!")
 
-    print("\nTesting DataBuilder (NSP Task)...")
-    data_builder_nsp = create_data_builder(
-        dataset_name="allenai/c4", dataset_config="en", # Using C4 for more text
-        seq_len=64, max_samples=100, # Further reduced for very fast NSP test
-        nsp_task=True
+    print("\nTesting DataBuilder (Levenshtein Task)...")
+    data_builder_lev = create_data_builder(
+        dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", # Using a smaller dataset for test
+        seq_len=64, max_samples=50, # Small values for quick test
+        use_levenshtein_task=True
     )
-    # Ensure model's cls_token_id would be set here in a real scenario
-    # model.cls_token_id = data_builder_nsp.cls_token_id
 
-    dataloaders_nsp = data_builder_nsp.create_dataloaders(batch_size=2)
-    if 'train' in dataloaders_nsp and dataloaders_nsp['train']:
-        train_loader_nsp = dataloaders_nsp['train']
-        print(f"Number of NSP training batches: {len(train_loader_nsp)}")
+    dataloaders_lev = data_builder_lev.create_dataloaders(batch_size=2)
+    if 'train' in dataloaders_lev and dataloaders_lev['train']:
+        train_loader_lev = dataloaders_lev['train']
+        print(f"Number of Levenshtein training batches: {len(train_loader_lev)}")
         try:
-            for batch_idx, (input_ids, lm_target_ids, nsp_label) in enumerate(train_loader_nsp):
-                print(f"NSP Batch {batch_idx}: Inputs: {input_ids.shape}, Targets: {lm_target_ids.shape}, NSP Label: {nsp_label.shape}")
-                if input_ids.numel() > 0:
-                    sample_tokens = input_ids[0][:30].tolist() # Shorter sample
-                    decoded_sample = data_builder_nsp.decode_tokens(sample_tokens)
-                    print(f"NSP Sample tokens: {sample_tokens}")
-                    print(f"NSP Sample decoded: {decoded_sample}")
+            # LevenshteinDataset returns 5 items
+            for batch_idx, (orig_tok, lm_tgt, shuf_tok, lev_dist, coh_score) in enumerate(train_loader_lev):
+                print(f"Lev Batch {batch_idx}:")
+                print(f"  Orig Toks: {orig_tok.shape}")
+                print(f"  LM Tgts:   {lm_tgt.shape}")
+                print(f"  Shuf Toks: {shuf_tok.shape}")
+                print(f"  Lev Dist:  {lev_dist.shape}, Values: {lev_dist.tolist()}")
+                print(f"  Coh Score: {coh_score.shape}, Values: {coh_score.tolist()}")
+
+                if orig_tok.numel() > 0:
+                    sample_orig_text = data_builder_lev.decode_tokens(orig_tok[0][:30])
+                    print(f"  Sample Original Decoded (approx): {sample_orig_text}")
+                if shuf_tok.numel() > 0:
+                    sample_shuf_text = data_builder_lev.decode_tokens(shuf_tok[0][:30])
+                    print(f"  Sample Shuffled Decoded (approx): {sample_shuf_text}")
+
                 if batch_idx >= 0: break # Only show first batch
         except Exception as e:
-            print(f"Error during NSP dataloader iteration test: {e}")
+            print(f"Error during Levenshtein dataloader iteration test: {e}")
             raise
     else:
-        print("NSP train dataloader not created or empty.")
-    print("DataBuilder NSP test completed!")
+        print("Levenshtein train dataloader not created or empty.")
+    print("DataBuilder Levenshtein test completed!")

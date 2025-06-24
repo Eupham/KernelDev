@@ -95,16 +95,16 @@ class GPTModel(nn.Module):
         mlp_ratio=4,
         causal=True,
         cls_token_id: int | None = None,
-        nsp_task: bool = False,
-        use_cls_prefix_attention: bool = True, # New parameter
+        # nsp_task: bool = False, # Removed nsp_task
+        use_cls_prefix_attention: bool = True,
+        # use_levenshtein_task: bool = False # Model doesn't need this if it just provides heads
     ):
         super().__init__()
         self.dim = dim
         self.cls_token_id = cls_token_id
-        self.nsp_task = nsp_task
-        self.use_cls_prefix_attention = use_cls_prefix_attention # Store it
-        # Updated print to include the new parameter
-        print(f"GPTModel.__init__: nsp_task={self.nsp_task}, cls_token_id={self.cls_token_id}, use_cls_prefix_attention={self.use_cls_prefix_attention}")
+        # self.nsp_task = nsp_task # Removed
+        self.use_cls_prefix_attention = use_cls_prefix_attention
+        print(f"GPTModel.__init__: cls_token_id={self.cls_token_id}, use_cls_prefix_attention={self.use_cls_prefix_attention}. Levenshtein head added.")
         self.max_seq_len = max_seq_len
         
         # Token and position embeddings (no bias)
@@ -126,8 +126,8 @@ class GPTModel(nn.Module):
         self.norm_out = RMSNorm(dim)
         self.head = nn.Linear(dim, vocab_size, bias=False)
         
-        # NSP head
-        self.nsp_head = nn.Linear(dim, 1) # Binary classification for NSP
+        # Levenshtein head (replaces NSP head)
+        self.levenshtein_head = nn.Linear(self.dim, 1) # Output a single scalar value
 
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
@@ -145,9 +145,10 @@ class GPTModel(nn.Module):
     def forward(self, x, targets=None, force_disable_prefix_attention: bool = False):
         batch_size, seq_len = x.shape # x is input token IDs (batch_size, seq_len)
         
-        # Initialize loss and nsp_logits
+        # Initialize loss and auxiliary output
         loss = None
-        nsp_logits = None
+        # nsp_logits = None # Removed
+        predicted_distance_score = None # New auxiliary output
 
         # Create current_is_prefix_token_mask based on cls_token_id and use_cls_prefix_attention
         current_is_prefix_token_mask = None
@@ -184,51 +185,39 @@ class GPTModel(nn.Module):
 
         # NSP logits calculation
         # processed_x is the output of self.norm_out(x), shape (batch_size, seq_len, dim)
-        # nsp_logits = None # Already initialized at the beginning of the method
-        if self.nsp_task:
-            # Assuming NSPDataset places the CLS token at index 0
-            # And its representation is taken from the output hidden states.
-            cls_token_representation = processed_x[:, 0, :]
-            nsp_logits = self.nsp_head(cls_token_representation)
+
+        # Levenshtein distance score prediction (if CLS token is present and model is configured for it)
+        # The decision to use Levenshtein head can be implicit: if cls_token_id is available, this head is used.
+        # The training loop will decide whether to use the output based on its task config.
+        if self.cls_token_id is not None: # Indicates CLS token processing is relevant
+            cls_representation = processed_x[:, 0, :]
+            predicted_distance_score = self.levenshtein_head(cls_representation).squeeze(-1) # Output shape: (batch_size,)
 
         if targets is not None:
             # Calculate raw per-token loss, without reduction
             raw_lm_loss_per_token = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=-1, # Assuming -1 is used for padding/ignored LM targets
+                ignore_index=-1,
                 reduction='none'
             )
             # Reshape per-token loss to (batch_size, seq_len)
             lm_loss_per_token_unmasked = raw_lm_loss_per_token.view(batch_size, seq_len)
 
-            # Create a mask for valid (non-ignored) target tokens
-            # targets has shape (batch_size, seq_len)
-            valid_targets_mask = (targets != -1).float() # Convert to float for multiplication
-
-            # Sum loss only for valid tokens across seq_len for each batch item
+            valid_targets_mask = (targets != -1).float()
             per_item_lm_loss_sum = (lm_loss_per_token_unmasked * valid_targets_mask).sum(dim=1)
-
-            # Count valid (non-ignored) tokens per batch item
             per_item_valid_token_count = valid_targets_mask.sum(dim=1)
-
-            # Avoid division by zero if a sequence has no valid targets
-            # Replace count of 0 with 1 to avoid NaN; loss for that item will be 0 if sum is 0.
             per_item_valid_token_count = torch.where(
                 per_item_valid_token_count == 0,
                 torch.ones_like(per_item_valid_token_count),
                 per_item_valid_token_count
             )
-
-            # Calculate mean loss per batch item
-            lm_loss_per_item = per_item_lm_loss_sum / per_item_valid_token_count # Shape: (batch_size,)
-
-            # The 'loss' variable returned by this method should now be this per-item loss tensor
+            lm_loss_per_item = per_item_lm_loss_sum / per_item_valid_token_count
             loss = lm_loss_per_item
         else:
-            loss = None # Keep as None if targets are not provided
+            loss = None
 
-        return logits, loss, nsp_logits
+        return logits, loss, predicted_distance_score # Return predicted_distance_score instead of nsp_logits
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_prefix_attention_in_prompt: bool = False):
         """
