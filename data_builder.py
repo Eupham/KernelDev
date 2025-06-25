@@ -55,7 +55,7 @@ class DataBuilder:
         else: # Not using Levenshtein task
             self.vocab_size = vocab_size # Use vocab_size as passed
 
-        self.max_eval_tokens = max_eval_tokens
+        self.max_eval_tokens = max_eval_tokens if max_eval_tokens is not None else float('inf')
 
         print(f"Effective vocabulary size: {self.vocab_size}")
         print(f"Max evaluation tokens per split: {self.max_eval_tokens}")
