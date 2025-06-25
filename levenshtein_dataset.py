@@ -170,5 +170,3 @@ if __name__ == '__main__':
             # This requires a mock_detokenizer or knowledge of how CLS/PAD are handled by it
             print(f"  Original (approx): CLS + '{''.join([chr(t) for t in orig_tok.tolist()[1:15] if t!=pad_id and t!=cls_id])}'...")
             print(f"  Shuffled (approx): CLS + '{''.join([chr(t) for t in shuf_tok.tolist()[1:15] if t!=pad_id and t!=cls_id])}'...")
-
-```
