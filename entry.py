@@ -89,6 +89,11 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     if hasattr(args, 'lm_self_critique_reward_max') and args.lm_self_critique_reward_max is not None:
         config.setdefault('model', {})['lm_self_critique_reward_max'] = args.lm_self_critique_reward_max
 
+    # Handle Levenshtein shuffle percentage
+    data_config_entry = config.setdefault('data', {})
+    if hasattr(args, 'levenshtein_shuffle_percentage') and args.levenshtein_shuffle_percentage is not None:
+        data_config_entry['levenshtein_shuffle_percentage'] = args.levenshtein_shuffle_percentage
+
     return config
 
 
@@ -433,8 +438,12 @@ def start_actual_training(cli_args):
     
     # Create data builder
     print("\n=== Loading and Processing Data ===")
-    # Pass use_levenshtein_task to create_data_builder
-    data_config_for_builder = {**data_config, 'use_levenshtein_task': lev_task_enabled}
+    # Pass use_levenshtein_task and shuffle percentage to create_data_builder
+    data_config_for_builder = {
+        **data_config,
+        'use_levenshtein_task': lev_task_enabled,
+        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage') # Pass as None if not in data_cfg
+    }
     data_builder = create_data_builder(**data_config_for_builder)
 
     # Create dataloaders
@@ -793,6 +802,12 @@ if __name__ == "__main__":
         type=float,
         default=None, # Default handled by TrainingConfig or YAML
         help='Weight for Levenshtein auxiliary loss component (overrides config, e.g., 0.1).'
+    )
+    parser.add_argument(
+        '--levenshtein-shuffle-percentage',
+        type=float,
+        default=None,
+        help='Percentage of items to be shuffled in LevenshteinDataset (0.0 to 1.0). Overrides config.'
     )
     parser.add_argument(
         '--lm-self-critique-base-penalty',

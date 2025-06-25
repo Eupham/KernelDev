@@ -64,7 +64,7 @@ data:
   max_eval_tokens: 50000
   
   # DataLoader settings
-  num_workers: 0       # Set to 0 to avoid multiprocessing issues
+  num_workers: 2       # Set to 0 to avoid multiprocessing issues
   shuffle_train: true  # Shuffle training data
 
 # Model Configuration

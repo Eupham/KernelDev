@@ -190,7 +190,8 @@ class GPTModel(nn.Module):
         # The training loop will decide whether to use the output based on its task config.
         if self.cls_token_id is not None: # Indicates CLS token processing is relevant
             cls_representation = processed_x[:, 0, :]
-            predicted_distance_score = self.levenshtein_head(cls_representation).squeeze(-1) # Output shape: (batch_size,)
+            # Apply relu to ensure non-negative distance prediction
+            predicted_distance_score = torch.relu(self.levenshtein_head(cls_representation).squeeze(-1)) # Output shape: (batch_size,)
 
         if targets is not None:
             # Calculate raw per-token loss, without reduction

@@ -30,13 +30,15 @@ class DataBuilder:
         max_samples: Optional[int] = 2000,
         vocab_size: int = 256,
         max_eval_tokens: int = 50000,
-        use_levenshtein_task: bool = False, # Changed from nsp_task
+        use_levenshtein_task: bool = False,
+        levenshtein_shuffle_percentage: float = 0.25, # New parameter
     ):
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
         self.seq_len = seq_len
         self.max_samples = max_samples if max_samples is not None else float('inf')
         self.use_levenshtein_task = use_levenshtein_task
+        self.levenshtein_shuffle_percentage = levenshtein_shuffle_percentage # Store it
 
         self.cls_token_id = None # Default to None
         if self.use_levenshtein_task:
@@ -402,7 +404,8 @@ class DataBuilder:
                     seq_len=self.seq_len,
                     cls_token_id=self.cls_token_id,
                     lm_ignore_idx=-1,
-                    input_pad_id=0    # Assuming 0 is a safe padding ID not overlapping with CLS
+                    input_pad_id=0,    # Assuming 0 is a safe padding ID not overlapping with CLS
+                    shuffle_percentage=self.levenshtein_shuffle_percentage # Pass stored value
                 )
                 print(f"{split_name} Levenshtein dataset: {len(datasets[split_name])} examples")
             else: # Standard TokenizedDataset for LM
@@ -463,13 +466,15 @@ def create_data_builder(
     dataset_name: str = "allenai/c4", dataset_config: str = "en",
     seq_len: int = 512, max_samples: Optional[int] = 2000,
     max_eval_tokens: int = 50000,
-    use_levenshtein_task: bool = False, # Changed from nsp_task
+    use_levenshtein_task: bool = False,
+    levenshtein_shuffle_percentage: float = 0.25, # New parameter
 ) -> DataBuilder:
     return DataBuilder(
         dataset_name=dataset_name, dataset_config=dataset_config,
         seq_len=seq_len, max_samples=max_samples,
         max_eval_tokens=max_eval_tokens,
-        use_levenshtein_task=use_levenshtein_task # Pass to constructor
+        use_levenshtein_task=use_levenshtein_task,
+        levenshtein_shuffle_percentage=levenshtein_shuffle_percentage # Pass to constructor
     )
 
 if __name__ == "__main__":
@@ -478,7 +483,7 @@ if __name__ == "__main__":
     data_builder_std = create_data_builder(
         dataset_name="allenai/c4", dataset_config="en", # Using C4 for more text
         seq_len=128, max_samples=200, # Reduced max_samples for faster test
-        nsp_task=False
+        use_levenshtein_task=False # Explicitly false for this standard test
     )
     dataloaders_std = data_builder_std.create_dataloaders(batch_size=2)
     if 'train' in dataloaders_std and dataloaders_std['train']:
@@ -502,31 +507,34 @@ if __name__ == "__main__":
     data_builder_lev = create_data_builder(
         dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", # Using a smaller dataset for test
         seq_len=64, max_samples=50, # Small values for quick test
-        use_levenshtein_task=True
+        use_levenshtein_task=True,
+        levenshtein_shuffle_percentage=0.5 # Test with a specific shuffle percentage
     )
+    print(f"DataBuilder for Levenshtein created with shuffle_percentage: {data_builder_lev.levenshtein_shuffle_percentage}")
 
     dataloaders_lev = data_builder_lev.create_dataloaders(batch_size=2)
     if 'train' in dataloaders_lev and dataloaders_lev['train']:
         train_loader_lev = dataloaders_lev['train']
         print(f"Number of Levenshtein training batches: {len(train_loader_lev)}")
         try:
-            # LevenshteinDataset returns 5 items
-            for batch_idx, (orig_tok, lm_tgt, shuf_tok, lev_dist, coh_score) in enumerate(train_loader_lev):
-                print(f"Lev Batch {batch_idx}:")
-                print(f"  Orig Toks: {orig_tok.shape}")
-                print(f"  LM Tgts:   {lm_tgt.shape}")
-                print(f"  Shuf Toks: {shuf_tok.shape}")
-                print(f"  Lev Dist:  {lev_dist.shape}, Values: {lev_dist.tolist()}")
-                print(f"  Coh Score: {coh_score.shape}, Values: {coh_score.tolist()}")
+            # LevenshteinDataset now returns 4 items
+            for batch_idx, (input_tokens, lm_targets, lev_dist_target, is_shuffled_flag) in enumerate(train_loader_lev):
+                item_type = "Shuffled" if is_shuffled_flag[0].item() == 1.0 else "Original"
+                print(f"Lev Batch {batch_idx} (Item 0 Type: {item_type}):")
+                print(f"  Input Tokens: {input_tokens.shape}")
+                print(f"  LM Targets:   {lm_targets.shape}")
+                print(f"  Lev Dist Target: {lev_dist_target.shape}, Values: {lev_dist_target.tolist()}")
+                print(f"  Is Shuffled Flag: {is_shuffled_flag.shape}, Values: {is_shuffled_flag.tolist()}")
 
-                if orig_tok.numel() > 0:
-                    sample_orig_text = data_builder_lev.decode_tokens(orig_tok[0][:30])
-                    print(f"  Sample Original Decoded (approx): {sample_orig_text}")
-                if shuf_tok.numel() > 0:
-                    sample_shuf_text = data_builder_lev.decode_tokens(shuf_tok[0][:30])
-                    print(f"  Sample Shuffled Decoded (approx): {sample_shuf_text}")
+                if input_tokens.numel() > 0:
+                    sample_text = data_builder_lev.decode_tokens(input_tokens[0][:30])
+                    print(f"  Sample Input Decoded (approx): {sample_text}")
 
-                if batch_idx >= 0: break # Only show first batch
+                if lm_targets[0,0].item() != -1 : # If first target is not ignore (means it's an original sentence)
+                    self_is_shuffled = is_shuffled_flag[0].item()
+                    assert self_is_shuffled == 0.0, "LM targets should be ignored for shuffled items!"
+
+                if batch_idx >= 1: break # Show a couple of batches
         except Exception as e:
             print(f"Error during Levenshtein dataloader iteration test: {e}")
             raise

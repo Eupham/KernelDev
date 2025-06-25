@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import Dataset
 import re # For sentence splitting if needed, though text_utils handles word splitting
+import random # New import
 
 # Assuming text_utils.py is in the same directory or accessible in PYTHONPATH
 try:
@@ -25,7 +26,8 @@ class LevenshteinDataset(Dataset):
                  seq_len: int,
                  cls_token_id: int,
                  lm_ignore_idx: int = -1, # For masking targets
-                 input_pad_id: int = 0):  # For padding input token sequences
+                 input_pad_id: int = 0,  # For padding input token sequences
+                 shuffle_percentage: float = 0.25): # New parameter
         """
         Args:
             raw_documents_or_sentences: List of strings (sentences or short documents).
@@ -41,6 +43,10 @@ class LevenshteinDataset(Dataset):
         self.lm_ignore_idx = lm_ignore_idx
         self.input_pad_id = input_pad_id
 
+        if not 0.0 <= shuffle_percentage <= 1.0:
+            raise ValueError("shuffle_percentage must be between 0.0 and 1.0")
+        self.shuffle_percentage = shuffle_percentage
+
         self.sentences = raw_documents_or_sentences # Store raw data directly
         # self.examples list and call to _prepare_examples are removed
 
@@ -49,78 +55,65 @@ class LevenshteinDataset(Dataset):
 
     def __getitem__(self, idx):
         original_sentence_text = self.sentences[idx]
+        if not original_sentence_text.strip(): # Handle empty strings
+            original_sentence_text = ""
 
-        # Handle potential empty strings if not filtered upstream, though DataBuilder tries to.
-        if not original_sentence_text.strip():
-            # Return a "degenerate" sample that should ideally be filtered by a collate_fn
-            # or represent a very small loss.
-            # All tokens will be padding, CLS will be masked in targets.
-            # Distances will be 0.
-            original_sentence_text = "" # Ensure it's empty string not just whitespace
+        # Decide if this item should be shuffled
+        is_shuffled_item_flag_val = 1.0 if random.random() < self.shuffle_percentage else 0.0
 
-        # 1. Shuffle words and calculate Levenshtein distance
-        shuffled_sentence_text, original_words, shuffled_words = shuffle_words_in_sentence(original_sentence_text)
+        input_text_to_tokenize = ""
+        target_lev_distance_for_item = 0.0
+        create_valid_lm_targets = False
 
-        true_target_lev_dist = float(word_levenshtein_distance(original_words, shuffled_words))
+        if is_shuffled_item_flag_val == 1.0:
+            shuffled_sentence_text, original_words, shuffled_words = shuffle_words_in_sentence(original_sentence_text)
+            input_text_to_tokenize = shuffled_sentence_text
+            num_original_words = len(original_words)
+            if num_original_words > 0:
+                raw_lev_dist = word_levenshtein_distance(original_words, shuffled_words)
+                target_lev_distance_for_item = float(raw_lev_dist) / num_original_words
+            else:
+                target_lev_distance_for_item = 0.0
+            create_valid_lm_targets = False # No LM loss for shuffled items
+        else: # Original item
+            input_text_to_tokenize = original_sentence_text
+            target_lev_distance_for_item = 0.0 # Target for Levenshtein head on original is 0
+            create_valid_lm_targets = True # Calculate LM loss for original items
 
-        # Normalize the Levenshtein distance for the shuffled sentence
-        num_original_words = len(original_words)
-        if num_original_words > 0:
-            normalized_target_lev_dist_for_shuffled = true_target_lev_dist / num_original_words
+        # Tokenize, Prepend CLS, Truncate/Pad the chosen input_text_to_tokenize
+        tokens = self.tokenizer_fn(input_text_to_tokenize)
+        tokens_cls_list = [self.cls_token_id] + tokens
+        if len(tokens_cls_list) > self.seq_len:
+            final_tokens_list = [self.cls_token_id] + tokens_cls_list[1:self.seq_len]
         else:
-            normalized_target_lev_dist_for_shuffled = 0.0
+            final_tokens_list = tokens_cls_list
+        padded_input_tokens = _truncate_or_pad_tokens(final_tokens_list, self.seq_len, self.input_pad_id)
 
-        target_coherence_score = 0.0  # Target for original sentence's coherence score is always 0
+        # Create LM Targets
+        lm_targets_padded_list = []
+        if create_valid_lm_targets:
+            temp_lm_targets = []
+            for i in range(self.seq_len):
+                if i < len(padded_input_tokens) - 1:
+                    is_cls_at_start = (i == 0 and padded_input_tokens[i] == self.cls_token_id)
+                    is_input_padding = (padded_input_tokens[i] == self.input_pad_id)
 
-        # 2. Tokenize, Prepend CLS, Truncate/Pad for Original Sentence
-        original_tokens = self.tokenizer_fn(original_sentence_text)
-        original_tokens_cls_list = [self.cls_token_id] + original_tokens
-        # Truncate content if too long, keeping CLS at the beginning
-        if len(original_tokens_cls_list) > self.seq_len:
-            final_original_tokens_list = [self.cls_token_id] + original_tokens_cls_list[1:self.seq_len]
-        else:
-            final_original_tokens_list = original_tokens_cls_list
-        padded_original_tokens = _truncate_or_pad_tokens(final_original_tokens_list, self.seq_len, self.input_pad_id)
-
-        # 3. Create LM Targets for Original Sentence
-        temp_lm_targets = []
-        for i in range(self.seq_len):
-            # Target for token at padded_original_tokens[i] is padded_original_tokens[i+1]
-            # unless it's CLS, current is padding, or next is padding
-            if i < len(padded_original_tokens) - 1:
-                is_current_cls = (i == 0 and padded_original_tokens[i] == self.cls_token_id)
-                is_current_pad = (padded_original_tokens[i] == self.input_pad_id)
-                is_next_pad = (padded_original_tokens[i+1] == self.input_pad_id)
-
-                if is_current_cls or is_current_pad or is_next_pad:
-                    temp_lm_targets.append(self.lm_ignore_idx)
+                    if is_cls_at_start or is_input_padding or padded_input_tokens[i+1] == self.input_pad_id:
+                        temp_lm_targets.append(self.lm_ignore_idx)
+                    else:
+                        temp_lm_targets.append(padded_input_tokens[i+1])
                 else:
-                    temp_lm_targets.append(padded_original_tokens[i+1])
-            else: # Current token is the last in seq_len or already into padding territory
-                temp_lm_targets.append(self.lm_ignore_idx)
+                    temp_lm_targets.append(self.lm_ignore_idx)
+            lm_targets_padded_list = _truncate_or_pad_tokens(temp_lm_targets[:self.seq_len], self.seq_len, self.lm_ignore_idx)
+        else: # For shuffled items, LM targets are all ignored
+            lm_targets_padded_list = [self.lm_ignore_idx] * self.seq_len
 
-        # Ensure lm_targets_padded is exactly seq_len
-        # temp_lm_targets should already be seq_len due to loop range, but an explicit truncate/pad is safer.
-        lm_targets_padded = _truncate_or_pad_tokens(temp_lm_targets[:self.seq_len], self.seq_len, self.lm_ignore_idx)
-
-
-        # 4. Tokenize, Prepend CLS, Truncate/Pad for Shuffled Sentence
-        shuffled_tokens = self.tokenizer_fn(shuffled_sentence_text)
-        shuffled_tokens_cls_list = [self.cls_token_id] + shuffled_tokens
-        # Truncate content if too long, keeping CLS
-        if len(shuffled_tokens_cls_list) > self.seq_len:
-            final_shuffled_tokens_list = [self.cls_token_id] + shuffled_tokens_cls_list[1:self.seq_len]
-        else:
-            final_shuffled_tokens_list = shuffled_tokens_cls_list
-        padded_shuffled_tokens = _truncate_or_pad_tokens(final_shuffled_tokens_list, self.seq_len, self.input_pad_id)
-
-        # 5. Return Tensors
+        # Return 4 Tensors
         return (
-            torch.tensor(padded_original_tokens, dtype=torch.long),
-            torch.tensor(lm_targets_padded, dtype=torch.long),
-            torch.tensor(padded_shuffled_tokens, dtype=torch.long),
-            torch.tensor(normalized_target_lev_dist_for_shuffled, dtype=torch.float32),
-            torch.tensor(target_coherence_score, dtype=torch.float32)
+            torch.tensor(padded_input_tokens, dtype=torch.long),
+            torch.tensor(lm_targets_padded_list, dtype=torch.long),
+            torch.tensor(target_lev_distance_for_item, dtype=torch.float32),
+            torch.tensor(is_shuffled_item_flag_val, dtype=torch.float32)
         )
 
 if __name__ == '__main__':
@@ -144,20 +137,37 @@ if __name__ == '__main__':
         "Test with CLS in text should not be an issue for tokenizer." # CLS here is text, not id
     ]
 
-    dataset = LevenshteinDataset(sample_sentences, mock_tokenizer, seq_len, cls_id, lm_ignore_idx=lm_ignore, input_pad_id=pad_id)
-    print(f"Created dataset with {len(dataset)} examples.")
+    dataset = LevenshteinDataset(
+        sample_sentences,
+        mock_tokenizer,
+        seq_len,
+        cls_id,
+        lm_ignore_idx=lm_ignore,
+        input_pad_id=pad_id,
+        shuffle_percentage=0.5 # Example different from default
+    )
+    print(f"Created dataset with {len(dataset)} examples. Shuffle Pct: {dataset.shuffle_percentage}")
 
     if len(dataset) > 0:
-        for i in range(min(len(dataset), 2)): # Print first 2 samples
-            orig_tok, lm_tgt, shuf_tok, lev_dist, coh_score = dataset[i]
-            print(f"--- Sample {i} ---")
-            print(f"  Original Tokens (CLS): {orig_tok.tolist()}")
-            print(f"  LM Targets:            {lm_tgt.tolist()}")
-            print(f"  Shuffled Tokens (CLS): {shuf_tok.tolist()}")
-            print(f"  Target Levenshtein Dist (for shuffled): {lev_dist.item()}")
-            print(f"  Target Coherence Score (for original):  {coh_score.item()}")
+        print("\n--- Testing a few samples from the dataset ---")
+        for i in range(min(len(dataset), 5)): # Print first 5 samples
+            input_toks, lm_tgts, lev_dist_target, is_shuf_flag = dataset[i]
+            item_type = "Shuffled" if is_shuf_flag.item() == 1.0 else "Original"
+
+            print(f"\n--- Sample {i} ({item_type}) ---")
+            print(f"  Input Tokens:          {input_toks.tolist()}")
+            print(f"  LM Targets:            {lm_tgts.tolist()}")
+            print(f"  Target Levenshtein:    {lev_dist_target.item():.4f}")
+            print(f"  Is Shuffled Flag:      {is_shuf_flag.item()}")
 
             # Try to decode parts for readability
             # This requires a mock_detokenizer or knowledge of how CLS/PAD are handled by it
-            print(f"  Original (approx): CLS + '{''.join([chr(t) for t in orig_tok.tolist()[1:15] if t!=pad_id and t!=cls_id])}'...")
-            print(f"  Shuffled (approx): CLS + '{''.join([chr(t) for t in shuf_tok.tolist()[1:15] if t!=pad_id and t!=cls_id])}'...")
+            approx_decoded_text = "".join([chr(t) for t in input_toks.tolist()[1:25] if t != pad_id and t != cls_id and 32 <= t <= 126])
+            print(f"  Input Text (approx):   CLS + '{approx_decoded_text}'...")
+
+            if item_type == "Original":
+                non_ignored_targets = sum(1 for t_id in lm_tgts.tolist() if t_id != lm_ignore)
+                print(f"  Num Valid LM Targets:  {non_ignored_targets}")
+            else: # Shuffled
+                all_ignored = all(t_id == lm_ignore for t_id in lm_tgts.tolist())
+                print(f"  LM Targets All Ignored: {all_ignored}")

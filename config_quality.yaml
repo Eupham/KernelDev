@@ -22,7 +22,7 @@ data:
   seq_len: 2048              # Longer sequences for better context
   max_samples: 20000         # More samples for better training
   max_eval_tokens: 100000    # More eval tokens
-  num_workers: 0
+  num_workers: 2
   shuffle_train: true
 
 model:

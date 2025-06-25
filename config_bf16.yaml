@@ -22,7 +22,7 @@ data:
   seq_len: 1024              # Balanced sequence length
   max_samples: 5000          # Standard samples for development
   max_eval_tokens: 50000     # Standard eval tokens
-  num_workers: 0
+  num_workers: 2
   shuffle_train: true
 
 model:

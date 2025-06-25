@@ -205,113 +205,134 @@ class Trainer:
         print(f"Trainer initialized on device: {self.config.device}. Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
     def train_step(self, batch: Tuple[torch.Tensor, ...]) -> Tuple[float, Optional[float], Optional[float], Optional[float], Optional[float]]:
+        # Metrics initialization
         mean_lm_loss_component_item = None
         mean_lev_aux_loss_item = None
-        mean_pred_dist_orig_item = None
+        mean_pred_dist_orig_item = None # For monitoring pred_dist on original items
         mean_d_self_critique_for_batch_item = None
 
+        # 1. Batch Unpacking (LevenshteinDataset format)
         if self.config.use_levenshtein_task:
-            original_tokens_cls, lm_targets, shuffled_tokens_cls, \
-            target_lev_distance_for_shuffled, target_coherence_score_for_original = batch
-
-            original_tokens_cls = original_tokens_cls.to(self.config.device)
+            # input_tokens, lm_targets, true_lev_distances, is_shuffled_flags
+            # (B, T), (B, T), (B,), (B,)
+            input_tokens, lm_targets, true_lev_distances, is_shuffled_flags = batch
+            input_tokens = input_tokens.to(self.config.device)
             lm_targets = lm_targets.to(self.config.device)
-            shuffled_tokens_cls = shuffled_tokens_cls.to(self.config.device)
-            target_lev_distance_for_shuffled = target_lev_distance_for_shuffled.to(self.config.device)
-            target_coherence_score_for_original = target_coherence_score_for_original.to(self.config.device)
-        else:
-            original_tokens_cls, lm_targets = batch
-            original_tokens_cls = original_tokens_cls.to(self.config.device)
+            true_lev_distances = true_lev_distances.to(self.config.device)
+            is_shuffled_flags = is_shuffled_flags.to(self.config.device)
+        else: # Standard LM task
+            input_tokens, lm_targets = batch
+            input_tokens = input_tokens.to(self.config.device)
             lm_targets = lm_targets.to(self.config.device)
-            shuffled_tokens_cls, target_lev_distance_for_shuffled, target_coherence_score_for_original = None, None, None
+            # For non-Levenshtein tasks, these will remain None or 0.0
+            true_lev_distances = None
+            is_shuffled_flags = None
 
         self.optimizer.zero_grad()
         
+        combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
         final_batch_lm_loss_component = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-        aux_loss_components_sum = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-        num_aux_losses_calculated = 0
-
-        lm_logits_orig, per_item_lm_loss, pred_dist_original, pred_dist_shuffled, d_self_critique_batch = None, None, None, None, None
 
         autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
 
         with autocast_context:
-            # Pass 1: Original Data
-            if original_tokens_cls is not None:
-                lm_logits_orig, per_item_lm_loss, pred_dist_original = self.model(
-                    original_tokens_cls, lm_targets, force_disable_prefix_attention=False
-                )
-            # Pass 2: Shuffled Data
-            if self.config.use_levenshtein_task and shuffled_tokens_cls is not None:
-                _, _, pred_dist_shuffled = self.model(
-                    shuffled_tokens_cls, targets=None, force_disable_prefix_attention=False
-                )
-            # Pass 3: Self-Critique
-            if self.config.use_levenshtein_task and lm_logits_orig is not None:
-                with torch.no_grad():
-                    s_model_output_tokens = torch.argmax(lm_logits_orig.float(), dim=-1)
-                    if hasattr(self.data_builder, 'cls_token_id') and self.data_builder.cls_token_id is not None:
-                        cls_id = self.data_builder.cls_token_id
-                        cls_tensor = torch.full((s_model_output_tokens.shape[0], 1), cls_id,
-                                                device=s_model_output_tokens.device, dtype=torch.long)
-                        current_seq_len = s_model_output_tokens.shape[1]
-                        input_for_critique_model = torch.cat([cls_tensor, s_model_output_tokens[:, :current_seq_len-1]], dim=1)
+            # 2. Single Main Forward Pass (Pass 1)
+            # lm_targets for shuffled items are all ignore_idx, so per_item_lm_loss_all will be effectively 0 for them.
+            lm_logits_all, per_item_lm_loss_all, predicted_lev_distances_all = self.model(
+                input_tokens,
+                lm_targets, # lm_targets are valid for original, all-ignore for shuffled
+                force_disable_prefix_attention=False
+            )
 
-                        # Inner model call for critique score also needs autocast if outer AMP is active.
-                        with autocast_context: # Ensures this model call is also under autocast if AMP enabled
-                            _, _, d_self_critique_batch = self.model(
-                                    input_for_critique_model, targets=None, force_disable_prefix_attention=False
-                                )
-                        if d_self_critique_batch is not None:
-                             mean_d_self_critique_for_batch_item = d_self_critique_batch.mean().item()
-                    # else: Warning about cls_token_id missing can be added if necessary
+            # 3. Levenshtein Auxiliary Loss Calculation
+            mean_lev_aux_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+            if self.config.use_levenshtein_task and predicted_lev_distances_all is not None and true_lev_distances is not None:
+                loss_fn_dist = torch.nn.MSELoss()
+                # This MSE is calculated over all items.
+                # For original items, true_lev_distances is 0.0.
+                # For shuffled items, true_lev_distances is normalized Levenshtein distance.
+                lev_aux_loss_per_item = loss_fn_dist(predicted_lev_distances_all.float(), true_lev_distances.float())
+                mean_lev_aux_loss_tensor = lev_aux_loss_per_item # MSELoss with reduction='mean' is already a scalar
+                mean_lev_aux_loss_item = mean_lev_aux_loss_tensor.item()
 
-            # --- LM Loss Component Calculation (with Self-Critique Scaling) ---
-            if per_item_lm_loss is not None:
-                if self.config.use_levenshtein_task and d_self_critique_batch is not None:
-                    per_item_lm_loss_float = per_item_lm_loss.float()
-                    d_self_critique_float = d_self_critique_batch.float().to(per_item_lm_loss_float.device)
-                    l_lm_item_adjusted = per_item_lm_loss_float + self.config.lm_self_critique_base_penalty
-                    d_min_batch = d_self_critique_float.min()
-                    d_max_batch = d_self_critique_float.max()
-                    denominator = d_max_batch - d_min_batch
-                    if denominator.abs() < 1e-6:
-                        norm_d_item_batch = torch.zeros_like(d_self_critique_float)
-                    else:
-                        norm_d_item_batch = (d_self_critique_float - d_min_batch) / denominator
-                    reward_scalar_r_batch = (1.0 - norm_d_item_batch) * self.config.lm_self_critique_reward_max
-                    final_scaled_lm_loss_item_batch = l_lm_item_adjusted - reward_scalar_r_batch
-                    final_batch_lm_loss_component = final_scaled_lm_loss_item_batch.mean()
-                else:
-                    final_batch_lm_loss_component = per_item_lm_loss.float().mean()
-            # If per_item_lm_loss was None, final_batch_lm_loss_component remains 0.0 tensor.
-            mean_lm_loss_component_item = final_batch_lm_loss_component.item() if per_item_lm_loss is not None else None
+                # For monitoring: mean predicted distance on original items
+                if is_shuffled_flags is not None:
+                    original_item_mask_for_dist_pred = (is_shuffled_flags == 0.0)
+                    if original_item_mask_for_dist_pred.any():
+                        mean_pred_dist_orig_item = predicted_lev_distances_all[original_item_mask_for_dist_pred].mean().item()
 
+            # 4. Isolate Original Items' Data for LM Loss and Self-Critique
+            d_self_critique_items = None # For items from original text that undergo critique
+            if self.config.use_levenshtein_task and is_shuffled_flags is not None:
+                original_item_mask = (is_shuffled_flags == 0.0)
+                if original_item_mask.any():
+                    lm_logits_orig = lm_logits_all[original_item_mask]
+                    # per_item_lm_loss_all is already correctly calculated by model for valid targets
+                    # and should be effectively zero or ignorable for shuffled items due to masked lm_targets.
+                    # We select only the losses corresponding to original items.
+                    per_item_lm_loss_orig = per_item_lm_loss_all[original_item_mask]
 
-            # --- Auxiliary Losses Calculation ---
-            loss_fn_dist = torch.nn.MSELoss()
+                    # 5. Self-Critique Forward Pass (Pass 2, no_grad)
+                    if lm_logits_orig.numel() > 0: # Ensure there are original items
+                        with torch.no_grad(): # No gradients for critique generation/evaluation
+                            s_model_output_tokens = torch.argmax(lm_logits_orig.float(), dim=-1)
+                            if hasattr(self.data_builder, 'cls_token_id') and self.data_builder.cls_token_id is not None:
+                                cls_id = self.data_builder.cls_token_id
+                                cls_tensor = torch.full((s_model_output_tokens.shape[0], 1), cls_id,
+                                                        device=s_model_output_tokens.device, dtype=torch.long)
+                                current_seq_len = s_model_output_tokens.shape[1]
+                                input_for_critique_model = torch.cat([cls_tensor, s_model_output_tokens[:, :current_seq_len-1]], dim=1)
+
+                                with autocast_context: # Inner model call for critique
+                                    _, _, d_self_critique_items = self.model(
+                                            input_for_critique_model, targets=None, force_disable_prefix_attention=False
+                                        )
+                                if d_self_critique_items is not None:
+                                    mean_d_self_critique_for_batch_item = d_self_critique_items.mean().item()
+
+                    # 6. LM Loss Scaling (using per_item_lm_loss_orig and d_self_critique_items)
+                    if per_item_lm_loss_orig is not None and per_item_lm_loss_orig.numel() > 0 :
+                        if d_self_critique_items is not None:
+                            d_self_critique_float = d_self_critique_items.float().to(per_item_lm_loss_orig.device)
+                            l_lm_item_adjusted = per_item_lm_loss_orig.float() + self.config.lm_self_critique_base_penalty
+
+                            # Normalize d_self_critique_float (0 to 1, lower is better)
+                            # This normalization is per batch of original items
+                            d_min_batch = d_self_critique_float.min()
+                            d_max_batch = d_self_critique_float.max()
+                            denominator = d_max_batch - d_min_batch
+                            norm_d_item_batch = torch.zeros_like(d_self_critique_float)
+                            if denominator.abs() >= 1e-6: # Avoid division by zero if all critique scores are same
+                                norm_d_item_batch = (d_self_critique_float - d_min_batch) / denominator
+
+                            reward_scalar_r_batch = (1.0 - norm_d_item_batch) * self.config.lm_self_critique_reward_max
+                            final_scaled_lm_loss_item_batch = l_lm_item_adjusted - reward_scalar_r_batch
+                            final_batch_lm_loss_component = final_scaled_lm_loss_item_batch.mean()
+                        else: # No critique score, use original LM loss for these items
+                            final_batch_lm_loss_component = per_item_lm_loss_orig.float().mean()
+                    # else: final_batch_lm_loss_component remains 0 if no original items or no loss.
+                # else (no original items in batch): final_batch_lm_loss_component remains 0.
+
+            else: # Not using Levenshtein task (standard LM)
+                if per_item_lm_loss_all is not None:
+                     final_batch_lm_loss_component = per_item_lm_loss_all.float().mean()
+
+            mean_lm_loss_component_item = final_batch_lm_loss_component.item() if final_batch_lm_loss_component.requires_grad else None
+
+            # 7. Total Loss
+            combined_loss = final_batch_lm_loss_component
             if self.config.use_levenshtein_task:
-                if pred_dist_original is not None and target_coherence_score_for_original is not None:
-                    loss_orig_dist = loss_fn_dist(pred_dist_original.float(), target_coherence_score_for_original.float())
-                    aux_loss_components_sum += loss_orig_dist
-                    num_aux_losses_calculated +=1
-                    mean_pred_dist_orig_item = pred_dist_original.mean().item()
-                if pred_dist_shuffled is not None and target_lev_distance_for_shuffled is not None:
-                    loss_shuf_dist = loss_fn_dist(pred_dist_shuffled.float(), target_lev_distance_for_shuffled.float())
-                    aux_loss_components_sum += loss_shuf_dist
-                    num_aux_losses_calculated +=1
-                    mean_lev_aux_loss_item = loss_shuf_dist.item()
-
-            # --- Assemble Combined Loss ---
-            combined_loss = final_batch_lm_loss_component.float()
-            if self.config.use_levenshtein_task and num_aux_losses_calculated > 0:
-                mean_aux_loss_tensor_for_combined = (aux_loss_components_sum / num_aux_losses_calculated).float()
-                combined_loss = combined_loss + (self.config.levenshtein_loss_weight * mean_aux_loss_tensor_for_combined)
+                combined_loss = combined_loss + (self.config.levenshtein_loss_weight * mean_lev_aux_loss_tensor)
 
         # --- End of autocast_context for AMP ---
 
-        if not combined_loss.requires_grad and combined_loss.abs().item() < 1e-9:
-             return 0.0, None, None, None, None
+        # Handle cases where loss might not require grad (e.g. all items were shuffled, no LM loss)
+        if not combined_loss.requires_grad and combined_loss.abs().item() < 1e-9 : # If loss is effectively zero and has no grad
+             if not self.config.use_levenshtein_task or (self.config.use_levenshtein_task and not mean_lev_aux_loss_tensor.requires_grad):
+                # This can happen if batch had only shuffled items, or if aux loss also has no grad (e.g. model not changing outputs)
+                # Return 0s or Nones to indicate no actual backpropagation happened for this step.
+                return 0.0, None, mean_lev_aux_loss_item, mean_pred_dist_orig_item, mean_d_self_critique_for_batch_item
+
 
         if self.config.use_amp and self.config.scaler is not None:
             self.config.scaler.scale(combined_loss).backward()
@@ -327,6 +348,7 @@ class Trainer:
             self.optimizer.step()
 
         combined_loss_val = combined_loss.item()
+        # 8. Return values for metrics
         return combined_loss_val, mean_lm_loss_component_item, mean_lev_aux_loss_item, mean_pred_dist_orig_item, mean_d_self_critique_for_batch_item
     
     def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
