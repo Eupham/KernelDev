@@ -41,89 +41,73 @@ class LevenshteinDataset(Dataset):
         self.lm_ignore_idx = lm_ignore_idx
         self.input_pad_id = input_pad_id
 
-        self.examples = []
-        self._prepare_examples(raw_documents_or_sentences)
-
-    def _prepare_examples(self, documents: list[str]):
-        for doc_text in documents:
-            if not doc_text.strip():
-                continue
-
-            # For this dataset, we treat each document/line as a single "sentence"
-            # for shuffling. If finer-grained sentence splitting is needed from
-            # longer documents, it should happen before passing to this Dataset.
-            original_sentence_text = doc_text
-
-            shuffled_sentence_text, original_words, shuffled_words = shuffle_words_in_sentence(original_sentence_text)
-
-            # Only include if there are words to process
-            if not original_words:
-                continue
-
-            true_lev_dist = word_levenshtein_distance(original_words, shuffled_words)
-
-            self.examples.append({
-                "original_text": original_sentence_text,
-                "shuffled_text": shuffled_sentence_text,
-                "levenshtein_distance": float(true_lev_dist) # Target for shuffled
-            })
+        self.sentences = raw_documents_or_sentences # Store raw data directly
+        # self.examples list and call to _prepare_examples are removed
 
     def __len__(self):
-        return len(self.examples)
+        return len(self.sentences)
 
     def __getitem__(self, idx):
-        example = self.examples[idx]
+        original_sentence_text = self.sentences[idx]
 
-        original_text = example["original_text"]
-        shuffled_text = example["shuffled_text"]
-        target_lev_dist = example["levenshtein_distance"]
+        # Handle potential empty strings if not filtered upstream, though DataBuilder tries to.
+        if not original_sentence_text.strip():
+            # Return a "degenerate" sample that should ideally be filtered by a collate_fn
+            # or represent a very small loss.
+            # All tokens will be padding, CLS will be masked in targets.
+            # Distances will be 0.
+            original_sentence_text = "" # Ensure it's empty string not just whitespace
 
-        # Process Original Sentence
-        original_tokens = self.tokenizer_fn(original_text)
-        # Prepend CLS, then truncate/pad to ensure CLS is [0] if sequence is too long AFTER CLS
+        # 1. Shuffle words and calculate Levenshtein distance
+        shuffled_sentence_text, original_words, shuffled_words = shuffle_words_in_sentence(original_sentence_text)
+
+        # Calculate Levenshtein distance. If original_words is empty (e.g. empty sentence_text), distance is 0.
+        target_lev_dist = float(word_levenshtein_distance(original_words, shuffled_words))
+        target_coherence_score = 0.0  # Target for original sentence's coherence score is always 0
+
+        # 2. Tokenize, Prepend CLS, Truncate/Pad for Original Sentence
+        original_tokens = self.tokenizer_fn(original_sentence_text)
         original_tokens_cls_list = [self.cls_token_id] + original_tokens
+        # Truncate content if too long, keeping CLS at the beginning
         if len(original_tokens_cls_list) > self.seq_len:
-            # Ensure CLS is always the first token, truncate the rest
             final_original_tokens_list = [self.cls_token_id] + original_tokens_cls_list[1:self.seq_len]
         else:
             final_original_tokens_list = original_tokens_cls_list
         padded_original_tokens = _truncate_or_pad_tokens(final_original_tokens_list, self.seq_len, self.input_pad_id)
 
-        # Create LM targets: shift by 1, pad, and mask CLS
+        # 3. Create LM Targets for Original Sentence
         temp_lm_targets = []
         for i in range(self.seq_len):
-            if i < len(padded_original_tokens) - 1: # Target for token at padded_original_tokens[i] is padded_original_tokens[i+1]
-                current_token_is_cls_at_start = (i == 0 and padded_original_tokens[i] == self.cls_token_id)
-                next_token_is_padding = (padded_original_tokens[i+1] == self.input_pad_id)
+            # Target for token at padded_original_tokens[i] is padded_original_tokens[i+1]
+            # unless it's CLS, current is padding, or next is padding
+            if i < len(padded_original_tokens) - 1:
+                is_current_cls = (i == 0 and padded_original_tokens[i] == self.cls_token_id)
+                is_current_pad = (padded_original_tokens[i] == self.input_pad_id)
+                is_next_pad = (padded_original_tokens[i+1] == self.input_pad_id)
 
-                if current_token_is_cls_at_start: # Mask target for CLS token
-                    temp_lm_targets.append(self.lm_ignore_idx)
-                elif padded_original_tokens[i] == self.input_pad_id: # If current input token is padding, its target is also ignore
-                    temp_lm_targets.append(self.lm_ignore_idx)
-                elif next_token_is_padding : # If next token (target) would be padding, also ignore
+                if is_current_cls or is_current_pad or is_next_pad:
                     temp_lm_targets.append(self.lm_ignore_idx)
                 else:
                     temp_lm_targets.append(padded_original_tokens[i+1])
-            else: # Handles the last token (which has no next token) and any explicit padding
+            else: # Current token is the last in seq_len or already into padding territory
                 temp_lm_targets.append(self.lm_ignore_idx)
 
-        # Ensure it's exactly seq_len by truncating if somehow longer, then padding
+        # Ensure lm_targets_padded is exactly seq_len
+        # temp_lm_targets should already be seq_len due to loop range, but an explicit truncate/pad is safer.
         lm_targets_padded = _truncate_or_pad_tokens(temp_lm_targets[:self.seq_len], self.seq_len, self.lm_ignore_idx)
 
 
-        # Process Shuffled Sentence
-        shuffled_tokens = self.tokenizer_fn(shuffled_text)
+        # 4. Tokenize, Prepend CLS, Truncate/Pad for Shuffled Sentence
+        shuffled_tokens = self.tokenizer_fn(shuffled_sentence_text)
         shuffled_tokens_cls_list = [self.cls_token_id] + shuffled_tokens
+        # Truncate content if too long, keeping CLS
         if len(shuffled_tokens_cls_list) > self.seq_len:
-            # Ensure CLS is always the first token
             final_shuffled_tokens_list = [self.cls_token_id] + shuffled_tokens_cls_list[1:self.seq_len]
         else:
             final_shuffled_tokens_list = shuffled_tokens_cls_list
         padded_shuffled_tokens = _truncate_or_pad_tokens(final_shuffled_tokens_list, self.seq_len, self.input_pad_id)
 
-        # Target for original sentence's coherence score (predicted by Levenshtein head) is 0.0
-        target_coherence_score = 0.0
-
+        # 5. Return Tensors
         return (
             torch.tensor(padded_original_tokens, dtype=torch.long),
             torch.tensor(lm_targets_padded, dtype=torch.long),
