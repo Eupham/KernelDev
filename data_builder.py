@@ -386,11 +386,18 @@ class DataBuilder:
                 # This is a rough way to limit; actual token count depends on seq_len.
                 # Note: This logic was copied from previous attempt, might need review based on actual dataset structure
                 if split_name in ['validation', 'test'] and len(data_for_split) * self.seq_len > self.max_eval_tokens:
-                    approx_docs_to_keep = self.max_eval_tokens // self.seq_len
-                    if approx_docs_to_keep == 0 and self.max_eval_tokens > 0 : approx_docs_to_keep = 1
-                    if approx_docs_to_keep < len(data_for_split):
-                         print(f"Limiting {split_name} for Levenshtein to approx {approx_docs_to_keep} documents from {len(data_for_split)} for faster evaluation.")
-                         data_for_split = data_for_split[:approx_docs_to_keep]
+                    if self.max_eval_tokens == float('inf'):
+                        approx_docs_to_keep = float('inf')
+                    else:
+                        approx_docs_to_keep = self.max_eval_tokens // self.seq_len
+
+                    if approx_docs_to_keep == 0 and self.max_eval_tokens > 0 and self.max_eval_tokens != float('inf'):
+                        approx_docs_to_keep = 1
+
+                    if approx_docs_to_keep < len(data_for_split): # This condition handles approx_docs_to_keep = float('inf') correctly
+                         print(f"Limiting {split_name} for Levenshtein to approx {int(approx_docs_to_keep)} documents from {len(data_for_split)} for faster evaluation.")
+                         data_for_split = data_for_split[:int(approx_docs_to_keep)] # Slicing requires int
+
                     if not data_for_split and len(tokenized_or_raw_data[split_name]) > 0 :
                          data_for_split = tokenized_or_raw_data[split_name][:1]
 
@@ -422,8 +429,10 @@ class DataBuilder:
                 if len(tokens) > self.seq_len:
                     if split_name in ['validation', 'test']:
                         if len(tokens) > current_max_eval_tokens:
-                            tokens = tokens[:current_max_eval_tokens]
-                            print(f"Limited {split_name} to {len(tokens)} tokens for faster evaluation (target: {current_max_eval_tokens})")
+                            if current_max_eval_tokens != float('inf'):
+                                tokens = tokens[:int(current_max_eval_tokens)] # Ensure int for slicing
+                            # If current_max_eval_tokens is float('inf'), no slicing occurs, all tokens are kept.
+                            print(f"Limited {split_name} to {len(tokens)} tokens for faster evaluation (target was: {current_max_eval_tokens})")
 
                     datasets[split_name] = TokenizedDataset(tokens, self.seq_len)
                     print(f"{split_name} dataset: {len(datasets[split_name])} samples")
