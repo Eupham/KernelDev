@@ -61,8 +61,15 @@ class LevenshteinDataset(Dataset):
         # 1. Shuffle words and calculate Levenshtein distance
         shuffled_sentence_text, original_words, shuffled_words = shuffle_words_in_sentence(original_sentence_text)
 
-        # Calculate Levenshtein distance. If original_words is empty (e.g. empty sentence_text), distance is 0.
-        target_lev_dist = float(word_levenshtein_distance(original_words, shuffled_words))
+        true_target_lev_dist = float(word_levenshtein_distance(original_words, shuffled_words))
+
+        # Normalize the Levenshtein distance for the shuffled sentence
+        num_original_words = len(original_words)
+        if num_original_words > 0:
+            normalized_target_lev_dist_for_shuffled = true_target_lev_dist / num_original_words
+        else:
+            normalized_target_lev_dist_for_shuffled = 0.0
+
         target_coherence_score = 0.0  # Target for original sentence's coherence score is always 0
 
         # 2. Tokenize, Prepend CLS, Truncate/Pad for Original Sentence
@@ -112,7 +119,7 @@ class LevenshteinDataset(Dataset):
             torch.tensor(padded_original_tokens, dtype=torch.long),
             torch.tensor(lm_targets_padded, dtype=torch.long),
             torch.tensor(padded_shuffled_tokens, dtype=torch.long),
-            torch.tensor(target_lev_dist, dtype=torch.float32),
+            torch.tensor(normalized_target_lev_dist_for_shuffled, dtype=torch.float32),
             torch.tensor(target_coherence_score, dtype=torch.float32)
         )
 
