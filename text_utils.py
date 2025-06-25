@@ -98,4 +98,3 @@ if __name__ == '__main__':
     words6 = ["a", "d", "c", "e"]
     dist5 = word_levenshtein_distance(words5, words6)
     print(f"Distance between {words5} and {words6}: {dist5}") # Expected: 2 (sub b->d, ins e)
-```
