@@ -94,6 +94,10 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     if hasattr(args, 'levenshtein_shuffle_percentage') and args.levenshtein_shuffle_percentage is not None:
         data_config_entry['levenshtein_shuffle_percentage'] = args.levenshtein_shuffle_percentage
 
+    # Handle max_train_tokens
+    if hasattr(args, 'max_train_tokens') and args.max_train_tokens is not None:
+        data_config_entry['max_train_tokens'] = args.max_train_tokens
+
     return config
 
 
@@ -239,7 +243,8 @@ def start_actual_training(cli_args):
         'dataset_config': data_cfg.get('dataset_config', 'en'),
         'seq_len': data_cfg.get('seq_len', 1024),
         'max_samples': data_cfg.get('max_samples', 5000),
-        'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000)
+        'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000),
+        'max_train_tokens': data_cfg.get('max_train_tokens', None) # Retrieve, pass None if not set
     }
     
     # Model configuration
@@ -442,7 +447,8 @@ def start_actual_training(cli_args):
     data_config_for_builder = {
         **data_config,
         'use_levenshtein_task': lev_task_enabled,
-        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage') # Pass as None if not in data_cfg
+        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage'), # Pass as None if not in data_cfg
+        'max_train_tokens': data_cfg.get('max_train_tokens') # Pass as None if not in data_cfg (already fetched into data_config)
     }
     data_builder = create_data_builder(**data_config_for_builder)
 
@@ -808,6 +814,12 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help='Percentage of items to be shuffled in LevenshteinDataset (0.0 to 1.0). Overrides config.'
+    )
+    parser.add_argument(
+        '--max-train-tokens',
+        type=int, # Or float if DataBuilder handles float('inf') directly
+        default=None,
+        help='Maximum number of tokens to process for the training set (overrides config data:max_train_tokens).'
     )
     parser.add_argument(
         '--lm-self-critique-base-penalty',

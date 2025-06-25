@@ -26,19 +26,34 @@ class DataBuilder:
         self,
         dataset_name: str = "allenai/c4",
         dataset_config: str = "en",
-        seq_len: int = 512,
+        seq_len: Optional[Any] = 512, # Allow None or str for robust init
         max_samples: Optional[int] = 2000,
         vocab_size: int = 256,
-        max_eval_tokens: int = 50000,
+        max_eval_tokens: Optional[Any] = 50000, # Allow None for robust init
         use_levenshtein_task: bool = False,
-        levenshtein_shuffle_percentage: float = 0.25, # New parameter
+        levenshtein_shuffle_percentage: float = 0.25,
+        max_train_tokens: Optional[Any] = None, # New parameter
     ):
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
-        self.seq_len = seq_len
+
+        default_seq_len = 512
+        if seq_len is None:
+            print(f"Warning: Input 'seq_len' was None. Defaulting to {default_seq_len}.")
+            self.seq_len = default_seq_len
+        else:
+            try:
+                self.seq_len = int(seq_len)
+                if self.seq_len <= 0:
+                    print(f"Warning: Input 'seq_len' ({self.seq_len}) must be positive. Defaulting to {default_seq_len}.")
+                    self.seq_len = default_seq_len
+            except ValueError:
+                print(f"Error: Could not convert 'seq_len' value '{seq_len}' to an integer. Defaulting to {default_seq_len}.")
+                self.seq_len = default_seq_len
+
         self.max_samples = max_samples if max_samples is not None else float('inf')
         self.use_levenshtein_task = use_levenshtein_task
-        self.levenshtein_shuffle_percentage = levenshtein_shuffle_percentage # Store it
+        self.levenshtein_shuffle_percentage = levenshtein_shuffle_percentage
 
         self.cls_token_id = None # Default to None
         if self.use_levenshtein_task:
@@ -57,7 +72,17 @@ class DataBuilder:
 
         self.max_eval_tokens = max_eval_tokens if max_eval_tokens is not None else float('inf')
 
+        if max_train_tokens is None:
+            self.max_train_tokens = float('inf')
+        else:
+            try:
+                self.max_train_tokens = float(max_train_tokens)
+            except ValueError:
+                print(f"Warning: Could not convert max_train_tokens value '{max_train_tokens}' to float. Defaulting to float('inf').")
+                self.max_train_tokens = float('inf')
+
         print(f"Effective vocabulary size: {self.vocab_size}")
+        print(f"Max train tokens: {self.max_train_tokens}")
         print(f"Max evaluation tokens per split: {self.max_eval_tokens}")
         if self.max_samples != float('inf'):
             print(f"Will attempt to load up to {self.max_samples} samples from the dataset.")
@@ -473,17 +498,19 @@ class DataBuilder:
 
 def create_data_builder(
     dataset_name: str = "allenai/c4", dataset_config: str = "en",
-    seq_len: int = 512, max_samples: Optional[int] = 2000,
-    max_eval_tokens: int = 50000,
+    seq_len: Optional[Any] = 512, max_samples: Optional[int] = 2000,
+    max_eval_tokens: Optional[Any] = 50000,
     use_levenshtein_task: bool = False,
-    levenshtein_shuffle_percentage: float = 0.25, # New parameter
+    levenshtein_shuffle_percentage: float = 0.25,
+    max_train_tokens: Optional[Any] = None,
 ) -> DataBuilder:
     return DataBuilder(
         dataset_name=dataset_name, dataset_config=dataset_config,
         seq_len=seq_len, max_samples=max_samples,
         max_eval_tokens=max_eval_tokens,
         use_levenshtein_task=use_levenshtein_task,
-        levenshtein_shuffle_percentage=levenshtein_shuffle_percentage # Pass to constructor
+        levenshtein_shuffle_percentage=levenshtein_shuffle_percentage,
+        max_train_tokens=max_train_tokens
     )
 
 if __name__ == "__main__":
