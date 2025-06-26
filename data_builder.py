@@ -26,10 +26,10 @@ class DataBuilder:
         self,
         dataset_name: str = "allenai/c4",
         dataset_config: str = "en",
-        seq_len: Optional[Any] = 512, # Allow None or str for robust init
+        seq_len: Optional[Any] = 512,
         max_samples: Optional[int] = 2000,
         vocab_size: int = 256,
-        max_eval_tokens: Optional[Any] = 50000, # Allow None for robust init
+        max_eval_tokens: Optional[Any] = 50000,
         use_levenshtein_task: bool = False,
         levenshtein_shuffle_percentage: float = 0.25,
         max_train_tokens: Optional[Any] = None, # New parameter
@@ -37,19 +37,21 @@ class DataBuilder:
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
 
+        # Robust initialization for self.seq_len
         default_seq_len = 512
         if seq_len is None:
-            print(f"Warning: Input 'seq_len' was None. Defaulting to {default_seq_len}.")
+            # print(f"Debug: seq_len param is None. Defaulting to {default_seq_len}.")
             self.seq_len = default_seq_len
         else:
             try:
                 self.seq_len = int(seq_len)
                 if self.seq_len <= 0:
-                    print(f"Warning: Input 'seq_len' ({self.seq_len}) must be positive. Defaulting to {default_seq_len}.")
+                    # print(f"Debug: seq_len {self.seq_len} is not positive. Defaulting to {default_seq_len}.")
                     self.seq_len = default_seq_len
             except ValueError:
-                print(f"Error: Could not convert 'seq_len' value '{seq_len}' to an integer. Defaulting to {default_seq_len}.")
+                # print(f"Debug: Could not convert seq_len '{seq_len}' to int. Defaulting to {default_seq_len}.")
                 self.seq_len = default_seq_len
+        # print(f"Debug: Final self.seq_len: {self.seq_len}")
 
         self.max_samples = max_samples if max_samples is not None else float('inf')
         self.use_levenshtein_task = use_levenshtein_task
@@ -476,15 +478,40 @@ class DataBuilder:
             return dataloaders
 
         for split_name, dataset_obj in datasets.items():
-            if not dataset_obj:
-                print(f"Skipping DataLoader for {split_name} as dataset is empty or invalid.")
+            print(f"\n--- Preparing {split_name}_dataloader ---")
+            print(f"Dataset object: {dataset_obj}")
+            if dataset_obj is not None:
+                try:
+                    print(f"len(dataset): {len(dataset_obj)}")
+                    if hasattr(dataset_obj, 'seq_len'):
+                        print(f"dataset.seq_len: {dataset_obj.seq_len}")
+                    if isinstance(dataset_obj, LevenshteinDataset):
+                        # LevenshteinDataset stores input_pad_id directly
+                        if hasattr(dataset_obj, 'input_pad_id'):
+                             print(f"dataset.input_pad_id: {dataset_obj.input_pad_id}")
+                except Exception as e:
+                    print(f"Error getting dataset attributes for {split_name}_dataset: {e}")
+
+            current_shuffle_status = shuffle_train if split_name == 'train' else False
+            current_pin_memory = torch.cuda.is_available()
+
+            print(f"batch_size: {batch_size}")
+            print(f"shuffle: {current_shuffle_status}")
+            print(f"num_workers: {num_workers}")
+            print(f"collate_fn: None (using default)") # DataLoader uses default_collate if None
+            print(f"pin_memory: {current_pin_memory}")
+
+            if not dataset_obj: # Re-check after prints, before DataLoader call
+                print(f"Skipping DataLoader for {split_name} as dataset is None or invalid after attribute checks.")
+                print(f"--- {split_name}_dataloader preparation skipped ---")
                 continue
-            shuffle = shuffle_train if split_name == 'train' else False
+
             dataloaders[split_name] = DataLoader(
-                dataset_obj, batch_size=batch_size, shuffle=shuffle,
-                num_workers=num_workers, pin_memory=torch.cuda.is_available()
+                dataset_obj, batch_size=batch_size, shuffle=current_shuffle_status,
+                num_workers=num_workers, pin_memory=current_pin_memory
             )
-            print(f"{split_name} dataloader: {len(dataloaders[split_name])} batches")
+            print(f"{split_name} dataloader created: {len(dataloaders[split_name])} batches")
+            print(f"--- {split_name}_dataloader preparation complete ---")
         return dataloaders
 
     def get_vocab_size(self) -> int:
@@ -498,7 +525,8 @@ class DataBuilder:
 
 def create_data_builder(
     dataset_name: str = "allenai/c4", dataset_config: str = "en",
-    seq_len: Optional[Any] = 512, max_samples: Optional[int] = 2000,
+    seq_len: Optional[Any] = 512, # Keep Optional[Any] as it's passed to DataBuilder constructor
+    max_samples: Optional[int] = 2000,
     max_eval_tokens: Optional[Any] = 50000,
     use_levenshtein_task: bool = False,
     levenshtein_shuffle_percentage: float = 0.25,
