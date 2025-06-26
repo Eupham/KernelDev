@@ -62,43 +62,29 @@ if _cli_pre_args.cpu_test_attention:
         attn_weights = F.softmax(attn_weights, dim=-1)
         output = torch.matmul(attn_weights, v)
 
-        # Mimic return type of original_kernel._flash_attention -> (O, LSE) or O
-        # The _flash_attention wrapper in original_kernel.py handles this.
-        # The custom op torch.ops.flash_attention.forward returns O, LSE.
-        # The CPU fallback in entry.py's cpu_test_mode also returns O, LSE_dummy
-        # So this mock should also return O, LSE_dummy for consistency if return_lse is true.
-
-        lse_dummy = torch.empty(0, device=target_device, dtype=torch.float32) # Default empty LSE
-        if return_lse or any(x.requires_grad for x in [q_orig, k_orig, v_orig]): # Mimic logic for when LSE is computed
-            # A simple LSE approximation for CPU, not as accurate as Triton's
-            scores = torch.matmul(q_scaled, k.transpose(-2, -1)) + attn_bias # Re-use attn_bias with potential -inf
+        lse_dummy = torch.empty(0, device=target_device, dtype=torch.float32)
+        if return_lse or any(x.requires_grad for x in [q_orig, k_orig, v_orig]):
+            scores = torch.matmul(q_scaled, k.transpose(-2, -1)) + attn_bias
             lse_dummy = torch.logsumexp(scores, dim=-1)
             return output, lse_dummy
         return output
 
-    # Create and register the mock for 'original_kernel'
     _mock_original_kernel_module = types.ModuleType('original_kernel')
     _mock_original_kernel_module.flash_attention = _cpu_flash_attention_mock
-    # Add any other attributes model.py might expect from original_kernel, if any.
-    # For example, if it imports IncoherentFlashAttention or set_t4_optimization directly.
-    # Based on model.py, only flash_attention is directly imported.
     sys.modules['original_kernel'] = _mock_original_kernel_module
 
-    # Create and register a mock for 'triton' and 'triton.language'
-    # This prevents errors if original_kernel.py (even if not used) still tries to import triton at module level.
     _mock_triton_module = types.ModuleType('triton')
-    # Define dummy decorators/classes on the mock triton module if original_kernel.py uses them at the top level
     class _DummyDecorator:
         def __init__(self, *args, **kwargs): pass
         def __call__(self, fn): return fn
     _mock_triton_module.autotune = _DummyDecorator
     _mock_triton_module.jit = _DummyDecorator
     _mock_triton_module.heuristics = _DummyDecorator
-    _mock_triton_module.Config = lambda *args, **kwargs: None # Dummy Config
-    _mock_triton_module.cdiv = lambda a, b: (a + b - 1) // b # Basic cdiv
+    _mock_triton_module.Config = lambda *args, **kwargs: None
+    _mock_triton_module.cdiv = lambda a, b: (a + b - 1) // b
 
     sys.modules['triton'] = _mock_triton_module
-    sys.modules['triton.language'] = types.ModuleType('triton.language') # Empty mock for triton.language
+    sys.modules['triton.language'] = types.ModuleType('triton.language')
 
 # Now, the actual imports that might trigger original_kernel or triton can proceed.
 # These will get the mocked versions if cpu_test_attention was true.
@@ -345,14 +331,13 @@ def start_actual_training(cli_args):
     print("Setting up configuration...")
     
     # Data configuration
-    mtt_value = data_cfg.get('max_train_tokens', None)
     data_config = {
         'dataset_name': data_cfg.get('dataset_name', 'allenai/c4'),
         'dataset_config': data_cfg.get('dataset_config', 'en'),
         'seq_len': data_cfg.get('seq_len', 1024),
         'max_samples': data_cfg.get('max_samples', 5000),
         'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000),
-        'max_train_tokens': float('inf') if mtt_value is None else mtt_value # Ensure it's inf if None
+        'max_train_tokens': data_cfg.get('max_train_tokens', None) # Retrieve, pass None if not set
     }
     
     # Model configuration
@@ -553,10 +538,10 @@ def start_actual_training(cli_args):
     print("\n=== Loading and Processing Data ===")
     # Pass use_levenshtein_task and shuffle percentage to create_data_builder
     data_config_for_builder = {
-        **data_config, # data_config already has max_train_tokens correctly set (non-None)
+        **data_config,
         'use_levenshtein_task': lev_task_enabled,
-        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage') # Pass as None if not in data_cfg
-        # max_train_tokens is now correctly passed via **data_config
+        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage'), # Pass as None if not in data_cfg
+        'max_train_tokens': data_cfg.get('max_train_tokens') # Pass as None if not in data_cfg (already fetched into data_config)
     }
     data_builder = create_data_builder(**data_config_for_builder)
 

@@ -55,7 +55,10 @@ class DataBuilder:
 
         self.max_samples = max_samples if max_samples is not None else float('inf')
         self.use_levenshtein_task = use_levenshtein_task
-        self.levenshtein_shuffle_percentage = levenshtein_shuffle_percentage
+        if levenshtein_shuffle_percentage is None:
+            self.levenshtein_shuffle_percentage = 0.25  # Default value if None is passed
+        else:
+            self.levenshtein_shuffle_percentage = levenshtein_shuffle_percentage
 
         self.cls_token_id = None # Default to None
         if self.use_levenshtein_task:
