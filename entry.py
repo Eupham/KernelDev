@@ -582,12 +582,14 @@ def start_actual_training(cli_args):
         print("\n=== Data Sample ===")
         # Adjust for LevenshteinDataset or standard output
         if lev_task_enabled:
-            # LevenshteinDataset yields: orig_tok, lm_tgt, shuf_tok, lev_dist, coh_score
-            for orig_tok_sample, lm_tgt_sample, _, _, _ in dataloaders['train']:
-                print(f"Levenshtein Batch shapes: Orig Toks-{orig_tok_sample.shape}, LM Targets-{lm_tgt_sample.shape}")
-                print(f"Sample Levenshtein input tokens (original): {orig_tok_sample[0][:20].tolist()}")
-                sample_text = data_builder.decode_tokens(orig_tok_sample[0][:50])
-                print(f"Sample Levenshtein text (original): '{sample_text[:100]}...'")
+            # LevenshteinDataset yields: input_tokens, lm_targets, lev_dist_target, is_shuffled_flag
+            for input_tokens, lm_targets, lev_dist_target, is_shuffled_flag in dataloaders['train']:
+                print(f"Levenshtein Batch shapes: Input Toks-{input_tokens.shape}, LM Targets-{lm_targets.shape}, LevDist-{lev_dist_target.shape}, IsShuffled-{is_shuffled_flag.shape}")
+                print(f"Sample Levenshtein input tokens: {input_tokens[0][:20].tolist()}")
+                # Determine if the first item in the batch was shuffled to adjust log message
+                item_type_sample = "Shuffled" if is_shuffled_flag[0].item() == 1.0 else "Original"
+                sample_text = data_builder.decode_tokens(input_tokens[0][:50])
+                print(f"Sample Levenshtein text ({item_type_sample} sample): '{sample_text[:100]}...'")
                 break
         else: # Standard LM task
             for x, y in dataloaders['train']:

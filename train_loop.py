@@ -368,56 +368,61 @@ class Trainer:
                     print(f"Evaluation limited to {max_batches} batches for speed")
                     break
                 
+                # Unpack batch according to LevenshteinDataset (4 items) or standard (2 items)
                 if self.config.use_levenshtein_task:
-                    original_tokens_cls, lm_targets, shuffled_tokens_cls, target_lev_distance_for_shuffled, target_coherence_score_for_original = batch
-                    original_tokens_cls = original_tokens_cls.to(self.config.device)
+                    input_tokens, lm_targets, true_lev_distances, is_shuffled_flags = batch
+                    input_tokens = input_tokens.to(self.config.device)
                     lm_targets = lm_targets.to(self.config.device)
-                    shuffled_tokens_cls = shuffled_tokens_cls.to(self.config.device)
-                    target_lev_distance_for_shuffled = target_lev_distance_for_shuffled.to(self.config.device)
-                    target_coherence_score_for_original = target_coherence_score_for_original.to(self.config.device)
-                else:
-                    original_tokens_cls, lm_targets = batch
-                    original_tokens_cls = original_tokens_cls.to(self.config.device)
+                    true_lev_distances = true_lev_distances.to(self.config.device)
+                    is_shuffled_flags = is_shuffled_flags.to(self.config.device) # Used for metrics
+                else: # Standard LM task
+                    input_tokens, lm_targets = batch
+                    input_tokens = input_tokens.to(self.config.device)
                     lm_targets = lm_targets.to(self.config.device)
-                    shuffled_tokens_cls, target_lev_distance_for_shuffled, target_coherence_score_for_original = None, None, None
+                    true_lev_distances, is_shuffled_flags = None, None # Not applicable
 
                 current_batch_lm_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
                 current_batch_aux_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
 
-                per_item_lm_loss, pred_dist_original, pred_dist_shuffled = None, None, None
+                per_item_lm_loss, predicted_lev_distances = None, None # Model returns predicted_lev_distances for the input_tokens
+
                 autocast_context_eval = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
                 with autocast_context_eval:
-                    if original_tokens_cls is not None:
-                        _, per_item_lm_loss, pred_dist_original = self.model(original_tokens_cls, lm_targets, force_disable_prefix_attention=False)
-                    if self.config.use_levenshtein_task and shuffled_tokens_cls is not None:
-                        _, _, pred_dist_shuffled = self.model(shuffled_tokens_cls, targets=None, force_disable_prefix_attention=False)
+                    # Model's forward pass; lm_targets are already masked for shuffled items by the dataset
+                    _, per_item_lm_loss, predicted_lev_distances = self.model(
+                        input_tokens,
+                        lm_targets,
+                        force_disable_prefix_attention=False
+                    )
 
                 if per_item_lm_loss is not None:
-                    current_batch_lm_loss_tensor = per_item_lm_loss.mean().float()
-                    accum_lm_loss_component += current_batch_lm_loss_tensor.item()
-                    num_lm_batches += 1
+                    current_batch_lm_loss_tensor = per_item_lm_loss.mean().float() # per_item_lm_loss can be empty if batch has only fully masked items
+                    if not torch.isnan(current_batch_lm_loss_tensor) and not torch.isinf(current_batch_lm_loss_tensor):
+                         accum_lm_loss_component += current_batch_lm_loss_tensor.item()
+                         num_lm_batches += 1
 
-                loss_fn_dist = torch.nn.MSELoss()
-                num_aux_losses_in_batch_eval = 0
-                if self.config.use_levenshtein_task:
-                    if pred_dist_original is not None and target_coherence_score_for_original is not None:
-                        loss_orig_dist = loss_fn_dist(pred_dist_original.float(), target_coherence_score_for_original.float())
-                        current_batch_aux_loss_tensor += loss_orig_dist
-                        num_aux_losses_in_batch_eval +=1
-                        accum_pred_dist_orig_mean += pred_dist_original.mean().item()
-                        num_pred_dist_orig_batches +=1
-                    if pred_dist_shuffled is not None and target_lev_distance_for_shuffled is not None:
-                        loss_shuf_dist = loss_fn_dist(pred_dist_shuffled.float(), target_lev_distance_for_shuffled.float())
-                        current_batch_aux_loss_tensor += loss_shuf_dist
-                        num_aux_losses_in_batch_eval +=1
-                        accum_lev_aux_loss += loss_shuf_dist.item()
+
+                if self.config.use_levenshtein_task and predicted_lev_distances is not None and true_lev_distances is not None:
+                    loss_fn_dist = torch.nn.MSELoss()
+                    # Compare model's predicted distances with the true distances from the batch
+                    aux_loss_for_batch = loss_fn_dist(predicted_lev_distances.float(), true_lev_distances.float())
+                    current_batch_aux_loss_tensor = aux_loss_for_batch
+                    if not torch.isnan(current_batch_aux_loss_tensor) and not torch.isinf(current_batch_aux_loss_tensor):
+                        accum_lev_aux_loss += current_batch_aux_loss_tensor.item()
                         num_lev_batches +=1
-                    if num_aux_losses_in_batch_eval > 0 :
-                         current_batch_aux_loss_tensor /= num_aux_losses_in_batch_eval
+
+                    # For monitoring: mean predicted distance on original items
+                    if is_shuffled_flags is not None:
+                         original_item_mask_eval = (is_shuffled_flags == 0.0)
+                         if original_item_mask_eval.any() and predicted_lev_distances[original_item_mask_eval].numel() > 0:
+                             mean_pred_dist_orig_batch = predicted_lev_distances[original_item_mask_eval].mean().item()
+                             if not math.isnan(mean_pred_dist_orig_batch) and not math.isinf(mean_pred_dist_orig_batch):
+                                 accum_pred_dist_orig_mean += mean_pred_dist_orig_batch
+                                 num_pred_dist_orig_batches +=1
 
                 batch_total_loss = current_batch_lm_loss_tensor
                 if self.config.use_levenshtein_task:
-                    batch_total_loss += self.config.levenshtein_loss_weight * current_batch_aux_loss_tensor
+                    batch_total_loss = batch_total_loss + (self.config.levenshtein_loss_weight * current_batch_aux_loss_tensor)
                 total_combined_loss_epoch += batch_total_loss.item()
                 num_batches_processed +=1
 
