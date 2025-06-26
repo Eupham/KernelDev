@@ -98,6 +98,11 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     if hasattr(args, 'max_train_tokens') and args.max_train_tokens is not None:
         data_config_entry['max_train_tokens'] = args.max_train_tokens
 
+    # Handle debug_max_samples
+    if hasattr(args, 'debug_max_samples') and args.debug_max_samples is not None:
+        print(f"Overriding max_samples with CLI debug argument: {args.debug_max_samples}")
+        data_config_entry['max_samples'] = args.debug_max_samples
+
     return config
 
 
@@ -833,6 +838,12 @@ if __name__ == "__main__":
         type=int, # Or float if DataBuilder handles float('inf') directly
         default=None,
         help='Maximum number of tokens to process for the training set (overrides config data:max_train_tokens).'
+    )
+    parser.add_argument(
+        '--debug-max-samples',
+        type=int,
+        default=None,
+        help='(For debugging) Override max_samples from config to process only a few samples. e.g., --debug-max-samples 100'
     )
     parser.add_argument(
         '--lm-self-critique-base-penalty',
