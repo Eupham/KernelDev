@@ -1,6 +1,108 @@
+import argparse # Keep this, but ArgumentParser might be used from new imports
+import os # For environment variables
+import sys # For sys.modules manipulation
+import types # For creating mock modules
 import torch
 import torch.nn.functional as F
 import numpy as np
+
+# Early argument parsing for --cpu-test-attention and --config
+# This is a simplified parser for pre-setup.
+# The main parser is defined later for the full script logic.
+# Use a basic parser that doesn't conflict with the main one later.
+_cli_pre_parser = argparse.ArgumentParser(add_help=False)
+_cli_pre_parser.add_argument('--cpu-test-attention', action='store_true')
+# We don't need --config for this pre-check, cpu-test-attention is enough.
+_cli_pre_args, _ = _cli_pre_parser.parse_known_args()
+
+if _cli_pre_args.cpu_test_attention:
+    print("Entry.py: --cpu-test-attention detected. Mocking 'original_kernel' and 'triton' modules.")
+
+    # Define the CPU fallback function that original_kernel.flash_attention will point to.
+    # Its signature must match what model.py's Attention class calls,
+    # which is the signature of original_kernel.flash_attention itself.
+    def _cpu_flash_attention_mock(
+        q_orig: torch.Tensor, k_orig: torch.Tensor, v_orig: torch.Tensor,
+        lens: torch.Tensor | None = None, # Kept for signature matching
+        sm_scale: float | None = None,
+        causal: bool = True,
+        autotune: bool = False, # Kept for signature matching
+        return_lse: bool = False,
+        prescale_qk: bool = False, # Kept for signature matching
+        precision: str = "ieee", # Kept for signature matching
+        is_prefix_token_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor : # Matches original_kernel._flash_attention and outer wrapper
+
+        q = q_orig.to(device='cpu', non_blocking=False)
+        k = k_orig.to(device='cpu', non_blocking=False)
+        v = v_orig.to(device='cpu', non_blocking=False)
+
+        B, H, T, D = q.shape
+        target_device = q.device
+
+        if sm_scale is None: sm_scale = D**-0.5
+
+        q_scaled = q * sm_scale
+        attn_bias = torch.zeros(B, H, T, T, dtype=q.dtype, device=target_device)
+
+        if causal:
+            causal_mask_values = torch.triu(torch.ones(T, T, device=target_device, dtype=torch.bool), diagonal=1)
+            expanded_causal_mask = causal_mask_values.unsqueeze(0).unsqueeze(0)
+
+            if is_prefix_token_mask is not None:
+                prefix_mask_for_q = is_prefix_token_mask.to(device=target_device, non_blocking=False)
+                prefix_q_expanded_mask = prefix_mask_for_q.view(1, 1, T, 1).expand(B, H, T, T)
+                final_causal_mask = torch.where(prefix_q_expanded_mask, torch.zeros_like(expanded_causal_mask), expanded_causal_mask)
+            else:
+                final_causal_mask = expanded_causal_mask
+
+            attn_bias.masked_fill_(final_causal_mask, float("-inf"))
+
+        attn_weights = torch.matmul(q_scaled, k.transpose(-2, -1)) + attn_bias
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        output = torch.matmul(attn_weights, v)
+
+        # Mimic return type of original_kernel._flash_attention -> (O, LSE) or O
+        # The _flash_attention wrapper in original_kernel.py handles this.
+        # The custom op torch.ops.flash_attention.forward returns O, LSE.
+        # The CPU fallback in entry.py's cpu_test_mode also returns O, LSE_dummy
+        # So this mock should also return O, LSE_dummy for consistency if return_lse is true.
+
+        lse_dummy = torch.empty(0, device=target_device, dtype=torch.float32) # Default empty LSE
+        if return_lse or any(x.requires_grad for x in [q_orig, k_orig, v_orig]): # Mimic logic for when LSE is computed
+            # A simple LSE approximation for CPU, not as accurate as Triton's
+            scores = torch.matmul(q_scaled, k.transpose(-2, -1)) + attn_bias # Re-use attn_bias with potential -inf
+            lse_dummy = torch.logsumexp(scores, dim=-1)
+            return output, lse_dummy
+        return output
+
+    # Create and register the mock for 'original_kernel'
+    _mock_original_kernel_module = types.ModuleType('original_kernel')
+    _mock_original_kernel_module.flash_attention = _cpu_flash_attention_mock
+    # Add any other attributes model.py might expect from original_kernel, if any.
+    # For example, if it imports IncoherentFlashAttention or set_t4_optimization directly.
+    # Based on model.py, only flash_attention is directly imported.
+    sys.modules['original_kernel'] = _mock_original_kernel_module
+
+    # Create and register a mock for 'triton' and 'triton.language'
+    # This prevents errors if original_kernel.py (even if not used) still tries to import triton at module level.
+    _mock_triton_module = types.ModuleType('triton')
+    # Define dummy decorators/classes on the mock triton module if original_kernel.py uses them at the top level
+    class _DummyDecorator:
+        def __init__(self, *args, **kwargs): pass
+        def __call__(self, fn): return fn
+    _mock_triton_module.autotune = _DummyDecorator
+    _mock_triton_module.jit = _DummyDecorator
+    _mock_triton_module.heuristics = _DummyDecorator
+    _mock_triton_module.Config = lambda *args, **kwargs: None # Dummy Config
+    _mock_triton_module.cdiv = lambda a, b: (a + b - 1) // b # Basic cdiv
+
+    sys.modules['triton'] = _mock_triton_module
+    sys.modules['triton.language'] = types.ModuleType('triton.language') # Empty mock for triton.language
+
+# Now, the actual imports that might trigger original_kernel or triton can proceed.
+# These will get the mocked versions if cpu_test_attention was true.
+import matplotlib.pyplot as plt
 import matplotlib.pyplot as plt
 import argparse # Keep this, but ArgumentParser might be used from new imports
 import yaml
@@ -243,13 +345,14 @@ def start_actual_training(cli_args):
     print("Setting up configuration...")
     
     # Data configuration
+    mtt_value = data_cfg.get('max_train_tokens', None)
     data_config = {
         'dataset_name': data_cfg.get('dataset_name', 'allenai/c4'),
         'dataset_config': data_cfg.get('dataset_config', 'en'),
         'seq_len': data_cfg.get('seq_len', 1024),
         'max_samples': data_cfg.get('max_samples', 5000),
         'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000),
-        'max_train_tokens': data_cfg.get('max_train_tokens', None) # Retrieve, pass None if not set
+        'max_train_tokens': float('inf') if mtt_value is None else mtt_value # Ensure it's inf if None
     }
     
     # Model configuration
@@ -450,10 +553,10 @@ def start_actual_training(cli_args):
     print("\n=== Loading and Processing Data ===")
     # Pass use_levenshtein_task and shuffle percentage to create_data_builder
     data_config_for_builder = {
-        **data_config,
+        **data_config, # data_config already has max_train_tokens correctly set (non-None)
         'use_levenshtein_task': lev_task_enabled,
-        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage'), # Pass as None if not in data_cfg
-        'max_train_tokens': data_cfg.get('max_train_tokens') # Pass as None if not in data_cfg (already fetched into data_config)
+        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage') # Pass as None if not in data_cfg
+        # max_train_tokens is now correctly passed via **data_config
     }
     data_builder = create_data_builder(**data_config_for_builder)
 
