@@ -46,7 +46,7 @@ class TrainingConfig:
         levenshtein_loss_weight: float = 0.1,
         lm_self_critique_base_penalty: float = 0.3,
         lm_self_critique_reward_max: float = 0.3,
-        self_critique_temperature: float = 1.2,
+        self_critique_temperature: float = 1.5,
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
