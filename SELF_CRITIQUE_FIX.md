@@ -11,54 +11,28 @@ Additionally, the previous temperature sampling fix caused a 25% performance deg
 
 This prevented the self-critique reward mechanism from providing useful training signals and slowed down training significantly.
 
-## Root Cause Analysis
+## Final Solution: Complete Removal
 
-The problem was in the `train_step` method where model-generated sequences for critique evaluation were:
+Based on user feedback that the second forward pass was not producing meaningful signals, the **entire self-critique mechanism has been removed**. This approach:
 
-1. **Expensive sampling**: `torch.multinomial(probs.view(-1, probs.size(-1)), 1)` was computationally expensive
-2. **Complex sequence construction**: Mixing context and generated tokens created unnecessary complexity
-3. **Poor performance**: The sampling approach caused 25% slowdown per step
-4. **Inconsistent results**: Generated sequences were not providing meaningful critique scores
+1. **Eliminated performance overhead**: Removes the expensive second forward pass that caused 25% slowdown
+2. **Removes meaningless metrics**: No more confusing zero values in training logs
+3. **Simplifies training**: Returns focus to the core language modeling and Levenshtein auxiliary tasks
+4. **Maintains text quality encouragement**: Keeps the Levenshtein auxiliary loss for distinguishing coherent vs shuffled text
 
-## Solution Implementation
+## Changes Made
 
-### Efficient Direct Prediction Approach
+### Removed Components:
+- Second forward pass using model predictions
+- Self-critique score calculation and normalization  
+- LM loss scaling based on critique scores
+- All related metrics (AvgCritiqueD, EMA_CritiqueD, DeltaCritiqueD)
+- Configuration parameters for self-critique mechanism
 
-**Previous Problematic Approach:**
-```python
-# Expensive temperature sampling
-temperature = self.config.self_critique_temperature
-scaled_logits = lm_logits_orig.float() / temperature
-probs = F.softmax(scaled_logits, dim=-1)
-s_model_output_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(probs.shape[:-1])
-
-# Complex sequence construction
-context_length = min(seq_len // 2, seq_len - 1)
-if context_length > 0:
-    input_context = input_tokens_orig[:, 1:1+context_length]
-    generated_continuation = s_model_output_tokens[:, :seq_len-context_length-1]
-    input_for_critique_model = torch.cat([cls_tensor, input_context, generated_continuation], dim=1)
-```
-
-**New Efficient Approach:**
-```python
-# Direct efficient prediction
-predicted_tokens = torch.argmax(lm_logits_orig, dim=-1)
-
-# Simple direct sequence construction
-input_for_critique_model = torch.cat([cls_tensor, predicted_tokens], dim=1)
-
-# Proper sequence length handling
-if input_for_critique_model.shape[1] > input_tokens_orig.shape[1]:
-    input_for_critique_model = input_for_critique_model[:, :input_tokens_orig.shape[1]]
-```
-
-### Key Improvements
-
-1. **Performance**: Eliminated expensive `torch.multinomial` sampling
-2. **Simplicity**: Direct use of model's most likely predictions via `torch.argmax`
-3. **Efficiency**: Removed complex sequence mixing and context handling
-4. **Effectiveness**: Uses actual model predictions for meaningful critique comparison
+### Simplified Training:
+- Direct use of per-item LM loss without modification
+- Retained Levenshtein auxiliary loss for text quality signal
+- Clean training logs focused on meaningful metrics
 
 ## Results
 
@@ -70,47 +44,26 @@ Performance: 25% slower per step due to expensive sampling
 
 ### After Fix:
 ```
-Expected: AvgCritiqueD: non-zero meaningful values
-Expected: Pred Dist (orig): non-zero meaningful values  
-Expected: Performance: 25% faster (back to baseline)
+Performance: 25% faster (second forward pass eliminated)
+Logs: Clean, meaningful metrics only
+Training: Simplified focus on LM loss + Levenshtein auxiliary loss
 ```
 
 ### Key Improvements:
-- **Eliminated performance degradation**: Removed expensive multinomial sampling
-- **Direct model predictions**: Uses argmax for most likely token predictions
-- **Meaningful comparisons**: Model predictions vs. actual targets for critique
-- **Simplified approach**: Direct sequence construction without complex mixing
-- **Better efficiency**: Single forward pass for critique evaluation
+- **Performance**: Eliminated 25% performance degradation
+- **Clarity**: Removed confusing zero-value metrics from logs
+- **Simplicity**: Streamlined training loop focused on effective signals
+- **Maintainability**: Reduced code complexity and potential failure points
 
-## Technical Details
+## Alternative Approaches for Content Quality
 
-### Efficient Prediction vs Expensive Sampling
-- **Previous**: `torch.multinomial` sampling was computationally expensive
-- **New**: `torch.argmax` provides direct, efficient predictions
-- **Result**: Eliminates 25% performance overhead
+With the self-critique mechanism removed, content quality is encouraged through:
 
-### Direct Sequence Construction
-- **Model predictions**: Uses what the model actually predicts should come next
-- **CLS prefixing**: Maintains proper format for Levenshtein head processing  
-- **Length handling**: Proper truncation and padding for sequence consistency
+1. **Levenshtein Auxiliary Loss**: Maintains ability to distinguish coherent vs shuffled text
+2. **Standard Language Modeling**: Core cross-entropy loss encourages coherent token sequences
+3. **Architecture**: CLS token prefix attention for improved coherence modeling
 
-### Self-Critique Logic
-- **Input**: Model's own predictions via argmax of logits
-- **Comparison**: CLS + predicted_tokens vs. original target sequence
-- **Output**: Meaningful Levenshtein distance representing prediction quality
-
-## Testing Verification
-
-The fix addresses both performance and effectiveness issues:
-
-1. **Performance Tests**: Eliminated expensive multinomial sampling
-2. **Logic Tests**: Direct argmax approach for model predictions  
-3. **Integration Tests**: Proper sequence construction and length handling
-4. **Expected Outcome**: Meaningful non-zero critique scores with baseline performance
-
-## Future Considerations
-
-- Monitor training stability with new direct prediction approach
-- Verify that argmax predictions provide sufficient variation for meaningful critique
-- Consider fallback mechanisms if predictions are too uniform
-- Potential for further optimization of sequence comparison logic
+Future improvements could explore:
+- Enhanced auxiliary tasks beyond Levenshtein distance
+- Different text quality metrics during training
+- Improved model architectures for coherence
