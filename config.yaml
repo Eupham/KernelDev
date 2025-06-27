@@ -96,6 +96,7 @@ model:
   # Self-critique LM loss scaling parameters
   lm_self_critique_base_penalty: 0.3
   lm_self_critique_reward_max: 0.3
+  self_critique_temperature: 1.5  # Temperature for sampling in self-critique mechanism
 
 # GPU/Memory Configuration
 hardware:

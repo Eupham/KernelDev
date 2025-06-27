@@ -46,6 +46,7 @@ class TrainingConfig:
         levenshtein_loss_weight: float = 0.1,
         lm_self_critique_base_penalty: float = 0.3,
         lm_self_critique_reward_max: float = 0.3,
+        self_critique_temperature: float = 1.5,
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -73,6 +74,7 @@ class TrainingConfig:
         self.levenshtein_loss_weight = levenshtein_loss_weight
         self.lm_self_critique_base_penalty = lm_self_critique_base_penalty
         self.lm_self_critique_reward_max = lm_self_critique_reward_max
+        self.self_critique_temperature = self_critique_temperature
         
         if device == "auto":
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -275,13 +277,41 @@ class Trainer:
                     # 5. Self-Critique Forward Pass (Pass 2, no_grad)
                     if lm_logits_orig.numel() > 0: # Ensure there are original items
                         with torch.no_grad(): # No gradients for critique generation/evaluation
-                            s_model_output_tokens = torch.argmax(lm_logits_orig.float(), dim=-1)
+                            # Get the original input tokens for the original items (not shuffled)
+                            input_tokens_orig = input_tokens[original_item_mask]
+                            
+                            # Generate next tokens using model logits (use sampling instead of argmax for better diversity)
+                            # Apply temperature to logits to make them less peaked
+                            temperature = self.config.self_critique_temperature
+                            scaled_logits = lm_logits_orig.float() / temperature
+                            
+                            # Sample tokens instead of using argmax to get more diverse/realistic sequences
+                            probs = F.softmax(scaled_logits, dim=-1)
+                            s_model_output_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(probs.shape[:-1])
+                            
                             if hasattr(self.data_builder, 'cls_token_id') and self.data_builder.cls_token_id is not None:
                                 cls_id = self.data_builder.cls_token_id
-                                cls_tensor = torch.full((s_model_output_tokens.shape[0], 1), cls_id,
+                                batch_size_orig = s_model_output_tokens.shape[0]
+                                seq_len = s_model_output_tokens.shape[1]
+                                
+                                # Create sequences by shifting: CLS + generated_tokens[:-1]
+                                # This maintains the sequence length while providing meaningful content
+                                cls_tensor = torch.full((batch_size_orig, 1), cls_id,
                                                         device=s_model_output_tokens.device, dtype=torch.long)
-                                current_seq_len = s_model_output_tokens.shape[1]
-                                input_for_critique_model = torch.cat([cls_tensor, s_model_output_tokens[:, :current_seq_len-1]], dim=1)
+                                
+                                # Instead of truncating, we construct a sequence that represents 
+                                # "what the model would generate starting from the input"
+                                # Use the original input context but with model-generated continuation
+                                context_length = min(seq_len // 2, seq_len - 1)  # Use half sequence as context
+                                
+                                if context_length > 0:
+                                    # Take some context from original input and some from model generation
+                                    input_context = input_tokens_orig[:, 1:1+context_length]  # Skip CLS from original
+                                    generated_continuation = s_model_output_tokens[:, :seq_len-context_length-1]
+                                    input_for_critique_model = torch.cat([cls_tensor, input_context, generated_continuation], dim=1)
+                                else:
+                                    # Fallback to previous approach if context is too small
+                                    input_for_critique_model = torch.cat([cls_tensor, s_model_output_tokens[:, :seq_len-1]], dim=1)
 
                                 with autocast_context: # Inner model call for critique
                                     _, _, d_self_critique_items = self.model(

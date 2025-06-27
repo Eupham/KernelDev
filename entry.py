@@ -420,6 +420,7 @@ def start_actual_training(cli_args):
         'levenshtein_loss_weight': lev_lw,
         'lm_self_critique_base_penalty': critique_base_penalty,
         'lm_self_critique_reward_max': critique_reward_max,
+        'self_critique_temperature': model_cfg.get('self_critique_temperature', 1.5),
         'scaler': scaler,
         'use_amp': use_amp,
         # Inference params from gen_cfg (defined earlier)
