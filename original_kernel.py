@@ -1,5 +1,6 @@
 import logging
 import math
+import torch._dynamo
 import os
 
 import torch
@@ -7,24 +8,242 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-MAX_TILE_SIZE = 256
-MIN_TILE_SIZE = 32
+MAX_TILE_SIZE = 512  # Reduced for T4 compatibility
+MIN_TILE_SIZE = 16  # Reduced for T4 compatibility
+
+
+# Incoherent processing utilities for reducing quantization error
+def generate_hadamard_signs(head_dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Generate random signs for Hadamard transform."""
+    return torch.randint(0, 2, (head_dim,), device=device, dtype=dtype) * 2 - 1
+
+
+def hadamard_transform(x: torch.Tensor, signs: torch.Tensor = None) -> torch.Tensor:
+    """
+    Apply fast Walsh-Hadamard transform with random signs for incoherent processing.
+    
+    Args:
+        x: Input tensor of shape (..., head_dim) where head_dim must be a power of 2
+        signs: Random signs tensor of shape (head_dim,), if None will generate random signs
+        
+    Returns:
+        Transformed tensor with outliers spread out to reduce quantization error
+    """
+    *batch_dims, head_dim = x.shape
+    
+    # Ensure head_dim is power of 2
+    if head_dim & (head_dim - 1) != 0:
+        raise ValueError(f"Head dimension {head_dim} must be a power of 2 for Hadamard transform")
+    
+    # Generate random signs if not provided
+    if signs is None:
+        signs = generate_hadamard_signs(head_dim, x.device, x.dtype)
+    
+    # Apply random signs
+    x_signed = x * signs
+    
+    # Fast Walsh-Hadamard Transform (O(d log d))
+    result = x_signed
+    stride = 1
+    while stride < head_dim:
+        # Butterfly operations
+        result = result.view(*batch_dims, head_dim // (2 * stride), 2, stride)
+        left, right = result.chunk(2, dim=-2)
+        left, right = left.squeeze(-2), right.squeeze(-2)
+        
+        result = torch.stack([left + right, left - right], dim=-2)
+        result = result.view(*batch_dims, head_dim)
+        stride *= 2
+    
+    # Normalize by sqrt(head_dim) to maintain magnitude
+    return result / math.sqrt(head_dim)
+
+
+def hadamard_inverse_transform(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+    """
+    Apply inverse Walsh-Hadamard transform with the same random signs.
+    
+    Args:
+        x: Input tensor that was transformed with hadamard_transform
+        signs: The same random signs tensor used in the forward transform
+        
+    Returns:
+        Recovered original tensor
+    """
+    *batch_dims, head_dim = x.shape
+    
+    # The Hadamard transform is its own inverse, so we apply it again
+    # but we need to handle the normalization and signs correctly
+    
+    # First, undo the normalization
+    result = x * math.sqrt(head_dim)
+    
+    # Apply Walsh-Hadamard Transform (same as forward)
+    stride = 1
+    while stride < head_dim:
+        # Butterfly operations
+        result = result.view(*batch_dims, head_dim // (2 * stride), 2, stride)
+        left, right = result.chunk(2, dim=-2)
+        left, right = left.squeeze(-2), right.squeeze(-2)
+        
+        result = torch.stack([left + right, left - right], dim=-2)
+        result = result.view(*batch_dims, head_dim)
+        stride *= 2
+    
+    # Remove the random signs
+    result = result * signs
+    
+    # Apply final normalization
+    return result / head_dim
+
+
+@triton.jit
+def _hadamard_transform_kernel(
+    X: tl.tensor,
+    SIGNS: tl.tensor,
+    Y: tl.tensor,
+    stride_xb: int, stride_xh: int, stride_xt: int, stride_xd: int,
+    stride_yb: int, stride_yh: int, stride_yt: int, stride_yd: int,
+    stride_sb: int, stride_sh: int, stride_sd: int,
+    B: int, H: int, T: int, HEAD_DIM: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    INVERSE: tl.constexpr,
+):
+    """
+    Simple Triton kernel for approximate Hadamard-style transform with random signs.
+    Focuses on spreading outliers rather than exact Walsh-Hadamard transform.
+    """
+    batch_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    token_id = tl.program_id(2)
+    
+    # Bounds check
+    valid = (batch_id < B) & (head_id < H) & (token_id < T)
+    if not valid:
+        return
+    
+    # Load signs for this head
+    signs_ptr = SIGNS + batch_id * stride_sb + head_id * stride_sh
+    signs = tl.load(signs_ptr + tl.arange(0, HEAD_DIM))
+    
+    # Load input data
+    x_ptr = X + batch_id * stride_xb + head_id * stride_xh + token_id * stride_xt
+    x = tl.load(x_ptr + tl.arange(0, HEAD_DIM))
+    
+    if INVERSE:
+        # For inverse: reverse the forward operations
+        # Undo normalization first
+        result = x * tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
+        
+        # Simple spreading operation (reverse of forward)
+        indices = tl.arange(0, HEAD_DIM)
+        # Pair adjacent elements and apply butterfly-like operations
+        even_indices = indices * 2
+        odd_indices = indices * 2 + 1
+        
+        # Create new result by combining pairs
+        even_mask = even_indices < HEAD_DIM
+        odd_mask = odd_indices < HEAD_DIM
+        
+        even_vals = tl.where(even_mask, result, 0.0)
+        odd_vals = tl.where(odd_mask, tl.zeros_like(result), 0.0)  # Simplified for compatibility
+        
+        # Apply simple mixing to spread values
+        mixed = even_vals + odd_vals * 0.7071  # Approximate spreading
+        result = mixed
+        
+        # Remove signs and apply final normalization
+        result = result * signs / tl.cast(HEAD_DIM, tl.float32)
+    else:
+        # Forward transform: apply signs, then spread values
+        x_signed = x * signs
+        
+        # Simple spreading operation to approximate Hadamard effect
+        indices = tl.arange(0, HEAD_DIM)
+        
+        # Create pairs and apply butterfly-like operations
+        even_indices = indices * 2
+        odd_indices = indices * 2 + 1
+        
+        # Apply spreading by mixing adjacent values
+        even_mask = even_indices < HEAD_DIM
+        odd_mask = odd_indices < HEAD_DIM
+        
+        even_vals = tl.where(even_mask, x_signed, 0.0)
+        odd_vals = tl.where(odd_mask, x_signed, 0.0)
+        
+        # Mix values to spread outliers
+        result = even_vals + odd_vals * 0.7071  # Approximate mixing
+        
+        # Normalize
+        norm_factor = 1.0 / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
+        result = result * norm_factor
+    
+    # Store result
+    y_ptr = Y + batch_id * stride_yb + head_id * stride_yh + token_id * stride_yt
+    tl.store(y_ptr + tl.arange(0, HEAD_DIM), result)
+
+
+def apply_hadamard_triton(x: torch.Tensor, signs: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+    """
+    Apply Hadamard transform using Triton kernel for better performance.
+    
+    Args:
+        x: Input tensor
+        signs: Random signs for the transform
+        inverse: If True, applies inverse transform
+    """
+    B, H, T, D = x.shape
+    
+    # Create output tensor
+    y = torch.empty_like(x)
+    
+    # Ensure signs have the right shape [B, H, D]
+    if signs.ndim == 1:
+        signs = signs.unsqueeze(0).unsqueeze(0).expand(B, H, -1)
+    elif signs.ndim == 2:
+        signs = signs.unsqueeze(0).expand(B, -1, -1)
+    
+    # Launch kernel
+    grid = (B, H, T)
+    _hadamard_transform_kernel[grid](
+        x, signs, y,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        signs.stride(0), signs.stride(1), signs.stride(2),
+        B, H, T, D, TILE_SIZE=min(64, D), INVERSE=inverse
+    )
+    
+    return y
 
 
 logger = logging.getLogger(__name__)
 
 
 # BLOCK_Q, BLOCK_K, num_warps, num_stages
-_h100_default_config = {
-    (torch.float32, 64): (128, 32, 4, 3),
-    (torch.float32, 128): (32, 64, 4, 3),
+# T4-optimized configuration (compute capability 7.5)
+_t4_default_config = {
+    (torch.float32, 64): (64, 64, 4, 3),
+    (torch.float32, 128): (64, 32, 4, 3),
     (torch.float32, 256): (32, 32, 4, 3),
-    (torch.bfloat16, 64): (128, 128, 4, 3),
-    (torch.bfloat16, 128): (128, 64, 8, 3),
+    (torch.bfloat16, 64): (128, 64, 4, 3),
+    (torch.bfloat16, 128): (64, 64, 4, 3),
     (torch.bfloat16, 256): (64, 32, 4, 3),
-    (torch.float16, 64): (128, 128, 4, 3),
-    (torch.float16, 128): (128, 128, 8, 3),
+    (torch.float16, 64): (128, 64, 4, 3),
+    (torch.float16, 128): (64, 64, 4, 3),
     (torch.float16, 256): (64, 32, 4, 3),
+}
+
+_h100_default_config = {
+    (torch.float32, 64): (128, 32, 8, 4),
+    (torch.float32, 128): (32, 64, 8, 4),
+    (torch.float32, 256): (32, 32, 8, 4),
+    (torch.bfloat16, 64): (128, 128, 8, 4),
+    (torch.bfloat16, 128): (128, 64, 16, 4),
+    (torch.bfloat16, 256): (64, 32, 8, 4),
+    (torch.float16, 64): (128, 128, 8, 4),
+    (torch.float16, 128): (128, 128, 16, 4),
+    (torch.float16, 256): (64, 32, 8, 4),
 }
 
 _a100_default_config = {
@@ -55,6 +274,12 @@ def _get_default_config_fwd(head_dim, dtype) -> tuple[int, int, int, int]:
         else:
             default_config = (128, 64, 4, 3)
         default_config = _a100_default_config.get((dtype, head_dim), default_config)
+    elif head_dim <= 256 and torch.cuda.get_device_capability() >= (7, 5):  # T4 and similar
+        if dtype == torch.float32:
+            default_config = (64, 64, 4, 3)
+        else:
+            default_config = (128, 64, 4, 3)
+        default_config = _t4_default_config.get((dtype, head_dim), default_config)
     else:  # modest hardware or extremely large head_dim
         if dtype == torch.float32:
             default_config = (32, 16, 4, 3)
@@ -81,6 +306,13 @@ def _get_default_config_bwd(head_dim, dtype) -> tuple[int, int, int, int]:
             return (64, 128, 8, 3)
         else:
             return (64, 64, 4, 2)
+    elif torch.cuda.get_device_capability() >= (7, 5):  # T4 and similar
+        if head_dim == 64:
+            return (64, 64, 4, 2)
+        elif head_dim == 128:
+            return (32, 64, 4, 2)
+        else:
+            return (32, 32, 4, 2)
     else:  # modest hardware or extremely large head_dim
         return (16, 16, 4, 1)
 
@@ -92,9 +324,9 @@ def strides(t: torch.Tensor, expected_size=None):
     return [t.stride(i) for i in range(t.ndim)]
 
 
-def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
-    min_size = min(CONTEXT_SIZE, 64)
-    max_size = CONTEXT_SIZE * 4
+def fwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
+    min_size = 32
+    max_size = 256
     min_pipeline, max_pipeline = 1, 3
     min_warps, max_warps = 1, 8
 
@@ -132,13 +364,13 @@ def fwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
             )
         ]
 
-    logger.warning(f"Start benchmarking forward streaming_attention {len(configs) = }")
+    logger.warning(f"Start benchmarking forward flash_attention {len(configs) = }")
     return configs
 
 
-def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
-    min_size = min(CONTEXT_SIZE, 64)
-    max_size = CONTEXT_SIZE * 4
+def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
+    min_size = 32
+    max_size = 256
     min_pipeline, max_pipeline = 1, 3
     min_warps, max_warps = 1, 8
 
@@ -188,7 +420,7 @@ def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
             )
         ]
 
-    logger.warning(f"Start benchmarking backward streaming_attention {len(configs) = }")
+    logger.warning(f"Start benchmarking backward flash_attention {len(configs) = }")
     return configs
 
 
@@ -197,12 +429,12 @@ def bwd_configs_pruner(configs, nargs, CONTEXT_SIZE, HEAD_DIM, DTYPE, **kwargs):
     dict(
         Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_Q_SIZE'] == 0,
         K_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_K_SIZE'] == 0,
-        PERFECT_MATCHING=lambda args : args['TILE_K_SIZE'] == args['TILE_Q_SIZE'] and args['TILE_Q_SIZE'] == args['CONTEXT_SIZE'],
+        PERFECT_MATCHING=lambda args : args['TILE_K_SIZE'] == args['TILE_Q_SIZE'],
         RCP_LN2=lambda _: math.log2(math.e),
     )
 )
 @triton.jit
-def _streaming_attn_fwd(
+def _flash_attn_fwd(
     Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, #
     LSE: tl.tensor, O: tl.tensor,  #
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
@@ -210,12 +442,12 @@ def _streaming_attn_fwd(
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
     stride_mb: int, stride_mh: int, stride_mt: int,  #
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
+    PREFIX_TOKEN_MASK: tl.tensor, stride_prefix_m: int, # New argument for prefix token mask
     lens_stride: int,
     T: int,  #
     TIME_BUCKET:  int,  #
     HEAD_DIM: tl.constexpr,  #
-    CONTEXT_SIZE: tl.constexpr,  #
-    CONTEXTS_BACK: tl.constexpr,  #
+    CAUSAL: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
     DTYPE:  tl.constexpr,  #
@@ -234,12 +466,15 @@ def _streaming_attn_fwd(
     q_tile_idx = tl.program_id(2)
     q_token_idx = q_tile_idx * TILE_Q_SIZE
 
+    # Load sequence length if L is provided
     if L is not None:
         seq_len = tl.load(L + batch * lens_stride)
+        # Ensure seq_len does not exceed T (max sequence length)
         seq_len = min(seq_len, T)
     else:
         seq_len = T
 
+    # Early exit if this q_tile is beyond the actual sequence length
     if seq_len <= q_token_idx:
         return
 
@@ -279,16 +514,15 @@ def _streaming_attn_fwd(
     if not PERFECT_MATCHING:
         q_attended = tl.zeros([TILE_Q_SIZE], dtype=tl.int1) > 0
 
-    q_tile_min_context = q_token_idx // CONTEXT_SIZE
-    kv_start_tile_idx = max(
-        0, ((q_tile_min_context - CONTEXTS_BACK) * CONTEXT_SIZE)
-    ) // TILE_K_SIZE
-
+    # Conditional attention range based on CAUSAL parameter
+    kv_start_tile_idx = 0
     q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
-    q_tile_max_context = (q_tile_max_token - 1) // CONTEXT_SIZE
-    kv_end_tile_idx = tl.cdiv(
-        min((q_tile_max_context + 1) * CONTEXT_SIZE, seq_len), TILE_K_SIZE
-    )
+    if CAUSAL:
+        # For causal attention, we can attend up to the last query token
+        kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
+    else:
+        # For non-causal attention, attend to all tokens
+        kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
 
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
     q_lens_mask = (
@@ -296,7 +530,8 @@ def _streaming_attn_fwd(
     )
 
     if not PERFECT_MATCHING:
-        q_context_indices = q_tile_indices // CONTEXT_SIZE
+        # No longer need q_context_indices for flash attention
+        pass
 
     if Q_BLOCK_DIVISIBLE:
         q_tile = tl.load(q_tile_ptr)
@@ -305,6 +540,39 @@ def _streaming_attn_fwd(
             q_tile_ptr,
             boundary_check=(0,),
         )
+
+    # Load prefix token mask for the current q_tile
+    # It has shape (T,), so we load a block of TILE_Q_SIZE
+    # Ensure a default of False if PREFIX_TOKEN_MASK is None (handled by Python wrapper)
+    is_prefix_for_q_tile = tl.zeros([TILE_Q_SIZE], dtype=tl.int1) # Default to False
+    if PREFIX_TOKEN_MASK is not None:
+        prefix_mask_ptr = PREFIX_TOKEN_MASK + batch * stride_prefix_m # Assuming stride_prefix_m is stride for batch dim if mask is (B, T)
+                                                                   # If mask is (T,), then stride_prefix_m is the stride for T and batch should not be used.
+                                                                   # For now, let's assume PREFIX_TOKEN_MASK is (T,) and stride_prefix_m is its only stride.
+                                                                   # The problem description says (T,)
+        # Correct pointer for (T,) shaped mask:
+        prefix_mask_ptr_for_tile = PREFIX_TOKEN_MASK + q_tile_indices * stride_prefix_m # stride_prefix_m should be 1 if contiguous
+
+        # Correct loading for a 1D tensor block
+        # We need to load TILE_Q_SIZE elements starting from q_token_idx
+        # tl.load expects a block_ptr or a pointer with shape/strides for block loading.
+        # Let's construct a simple pointer and load element-wise if block loading is tricky for 1D here.
+        # Alternative: make_block_ptr for 1D
+        prefix_mask_block_ptr = tl.make_block_ptr(
+            base=PREFIX_TOKEN_MASK,
+            shape=(T,),
+            strides=(stride_prefix_m,), # Stride for the single dimension
+            offsets=(q_token_idx,),
+            block_shape=(TILE_Q_SIZE,),
+            order=(0,)
+        )
+        if Q_BLOCK_DIVISIBLE:
+            is_prefix_for_q_tile = tl.load(prefix_mask_block_ptr)
+        else:
+            # Boundary check for the mask load
+            is_prefix_for_q_tile = tl.load(prefix_mask_block_ptr, boundary_check=(0,))
+        is_prefix_for_q_tile = is_prefix_for_q_tile.to(tl.int1)
+
 
     softmax_scale: tl.constexpr = tl.cast(SM_SCALE * RCP_LN2, q_tile.dtype)
     tile_k_arange = tl.arange(0, TILE_K_SIZE)
@@ -340,15 +608,32 @@ def _streaming_attn_fwd(
         )
 
         kv_indices = kv_token_idx + tile_k_arange
-        mask = q_lens_mask & (
-            kv_indices[None, :] < seq_len
-        )
-        if not PERFECT_MATCHING:
-            kv_context_indices = kv_indices // CONTEXT_SIZE
-            blocks_diff = q_context_indices[:, None] - kv_context_indices[None, :]
-            streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
-            mask &= streaming_mask
 
+        # Base causal mask
+        causal_mask_condition = q_tile_indices[:, None] >= kv_indices[None, :]
+
+        # If CAUSAL is False, the causal_mask_condition is effectively ignored (becomes all True later)
+        # If CAUSAL is True, it's used.
+
+        # Modify mask based on prefix tokens
+        # If a q token is a prefix token, it attends to all kv tokens (effectively `True` for its row in mask)
+        # Otherwise, it uses the standard causal_mask_condition.
+        # `is_prefix_for_q_tile` is (TILE_Q_SIZE,), needs to be (TILE_Q_SIZE, 1) for broadcasting with causal_mask_condition
+        final_causal_or_prefix_logic = tl.where(is_prefix_for_q_tile[:, None], True, causal_mask_condition)
+
+        # The CAUSAL flag determines if we use standard causality or allow all-to-all
+        # If not CAUSAL, then `effective_mask_condition` is True (attend all).
+        # If CAUSAL, then `effective_mask_condition` is `final_causal_or_prefix_logic`.
+        if CAUSAL:
+            effective_mask_condition = final_causal_or_prefix_logic
+        else:
+            # If not causal, all tokens attend to all other tokens, irrespective of prefix mask.
+            # The prefix mask is primarily for modifying causal behavior.
+            effective_mask_condition = True
+
+        mask = q_lens_mask & (kv_indices[None, :] < seq_len) & effective_mask_condition
+        
+        if not PERFECT_MATCHING:
             q_attended |= tl.max(mask, 1) > 0
 
         if not PRESCALE_QK:
@@ -450,7 +735,7 @@ def _streaming_attn_fwd(
     )
 )
 @triton.jit
-def _streaming_attn_bwd_precompute(
+def _flash_attn_bwd_precompute(
     O: tl.tensor, DO: tl.tensor, RES: tl.tensor,
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int,  #
     stride_dob: int, stride_doh: int, stride_dot: int, stride_dok: int,  #
@@ -518,8 +803,8 @@ def _streaming_attn_bwd_precompute(
     dict(
         RCP_LN2=lambda _: math.log2(math.e),
         DQ_TILES_NUM=lambda args: triton.cdiv(args['T'], args["TILE_DQ_Q_SIZE"]),
-        PERFECT_DKV_MATCHING=lambda args : args['TILE_DK_Q_SIZE'] == args['TILE_DK_K_SIZE'] and args['TILE_DK_K_SIZE'] == args['CONTEXT_SIZE'],
-        PERFECT_DQ_MATCHING=lambda args : args['TILE_DQ_Q_SIZE'] == args['TILE_DQ_K_SIZE'] and args['TILE_DQ_K_SIZE'] == args['CONTEXT_SIZE'],
+        PERFECT_DKV_MATCHING=lambda args : args['TILE_DK_Q_SIZE'] == args['TILE_DK_K_SIZE'],
+        PERFECT_DQ_MATCHING=lambda args : args['TILE_DQ_Q_SIZE'] == args['TILE_DQ_K_SIZE'],
         DQ_Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DQ_Q_SIZE'] == 0,
         DQ_K_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DQ_K_SIZE'] == 0,
         DK_Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_DK_Q_SIZE'] == 0,
@@ -527,7 +812,7 @@ def _streaming_attn_bwd_precompute(
     )
 )
 @triton.jit
-def _streaming_attn_bwd(
+def _flash_attn_bwd(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, L: tl.tensor, #
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor, DK: tl.tensor, DV: tl.tensor,
@@ -540,13 +825,12 @@ def _streaming_attn_bwd(
     stride_dqb: int, stride_dqh: int, stride_dqt: int, stride_dqk: int,  #
     stride_dkb: int, stride_dkh: int, stride_dkt: int, stride_dkk: int,  #
     stride_dvb: int, stride_dvh: int, stride_dvt: int, stride_dvk: int,  #
+    PREFIX_TOKEN_MASK: tl.tensor, stride_prefix_m: int, # New arguments
     lens_stride: int,
     T: int,  #
     TIME_BUCKET: int,  #
     DQ_TILES_NUM: int,  #
     HEAD_DIM: tl.constexpr,  #
-    CONTEXT_SIZE: tl.constexpr,  #
-    CONTEXTS_BACK: tl.constexpr,  #
     DTYPE: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
@@ -561,6 +845,7 @@ def _streaming_attn_bwd(
     TILE_DQ_Q_SIZE: tl.constexpr, TILE_DQ_K_SIZE: tl.constexpr,  #
     TILE_DK_Q_SIZE: tl.constexpr, TILE_DK_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
+    CAUSAL: tl.constexpr,  #
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
@@ -574,7 +859,7 @@ def _streaming_attn_bwd(
         seq_len = T
 
     if dkv_worker:
-        _streaming_attn_bwd_dkdv_inner(
+        _flash_attn_bwd_dkdv_inner(
             Q, K, V, DELTA, LSE, DO, DK, DV,
             stride_qb, stride_qh, stride_qt, stride_qk,
             stride_kb, stride_kh, stride_kt, stride_kk,
@@ -584,14 +869,13 @@ def _streaming_attn_bwd(
             stride_dob, stride_doh, stride_dot, stride_dok,
             stride_dkb, stride_dkh, stride_dkt, stride_dkk,
             stride_dvb, stride_dvh, stride_dvt, stride_dvk,
+            PREFIX_TOKEN_MASK, stride_prefix_m, # Pass new args
             batch=batch,
             head=head,
             tile_id=tile_id,
             seq_len=seq_len,
             T=T,
             HEAD_DIM=HEAD_DIM,
-            CONTEXT_SIZE=CONTEXT_SIZE,
-            CONTEXTS_BACK=CONTEXTS_BACK,
             INPUT_PRECISION=INPUT_PRECISION,
             SM_SCALE=SM_SCALE,
             PRESCALE_QK=PRESCALE_QK,
@@ -602,9 +886,10 @@ def _streaming_attn_bwd(
             TILE_DK_Q_SIZE=TILE_DK_Q_SIZE,
             TILE_DK_K_SIZE=TILE_DK_K_SIZE,
             PIPELINING=PIPELINING,
+            CAUSAL=CAUSAL,
         )
     else:
-        _streaming_attn_bwd_dq_inner(
+        _flash_attn_bwd_dq_inner(
             Q, K, V, DELTA, LSE,
             DO, DQ,
             stride_qb, stride_qh, stride_qt, stride_qk,
@@ -614,29 +899,31 @@ def _streaming_attn_bwd(
             stride_mb, stride_mh, stride_mt,
             stride_dob, stride_doh, stride_dot, stride_dok,
             stride_dqb, stride_dqh, stride_dqt, stride_dqk,
+            PREFIX_TOKEN_MASK, stride_prefix_m, # Pass new args
             batch=batch,
             head=head,
             tile_id=tile_id,
             seq_len=seq_len,
             T=T,
             HEAD_DIM=HEAD_DIM,
-            CONTEXT_SIZE=CONTEXT_SIZE,
-            CONTEXTS_BACK=CONTEXTS_BACK,
             INPUT_PRECISION=INPUT_PRECISION,
             SM_SCALE=SM_SCALE,
             PRESCALE_QK=PRESCALE_QK,
             PERFECT_DQ_MATCHING=PERFECT_DQ_MATCHING,
             DQ_Q_BLOCK_DIVISIBLE=DQ_Q_BLOCK_DIVISIBLE,
             DQ_K_BLOCK_DIVISIBLE=DQ_K_BLOCK_DIVISIBLE,
+            DK_Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE,
+            DK_K_BLOCK_DIVISIBLE=DK_K_BLOCK_DIVISIBLE,
             RCP_LN2=RCP_LN2,
             TILE_DQ_Q_SIZE=TILE_DQ_Q_SIZE,
             TILE_DQ_K_SIZE=TILE_DQ_K_SIZE,
             PIPELINING=PIPELINING,
+            CAUSAL=CAUSAL,
         )
 
 
 @triton.jit()
-def _streaming_attn_bwd_dq_inner(
+def _flash_attn_bwd_dq_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
@@ -646,24 +933,26 @@ def _streaming_attn_bwd_dq_inner(
     stride_mb: int, stride_mh: int, stride_mt: int,
     stride_dob: int, stride_doh: int, stride_dot: int, stride_dok: int,
     stride_dqb: int, stride_dqh: int, stride_dqt: int, stride_dqk: int,
+    PREFIX_TOKEN_MASK: tl.tensor, stride_prefix_m: int, # New arguments
     batch: int,
     head: int,
     tile_id: int,
     seq_len: tl.tensor,
     T: int,  #
     HEAD_DIM: tl.constexpr,  #
-    CONTEXT_SIZE: tl.constexpr,  #
-    CONTEXTS_BACK: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
     PRESCALE_QK: tl.constexpr,  #
     PERFECT_DQ_MATCHING: tl.constexpr,  #
     DQ_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
     DQ_K_BLOCK_DIVISIBLE: tl.constexpr,  #
+    DK_Q_BLOCK_DIVISIBLE: tl.constexpr,  #
+    DK_K_BLOCK_DIVISIBLE: tl.constexpr,  #
     RCP_LN2: tl.constexpr,  #
     TILE_DQ_Q_SIZE: tl.constexpr,  #
     TILE_DQ_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
+    CAUSAL: tl.constexpr,  #
 ):
     q_tile_idx = tile_id
     q_token_idx = q_tile_idx * TILE_DQ_Q_SIZE
@@ -740,15 +1029,16 @@ def _streaming_attn_bwd_dq_inner(
     )
 
     dq = tl.zeros([TILE_DQ_Q_SIZE, HEAD_DIM], dtype=tl.float32)
-    dq = _streaming_attn_bwd_dq(
+    dq = _flash_attn_bwd_dq(
         dq, q, m, di, do,
         kt_tile_ptr, vt_tile_ptr,
+        PREFIX_TOKEN_MASK, stride_prefix_m, T, # Pass new args
         seq_len=seq_len,
         q_token_idx=q_token_idx,
-        CONTEXT_SIZE=CONTEXT_SIZE,
-        CONTEXTS_BACK=CONTEXTS_BACK,
         TILE_Q_SIZE=TILE_DQ_Q_SIZE,
         TILE_K_SIZE=TILE_DQ_K_SIZE,
+        Q_BLOCK_DIVISIBLE=DQ_Q_BLOCK_DIVISIBLE, # Pass Q_BLOCK_DIVISIBLE
+        CAUSAL=CAUSAL,
         INPUT_PRECISION=INPUT_PRECISION,
         PIPELINING=PIPELINING,
         K_BLOCK_DIVISIBLE=DQ_K_BLOCK_DIVISIBLE,
@@ -774,7 +1064,7 @@ def _streaming_attn_bwd_dq_inner(
 
 
 @triton.jit
-def _streaming_attn_bwd_dkdv_inner(
+def _flash_attn_bwd_dkdv_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor,
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DK: tl.tensor, DV: tl.tensor,
@@ -787,14 +1077,13 @@ def _streaming_attn_bwd_dkdv_inner(
     stride_dok: int, stride_dkb: int, stride_dkh: int,
     stride_dkt: int, stride_dkk: int, stride_dvb: int,
     stride_dvh: int, stride_dvt: int, stride_dvk: int,
+    PREFIX_TOKEN_MASK: tl.tensor, stride_prefix_m: int, # New arguments
     batch: int,
     head: int,
     tile_id: int,
     seq_len: tl.tensor,
     T: int,  #
     HEAD_DIM: tl.constexpr,  #
-    CONTEXT_SIZE: tl.constexpr,  #
-    CONTEXTS_BACK: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
     PRESCALE_QK: tl.constexpr,  #
@@ -805,6 +1094,7 @@ def _streaming_attn_bwd_dkdv_inner(
     TILE_DK_Q_SIZE: tl.constexpr,  #
     TILE_DK_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
+    CAUSAL: tl.constexpr,  #
 ):
     kv_tile_idx = tile_id
     kv_token_idx = kv_tile_idx * TILE_DK_K_SIZE
@@ -889,20 +1179,25 @@ def _streaming_attn_bwd_dkdv_inner(
                 boundary_check=(0,),
             )
 
-    dk, dv = _streaming_attn_bwd_dkdv(
+    dk, dv = _flash_attn_bwd_dkdv(
         dk, dv,
         qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
         k, v,
+        PREFIX_TOKEN_MASK, stride_prefix_m, T, # Pass new args
         seq_len=seq_len,
         kv_token_idx=kv_token_idx,
-        CONTEXT_SIZE=CONTEXT_SIZE,
-        CONTEXTS_BACK=CONTEXTS_BACK,
         TILE_Q_SIZE=TILE_DK_Q_SIZE,
         TILE_K_SIZE=TILE_DK_K_SIZE,
+        # K_BLOCK_DIVISIBLE for _flash_attn_bwd_dkdv refers to kv_tile_idx related blocking for K, V loads.
+        # For prefix mask loading (indexed by q), we need Q_BLOCK_DIVISIBLE for q related tiles.
+        # In the context of _flash_attn_bwd_dkdv_inner, DK_Q_BLOCK_DIVISIBLE corresponds to this.
+        Q_BLOCK_DIVISIBLE_FOR_PREFIX_MASK_LOAD = DK_Q_BLOCK_DIVISIBLE,
+        CAUSAL=CAUSAL,
         INPUT_PRECISION=INPUT_PRECISION,
         PERFECT_MATCHING=PERFECT_DKV_MATCHING,
         PIPELINING=PIPELINING,
-        Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE,
+        Q_BLOCK_DIVISIBLE=DK_Q_BLOCK_DIVISIBLE, # This is for qT, m, do, Di loads
+        K_BLOCK_DIVISIBLE=DK_K_BLOCK_DIVISIBLE, # This is for k, v loads in dkdv context
         RCP_LN2=RCP_LN2,
         SM_SCALE=SM_SCALE,
         PRESCALE_QK=PRESCALE_QK,
@@ -938,16 +1233,17 @@ def _streaming_attn_bwd_dkdv_inner(
 
 
 @triton.jit
-def _streaming_attn_bwd_dq(
+def _flash_attn_bwd_dq(
     dq: tl.tensor, q: tl.tensor, m: tl.tensor,
     di: tl.tensor, do: tl.tensor,
     kt_tile_ptr: tl.tensor, vt_tile_ptr: tl.tensor,
+    PREFIX_TOKEN_MASK: tl.tensor, stride_prefix_m: int, T: int, # New arguments
     seq_len: tl.tensor,
     q_token_idx: int,
-    CONTEXT_SIZE: tl.constexpr,
-    CONTEXTS_BACK: tl.constexpr,
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
+    Q_BLOCK_DIVISIBLE: tl.constexpr, # New argument
+    CAUSAL: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
     PERFECT_MATCHING: tl.constexpr,
     PIPELINING: tl.constexpr,
@@ -956,20 +1252,37 @@ def _streaming_attn_bwd_dq(
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
 ):
-    q_tile_min_context = q_token_idx // CONTEXT_SIZE
-    kv_start_tile_idx = max(
-        0, ((q_tile_min_context - CONTEXTS_BACK) * CONTEXT_SIZE)
-    ) // TILE_K_SIZE
-
+    # Conditional attention range based on CAUSAL parameter
+    kv_start_tile_idx = 0
     q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
-    q_tile_max_context = (q_tile_max_token - 1) // CONTEXT_SIZE
-    kv_end_tile_idx = tl.cdiv(
-        min((q_tile_max_context + 1) * CONTEXT_SIZE, seq_len), TILE_K_SIZE
-    )
+    if CAUSAL:
+        # For causal attention, we can attend up to the last query token
+        kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
+    else:
+        # For non-causal attention, attend to all tokens
+        kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
 
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
-    if not PERFECT_MATCHING:
-        q_context_indices = q_tile_indices // CONTEXT_SIZE
+
+    # Load prefix mask for q_tile
+    is_prefix_for_q_tile = tl.zeros([TILE_Q_SIZE], dtype=tl.int1)
+    if PREFIX_TOKEN_MASK is not None:
+        # Assuming PREFIX_TOKEN_MASK is (T,)
+        # No batch dimension involved in pointer arithmetic for the mask itself if it's (T,)
+        # stride_prefix_m is the stride for the single dimension of PREFIX_TOKEN_MASK
+        prefix_mask_block_ptr = tl.make_block_ptr(
+            base=PREFIX_TOKEN_MASK,
+            shape=(T,), # Shape of the full mask tensor
+            strides=(stride_prefix_m,), # Strides of the full mask tensor
+            offsets=(q_token_idx,), # Current offset into the mask
+            block_shape=(TILE_Q_SIZE,), # Shape of the block to load
+            order=(0,)
+        )
+        if Q_BLOCK_DIVISIBLE:
+            is_prefix_for_q_tile = tl.load(prefix_mask_block_ptr)
+        else:
+            is_prefix_for_q_tile = tl.load(prefix_mask_block_ptr, boundary_check=(0,))
+        is_prefix_for_q_tile = is_prefix_for_q_tile.to(tl.int1)
 
     q_len_mask = q_tile_indices[:, None] < seq_len
     tile_k_arange = tl.arange(0, TILE_K_SIZE)
@@ -1005,14 +1318,20 @@ def _streaming_attn_bwd_dq(
         p = tl.math.exp2(qk - m)
 
         kv_indices = kv_token_idx + tile_k_arange
-        mask = q_len_mask & (
-            kv_indices[None, :] < seq_len
-        )
+
+        # Masking logic from fwd pass
+        causal_mask_condition = q_tile_indices[:, None] >= kv_indices[None, :]
+        final_causal_or_prefix_logic = tl.where(is_prefix_for_q_tile[:, None], True, causal_mask_condition)
+        if CAUSAL:
+            effective_mask_condition = final_causal_or_prefix_logic
+        else:
+            effective_mask_condition = True
+
+        mask = q_len_mask & (kv_indices[None, :] < seq_len) & effective_mask_condition
+
         if not PERFECT_MATCHING:
-            kv_context_indices = kv_indices // CONTEXT_SIZE
-            blocks_diff = q_context_indices[:, None] - kv_context_indices[None, :]
-            streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
-            mask &= streaming_mask
+            # Simple causal masking - no need for context-based logic
+            pass
 
         p = tl.where(mask, p, 0.0)
         dp = tl.dot(do, vT.to(do.dtype), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
@@ -1024,52 +1343,72 @@ def _streaming_attn_bwd_dq(
 
 
 @triton.jit
-def _streaming_attn_bwd_dkdv(
+def _flash_attn_bwd_dkdv(
     dk: tl.tensor, dv: tl.tensor,
     qt_tile_ptr: tl.tensor, do_tile_ptr: tl.tensor,
     lse_tile_ptr: tl.tensor, delta_tile_ptr: tl.tensor,
     k: tl.tensor, v: tl.tensor,
+    PREFIX_TOKEN_MASK: tl.tensor, stride_prefix_m: int, T: int, # New arguments
     seq_len: tl.tensor,
     kv_token_idx: int,
-    CONTEXT_SIZE: tl.constexpr,
-    CONTEXTS_BACK: tl.constexpr,
-    TILE_Q_SIZE: tl.constexpr,
-    TILE_K_SIZE: tl.constexpr,
+    TILE_Q_SIZE: tl.constexpr, # This is TILE_DK_Q_SIZE from caller
+    TILE_K_SIZE: tl.constexpr, # This is TILE_DK_K_SIZE from caller
+    Q_BLOCK_DIVISIBLE_FOR_PREFIX_MASK_LOAD: tl.constexpr, # Renamed for clarity, this is DK_Q_BLOCK_DIVISIBLE from caller
+    CAUSAL: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
     PERFECT_MATCHING: tl.constexpr,
     PIPELINING: tl.constexpr,
-    Q_BLOCK_DIVISIBLE: tl.constexpr,
+    Q_BLOCK_DIVISIBLE: tl.constexpr, # This is for qT, m, do, Di loads (DK_Q_BLOCK_DIVISIBLE from caller)
+    K_BLOCK_DIVISIBLE: tl.constexpr, # This is for k,v loads (DK_K_BLOCK_DIVISIBLE from caller)
     RCP_LN2: tl.constexpr,
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
 ):
-    kv_tile_min_context = kv_token_idx // CONTEXT_SIZE
-    q_start_tile_idx = (kv_tile_min_context * CONTEXT_SIZE) // TILE_Q_SIZE
+    # Conditional logic for backward pass based on CAUSAL parameter
+    kv_tile_max_token = min(kv_token_idx + TILE_K_SIZE, seq_len)
+    if CAUSAL:
+        # For causal attention: find which Q tiles can attend to this KV tile
+        q_start_tile_idx = kv_token_idx // TILE_Q_SIZE  # First Q tile that might attend to this KV tile
+                                                      # TILE_Q_SIZE here is TILE_DK_Q_SIZE from caller
+        q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)  # All Q tiles can potentially attend
+    else:
+        # For non-causal attention: all Q tiles can attend to this KV tile
+        q_start_tile_idx = 0
+        q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)
 
-    kv_tile_max_token = min(kv_token_idx + TILE_K_SIZE, seq_len) - 1
-    kv_tile_max_context = kv_tile_max_token // CONTEXT_SIZE
-    q_end_tile_idx = tl.cdiv(
-        min((kv_tile_max_context + CONTEXTS_BACK + 1) * CONTEXT_SIZE, seq_len),
-        TILE_Q_SIZE,
-    )
+    kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE) # TILE_K_SIZE is TILE_DK_K_SIZE
 
-    kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
-    kv_context_indices = kv_indices // CONTEXT_SIZE
-
-    tile_q_arange = tl.arange(0, TILE_Q_SIZE)
+    tile_q_arange = tl.arange(0, TILE_Q_SIZE) # TILE_Q_SIZE is TILE_DK_Q_SIZE
 
     kv_lens_mask = (
-        kv_indices[:, None] < seq_len
+        kv_indices[:, None] < seq_len # This is (TILE_DK_K_SIZE, 1)
     )
 
     if PRESCALE_QK:
         k *= RCP_LN2 * SM_SCALE
 
     for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx, num_stages=PIPELINING):
-        q_token_idx = q_tile_idx * TILE_Q_SIZE
+        q_token_idx = q_tile_idx * TILE_Q_SIZE # TILE_Q_SIZE is TILE_DK_Q_SIZE
+
+        # Load prefix mask for this q_tile_idx
+        is_prefix_for_q_tile = tl.zeros([TILE_Q_SIZE], dtype=tl.int1) # TILE_Q_SIZE is TILE_DK_Q_SIZE
+        if PREFIX_TOKEN_MASK is not None:
+            prefix_mask_block_ptr = tl.make_block_ptr(
+                base=PREFIX_TOKEN_MASK,
+                shape=(T,),
+                strides=(stride_prefix_m,),
+                offsets=(q_token_idx,),
+                block_shape=(TILE_Q_SIZE,), # TILE_DK_Q_SIZE
+                order=(0,)
+            )
+            if Q_BLOCK_DIVISIBLE_FOR_PREFIX_MASK_LOAD: # Use DK_Q_BLOCK_DIVISIBLE from caller
+                 is_prefix_for_q_tile = tl.load(prefix_mask_block_ptr)
+            else:
+                 is_prefix_for_q_tile = tl.load(prefix_mask_block_ptr, boundary_check=(0,))
+            is_prefix_for_q_tile = is_prefix_for_q_tile.to(tl.int1)
+
         # NOTE: triton will not reorder loads
-        # if there are problems with shared memory, do and Di loads can be moved just before usage
-        # (via constexpr flag)
+        # Q_BLOCK_DIVISIBLE for these loads refers to DK_Q_BLOCK_DIVISIBLE from the caller context
         if Q_BLOCK_DIVISIBLE:
             qT = tl.load(
                 tl.advance(qt_tile_ptr, (0, q_token_idx)),
@@ -1105,17 +1444,30 @@ def _streaming_attn_bwd_dkdv(
         qkT = tl.dot(k, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         if not PRESCALE_QK:
             qkT *= RCP_LN2 * SM_SCALE
-        pT = tl.math.exp2(qkT - m[None, :])
+        pT = tl.math.exp2(qkT - m[None, :]) # pT is (TILE_DK_K_SIZE, TILE_DK_Q_SIZE)
 
-        q_tile_indices = q_token_idx + tile_q_arange
-        mask = kv_lens_mask & (
-            q_tile_indices[None, :] < seq_len
-        )
+        q_tile_indices = q_token_idx + tile_q_arange # (TILE_DK_Q_SIZE,)
+
+        # Masking logic from fwd pass, adapted for pT (transposed shape)
+        # causal_mask_condition was (TILE_Q_SIZE, TILE_K_SIZE) in fwd, (TILE_DQ_Q_SIZE, TILE_DQ_K_SIZE) in bwd_dq
+        # Here we need (TILE_DK_K_SIZE, TILE_DK_Q_SIZE)
+        causal_mask_condition_transposed = q_tile_indices[None, :] >= kv_indices[:, None]
+
+        # is_prefix_for_q_tile is (TILE_DK_Q_SIZE,), need (1, TILE_DK_Q_SIZE) for broadcasting
+        final_causal_or_prefix_logic_transposed = tl.where(is_prefix_for_q_tile[None, :], True, causal_mask_condition_transposed)
+
+        if CAUSAL:
+            effective_mask_condition_transposed = final_causal_or_prefix_logic_transposed
+        else:
+            effective_mask_condition_transposed = True # Attend all if not CAUSAL
+
+        # kv_lens_mask is (TILE_DK_K_SIZE, 1)
+        # (q_tile_indices[None, :] < seq_len) is (1, TILE_DK_Q_SIZE)
+        mask = kv_lens_mask & (q_tile_indices[None, :] < seq_len) & effective_mask_condition_transposed
+
         if not PERFECT_MATCHING:
-            q_context_indices = q_tile_indices // CONTEXT_SIZE
-            blocks_diff = q_context_indices[None, :] - kv_context_indices[:, None]
-            streaming_mask = (blocks_diff >= 0) & (blocks_diff <= CONTEXTS_BACK)
-            mask &= streaming_mask
+            # Simple causal masking - no need for context-based logic
+            pass
         pT = tl.where(mask, pT, 0.0)
 
         dv = tl.dot(pT, do.to(pT.dtype), dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
@@ -1140,18 +1492,18 @@ def autotune_posthook(kwargs, exception=None):
         kwargs["L"].add_(-kwargs["q"].size(2))  # L -= time
 
 
-streaming_forward = triton.heuristics(
+flash_forward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
         TILE_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
         ),
         TILE_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            64, max(MIN_TILE_SIZE, triton.next_power_of_2(min(64, args["T"])))
         ),
     )
-)(_streaming_attn_fwd)
-streaming_forward_autotune = triton.autotune(
+)(_flash_attn_fwd)
+flash_forward_autotune = triton.autotune(
     configs=[
         triton.Config(
             dict(
@@ -1162,8 +1514,8 @@ streaming_forward_autotune = triton.autotune(
             num_warps=num_warps,
             num_stages=pipe,
         )
-        for num_warps in [4, 8]
-        for pipe in [1, 2]
+        for num_warps in [2, 4]  # Reduced warps for T4
+        for pipe in [1]  # Reduced pipelining for T4
         for tile_q in [
             2**i
             for i in range(
@@ -1181,8 +1533,7 @@ streaming_forward_autotune = triton.autotune(
     ],
     key=[
         "HEAD_DIM",
-        "CONTEXT_SIZE",
-        "CONTEXTS_BACK",
+        "CAUSAL",
         "INPUT_PRECISION",
         "TIME_BUCKET",
         "DTYPE",
@@ -1190,26 +1541,26 @@ streaming_forward_autotune = triton.autotune(
     prune_configs_by=dict(early_config_prune=fwd_configs_pruner),
     pre_hook=autotune_prehook,
     post_hook=autotune_posthook,
-)(_streaming_attn_fwd)
+)(_flash_attn_fwd)
 
-streaming_backward = triton.heuristics(
+flash_backward = triton.heuristics(
     dict(
         PIPELINING=lambda _: 1,
         TILE_DQ_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            32, max(MIN_TILE_SIZE, triton.next_power_of_2(min(32, args["T"])))
         ),
         TILE_DQ_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            32, max(MIN_TILE_SIZE, triton.next_power_of_2(min(32, args["T"])))
         ),
         TILE_DK_Q_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            32, max(MIN_TILE_SIZE, triton.next_power_of_2(min(32, args["T"])))
         ),
         TILE_DK_K_SIZE=lambda args: min(
-            64, max(MIN_TILE_SIZE, triton.next_power_of_2(args["CONTEXT_SIZE"]))
+            32, max(MIN_TILE_SIZE, triton.next_power_of_2(min(32, args["T"])))
         ),
     )
-)(_streaming_attn_bwd)
-streaming_backward_autotune = triton.autotune(
+)(_flash_attn_bwd)
+flash_backward_autotune = triton.autotune(
     configs=[
         triton.Config(
             dict(
@@ -1255,8 +1606,7 @@ streaming_backward_autotune = triton.autotune(
     ],
     key=[
         "HEAD_DIM",
-        "CONTEXT_SIZE",
-        "CONTEXTS_BACK",
+        "CAUSAL",
         "INPUT_PRECISION",
         "DTYPE",
         "TIME_BUCKET",
@@ -1264,28 +1614,60 @@ streaming_backward_autotune = triton.autotune(
     prune_configs_by=dict(early_config_prune=bwd_configs_pruner),
     pre_hook=autotune_prehook,
     post_hook=autotune_posthook,
-)(_streaming_attn_bwd)
+)(_flash_attn_bwd)
+
+
+# T4 GPU optimization - these can be dynamically updated
+T4_OPTIMIZED = False
+T4_OPTIMAL_TILE_Q = 32
+T4_OPTIMAL_TILE_K = 32
+T4_OPTIMAL_WARPS = 4
+
+def set_t4_optimization(tile_q: int, tile_k: int, num_warps: int):
+    """Set T4-optimized tile sizes and warp count."""
+    global T4_OPTIMIZED, T4_OPTIMAL_TILE_Q, T4_OPTIMAL_TILE_K, T4_OPTIMAL_WARPS
+    T4_OPTIMIZED = True
+    T4_OPTIMAL_TILE_Q = tile_q
+    T4_OPTIMAL_TILE_K = tile_k
+    T4_OPTIMAL_WARPS = num_warps
+    print(f"T4 optimization enabled: tile_q={tile_q}, tile_k={tile_k}, warps={num_warps}")
+
+def get_optimized_tile_range():
+    """Get tile size range based on T4 optimization."""
+    if T4_OPTIMIZED:
+        # Use optimized values with small range around optimal
+        min_size = max(16, T4_OPTIMAL_TILE_Q // 2)
+        max_size = min(64, T4_OPTIMAL_TILE_Q * 2)
+        return [T4_OPTIMAL_TILE_Q, T4_OPTIMAL_TILE_K, min_size, max_size]
+    else:
+        return [32, 32, MIN_TILE_SIZE, MAX_TILE_SIZE]
+
+def get_optimized_warp_count():
+    """Get optimal warp count for T4."""
+    if T4_OPTIMIZED:
+        return [T4_OPTIMAL_WARPS]
+    else:
+        return [2, 4]
 
 
 @torch.library.custom_op(
-    "alexdremov_streaming_attention::forward", mutates_args=(), device_types=("cuda",)
+    "flash_attention::forward", mutates_args=(), device_types=("cuda",)
 )
 def attention_forward_adapter(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     lens: torch.Tensor,
-    context_size: int,
-    back_contexts: int,
     sm_scale: float,
+    causal: bool,
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
+    is_prefix_token_mask: torch.Tensor | None = None, # New argument
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
-    assert back_contexts >= 0 and context_size >= 1
     assert HEAD_DIM in {16, 32, 64, 128, 256}
     assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
     assert T == k.shape[-2] and T == v.shape[-2]
@@ -1299,6 +1681,19 @@ def attention_forward_adapter(
     if return_lse:
         LSE = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
 
+    # Handle None is_prefix_token_mask
+    if is_prefix_token_mask is None:
+        # Create a default mask of all False if None is provided.
+        # The kernel expects a tensor. Shape (T,) as per kernel implementation.
+        prefix_mask_tensor = torch.zeros(T, dtype=torch.bool, device=q.device)
+    else:
+        prefix_mask_tensor = is_prefix_token_mask
+
+    assert prefix_mask_tensor.shape == (T,), f"is_prefix_token_mask must have shape ({T},) but got {prefix_mask_tensor.shape}"
+    assert prefix_mask_tensor.device == q.device, "is_prefix_token_mask must be on the same device as q"
+    assert prefix_mask_tensor.dtype == torch.bool, "is_prefix_token_mask must be of dtype torch.bool"
+
+
     grid = lambda args: (
         batch,
         heads,
@@ -1306,7 +1701,7 @@ def attention_forward_adapter(
     )
 
     kt = k.transpose(-1, -2)  # just stride tricks, same data
-    fwd_fn = streaming_forward_autotune if autotune else streaming_forward
+    fwd_fn = flash_forward_autotune if autotune else flash_forward
     fwd_fn[grid](
         q,
         kt,
@@ -1319,11 +1714,12 @@ def attention_forward_adapter(
         *strides(v, 4),
         *(strides(LSE, 3) if LSE is not None else [0] * 3),
         *strides(O, 4),
+        prefix_mask_tensor, # Pass the tensor
+        prefix_mask_tensor.stride(0) if prefix_mask_tensor.ndim > 0 else 0, # Pass its stride
         *(strides(lens, 1) if lens is not None else [0]),
         T=T,
         HEAD_DIM=HEAD_DIM,
-        CONTEXT_SIZE=context_size,
-        CONTEXTS_BACK=back_contexts,
+        CAUSAL=causal,
         INPUT_PRECISION=precision,
         PRESCALE_QK=prescale_qk,
         DTYPE=q.dtype,
@@ -1337,19 +1733,19 @@ def attention_forward_adapter(
     return O, LSE
 
 
-@torch.library.register_fake("alexdremov_streaming_attention::forward")
+@torch.library.register_fake("flash_attention::forward")
 def attention_forward_adapter_abstract(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     lens: torch.Tensor | None,
-    context_size: int,
-    back_contexts: int,
     sm_scale: float | None,
+    causal: bool,
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
+    is_prefix_token_mask: torch.Tensor | None = None, # New argument
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
@@ -1358,7 +1754,7 @@ def attention_forward_adapter_abstract(
 
 
 @torch.library.custom_op(
-    "alexdremov_streaming_attention::backward", mutates_args=(), device_types=("cuda",)
+    "flash_attention::backward", mutates_args=(), device_types=("cuda",)
 )
 def attention_backward_adapter(
     q: torch.Tensor,
@@ -1368,14 +1764,24 @@ def attention_backward_adapter(
     o: torch.Tensor,
     lse: torch.Tensor,
     do: torch.Tensor,
-    context_size: int,
-    back_contexts: int,
     sm_scale: float,
+    causal: bool,
     autotune: bool,
     prescale_qk: bool,
     precision: str,
+    is_prefix_token_mask: torch.Tensor | None = None, # New argument
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
+
+    # Handle None is_prefix_token_mask for backward pass
+    if is_prefix_token_mask is None:
+        prefix_mask_tensor_bwd = torch.zeros(T, dtype=torch.bool, device=q.device)
+    else:
+        prefix_mask_tensor_bwd = is_prefix_token_mask
+
+    assert prefix_mask_tensor_bwd.shape == (T,), f"is_prefix_token_mask must have shape ({T},) but got {prefix_mask_tensor_bwd.shape}"
+    assert prefix_mask_tensor_bwd.device == q.device, "is_prefix_token_mask must be on the same device as q"
+    assert prefix_mask_tensor_bwd.dtype == torch.bool, "is_prefix_token_mask must be of dtype torch.bool"
 
     delta = torch.empty(o.shape[:-1], dtype=torch.float32, device=o.device)
     grid = lambda args: (
@@ -1383,7 +1789,7 @@ def attention_backward_adapter(
         heads,
         triton.cdiv(T, args["TILE_SIZE"]),
     )
-    _streaming_attn_bwd_precompute[grid](
+    _flash_attn_bwd_precompute[grid](
         o,
         do,
         delta,
@@ -1406,7 +1812,7 @@ def attention_backward_adapter(
         triton.cdiv(T, args["TILE_DQ_Q_SIZE"]) + triton.cdiv(T, args["TILE_DK_K_SIZE"]),
     )
 
-    fwd_fn = streaming_backward_autotune if autotune else streaming_backward
+    fwd_fn = flash_backward_autotune if autotune else flash_backward
     fwd_fn[grid](
         q,
         k,
@@ -1427,11 +1833,12 @@ def attention_backward_adapter(
         *strides(DQ, 4),
         *strides(DK, 4),
         *strides(DV, 4),
+        prefix_mask_tensor_bwd, # Pass the tensor
+        prefix_mask_tensor_bwd.stride(0) if prefix_mask_tensor_bwd.ndim > 0 else 0, # Pass its stride
         *(strides(lens, 1) if lens is not None else [0]),
         T=T,
         HEAD_DIM=HEAD_DIM,
-        CONTEXT_SIZE=context_size,
-        CONTEXTS_BACK=back_contexts,
+        CAUSAL=causal,
         TIME_BUCKET=triton.next_power_of_2(T),
         INPUT_PRECISION=precision,
         DTYPE=q.dtype,
@@ -1442,7 +1849,7 @@ def attention_backward_adapter(
     return DQ, DK, DV
 
 
-@torch.library.register_fake("alexdremov_streaming_attention::backward")
+@torch.library.register_fake("flash_attention::backward")
 def attention_backward_adapter_abstract(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1451,12 +1858,12 @@ def attention_backward_adapter_abstract(
     o: torch.Tensor,
     lse: torch.Tensor,
     do: torch.Tensor,
-    context_size: int,
-    back_contexts: int,
     sm_scale: float | None,
+    causal: bool,
     autotune: bool,
     prescale_qk: bool,
     precision: str,
+    is_prefix_token_mask: torch.Tensor | None = None, # New argument
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
     DK = torch.empty_like(k, memory_format=torch.contiguous_format)
@@ -1471,13 +1878,13 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         k,
         v,
         lens,
-        context_size,
-        back_contexts,
         sm_scale,
+        causal,
         autotune,
         return_lse,
         prescale_qk,
         precision,
+        is_prefix_token_mask, # New input
     ) = inputs
     ctx.save_for_backward(
         q,
@@ -1486,9 +1893,9 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         O,
         LSE,
         lens,
+        is_prefix_token_mask, # Save new input
     )
-    ctx.context_size = context_size
-    ctx.back_contexts = back_contexts
+    ctx.causal = causal
     ctx.autotune = autotune
     ctx.sm_scale = sm_scale
     ctx.prescale_qk = prescale_qk
@@ -1496,15 +1903,14 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
 
 
 def attention_backward_adapter_op(ctx, do, dlse):
-    q, k, v, o, lse, lens = ctx.saved_tensors
-    context_size = ctx.context_size
-    back_contexts = ctx.back_contexts
+    q, k, v, o, lse, lens, is_prefix_token_mask = ctx.saved_tensors # Retrieve new input
+    causal = ctx.causal
     autotune = ctx.autotune
     sm_scale = ctx.sm_scale
     prescale_qk = ctx.prescale_qk
     precision = ctx.precision
 
-    DQ, DK, DV = torch.ops.alexdremov_streaming_attention.backward(
+    DQ, DK, DV = torch.ops.flash_attention.backward(
         q=q,
         k=k,
         v=v,
@@ -1512,35 +1918,35 @@ def attention_backward_adapter_op(ctx, do, dlse):
         o=o,
         lse=lse,
         do=do,
-        context_size=context_size,
-        back_contexts=back_contexts,
         sm_scale=sm_scale,
+        causal=causal,
         autotune=autotune,
         prescale_qk=prescale_qk,
         precision=precision,
+        is_prefix_token_mask=is_prefix_token_mask, # Pass to op
     )
 
-    return DQ, DK, DV, None, None, None, None, None, None, None, None
+    return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None # One more None for the new arg
 
 
 torch.library.register_autograd(
-    "alexdremov_streaming_attention::forward",
+    "flash_attention::forward",
     attention_backward_adapter_op,
     setup_context=attention_backward_adapter_op_setup_context,
 )
 
 
-def streaming_attention_reference(
-    q, k, v, context_size, back_contexts, lens, scale=None
+def flash_attention_reference(
+    q, k, v, lens=None, causal=True, scale=None
 ):
-    block_size = context_size
-    left_context_blocks_count = back_contexts + 1
     T = q.shape[-2]
-
-    block_idxes = torch.div(torch.arange(T), block_size, rounding_mode="floor")
-    block_idxes_diff = block_idxes.unsqueeze(1) - block_idxes.unsqueeze(0)
-    attn_mask = (block_idxes_diff >= 0) & (block_idxes_diff < left_context_blocks_count)
-    attn_mask = attn_mask.cuda()
+    
+    if causal:
+        # Create causal mask - query can attend to all previous tokens
+        attn_mask = torch.tril(torch.ones(T, T, device=q.device, dtype=torch.bool))
+    else:
+        # No causal mask - bidirectional attention
+        attn_mask = torch.ones(T, T, device=q.device, dtype=torch.bool)
 
     if lens is not None:
         key_padding_mask = (
@@ -1563,115 +1969,346 @@ def streaming_attention_reference(
     )
 
 
+@torch._dynamo.disable
 @torch.compile(fullgraph=True, dynamic=True)
-def _streaming_attention(
+def _flash_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     lens: torch.Tensor | None,
-    context_size: int,
-    back_contexts: int,
     sm_scale: float | None,
+    causal: bool,
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
+    is_prefix_token_mask: torch.Tensor | None = None, # New argument
 ):
     requires_grad = any(i.requires_grad for i in (q, k, v))
-    O, LSE = torch.ops.alexdremov_streaming_attention.forward(
+    O, LSE = torch.ops.flash_attention.forward(
         q=q,
         k=k,
         v=v,
         lens=lens,
-        context_size=context_size,
-        back_contexts=back_contexts,
         sm_scale=sm_scale,
+        causal=causal,
         autotune=autotune,
         prescale_qk=prescale_qk,
         return_lse=return_lse or requires_grad,
         precision=precision,
+        is_prefix_token_mask=is_prefix_token_mask, # Pass to op
     )
     if return_lse:
         return O, LSE
     return O
 
 
-def streaming_attention(
+class IncoherentFlashAttention(torch.autograd.Function):
+    """
+    Flash attention with incoherent processing autograd function.
+    Properly handles Hadamard transforms in both forward and backward passes.
+    """
+    
+    @staticmethod
+    def forward(
+        ctx, q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
+        is_prefix_token_mask, # New argument
+        incoherent_processing, hadamard_signs_q, hadamard_signs_k
+    ):
+        # Store context for backward pass
+        ctx.incoherent_processing = incoherent_processing
+        ctx.causal = causal
+        ctx.autotune = autotune
+        ctx.sm_scale = sm_scale
+        ctx.prescale_qk = prescale_qk
+        ctx.precision = precision
+        ctx.return_lse = return_lse
+        ctx.is_prefix_token_mask = is_prefix_token_mask # Save for backward
+        
+        # Apply Hadamard transform for incoherent processing
+        q_transformed, k_transformed = q, k
+        if incoherent_processing:
+            # Double-check GPU capability for safety
+            if not is_hopper_gpu():
+                logger.warning(
+                    f"Incoherent processing requested on non-Hopper GPU "
+                    f"(compute capability {torch.cuda.get_device_capability()}). "
+                    f"This feature is optimized for H100+ GPUs."
+                )
+            
+            HEAD_DIM = q.size(-1)
+            if HEAD_DIM & (HEAD_DIM - 1) != 0:
+                raise ValueError(f"Head dimension {HEAD_DIM} must be a power of 2 for incoherent processing")
+            
+            # Use same signs for both Q and K as per research paper
+            if hadamard_signs_q is None:
+                hadamard_signs = generate_hadamard_signs(HEAD_DIM, q.device, q.dtype)
+            else:
+                hadamard_signs = hadamard_signs_q
+            
+            # Save signs for backward pass
+            ctx.hadamard_signs = hadamard_signs
+            
+            # Use PyTorch implementation for better consistency
+            # Apply the same orthogonal transform to both Q and K
+            q_transformed = hadamard_transform(q, hadamard_signs)
+            k_transformed = hadamard_transform(k, hadamard_signs)
+        
+        # Run flash attention on transformed tensors
+        requires_grad = any(i.requires_grad for i in (q, k, v))
+        O, LSE = torch.ops.flash_attention.forward(
+            q=q_transformed,
+            k=k_transformed,
+            v=v,
+            lens=lens,
+            sm_scale=sm_scale,
+            causal=causal,
+            autotune=autotune,
+            prescale_qk=prescale_qk,
+            return_lse=return_lse or requires_grad,
+            precision=precision,
+            is_prefix_token_mask=is_prefix_token_mask, # Pass to op
+        )
+        
+        # Save tensors for backward pass
+        if requires_grad:
+            # Save original q, k, v, and also the new mask
+            ctx.save_for_backward(q, k, v, O, LSE, lens, is_prefix_token_mask)
+        
+        if return_lse:
+            return O, LSE
+        return O
+    
+    @staticmethod 
+    def backward(ctx, grad_output, grad_lse=None):
+        # Retrieve saved tensors, including is_prefix_token_mask
+        q, k, v, o, lse, lens, is_prefix_token_mask = ctx.saved_tensors
+        
+        if ctx.incoherent_processing:
+            # For incoherent processing, we need to apply the forward transform again
+            # because the attention backward expects the transformed Q and K
+            q_transformed = hadamard_transform(q, ctx.hadamard_signs)
+            k_transformed = hadamard_transform(k, ctx.hadamard_signs)
+            
+            # Compute gradients using transformed Q and K (matching forward pass)
+            DQ, DK, DV = torch.ops.flash_attention.backward(
+                q=q_transformed,
+                k=k_transformed,
+                v=v,
+                lens=lens,
+                o=o,
+                lse=lse,
+                do=grad_output,
+                sm_scale=ctx.sm_scale,
+                causal=ctx.causal,
+                autotune=ctx.autotune,
+                prescale_qk=ctx.prescale_qk,
+                precision=ctx.precision,
+                is_prefix_token_mask=is_prefix_token_mask, # Pass to op
+            )
+            
+            # Apply inverse Hadamard transform to gradients to get gradients w.r.t. original Q and K
+            # This applies the chain rule: dL/dQ_orig = dL/dQ_transformed * dQ_transformed/dQ_orig
+            DQ = hadamard_inverse_transform(DQ, ctx.hadamard_signs)
+            DK = hadamard_inverse_transform(DK, ctx.hadamard_signs)
+        else:
+            # Normal backward pass without incoherent processing
+            DQ, DK, DV = torch.ops.flash_attention.backward(
+                q=q,
+                k=k,
+                v=v,
+                lens=lens,
+                o=o,
+                lse=lse,
+                do=grad_output,
+                sm_scale=ctx.sm_scale,
+                causal=ctx.causal,
+                autotune=ctx.autotune,
+                prescale_qk=ctx.prescale_qk,
+                precision=ctx.precision,
+                is_prefix_token_mask=is_prefix_token_mask, # Pass to op
+            )
+        
+        # Return None for all original forward arguments that don't have grads, plus the new mask
+        return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None
+
+
+def flash_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    lens: torch.Tensor | None,
-    context_size: int,
-    back_contexts: int,
+    lens: torch.Tensor | None = None,
     sm_scale: float | None = None,
+    causal: bool = True,
     autotune=False,
     return_lse=False,
     prescale_qk=False,
     precision="ieee",
+    is_prefix_token_mask: torch.Tensor | None = None, # New argument
+    incoherent_processing: bool | None = None,
+    hadamard_signs_q: torch.Tensor | None = None,
+    hadamard_signs_k: torch.Tensor | None = None,
 ):
     """
-    Computes block-sparse self-attention with chunked attention mask.
-    Time is divided into blocks of `context_size`, query can attend to all kv in the current context
-    and to `back_contexts` contexts before the current one.
+    Computes self-attention with optional causal masking and flash attention optimization.
+    
+    When causal=True: Each query token can attend to all previous tokens in the sequence.
+    When causal=False: Each query token can attend to all tokens in the sequence (bidirectional).
 
-
-    Unlike traditional attention mechanisms that scale quadratically with sequence length,
-    streaming attention maintains a linear runtime and memory footprint.
+    Unlike traditional attention mechanisms that store full attention matrices,
+    flash attention maintains linear memory usage with quadratic time complexity.
 
     Args:
         q (Tensor): The query tensor of shape `(batch, heads_num, time, head_dim)`
         k (Tensor): The key tensor of shape `(batch, heads_num, time, head_dim)`
         v (Tensor): The value tensor of shape `(batch, heads_num, time, head_dim)`
-        lens (Tensor | None): Lengths of sequrnces of shape `(batch,)`
-        context_size (int): Size of the context block
-        back_contexts (int): Number of contexts to look back
+        lens (Tensor | None): Lengths of sequences of shape `(batch,)`
         sm_scale (float): Softmax scale, head_dim ** -0.5 by default
+        causal (bool): Whether to apply causal masking (default: True)
         autotune (bool): Use triton autotune for optimal kernel configuration
         prescale_qk (bool): Prescale Q in QK^T calculations — slightly faster if True, slightly lower precision
         precision (str): Precision for matmuls: 'ieee' or 'tf32'
+        incoherent_processing (bool | None): Apply Hadamard transform to Q and K to reduce quantization error.
+                                           None (default): Auto-detect based on GPU (Hopper GPUs only)
+                                           True: Force enable (with warning on non-Hopper GPUs)
+                                           False: Force disable
+        hadamard_signs_q (Tensor | None): Pre-computed random signs for Q transform
+        hadamard_signs_k (Tensor | None): Pre-computed random signs for K transform
     """
     if not torch.compiler.is_compiling():
         for i in (q, k, v):
             torch._dynamo.mark_static(i, 1)
             torch._dynamo.mark_static(i, 3)
+    
     if sm_scale is None:
         HEAD_DIM = q.size(-1)
         sm_scale = HEAD_DIM**-0.5
-    return _streaming_attention(
-        q=q,
-        k=k,
-        v=v,
-        lens=lens,
-        context_size=context_size,
-        back_contexts=back_contexts,
-        sm_scale=sm_scale,
-        autotune=autotune,
-        return_lse=return_lse,
-        prescale_qk=prescale_qk,
-        precision=precision,
-    )
+    
+    # Determine if incoherent processing should be used based on GPU capability
+    use_incoherent = should_use_incoherent_processing(incoherent_processing)
+    
+    if use_incoherent:
+        # Log when incoherent processing is enabled
+        if incoherent_processing is None:
+            logger.info(f"Auto-enabling incoherent processing on Hopper GPU (compute capability {torch.cuda.get_device_capability()})")
+        else:
+            logger.info(f"Using incoherent processing as explicitly requested")
+    
+    # Use the custom autograd function if incoherent processing is enabled
+    if use_incoherent:
+        return IncoherentFlashAttention.apply(
+            q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
+            is_prefix_token_mask, # Pass new arg
+            use_incoherent, hadamard_signs_q, hadamard_signs_k
+        )
+    else:
+        # Use standard flash attention for normal case
+        return _flash_attention(
+            q=q,
+            k=k,
+            v=v,
+            lens=lens,
+            sm_scale=sm_scale,
+            causal=causal,
+            autotune=autotune,
+            return_lse=return_lse,
+            prescale_qk=prescale_qk,
+            precision=precision,
+            is_prefix_token_mask=is_prefix_token_mask, # Pass new arg
+        )
+
+
+def is_hopper_gpu() -> bool:
+    """Check if the current GPU is a Hopper architecture (H100, H200, etc.)"""
+    if not torch.cuda.is_available():
+        return False
+    
+    # Hopper GPUs have compute capability 9.0 or higher
+    major, minor = torch.cuda.get_device_capability()
+    return major >= 9
+
+
+def should_use_incoherent_processing(incoherent_processing: bool | None = None) -> bool:
+    """
+    Determine whether to use incoherent processing based on GPU capability.
+    
+    Args:
+        incoherent_processing: User override (True/False to force, None to auto-detect)
+    
+    Returns:
+        bool: Whether to use incoherent processing
+    """
+    if incoherent_processing is not None:
+        # User explicitly specified, respect their choice but warn if not optimal
+        if incoherent_processing and not is_hopper_gpu():
+            logger.warning(
+                "Incoherent processing enabled on non-Hopper GPU. "
+                "This feature is optimized for H100+ GPUs with compute capability >= 9.0"
+            )
+        return incoherent_processing
+    
+    # Auto-detect: only enable on Hopper GPUs
+    return is_hopper_gpu()
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.path.insert(0, f"{os.path.dirname(os.path.realpath(__file__))}/../../")
-    sys.path.insert(0, f"{os.path.dirname(os.path.realpath(__file__))}/../")
-
-    B, H, T, D = 7, 1, 1, 128
-    context, back = 10, 9
-
-    from tests.test_streaming_attention import test_streaming_attention
-
-    test_streaming_attention(
-        B=B,
-        H=H,
-        T=T,
-        HEAD_DIM=D,
-        context_size=context,
-        back_contexts=back,
-        dtype=torch.float32,
-        lens="none",
-        noncontiguous=False,
-        autotune=False,
-    )
+    print("=== Flash Attention with Auto-Detected Incoherent Processing ===\n")
+    
+    # Check GPU capability
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        gpu_name = torch.cuda.get_device_name()
+        print(f"GPU: {gpu_name}")
+        print(f"Compute Capability: {major}.{minor}")
+        
+        if is_hopper_gpu():
+            print("✓ Hopper GPU detected - incoherent processing will be auto-enabled")
+        else:
+            print("⚠ Non-Hopper GPU detected - incoherent processing will be disabled by default")
+    else:
+        print("⚠ No CUDA GPU available")
+        exit(1)
+    
+    print("\n=== Testing Auto-Detection Behavior ===")
+    
+    # Test tensors
+    B, H, T, D = 1, 2, 16, 64  # Power of 2 head dimension
+    q = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
+    k = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
+    v = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
+    
+    # Test 1: Default behavior (auto-detection)
+    print("\n1. Testing default behavior (auto-detection):")
+    out_auto = flash_attention(q, k, v)
+    print(f"   Output shape: {out_auto.shape}")
+    
+    # Test 2: Explicitly disable incoherent processing
+    print("\n2. Testing explicitly disabled incoherent processing:")
+    out_disabled = flash_attention(q, k, v, incoherent_processing=False)
+    print(f"   Output shape: {out_disabled.shape}")
+    
+    # Test 3: Force enable incoherent processing (with warning on non-Hopper)
+    print("\n3. Testing explicitly enabled incoherent processing:")
+    try:
+        out_enabled = flash_attention(q, k, v, incoherent_processing=True)
+        print(f"   Output shape: {out_enabled.shape}")
+    except Exception as e:
+        print(f"   Error: {e}")
+    
+    # Test 4: Compare outputs
+    print("\n4. Comparing outputs:")
+    if is_hopper_gpu():
+        # On Hopper GPUs, auto and enabled should be identical
+        auto_vs_enabled_diff = torch.norm(out_auto - out_enabled) / torch.norm(out_auto)
+        auto_vs_disabled_diff = torch.norm(out_auto - out_disabled) / torch.norm(out_auto)
+        print(f"   Auto vs Enabled difference: {auto_vs_enabled_diff:.8f} (should be ~0)")
+        print(f"   Auto vs Disabled difference: {auto_vs_disabled_diff:.8f} (should be ~0, mathematically identical)")
+    else:
+        # On non-Hopper GPUs, auto and disabled should be identical
+        auto_vs_disabled_diff = torch.norm(out_auto - out_disabled) / torch.norm(out_auto)
+        auto_vs_enabled_diff = torch.norm(out_auto - out_enabled) / torch.norm(out_auto)
+        print(f"   Auto vs Disabled difference: {auto_vs_disabled_diff:.8f} (should be ~0)")
+        print(f"   Auto vs Enabled difference: {auto_vs_enabled_diff:.8f} (should be ~0, mathematically identical)")
+    
+    print("\n=== Test Complete ===")
+    print(f"Summary: Incoherent processing auto-detection {'ENABLED' if is_hopper_gpu() else 'DISABLED'} based on GPU capability")

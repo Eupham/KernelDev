@@ -1,0 +1,65 @@
+# Fast Training Configuration (fp16, small model)
+# For quick testing and development
+
+training:
+  precision: 16              # Use fp16 for faster training
+  epochs: 2                  # Fewer epochs for quick testing
+  learning_rate: 0.001       # Slightly higher LR for faster convergence
+  batch_size: 8              # Smaller batch size for fp16
+  weight_decay: 0.01
+  warmup_steps: 50           # Fewer warmup steps
+  max_grad_norm: 1.0
+  save_every: 100            # Save checkpoints more frequently
+  eval_every: 50             # Evaluate more frequently
+  log_every: 10              # Log more frequently
+  checkpoint_dir: "checkpoints_fast"
+  use_levenshtein_task: true # Enable Levenshtein distance auxiliary task
+  levenshtein_loss_weight: 0.1 # Weight for Levenshtein loss
+
+data:
+  dataset_name: "allenai/c4"
+  dataset_config: "en"
+  seq_len: 512               # Shorter sequences for speed
+  max_samples: 1000          # Fewer samples for quick testing
+  max_eval_tokens: 10000     # Fewer eval tokens
+  num_workers: 2
+  shuffle_train: true
+
+model:
+  vocab_size: 256
+  dim: 256                   # Smaller model dimension
+  n_layers: 6                # Fewer layers
+  n_heads: 8                 # Fewer heads
+  max_seq_len: 1024          # Shorter max sequence
+  mlp_ratio: 4
+  causal: true
+  use_cls_prefix_attention: true # For CLS token if used by Levenshtein head
+  lm_self_critique_base_penalty: 0.3
+  lm_self_critique_reward_max: 0.3
+
+hardware:
+  available_memory_gb: 15
+  device: "auto"
+  memory_buffer_gb: 2
+
+evaluation:
+  max_eval_batches: 5        # Very fast evaluation
+  max_val_batches: 20
+
+generation:
+  max_length: 30             # Shorter generation
+  temperature: 0.8
+  top_k: 50
+  test_prompts:
+    - ""
+    - "Hello"
+    - "The quick"
+
+logging:
+  show_gpu_info: true
+  show_memory_estimation: true
+  test_attention_modes: true
+  test_generation: true
+  save_training_plots: true
+
+random_seed: 42
