@@ -1023,7 +1023,6 @@ if __name__ == "__main__":
         if "WORLD_SIZE" not in os.environ: os.environ["WORLD_SIZE"] = "1"
         if "LOCAL_RANK" not in os.environ: os.environ["LOCAL_RANK"] = "0"
         start_actual_training(args)
-=======
 #!/usr/bin/env python3
 """
 Entry point for testing flash attention implementation.
