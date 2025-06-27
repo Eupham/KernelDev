@@ -1023,385 +1023,166 @@ if __name__ == "__main__":
         if "WORLD_SIZE" not in os.environ: os.environ["WORLD_SIZE"] = "1"
         if "LOCAL_RANK" not in os.environ: os.environ["LOCAL_RANK"] = "0"
         start_actual_training(args)
-=======
-#!/usr/bin/env python3
-"""
-Entry point for testing flash attention implementation.
-Tests both loss reduction capability and gradient accuracy.
-"""
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-import matplotlib.pyplot as plt
-from typing import Tuple, List, Optional
-import time
-
-# Import our separated modules
-import fwd
-import bwd
-import register_autograd  # This registers the autograd function for flash attention
-
-class FlashAttentionTest:
-    """Test class for flash attention functionality."""
-    
-    def __init__(self, device: str = "cuda"):
-        self.device = device
-        torch.manual_seed(42)
-        np.random.seed(42)
-        
-    def create_test_data(self, batch_size: int = 2, seq_len: int = 1024, 
-                        head_dim: int = 64, num_heads: int = 8) -> Tuple[torch.Tensor, ...]:
-        """Create test data for flash attention."""
-        q = torch.randn(batch_size, num_heads, seq_len, head_dim, 
-                       device=self.device, dtype=torch.float16, requires_grad=True)
-        k = torch.randn(batch_size, num_heads, seq_len, head_dim, 
-                       device=self.device, dtype=torch.float16, requires_grad=True)
-        v = torch.randn(batch_size, num_heads, seq_len, head_dim, 
-                       device=self.device, dtype=torch.float16, requires_grad=True)
-        
-        return q, k, v
-    
-    def reference_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                           scale: Optional[float] = None) -> torch.Tensor:
-        """Reference attention implementation for comparison."""
-        if scale is None:
-            scale = 1.0 / (q.size(-1) ** 0.5)
-        
-        # Compute attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-        
-        # Apply causal mask
-        seq_len = q.size(-2)
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=q.device))
-        scores = scores.masked_fill(mask == 0, float('-inf'))
-        
-        # Apply softmax
-        attn_weights = torch.softmax(scores, dim=-1)
-        
-        # Apply to values
-        out = torch.matmul(attn_weights, v)
-        return out
-    
-    def flash_attention_forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                                  scale: Optional[float] = None) -> torch.Tensor:
-        """Flash attention forward pass using our implementation."""
-        if scale is None:
-            scale = 1.0 / (q.size(-1) ** 0.5)
-        
-        # Use the forward pass from our fwd module
-        try:
-            # First ensure that custom ops are properly registered
-            import fwd  # This will register the forward operation
-            import register_autograd  # This will register the autograd function
-            
-            # Call the flash attention custom op with proper precision setting
-            lens = None  # No length masking for now
-            # Use the precision matching input dtype
-            precision = "fp16" if q.dtype == torch.float16 else "fp32"
-            
-            # Check if the operation exists
-            if not hasattr(torch.ops, 'flash_attention') or not hasattr(torch.ops.flash_attention, 'forward'):
-                raise RuntimeError("flash_attention::forward operation not found")
-                
-            output, lse = torch.ops.flash_attention.forward(
-                q, k, v, lens, scale, 
-                autotune=False, return_lse=False, 
-                prescale_qk=False, precision=precision
-            )
-            return output
-        except Exception as e:
-            # Fallback to a simplified version for testing
-            print(f"Warning: Using reference attention for testing due to: {e}")
-            return self.reference_attention(q, k, v, scale)
-    
-    def test_gradient_accuracy(self, tolerance: float = 1e-3) -> bool:
-        """Test gradient accuracy between flash and reference attention."""
-        print("Testing gradient accuracy...")
-        
-        # Create test data
-        q, k, v = self.create_test_data(batch_size=1, seq_len=128, head_dim=32, num_heads=4)
-        scale = 1.0 / (q.size(-1) ** 0.5)
-        
-        # Reference implementation
-        q_ref, k_ref, v_ref = q.clone().detach().requires_grad_(True), \
-                              k.clone().detach().requires_grad_(True), \
-                              v.clone().detach().requires_grad_(True)
-        
-        out_ref = self.reference_attention(q_ref, k_ref, v_ref, scale)
-        loss_ref = out_ref.sum()
-        loss_ref.backward()
-        
-        # Flash implementation
-        q_flash, k_flash, v_flash = q.clone().detach().requires_grad_(True), \
-                                     k.clone().detach().requires_grad_(True), \
-                                     v.clone().detach().requires_grad_(True)
-        
-        out_flash = self.flash_attention_forward(q_flash, k_flash, v_flash, scale)
-        loss_flash = out_flash.sum()
-        loss_flash.backward()
-        
-        # Compare gradients
-        grad_q_diff = torch.abs(q_ref.grad - q_flash.grad).max().item()
-        grad_k_diff = torch.abs(k_ref.grad - k_flash.grad).max().item()
-        grad_v_diff = torch.abs(v_ref.grad - v_flash.grad).max().item()
-        
-        print(f"Gradient differences:")
-        print(f"  Q gradient max diff: {grad_q_diff:.6f}")
-        print(f"  K gradient max diff: {grad_k_diff:.6f}")
-        print(f"  V gradient max diff: {grad_v_diff:.6f}")
-        
-        gradient_accurate = all([
-            grad_q_diff < tolerance,
-            grad_k_diff < tolerance,
-            grad_v_diff < tolerance
-        ])
-        
-        print(f"Gradient accuracy test: {'PASSED' if gradient_accurate else 'FAILED'}")
-        return gradient_accurate
-    
-    def test_loss_reduction(self, num_epochs: int = 10) -> Tuple[List[float], List[float]]:
-        """Test loss reduction capability with a simple training loop."""
-        print("Testing loss reduction capability...")
-        
-        # Create a simple model using flash attention
-        class SimpleModel(nn.Module):
-            def __init__(self, hidden_dim: int = 256, num_heads: int = 8):
-                super().__init__()
-                self.hidden_dim = hidden_dim
-                self.num_heads = num_heads
-                self.head_dim = hidden_dim // num_heads
-                
-                self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-                
-            def forward(self, x):
-                batch_size, seq_len, _ = x.shape
-                
-                q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                
-                # Use flash attention
-                attn_out = test_instance.flash_attention_forward(q, k, v)
-                attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-                
-                return self.out_proj(attn_out)
-        
-        # Reference model using standard attention
-        class ReferenceModel(nn.Module):
-            def __init__(self, hidden_dim: int = 256, num_heads: int = 8):
-                super().__init__()
-                self.hidden_dim = hidden_dim
-                self.num_heads = num_heads
-                self.head_dim = hidden_dim // num_heads
-                
-                self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-                
-            def forward(self, x):
-                batch_size, seq_len, _ = x.shape
-                
-                q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                
-                # Use reference attention
-                attn_out = test_instance.reference_attention(q, k, v)
-                attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-                
-                return self.out_proj(attn_out)
-        
-        test_instance = self
-        
-        # Create models
-        flash_model = SimpleModel().to(self.device)
-        reference_model = ReferenceModel().to(self.device)
-        
-        # Copy weights to ensure fair comparison
-        reference_model.load_state_dict(flash_model.state_dict())
-        
-        # Create training data
-        batch_size, seq_len, hidden_dim = 2, 128, 256
-        x_train = torch.randn(batch_size, seq_len, hidden_dim, device=self.device)
-        y_train = torch.randn(batch_size, seq_len, hidden_dim, device=self.device)
-        
-        # Optimizers
-        optimizer_flash = optim.Adam(flash_model.parameters(), lr=1e-3)
-        optimizer_reference = optim.Adam(reference_model.parameters(), lr=1e-3)
-        
-        criterion = nn.MSELoss()
-        
-        flash_losses = []
-        reference_losses = []
-        
-        # Training loop
-        for epoch in range(num_epochs):
-            # Flash model
-            optimizer_flash.zero_grad()
-            out_flash = flash_model(x_train)
-            loss_flash = criterion(out_flash, y_train)
-            loss_flash.backward()
-            optimizer_flash.step()
-            flash_losses.append(loss_flash.item())
-            
-            # Reference model
-            optimizer_reference.zero_grad()
-            out_reference = reference_model(x_train)
-            loss_reference = criterion(out_reference, y_train)
-            loss_reference.backward()
-            optimizer_reference.step()
-            reference_losses.append(loss_reference.item())
-            
-            if epoch % 2 == 0:
-                print(f"Epoch {epoch}: Flash Loss = {loss_flash.item():.6f}, "
-                      f"Reference Loss = {loss_reference.item():.6f}")
-        
-        print(f"Final losses - Flash: {flash_losses[-1]:.6f}, "
-              f"Reference: {reference_losses[-1]:.6f}")
-        
-        return flash_losses, reference_losses
-    
-    def benchmark_performance(self, seq_lengths: List[int] = [128, 256, 512, 1024]) -> None:
-        """Benchmark performance comparison."""
-        print("Benchmarking performance...")
-        
-        streaming_times = []
-        reference_times = []
-        
-        for seq_len in seq_lengths:
-            print(f"Testing sequence length: {seq_len}")
-            
-            q, k, v = self.create_test_data(batch_size=1, seq_len=seq_len, head_dim=64, num_heads=8)
-            
-            # Warm up
-            for _ in range(3):
-                _ = self.flash_attention_forward(q, k, v)
-                _ = self.reference_attention(q, k, v)
-            
-            torch.cuda.synchronize()
-            
-            # Benchmark flash attention
-            start_time = time.time()
-            for _ in range(10):
-                _ = self.flash_attention_forward(q, k, v)
-            torch.cuda.synchronize()
-            flash_time = (time.time() - start_time) / 10
-            streaming_times.append(flash_time)
-            
-            # Benchmark reference
-            start_time = time.time()
-            for _ in range(10):
-                _ = self.reference_attention(q, k, v)
-            torch.cuda.synchronize()
-            reference_time = (time.time() - start_time) / 10
-            reference_times.append(reference_time)
-            
-            print(f"  Flash: {flash_time*1000:.2f}ms, Reference: {reference_time*1000:.2f}ms")
-        
-        # Plot results
-        try:
-            plt.figure(figsize=(10, 6))
-            plt.plot(seq_lengths, streaming_times, 'b-o', label='Flash Attention')
-            plt.plot(seq_lengths, reference_times, 'r-o', label='Reference Attention')
-            plt.xlabel('Sequence Length')
-            plt.ylabel('Time (seconds)')
-            plt.title('Performance Comparison: Flash vs Reference Attention')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig('./performance_comparison.png')
-            print("Performance plot saved as 'performance_comparison.png'")
-        except ImportError:
-            print("Matplotlib not available, skipping plot generation")
-    
-    def plot_loss_curves(self, flash_losses: List[float], reference_losses: List[float]) -> None:
-        """Plot loss curves for comparison."""
-        try:
-            plt.figure(figsize=(10, 6))
-            epochs = range(len(flash_losses))
-            plt.plot(epochs, flash_losses, 'b-o', label='Flash Attention')
-            plt.plot(epochs, reference_losses, 'r-o', label='Reference Attention')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.title('Training Loss Comparison')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig('./loss_comparison.png')
-            print("Loss comparison plot saved as 'loss_comparison.png'")
-        except ImportError:
-            print("Matplotlib not available, skipping plot generation")
-
-
-def main():
-    """Main test function."""
-    print("=" * 60)
-    print("FLASH ATTENTION COMPREHENSIVE TEST")
-    print("=" * 60)
-    
-    # Check CUDA availability
-    if not torch.cuda.is_available():
-        print("CUDA not available, running on CPU (may be slow)")
-        device = "cpu"
-    else:
-        print(f"CUDA available with {torch.cuda.device_count()} device(s)")
-        device = "cuda"
-    
-    # Initialize test class
-    tester = FlashAttentionTest(device=device)
-    
-    # Test 1: Gradient Accuracy
-    print("\n" + "="*40)
-    print("TEST 1: GRADIENT ACCURACY")
-    print("="*40)
-    gradient_test_passed = tester.test_gradient_accuracy(tolerance=1e-3)
-    
-    # Test 2: Loss Reduction
-    print("\n" + "="*40)
-    print("TEST 2: LOSS REDUCTION")
-    print("="*40)
-    flash_losses, reference_losses = tester.test_loss_reduction(num_epochs=10)
-    
-    # Plot loss curves
-    tester.plot_loss_curves(flash_losses, reference_losses)
-    
-    # Check if both models can reduce loss
-    flash_reduced = flash_losses[0] > flash_losses[-1]
-    reference_reduced = reference_losses[0] > reference_losses[-1]
-    
-    print(f"\nLoss reduction results:")
-    print(f"  Flash model reduced loss: {flash_reduced}")
-    print(f"  Reference model reduced loss: {reference_reduced}")
-    print(f"  Initial vs Final - Flash: {flash_losses[0]:.6f} -> {flash_losses[-1]:.6f}")
-    print(f"  Initial vs Final - Reference: {reference_losses[0]:.6f} -> {reference_losses[-1]:.6f}")
-    
-    # Test 3: Performance Benchmark
-    if device == "cuda":
-        print("\n" + "="*40)
-        print("TEST 3: PERFORMANCE BENCHMARK")
-        print("="*40)
-        tester.benchmark_performance([128, 256, 512])
-    
-    # Summary
-    print("\n" + "="*60)
-    print("SUMMARY")
-    print("="*60)
-    print(f"✓ Gradient accuracy test: {'PASSED' if gradient_test_passed else 'FAILED'}")
-    print(f"✓ Loss reduction test: {'PASSED' if flash_reduced else 'FAILED'}")
-    print(f"✓ Modules separated successfully: fwd.py and bwd.py")
-    print(f"✓ Integration test: {'PASSED' if gradient_test_passed and flash_reduced else 'FAILED'}")
-    
-    overall_success = gradient_test_passed and flash_reduced
-    print(f"\nOverall test result: {'SUCCESS' if overall_success else 'PARTIAL SUCCESS'}")
-    
-    if not overall_success:
-        print("\nNote: Some tests may show partial success due to simplified fallback implementations.")
-        print("For full functionality, ensure the flash attention kernels are properly compiled.")
 
 
 if __name__ == "__main__":
-    main()
+    # Main argument parser for the entry script, including distributed launch args
+    parser = ArgumentParser(description="GPT Model Training Entry Script")
+    parser.add_argument(
+        "--nproc_per_node",
+        type=int,
+        default=1,
+        help="Number of processes to launch for distributed training on this node."
+    )
+    # Add other existing arguments from the original parse_args()
+    # These are arguments that the training script itself needs, not just the launcher.
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='config.yaml',
+        help='Path to YAML configuration file (default: config.yaml)'
+    )
+    parser.add_argument(
+        '--precision',
+        type=str,
+        choices=['16', '32', 'bf16'],
+        default=None,
+        help='Floating point precision: 16 for fp16, 32 for fp32, bf16 for bfloat16 (overrides config)'
+    )
+    parser.add_argument(
+        '--epochs',
+        type=int,
+        default=None,
+        help='Number of training epochs (overrides config)'
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=None,
+        help='Batch size (overrides config; if null, auto-estimated based on GPU memory)'
+    )
+    parser.add_argument(
+        '--learning-rate',
+        type=float,
+        default=None, # Default to None
+        help='Learning rate (overrides config)'
+    )
+    # Use --use-levenshtein-task, nsp-task is removed
+    parser.add_argument(
+        '--use-levenshtein-task',
+        type=lambda x: (str(x).lower() == 'true'),
+        default=None, # YAMLs default to true, CLI can override to false
+        help='Enable/disable Levenshtein auxiliary task (True/False). Overrides config.'
+    )
+    parser.add_argument(
+        '--levenshtein-loss-weight',
+        type=float,
+        default=None, # Default handled by TrainingConfig or YAML
+        help='Weight for Levenshtein auxiliary loss component (overrides config, e.g., 0.1).'
+    )
+    parser.add_argument(
+        '--levenshtein-shuffle-percentage',
+        type=float,
+        default=None,
+        help='Percentage of items to be shuffled in LevenshteinDataset (0.0 to 1.0). Overrides config.'
+    )
+    parser.add_argument(
+        '--max-train-tokens',
+        type=int, # Or float if DataBuilder handles float('inf') directly
+        default=None,
+        help='Maximum number of tokens to process for the training set (overrides config data:max_train_tokens).'
+    )
+    parser.add_argument(
+        '--debug-max-samples',
+        type=int,
+        default=None,
+        help='(For debugging) Override max_samples from config to process only a few samples. e.g., --debug-max-samples 100'
+    )
+    parser.add_argument(
+        '--lm-self-critique-base-penalty',
+        type=float,
+        default=None,
+        help='Base value added to LM loss before self-critique reward subtraction (overrides config default: 0.3).'
+    )
+    parser.add_argument(
+        '--lm-self-critique-reward-max',
+        type=float,
+        default=None,
+        help='Max value for the self-critique reward scalar (0 to this value) (overrides config default: 0.3).'
+    )
+    parser.add_argument(
+        '--use-cls-prefix-attention', # This can still be relevant if CLS is used in Levenshtein task
+        type=lambda x: (str(x).lower() == 'true'),
+        default=None,
+        help='Enable/disable special prefix attention for CLS token if used. (e.g., True or False, overrides config)'
+    )
+    parser.add_argument('--cpu-test-attention', action='store_true', help='Use CPU fallback for attention mechanism (for testing).')
+
+    # Use parse_args() which will capture all defined args.
+    # REMAINDER is not needed here as we explicitly define training args.
+    args = parser.parse_args()
+
+    if "IS_WORKER_PROCESS" in os.environ:
+        print(f"Worker process RANK: {os.environ.get('RANK', 'N/A')}, LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'N/A')} starting.")
+        # Worker processes receive all arguments and proceed to training
+        start_actual_training(args)
+    elif args.nproc_per_node > 1:
+        print(f"Main process launching {args.nproc_per_node} worker processes.")
+        master_addr = "127.0.0.1"
+        master_port = find_free_port()
+        world_size = args.nproc_per_node
+
+        processes = []
+
+        # Construct the base command for worker processes
+        # We need to pass all arguments *except* --nproc_per_node to the workers
+        worker_cmd_args = [sys.executable, sys.argv[0]] # script itself
+
+        # Iterate over sys.argv to rebuild arguments, skipping --nproc_per_node
+        skip_next_arg = False
+        for i, arg_val in enumerate(sys.argv[1:]):
+            if skip_next_arg:
+                skip_next_arg = False
+                continue
+            if arg_val == "--nproc_per_node":
+                skip_next_arg = True # Skip the value of nproc_per_node
+                continue
+            worker_cmd_args.append(arg_val)
+
+        for rank in range(world_size):
+            env = os.environ.copy()
+            env["MASTER_ADDR"] = master_addr
+            env["MASTER_PORT"] = master_port
+            env["WORLD_SIZE"] = str(world_size)
+            env["RANK"] = str(rank)
+            env["LOCAL_RANK"] = str(rank) # Assuming single-node, local_rank == rank
+            env["IS_WORKER_PROCESS"] = "1"
+            env["PYTHONUNBUFFERED"] = "1"
+
+            print(f"Launching worker RANK {rank} with command: {' '.join(worker_cmd_args)}")
+            try:
+                process = subprocess.Popen(worker_cmd_args, env=env)
+                processes.append(process)
+            except Exception as e:
+                print(f"Error launching process for RANK {rank}: {e}")
+                for p_term in processes:
+                    try: p_term.terminate()
+                    except: pass # best effort
+                sys.exit(1)
+
+
+        for rank, process in enumerate(processes):
+            process.wait()
+            if process.returncode != 0:
+                print(f"Worker process RANK {rank} (PID {process.pid}) exited with error code {process.returncode}.")
+
+        print("All worker processes finished.")
+        sys.exit(0) # Main launcher process exits after workers are done
+    else:
+        print("Running in single process mode (nproc_per_node = 1).")
+        # In single process mode, RANK and WORLD_SIZE might not be set by an external launcher.
+        # For consistency with how init_distributed in train_loop might expect these for non-DDP single GPU:
+        if "RANK" not in os.environ: os.environ["RANK"] = "0"
+        if "WORLD_SIZE" not in os.environ: os.environ["WORLD_SIZE"] = "1"
+        if "LOCAL_RANK" not in os.environ: os.environ["LOCAL_RANK"] = "0"
+        start_actual_training(args)
