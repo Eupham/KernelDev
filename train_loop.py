@@ -712,7 +712,7 @@ class Trainer:
 
                 # Updated batch unpacking for perplexity
                 if self.config.use_levenshtein_task :
-                    input_ids, lm_targets, _, _, _ = batch # Original text and its LM targets
+                    input_ids, lm_targets, _, _ = batch # Original text and its LM targets
                 elif hasattr(self.config, 'nsp_task') and self.config.nsp_task: # old check, for safety
                     input_ids, lm_targets, _ = batch
                 else:

@@ -137,8 +137,12 @@ class GPTModel(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None: # Initialize bias for NSP head if it exists
-                torch.nn.init.zeros_(module.bias)
+            if module.bias is not None:
+                # Special initialization for Levenshtein head to avoid ReLU clipping
+                if hasattr(self, 'levenshtein_head') and module is self.levenshtein_head:
+                    torch.nn.init.constant_(module.bias, 0.05)  # Small positive bias
+                else:
+                    torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
