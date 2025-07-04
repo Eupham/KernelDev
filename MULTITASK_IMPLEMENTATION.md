@@ -8,7 +8,7 @@ This implementation replaces the problematic self-critique mechanism with a robu
 
 ### Combined Dataset (`CombinedMultiTaskDataset`)
 
-The training system now uses a combined dataset that randomly samples from three tasks in a single forward pass:
+The training system now uses a combined dataset that deterministically distributes three tasks within each batch for proper parallel training:
 
 - **25% Levenshtein Task**: Word shuffling + distance prediction for text coherence
 - **25% NSP Task**: Next Sentence Prediction with 3-class classification  
@@ -25,6 +25,22 @@ Where `task_type_flag` indicates:
 - `0.0`: Language Modeling task
 - `1.0`: Levenshtein task  
 - `2.0`: Next Sentence Prediction task
+
+### Deterministic Batch Composition
+
+The dataset ensures proper task distribution within each batch using a deterministic cyclic pattern:
+
+**For default distribution (0.25, 0.25, 0.5):**
+- Every 8 consecutive samples contain exactly:
+  - 2 NSP samples (positions 0-1)
+  - 2 Levenshtein samples (positions 2-3)  
+  - 4 LM samples (positions 4-7)
+
+**Benefits:**
+- Eliminates random task selection that could create unbalanced batches
+- Ensures consistent task distribution across all batches
+- Maintains proper parallel training of all three tasks
+- Supports custom task distributions while maintaining deterministic behavior
 
 ### Model Architecture Updates
 

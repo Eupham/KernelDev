@@ -100,18 +100,38 @@ class CombinedMultiTaskDataset(Dataset):
         return self.length
     
     def __getitem__(self, idx):
-        # Randomly choose which task to use
-        task_choice = random.random()
+        # Deterministic task selection based on index to ensure proper batch composition
+        # This creates a repeating pattern that ensures the correct distribution
+        # For default distribution (0.25, 0.25, 0.5), every 8 samples will have:
+        # - 2 NSP samples (positions 0,1)
+        # - 2 Levenshtein samples (positions 2,3)  
+        # - 4 LM samples (positions 4,5,6,7)
         
-        if task_choice < self.lev_ratio:
-            # Levenshtein task
-            lev_idx = idx % len(self.levenshtein_dataset)
-            return self.levenshtein_dataset[lev_idx]
-        elif task_choice < self.lev_ratio + self.nsp_ratio:
-            # NSP task
+        # Calculate the cycle length to ensure integer number of samples per task
+        cycle_length = 8  # This works for (0.25, 0.25, 0.5) distribution
+        position_in_cycle = idx % cycle_length
+        
+        # Calculate boundaries for each task type
+        nsp_boundary = int(cycle_length * self.nsp_ratio)  # 2 for default ratios
+        lev_boundary = nsp_boundary + int(cycle_length * self.lev_ratio)  # 4 for default ratios
+        
+        if position_in_cycle < nsp_boundary:
+            # NSP task - positions 0,1
+            if len(self.nsp_dataset) == 0:
+                # Fallback to LM if NSP dataset is empty
+                doc_idx = idx % len(self.raw_documents)
+                return self._create_lm_sample(self.raw_documents[doc_idx])
             nsp_idx = idx % len(self.nsp_dataset)
             return self.nsp_dataset[nsp_idx]
+        elif position_in_cycle < lev_boundary:
+            # Levenshtein task - positions 2,3
+            if len(self.levenshtein_dataset) == 0:
+                # Fallback to LM if Levenshtein dataset is empty
+                doc_idx = idx % len(self.raw_documents)
+                return self._create_lm_sample(self.raw_documents[doc_idx])
+            lev_idx = idx % len(self.levenshtein_dataset)
+            return self.levenshtein_dataset[lev_idx]
         else:
-            # Standard LM task
+            # LM task - positions 4,5,6,7
             doc_idx = idx % len(self.raw_documents)
             return self._create_lm_sample(self.raw_documents[doc_idx])
