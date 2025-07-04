@@ -183,7 +183,7 @@ class Trainer:
         )
         print(f"Trainer initialized on device: {self.config.device}. Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
-    def train_step(self, batch: Tuple[torch.Tensor, ...]) -> Tuple[float, Optional[float], Optional[float], Optional[float]]:
+    def train_step(self, batch: Tuple[torch.Tensor, ...]) -> Tuple[float, Optional[float], Optional[float], Optional[float], Optional[float]]:
         # Metrics initialization
         mean_lm_loss_component_item = None
         mean_lev_aux_loss_item = None
