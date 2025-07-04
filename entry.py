@@ -171,11 +171,7 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     if hasattr(args, 'levenshtein_loss_weight') and args.levenshtein_loss_weight is not None:
         config.setdefault('training', {})['levenshtein_loss_weight'] = args.levenshtein_loss_weight
 
-    # Handle self-critique LM loss scaling arguments
-    if hasattr(args, 'lm_self_critique_base_penalty') and args.lm_self_critique_base_penalty is not None:
-        config.setdefault('model', {})['lm_self_critique_base_penalty'] = args.lm_self_critique_base_penalty
-    if hasattr(args, 'lm_self_critique_reward_max') and args.lm_self_critique_reward_max is not None:
-        config.setdefault('model', {})['lm_self_critique_reward_max'] = args.lm_self_critique_reward_max
+
 
     # Handle Levenshtein shuffle percentage
     data_config_entry = config.setdefault('data', {})
@@ -301,10 +297,6 @@ def start_actual_training(cli_args):
     lev_task_enabled = training_cfg.get('use_levenshtein_task', True) # Default to True, as YAMLs will set it
     lev_lw = training_cfg.get('levenshtein_loss_weight', 0.1) # Default weight if not specified
 
-    # Self-critique parameters from model_cfg (after merge_config_with_args)
-    critique_base_penalty = model_cfg.get('lm_self_critique_base_penalty', 0.3)
-    critique_reward_max = model_cfg.get('lm_self_critique_reward_max', 0.3)
-
     cpu_test_mode = hardware_cfg.get('cpu_test_attention', False)
     
     # Set random seed for reproducibility
@@ -418,9 +410,6 @@ def start_actual_training(cli_args):
         'device': effective_device,
         'use_levenshtein_task': lev_task_enabled,
         'levenshtein_loss_weight': lev_lw,
-        'lm_self_critique_base_penalty': critique_base_penalty,
-        'lm_self_critique_reward_max': critique_reward_max,
-        'self_critique_temperature': model_cfg.get('self_critique_temperature', 1.5),
         'scaler': scaler,
         'use_amp': use_amp,
         # Inference params from gen_cfg (defined earlier)
@@ -583,14 +572,22 @@ def start_actual_training(cli_args):
         print("\n=== Data Sample ===")
         # Adjust for LevenshteinDataset or standard output
         if lev_task_enabled:
-            # LevenshteinDataset yields: input_tokens, lm_targets, lev_dist_target, is_shuffled_flag
-            for input_tokens, lm_targets, lev_dist_target, is_shuffled_flag in dataloaders['train']:
-                print(f"Levenshtein Batch shapes: Input Toks-{input_tokens.shape}, LM Targets-{lm_targets.shape}, LevDist-{lev_dist_target.shape}, IsShuffled-{is_shuffled_flag.shape}")
-                print(f"Sample Levenshtein input tokens: {input_tokens[0][:20].tolist()}")
-                # Determine if the first item in the batch was shuffled to adjust log message
-                item_type_sample = "Shuffled" if is_shuffled_flag[0].item() == 1.0 else "Original"
+            # CombinedMultiTaskDataset yields: input_tokens, lm_targets, auxiliary_value, task_type_flag
+            for input_tokens, lm_targets, auxiliary_values, task_type_flags in dataloaders['train']:
+                print(f"Multi-task Batch shapes: Input Toks-{input_tokens.shape}, LM Targets-{lm_targets.shape}, Aux-{auxiliary_values.shape}, TaskType-{task_type_flags.shape}")
+                print(f"Sample multi-task input tokens: {input_tokens[0][:20].tolist()}")
+                # Determine task type for the first item in the batch
+                task_type = task_type_flags[0].item()
+                if task_type == 0.0:
+                    item_type_sample = "LM"
+                elif task_type == 1.0:
+                    item_type_sample = "Levenshtein"
+                elif task_type == 2.0:
+                    item_type_sample = "NSP"
+                else:
+                    item_type_sample = "Unknown"
                 sample_text = data_builder.decode_tokens(input_tokens[0][:50])
-                print(f"Sample Levenshtein text ({item_type_sample} sample): '{sample_text[:100]}...'")
+                print(f"Sample multi-task text ({item_type_sample} task): '{sample_text[:100]}...'")
                 break
         else: # Standard LM task
             for x, y in dataloaders['train']:

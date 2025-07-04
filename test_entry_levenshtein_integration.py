@@ -58,8 +58,6 @@ class TestEntryLevenshteinIntegration(unittest.TestCase):
                 'n_heads': 2,
                 'max_seq_len': 32,
                 'use_cls_prefix_attention': True, # For Levenshtein CLS token
-                'lm_self_critique_base_penalty': 0.3, # New
-                'lm_self_critique_reward_max': 0.3,   # New
                 # vocab_size will be set by DataBuilder
             },
             'hardware': {
@@ -83,7 +81,6 @@ class TestEntryLevenshteinIntegration(unittest.TestCase):
             'nproc_per_node': 1,
             'precision': None, 'batch_size': None, 'seq_len': None, 'epochs': None, 'learning_rate': None,
             'use_levenshtein_task': None, 'levenshtein_loss_weight': None,
-            'lm_self_critique_base_penalty': None, 'lm_self_critique_reward_max': None,
             'cpu_test_attention': None,
             'use_cls_prefix_attention': None,
         }

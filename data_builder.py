@@ -61,17 +61,19 @@ class DataBuilder:
             self.levenshtein_shuffle_percentage = levenshtein_shuffle_percentage
 
         self.cls_token_id = None # Default to None
+        self.sep_token_id = None # Default to None
         if self.use_levenshtein_task:
             self.cls_token_id = 256 # Fixed ID for Levenshtein task's CLS
+            self.sep_token_id = 257 # Fixed ID for SEP token (for NSP task)
             original_vocab_size_param = vocab_size
             if original_vocab_size_param == 256: # Default byte vocab size
-                self.vocab_size = 257 # Accommodate CLS (256 is index, so size is 256+1)
-            elif self.cls_token_id >= original_vocab_size_param: # If CLS ID is outside original range
-                print(f"Warning: vocab_size {original_vocab_size_param} from config might be too small for cls_token_id {self.cls_token_id}. Adjusting vocab_size.")
-                self.vocab_size = self.cls_token_id + 1
-            else: # cls_token_id is within original vocab, assume it's accounted for (user configured)
+                self.vocab_size = 258 # Accommodate CLS (256) and SEP (257)
+            elif self.sep_token_id >= original_vocab_size_param: # If SEP ID is outside original range
+                print(f"Warning: vocab_size {original_vocab_size_param} from config might be too small for sep_token_id {self.sep_token_id}. Adjusting vocab_size.")
+                self.vocab_size = self.sep_token_id + 1
+            else: # tokens are within original vocab, assume it's accounted for (user configured)
                 self.vocab_size = original_vocab_size_param
-            print(f"Levenshtein task active: cls_token_id={self.cls_token_id}, effective vocab_size={self.vocab_size}")
+            print(f"Levenshtein task active: cls_token_id={self.cls_token_id}, sep_token_id={self.sep_token_id}, effective vocab_size={self.vocab_size}")
         else: # Not using Levenshtein task
             self.vocab_size = vocab_size # Use vocab_size as passed
 
@@ -108,7 +110,11 @@ class DataBuilder:
                         string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
                         current_byte_sequence = []
                     string_parts.append("[CLS]")
-                # Removed SEP token logic
+                elif self.sep_token_id is not None and token == self.sep_token_id: # Check if sep_token_id is defined
+                    if current_byte_sequence:
+                        string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
+                        current_byte_sequence = []
+                    string_parts.append("[SEP]")
                 elif 0 <= token <= 255:
                     current_byte_sequence.append(token)
                 else: # Special tokens other than CLS (e.g., padding -1) or unknown tokens
@@ -407,14 +413,15 @@ class DataBuilder:
                 continue
 
             if self.use_levenshtein_task:
+                # Use combined multi-task dataset
                 # data_for_split is List[str] here
-                if self.cls_token_id is None: # cls_token_id must be set for LevenshteinDataset
-                    raise ValueError("cls_token_id not set in DataBuilder for Levenshtein task, but use_levenshtein_task is True.")
+                if self.cls_token_id is None or self.sep_token_id is None: # Both tokens must be set
+                    raise ValueError("cls_token_id and sep_token_id must be set in DataBuilder for multi-task, but use_levenshtein_task is True.")
+                
+                # Import the combined dataset
+                from combined_dataset import CombinedMultiTaskDataset
                 
                 # Limit number of raw sentences for eval splits if max_eval_tokens is a concern
-                # LevenshteinDataset will generate one example per sentence/document.
-                # This is a rough way to limit; actual token count depends on seq_len.
-                # Note: This logic was copied from previous attempt, might need review based on actual dataset structure
                 if split_name in ['validation', 'test'] and len(data_for_split) * self.seq_len > self.max_eval_tokens:
                     if self.max_eval_tokens == float('inf'):
                         approx_docs_to_keep = float('inf')
@@ -425,26 +432,27 @@ class DataBuilder:
                         approx_docs_to_keep = 1
 
                     if approx_docs_to_keep < len(data_for_split): # This condition handles approx_docs_to_keep = float('inf') correctly
-                         print(f"Limiting {split_name} for Levenshtein to approx {int(approx_docs_to_keep)} documents from {len(data_for_split)} for faster evaluation.")
+                         print(f"Limiting {split_name} for multi-task to approx {int(approx_docs_to_keep)} documents from {len(data_for_split)} for faster evaluation.")
                          data_for_split = data_for_split[:int(approx_docs_to_keep)] # Slicing requires int
 
                     if not data_for_split and len(tokenized_or_raw_data[split_name]) > 0 :
                          data_for_split = tokenized_or_raw_data[split_name][:1]
 
                 if not data_for_split:
-                    print(f"Warning: {split_name} split became empty after limiting for Levenshtein eval. Skipping.")
+                    print(f"Warning: {split_name} split became empty after limiting for multi-task eval. Skipping.")
                     continue
 
-                datasets[split_name] = LevenshteinDataset(
-                    raw_documents_or_sentences=data_for_split,
+                datasets[split_name] = CombinedMultiTaskDataset(
+                    raw_documents=data_for_split,
                     tokenizer_fn=self._tokenize_text,
                     seq_len=self.seq_len,
                     cls_token_id=self.cls_token_id,
+                    sep_token_id=self.sep_token_id,
                     lm_ignore_idx=-1,
-                    input_pad_id=0,    # Assuming 0 is a safe padding ID not overlapping with CLS
-                    shuffle_percentage=self.levenshtein_shuffle_percentage # Pass stored value
+                    input_pad_id=0,    # Assuming 0 is a safe padding ID not overlapping with CLS/SEP
+                    task_distribution=(0.25, 0.25, 0.5)  # 25% Lev, 25% NSP, 50% LM
                 )
-                print(f"{split_name} Levenshtein dataset: {len(datasets[split_name])} examples")
+                print(f"{split_name} Combined multi-task dataset: {len(datasets[split_name])} examples")
             else: # Standard TokenizedDataset for LM
                 # data_for_split is list[int] (concatenated tokens)
                 tokens = data_for_split

@@ -128,6 +128,9 @@ class GPTModel(nn.Module):
         
         # Levenshtein head (replaces NSP head)
         self.levenshtein_head = nn.Linear(self.dim, 1) # Output a single scalar value
+        
+        # NSP head for 3-class classification
+        self.nsp_head = nn.Linear(self.dim, 3)  # 3 classes: 0=order, 1=out of order, 2=garbled
 
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
@@ -151,8 +154,8 @@ class GPTModel(nn.Module):
         
         # Initialize loss and auxiliary output
         loss = None
-        # nsp_logits = None # Removed
-        predicted_distance_score = None # New auxiliary output
+        predicted_distance_score = None # For Levenshtein task
+        nsp_logits = None # For NSP task
 
         # Create current_is_prefix_token_mask based on cls_token_id and use_cls_prefix_attention
         current_is_prefix_token_mask = None
@@ -186,16 +189,13 @@ class GPTModel(nn.Module):
         # Language model logits
         logits = self.head(processed_x) # (batch_size, seq_len, vocab_size)
 
-        # NSP logits calculation
-        # processed_x is the output of self.norm_out(x), shape (batch_size, seq_len, dim)
-
-        # Levenshtein distance score prediction (if CLS token is present and model is configured for it)
-        # The decision to use Levenshtein head can be implicit: if cls_token_id is available, this head is used.
-        # The training loop will decide whether to use the output based on its task config.
+        # Auxiliary heads using CLS token representation
         if self.cls_token_id is not None: # Indicates CLS token processing is relevant
             cls_representation = processed_x[:, 0, :]
             # Apply relu to ensure non-negative distance prediction
             predicted_distance_score = torch.relu(self.levenshtein_head(cls_representation).squeeze(-1)) # Output shape: (batch_size,)
+            # NSP logits for 3-class classification
+            nsp_logits = self.nsp_head(cls_representation) # Output shape: (batch_size, 3)
 
         if targets is not None:
             # Calculate raw per-token loss, without reduction
@@ -221,7 +221,7 @@ class GPTModel(nn.Module):
         else:
             loss = None
 
-        return logits, loss, predicted_distance_score # Return predicted_distance_score instead of nsp_logits
+        return logits, loss, predicted_distance_score, nsp_logits # Return both auxiliary outputs
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_prefix_attention_in_prompt: bool = False):
         """

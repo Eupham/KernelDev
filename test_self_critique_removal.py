@@ -50,8 +50,8 @@ def test_train_step_signature():
         print("❌ FAIL: Could not find train_step method definition")
         return False
     
-    # Should return 4 values instead of 5 (removed d_self_critique_mean)
-    expected_return_type = "Tuple[float, Optional[float], Optional[float], Optional[float]]"
+    # Should return 5 values (added nsp_loss for multi-task training)
+    expected_return_type = "Tuple[float, Optional[float], Optional[float], Optional[float], Optional[float]]"
     if expected_return_type in train_step_line:
         print(f"✅ PASS: train_step signature updated correctly: {train_step_line}")
         return True
