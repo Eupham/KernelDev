@@ -572,14 +572,22 @@ def start_actual_training(cli_args):
         print("\n=== Data Sample ===")
         # Adjust for LevenshteinDataset or standard output
         if lev_task_enabled:
-            # LevenshteinDataset yields: input_tokens, lm_targets, lev_dist_target, is_shuffled_flag
-            for input_tokens, lm_targets, lev_dist_target, is_shuffled_flag in dataloaders['train']:
-                print(f"Levenshtein Batch shapes: Input Toks-{input_tokens.shape}, LM Targets-{lm_targets.shape}, LevDist-{lev_dist_target.shape}, IsShuffled-{is_shuffled_flag.shape}")
-                print(f"Sample Levenshtein input tokens: {input_tokens[0][:20].tolist()}")
-                # Determine if the first item in the batch was shuffled to adjust log message
-                item_type_sample = "Shuffled" if is_shuffled_flag[0].item() == 1.0 else "Original"
+            # CombinedMultiTaskDataset yields: input_tokens, lm_targets, auxiliary_value, task_type_flag
+            for input_tokens, lm_targets, auxiliary_values, task_type_flags in dataloaders['train']:
+                print(f"Multi-task Batch shapes: Input Toks-{input_tokens.shape}, LM Targets-{lm_targets.shape}, Aux-{auxiliary_values.shape}, TaskType-{task_type_flags.shape}")
+                print(f"Sample multi-task input tokens: {input_tokens[0][:20].tolist()}")
+                # Determine task type for the first item in the batch
+                task_type = task_type_flags[0].item()
+                if task_type == 0.0:
+                    item_type_sample = "LM"
+                elif task_type == 1.0:
+                    item_type_sample = "Levenshtein"
+                elif task_type == 2.0:
+                    item_type_sample = "NSP"
+                else:
+                    item_type_sample = "Unknown"
                 sample_text = data_builder.decode_tokens(input_tokens[0][:50])
-                print(f"Sample Levenshtein text ({item_type_sample} sample): '{sample_text[:100]}...'")
+                print(f"Sample multi-task text ({item_type_sample} task): '{sample_text[:100]}...'")
                 break
         else: # Standard LM task
             for x, y in dataloaders['train']:
