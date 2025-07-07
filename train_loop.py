@@ -80,37 +80,64 @@ class TrainingConfig:
         self.is_distributed = False
 
 def init_distributed(trainer_instance: 'Trainer'):
+    # Check if already initialized (e.g., by DeepSpeed or another launcher)
     if dist.is_available() and dist.is_initialized():
         trainer_instance.is_distributed = True
-        if hasattr(trainer_instance.config, 'local_rank') and trainer_instance.config.local_rank == -1:
-             trainer_instance.config.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        # Attempt to get local_rank if not already set in config, common for some launchers
+        if not hasattr(trainer_instance.config, 'local_rank') or trainer_instance.config.local_rank == -1:
+            trainer_instance.config.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        # Assume device is already set correctly by the external launcher or will be handled
+        # For example, if DDP is used, device is often set based on local_rank
+        if torch.cuda.is_available():
+            if hasattr(trainer_instance.config, 'local_rank') and trainer_instance.config.local_rank != -1:
+                 trainer_instance.config.device = torch.device(f"cuda:{trainer_instance.config.local_rank}")
+            else: # Fallback if local_rank couldn't be determined but dist is initialized
+                 trainer_instance.config.device = torch.device('cuda')
+        else:
+            trainer_instance.config.device = torch.device('cpu')
+        print(f"Distributed training already initialized. Using rank: {dist.get_rank()}, world_size: {dist.get_world_size()}, device: {trainer_instance.config.device}")
         return
+
+    # Standard environment variable check for torch.distributed.launch or similar
     rank_env = os.environ.get('RANK')
     world_size_env = os.environ.get('WORLD_SIZE')
     local_rank_env = os.environ.get('LOCAL_RANK')
+
     if rank_env is not None and world_size_env is not None:
         try:
             rank = int(rank_env)
             world_size = int(world_size_env)
-            local_rank = int(local_rank_env) if local_rank_env is not None else rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
-            trainer_instance.config.local_rank = local_rank
-            if torch.cuda.is_available():
+
+            if world_size > 1 and torch.cuda.is_available(): # Only init if world_size > 1 and CUDA is present
+                local_rank = int(local_rank_env) if local_rank_env is not None else rank % torch.cuda.device_count()
+                trainer_instance.config.local_rank = local_rank
+
                 backend = 'nccl'
                 torch.cuda.set_device(local_rank)
+                # MASTER_ADDR and MASTER_PORT must be set in the environment for this to succeed
                 dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
                 trainer_instance.is_distributed = True
                 trainer_instance.config.device = torch.device(f"cuda:{local_rank}")
-            else:
+                print(f"Distributed training initialized by train_loop. Rank: {rank}, World Size: {world_size}, Device: {trainer_instance.config.device}")
+            elif world_size > 1 and not torch.cuda.is_available():
+                print("Warning: Distributed training requested (world_size > 1) but CUDA is not available. Falling back to non-distributed CPU mode.")
+                trainer_instance.is_distributed = False
+            else: # world_size is 1 or less
                 trainer_instance.is_distributed = False
         except Exception as e:
-            print(f"Error initializing distributed group: {e}")
+            print(f"Error initializing distributed group: {e}. Falling back to non-distributed mode.")
             trainer_instance.is_distributed = False
     else:
         trainer_instance.is_distributed = False
+
     if not trainer_instance.is_distributed:
-        if trainer_instance.config.device == "auto" or not isinstance(trainer_instance.config.device, torch.device):
-             trainer_instance.config.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        trainer_instance.config.local_rank = 0
+        # Set device for non-distributed mode
+        if torch.cuda.is_available():
+            trainer_instance.config.device = torch.device('cuda')
+            trainer_instance.config.local_rank = 0 # Default local_rank for single GPU
+        else:
+            trainer_instance.config.device = torch.device('cpu')
+            trainer_instance.config.local_rank = 0
         print(f"Running in non-distributed mode on device: {trainer_instance.config.device}")
 
 class TrainingMetrics:
@@ -236,7 +263,7 @@ class Trainer:
                 nsp_task_mask = (task_type_flags == 2.0)  # NSP task
                 
                 # LM Loss (from LM and Levenshtein tasks, not NSP)
-                lm_valid_mask = lm_task_mask | lev_task_mask
+                lm_valid_mask = lm_task_mask # Changed: Only pure LM tasks for this component
                 if lm_valid_mask.any() and per_item_lm_loss_all is not None:
                     per_item_lm_loss_valid = per_item_lm_loss_all[lm_valid_mask]
                     if per_item_lm_loss_valid.numel() > 0:
@@ -349,11 +376,42 @@ class Trainer:
                         force_disable_prefix_attention=False
                     )
 
+                # LM Loss Component Calculation for pure LM tasks
                 if per_item_lm_loss is not None:
-                    current_batch_lm_loss_tensor = per_item_lm_loss.mean().float() # per_item_lm_loss can be empty if batch has only fully masked items
-                    if not torch.isnan(current_batch_lm_loss_tensor) and not torch.isinf(current_batch_lm_loss_tensor):
-                         accum_lm_loss_component += current_batch_lm_loss_tensor.item()
-                         num_lm_batches += 1
+                    if task_type_flags is not None: # Multi-task case
+                        lm_task_mask_eval = (task_type_flags == 0.0)
+                        if lm_task_mask_eval.any():
+                            lm_loss_for_lm_items = per_item_lm_loss[lm_task_mask_eval]
+                            if lm_loss_for_lm_items.numel() > 0:
+                                # Calculate mean only if there are valid items after masking
+                                # Handle cases where lm_loss_for_lm_items might be empty if all targets were -1
+                                valid_lm_loss_items = lm_loss_for_lm_items[lm_loss_for_lm_items != float('inf')] # Assuming -inf or inf isn't a valid loss
+                                if valid_lm_loss_items.numel() > 0:
+                                     current_lm_loss_value = valid_lm_loss_items.float().mean().item()
+                                     if not math.isnan(current_lm_loss_value) and not math.isinf(current_lm_loss_value):
+                                        accum_lm_loss_component += current_lm_loss_value
+                                        num_lm_batches += 1
+                    else: # Single-task LM case (task_type_flags is None)
+                        # All items are LM items, per_item_lm_loss is for them
+                        current_lm_loss_value = per_item_lm_loss.float().mean().item()
+                        if not math.isnan(current_lm_loss_value) and not math.isinf(current_lm_loss_value):
+                            accum_lm_loss_component += current_lm_loss_value
+                            num_lm_batches += 1
+
+                # current_batch_lm_loss_tensor is used for the batch_total_loss calculation below
+                # It needs to be defined. If pure LM items are not present or their loss is invalid, it should reflect that (e.g. 0 or not contribute)
+                # For simplicity, we can re-calculate it here for the combined loss if needed, or ensure it's correctly set from above.
+                # The current logic for batch_total_loss uses current_batch_lm_loss_tensor which was the unfilterd mean.
+                # Let's ensure current_batch_lm_loss_tensor for combined loss is the overall mean LM loss if present.
+                if per_item_lm_loss is not None and per_item_lm_loss.numel() > 0:
+                     valid_total_lm_losses = per_item_lm_loss[per_item_lm_loss != float('inf')]
+                     if valid_total_lm_losses.numel() > 0:
+                         current_batch_lm_loss_tensor = valid_total_lm_losses.float().mean()
+                     else: # No valid LM losses in the batch at all
+                         current_batch_lm_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+                else: # No per_item_lm_loss at all for this batch
+                    current_batch_lm_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+
 
                 if self.config.use_levenshtein_task and predicted_lev_distances is not None and task_type_flags is not None and auxiliary_values is not None:
                     lev_task_mask_eval = (task_type_flags == 1.0)  # Levenshtein task items
