@@ -218,10 +218,6 @@ class DataBuilder:
             dataset_stream = load_dataset(
                 self.dataset_name, name=self.dataset_config, streaming=True, split='train', trust_remote_code=True
             )
-            # Convert generator to list to avoid 'len()' error
-            if isinstance(dataset_stream, (list, tuple)):
-                dataset_stream = list(dataset_stream)
-
             print("C4 'en' (streaming) load_dataset call succeeded. Processing samples...")
             loaded_samples = self._process_iterable_dataset(dataset_stream, "C4 'en' streaming")
             
@@ -247,10 +243,6 @@ class DataBuilder:
                     dataset_non_stream = load_dataset(
                         self.dataset_name, name=self.dataset_config, split=f'train[:{fetch_n}]', trust_remote_code=True
                     )
-                    # Ensure dataset_non_stream is also converted to list if needed
-                    if isinstance(dataset_non_stream, (list, tuple)):
-                        dataset_non_stream = list(dataset_non_stream)
-
                     print("C4 'en' (non-streaming) load_dataset call succeeded. Processing samples...")
                     loaded_samples = self._process_iterable_dataset(dataset_non_stream, "C4 'en' non-streaming")
                     if not loaded_samples and self.max_samples > 0:
@@ -501,7 +493,13 @@ class DataBuilder:
             print(f"Dataset object: {dataset_obj}")
             if dataset_obj is not None:
                 try:
-                    print(f"len(dataset): {len(dataset_obj)}")
+                    try:
+                        dataset_len = len(dataset_obj)
+                        print(f"len(dataset): {dataset_len}")
+                    except TypeError:
+                        # Handle datasets that don't support len() (e.g., generators, IterableDatasets)
+                        print(f"len(dataset): unknown (iterable dataset)")
+                    
                     if hasattr(dataset_obj, 'seq_len'):
                         print(f"dataset.seq_len: {dataset_obj.seq_len}")
                     if isinstance(dataset_obj, LevenshteinDataset):
