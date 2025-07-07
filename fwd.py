@@ -367,18 +367,25 @@ flash_forward_autotune = triton.autotune(
 @torch.library.custom_op(
     "flash_attention::forward", mutates_args=(), device_types=("cuda",)
 )
+# Matches the 11-arg schema: (q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision, is_prefix_token_mask)
 def attention_forward_adapter(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    lens: torch.Tensor,
-    sm_scale: float,
+    lens: torch.Tensor | None, # Made Noneable to match schema
+    sm_scale: float | None,    # Made Noneable to match schema
+    causal: bool,              # Added
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
+    is_prefix_token_mask: torch.Tensor | None # Added
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
+
+    # sm_scale defaults if None (though schema implies it should be provided by dispatcher)
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(HEAD_DIM)
 
     assert HEAD_DIM in {16, 32, 64, 128, 256}
     assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
@@ -435,10 +442,12 @@ def attention_forward_adapter_abstract(
     v: torch.Tensor,
     lens: torch.Tensor | None,
     sm_scale: float | None,
+    causal: bool,              # Added
     autotune: bool,
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
+    is_prefix_token_mask: torch.Tensor | None # Added
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
