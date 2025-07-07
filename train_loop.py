@@ -684,14 +684,15 @@ class Trainer:
                     input_ids, lm_targets = batch
                 input_ids, lm_targets = input_ids.to(self.config.device), lm_targets.to(self.config.device)
                 
-                lm_loss = None
+                per_item_lm_loss_for_ppl = None # Initialize to None
                 autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
                 with autocast_context:
                     # Model's forward for perplexity should focus on LM loss from original_tokens_cls
-                    # The third output (aux_score) is not used for perplexity.
-                    _, lm_loss, _ = self.model(input_ids, lm_targets, force_disable_prefix_attention=True) # Force disable prefix for pure LM perplexity
-                if lm_loss is not None:
-                    total_loss += lm_loss.mean().item()
+                    # It returns: lm_logits, per_item_lm_loss, predicted_lev_distances, nsp_logits
+                    _, per_item_lm_loss_for_ppl, _, _ = self.model(input_ids, lm_targets, force_disable_prefix_attention=True) # Force disable prefix for pure LM perplexity
+
+                if per_item_lm_loss_for_ppl is not None:
+                    total_loss += per_item_lm_loss_for_ppl.mean().item()
                     num_batches += 1
         self.model.train()
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
