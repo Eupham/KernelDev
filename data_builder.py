@@ -263,59 +263,119 @@ class DataBuilder:
                 print(f"DataBuilder: Using streaming approach for {self.dataset_name}")
                 for split_name_to_try in ['train', 'validation']: # Try train, then validation
                     print(f"Attempting to load '{split_name_to_try}' split via streaming...")
-                    try:
-                        # Load the streaming dataset
-                        streaming_dataset = datasets.load_dataset(
-                            self.dataset_name,
-                            name=self.dataset_config,
-                            split=split_name_to_try, # Load the whole split as a stream
-                            streaming=True,
-                            trust_remote_code=True
-                        )
-                        print(f"Successfully initiated streaming for '{split_name_to_try}' split.")
+                    if split_name_to_try == 'train':
+                        try:
+                            # Load the streaming dataset for 'train'
+                            streaming_dataset = datasets.load_dataset(
+                                self.dataset_name,
+                                name=self.dataset_config,
+                                split=split_name_to_try,
+                                streaming=True,
+                                trust_remote_code=True
+                            )
+                            print(f"Successfully initiated streaming for '{split_name_to_try}' split.")
 
-                        # Iterate and collect samples up to max_samples
-                        temp_samples_for_split = []
-                        # Handle cases where max_samples might be float('inf')
-                        samples_to_collect = self.max_samples
-                        if samples_to_collect == float('inf'):
-                            # No practical limit for streaming other than dataset size or time
-                            # For safety in a loop, one might add a very large number,
-                            # but direct iteration is usually fine if the stream ends.
-                            # Here, we rely on breaking once enough are collected if max_samples is finite.
-                            pass
+                            temp_samples_for_split = []
+                            samples_to_collect = self.max_samples
 
+                            for i, sample_data in enumerate(streaming_dataset):
+                                if samples_to_collect != float('inf') and len(temp_samples_for_split) >= samples_to_collect:
+                                    print(f"Reached max_samples ({samples_to_collect}) while streaming '{split_name_to_try}'.")
+                                    break
+                                text_content = ""
+                                if isinstance(sample_data, dict):
+                                    if 'text' in sample_data: text_content = sample_data['text']
+                                    elif 'content' in sample_data: text_content = sample_data['content']
+                                if text_content and text_content.strip():
+                                    temp_samples_for_split.append({'text': text_content})
+                                if (i + 1) % 1000 == 0:
+                                    print(f"Streamed {i+1} items from '{split_name_to_try}', collected {len(temp_samples_for_split)} valid samples...")
 
-                        for i, sample_data in enumerate(streaming_dataset):
-                            # Check if we've already collected enough samples if max_samples is finite
-                            if samples_to_collect != float('inf') and len(temp_samples_for_split) >= samples_to_collect:
-                                print(f"Reached max_samples ({samples_to_collect}) while streaming '{split_name_to_try}'.")
-                                break
+                            loaded_samples.extend(temp_samples_for_split)
+                            print(f"Collected {len(temp_samples_for_split)} samples from '{split_name_to_try}' split via streaming.")
 
-                            text_content = ""
-                            if isinstance(sample_data, dict):
-                                if 'text' in sample_data:
-                                    text_content = sample_data['text']
-                                elif 'content' in sample_data: # Add other common text fields if necessary
-                                    text_content = sample_data['content']
+                        except Exception as e:
+                            if isinstance(e, TypeError) and "object of type 'generator' has no len()" in str(e):
+                                print(f"DataBuilder: Streaming for C4 'train' failed with TypeError: {e}. Fallback to non-streaming.")
+                                try:
+                                    # Fallback non-streaming logic for C4 'train'
+                                    chunk_size = 50000 # Max chunk size
+                                    if self.max_samples != float('inf'):
+                                        chunk_size = min(self.max_samples + 1000, 50000)
 
-                            if text_content and text_content.strip():
-                                temp_samples_for_split.append({'text': text_content})
+                                    print(f"DataBuilder: Attempting non-streaming load for C4 'train' with chunk_size: {chunk_size}")
+                                    dataset_chunk = datasets.load_dataset(
+                                        self.dataset_name,
+                                        name=self.dataset_config,
+                                        split=f'train[:{chunk_size}]',
+                                        streaming=False,
+                                        trust_remote_code=True
+                                    )
+                                    dataset_list = self._safe_convert_to_list(dataset_chunk, "C4 'train' non-streaming fallback")
 
-                            if (i + 1) % 1000 == 0: # Log progress
-                                print(f"Streamed {i+1} items from '{split_name_to_try}', collected {len(temp_samples_for_split)} valid samples...")
-                        
-                        loaded_samples.extend(temp_samples_for_split)
-                        print(f"Collected {len(temp_samples_for_split)} samples from '{split_name_to_try}' split.")
+                                    temp_samples_for_split = []
+                                    samples_to_collect = self.max_samples
 
-                        # If we got enough samples from 'train', we might not need 'validation' or other splits.
-                        if samples_to_collect != float('inf') and len(loaded_samples) >= samples_to_collect:
-                            print(f"Total collected samples ({len(loaded_samples)}) reached/exceeded max_samples ({samples_to_collect}).")
-                            break # Break from the loop over split_name_to_try
+                                    for sample_data in dataset_list:
+                                        if samples_to_collect != float('inf') and len(temp_samples_for_split) >= samples_to_collect:
+                                            break
+                                        text_content = ""
+                                        if isinstance(sample_data, dict):
+                                            if 'text' in sample_data: text_content = sample_data['text']
+                                            elif 'content' in sample_data: text_content = sample_data['content']
+                                        if text_content and text_content.strip():
+                                            temp_samples_for_split.append({'text': text_content})
 
-                    except Exception as e:
-                        print(f"Failed to load or stream '{split_name_to_try}' split for {self.dataset_name}: {e}")
-                        continue # Try next split if current one fails
+                                    loaded_samples.extend(temp_samples_for_split)
+                                    print(f"Collected {len(temp_samples_for_split)} samples from C4 'train' split via non-streaming fallback.")
+                                except Exception as fallback_e:
+                                    print(f"DataBuilder: Non-streaming fallback for C4 'train' also failed: {fallback_e}")
+                                    # This failure will be handled by the outer loop (continue to next split)
+                                    # or overall error handling if this was the last attempt.
+                                    # We print and then let the original outer exception handler catch it or continue.
+                                    print(f"Failed to load or stream '{split_name_to_try}' split for {self.dataset_name}: {e}") # Original error
+                                    continue # Try next split ('validation') if 'train' fails completely
+                            else:
+                                # Not the specific TypeError, or some other error during streaming
+                                print(f"Failed to load or stream '{split_name_to_try}' split for {self.dataset_name}: {e}")
+                                continue # Try next split
+                    else: # For 'validation' split, use the original streaming logic
+                        try:
+                            streaming_dataset = datasets.load_dataset(
+                                self.dataset_name,
+                                name=self.dataset_config,
+                                split=split_name_to_try,
+                                streaming=True,
+                                trust_remote_code=True
+                            )
+                            print(f"Successfully initiated streaming for '{split_name_to_try}' split.")
+
+                            temp_samples_for_split = []
+                            samples_to_collect = self.max_samples
+
+                            for i, sample_data in enumerate(streaming_dataset):
+                                if samples_to_collect != float('inf') and len(temp_samples_for_split) >= samples_to_collect:
+                                    print(f"Reached max_samples ({samples_to_collect}) while streaming '{split_name_to_try}'.")
+                                    break
+                                text_content = ""
+                                if isinstance(sample_data, dict):
+                                    if 'text' in sample_data: text_content = sample_data['text']
+                                    elif 'content' in sample_data: text_content = sample_data['content']
+                                if text_content and text_content.strip():
+                                    temp_samples_for_split.append({'text': text_content})
+                                if (i + 1) % 1000 == 0:
+                                    print(f"Streamed {i+1} items from '{split_name_to_try}', collected {len(temp_samples_for_split)} valid samples...")
+
+                            loaded_samples.extend(temp_samples_for_split)
+                            print(f"Collected {len(temp_samples_for_split)} samples from '{split_name_to_try}' split.")
+                        except Exception as e:
+                            print(f"Failed to load or stream '{split_name_to_try}' split for {self.dataset_name}: {e}")
+                            continue # Try next split if current one fails
+
+                    # Common logic after attempting 'train' or 'validation'
+                    if self.max_samples != float('inf') and len(loaded_samples) >= self.max_samples:
+                        print(f"Total collected samples ({len(loaded_samples)}) reached/exceeded max_samples ({self.max_samples}). Stopping C4 loading.")
+                        break # Break from the loop over split_name_to_try
                 
                 if not loaded_samples:
                     print(f"Warning: No samples collected via streaming for {self.dataset_name}. Will proceed to fallback if configured.")
