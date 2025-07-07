@@ -700,11 +700,12 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
         return
 
     if lev_task_enabled:
-        # Expecting (orig_tok, lm_tgt, shuf_tok, lev_dist, coh_score)
-        if len(first_batch) == 5:
-            x, _, _, _, _ = first_batch # Use the first item (original_tokens_cls)
+        # Expecting (input_tokens, lm_targets, auxiliary_values, task_type_flags)
+        if len(first_batch) == 4:
+            input_tokens, lm_targets, auxiliary_values, task_type_flags = first_batch
+            x = input_tokens # Use the input_tokens
         else:
-            print(f"Warning: Expected 5 items in Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            print(f"Warning: Expected 4 items in Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
     else:
         # Expecting (input_ids, lm_targets)
@@ -723,8 +724,8 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
     with torch.no_grad():
         # Test with causal=True (default)
         print("Testing with causal=True...")
-        # model.forward now returns logits, loss, nsp_logits
-        logits_causal, _, _ = model(x)
+        # model.forward now returns logits, loss, predicted_distance_score, nsp_logits
+        logits_causal, _, _, _ = model(x)
         
         # Test with causal=False by modifying the attention layers
         print("Testing with causal=False...")
@@ -734,8 +735,8 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
             original_causal.append(block.attn.causal)
             block.attn.causal = False
         
-        # model.forward now returns logits, loss, nsp_logits
-        logits_non_causal, _, _ = model(x)
+        # model.forward now returns logits, loss, predicted_distance_score, nsp_logits
+        logits_non_causal, _, _, _ = model(x)
         
         # Restore original causal setting
         for i, block in enumerate(model.blocks):
@@ -1103,9 +1104,13 @@ class FlashAttentionTest:
                 raise RuntimeError("flash_attention::forward operation not found")
                 
             output, lse = torch.ops.flash_attention.forward(
-                q, k, v, lens, scale, 
-                autotune=False, return_lse=False, 
-                prescale_qk=False, precision=precision
+                q, k, v, lens, scale,  # scale is sm_scale
+                causal=True,           # Added
+                autotune=False,
+                return_lse=False,
+                prescale_qk=False,
+                precision=precision,
+                is_prefix_token_mask=None # Added
             )
             return output
         except Exception as e:
