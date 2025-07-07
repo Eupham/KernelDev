@@ -5,6 +5,7 @@ This allows PyTorch to use our custom autograd function for backpropagation.
 """
 
 import torch
+import torch._dynamo # Added
 
 # Register the backward function for flash_attention::forward
 def flash_attention_backward_setup_context(ctx, inputs, output): # output is already correctly named by PyTorch
@@ -44,6 +45,7 @@ def flash_attention_backward_setup_context(ctx, inputs, output): # output is alr
     ctx.o = o
     ctx.lse = lse
 
+@torch._dynamo.disable # Added decorator
 def flash_attention_backward_adapter(ctx, grad_out, grad_lse=None):
     # Unpack saved tensors. The order matters.
     # Based on the new save_for_backward: q, k, v, [lens], [is_prefix_token_mask]
