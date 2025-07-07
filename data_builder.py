@@ -256,115 +256,138 @@ class DataBuilder:
 
         # Robust dataset loading with proper streaming dataset handling
         try:
-            print("DataBuilder: Using robust dataset loading approach...")
-            
-            # Import here to avoid any module-level conflicts
+            # Import datasets at the beginning of the method or ensure it's available
             import datasets
-            
-            # Force disable caching and use a different approach
-            datasets.disable_caching()
-            
-            # Calculate chunk size
-            if self.max_samples == float('inf'):
-                chunk_size = 10000
-            else:
-                chunk_size = min(self.max_samples + 1000, 50000)
-            
-            print(f"DataBuilder: Will load {chunk_size} samples using alternative method")
-            
-            # Try multiple loading strategies with proper streaming handling
-            dataset_chunk = None
-            
-            # Strategy 1: Try with explicit streaming=False to avoid generator issues
-            for split_name in ['train', 'validation', 'test']:
-                print(f"Attempting to load '{split_name}' split...")
-                print(f"Streaming for '{split_name}' split: False")
-                
-                for attempt in range(3):  # Try up to 3 different approaches
-                    try:
-                        if attempt == 0:
-                            # First try: explicit non-streaming with slice
-                            dataset_chunk = datasets.load_dataset(
-                                self.dataset_name, 
-                                name=self.dataset_config, 
-                                split=f'{split_name}[:{chunk_size}]',
-                                streaming=False,  # Explicitly disable streaming
-                                trust_remote_code=True
-                            )
-                        elif attempt == 1:
-                            # Second try: with download mode
-                            dataset_chunk = datasets.load_dataset(
-                                self.dataset_name, 
-                                name=self.dataset_config, 
-                                split=f'{split_name}[:{chunk_size}]',
-                                streaming=False,
-                                download_mode=datasets.DownloadMode.FORCE_REDOWNLOAD,
-                                trust_remote_code=True
-                            )
-                        else:
-                            # Third try: basic loading
-                            dataset_chunk = datasets.load_dataset(
-                                self.dataset_name, 
-                                name=self.dataset_config, 
-                                split=f'{split_name}[:{chunk_size}]',
-                                trust_remote_code=True
-                            )
-                        
-                        # Successfully loaded dataset
-                        print(f"DataBuilder: Dataset '{split_name}' split loaded successfully")
-                        break
-                        
-                    except Exception as e:
-                        print(f"Failed to load '{split_name}' split for {self.dataset_name}: {e}")
-                        if attempt == 2:  # Last attempt failed
-                            continue  # Try next split
-                        else:
-                            continue  # Try next approach
-                
-                # If we successfully loaded any split, break out of the split loop
-                if dataset_chunk is not None:
-                    break
-            
-            # If no split was loaded successfully, raise an error
-            if dataset_chunk is None:
-                raise ValueError(f"Failed to load any split from {self.dataset_name}")
-            
-            print("DataBuilder: Dataset loading succeeded. Processing samples...")
-            
-            # CRITICAL: Handle generator objects properly to avoid len() errors
-            dataset_list = self._safe_convert_to_list(dataset_chunk, "main dataset")
-            print(f"DataBuilder: Converted dataset to list with {len(dataset_list)} items")
 
-            # Process the samples
-            samples_processed = 0
-            for i, sample_data in enumerate(dataset_list):
-                if samples_processed >= self.max_samples:
-                    print(f"DataBuilder: Reached max_samples ({self.max_samples}). Stopping.")
-                    break
-                
-                text_content = ""
-                if isinstance(sample_data, dict):
-                    if 'text' in sample_data:
-                        text_content = sample_data['text']
-                    elif 'content' in sample_data:
-                        text_content = sample_data['content']
-                    else:
-                        for key, value in sample_data.items():
-                            if isinstance(value, str) and value.strip():
-                                text_content = value
+            if self.dataset_name == "allenai/c4":
+                print(f"DataBuilder: Using streaming approach for {self.dataset_name}")
+                for split_name_to_try in ['train', 'validation']: # Try train, then validation
+                    print(f"Attempting to load '{split_name_to_try}' split via streaming...")
+                    try:
+                        # Load the streaming dataset
+                        streaming_dataset = datasets.load_dataset(
+                            self.dataset_name,
+                            name=self.dataset_config,
+                            split=split_name_to_try, # Load the whole split as a stream
+                            streaming=True,
+                            trust_remote_code=True
+                        )
+                        print(f"Successfully initiated streaming for '{split_name_to_try}' split.")
+
+                        # Iterate and collect samples up to max_samples
+                        temp_samples_for_split = []
+                        # Handle cases where max_samples might be float('inf')
+                        samples_to_collect = self.max_samples
+                        if samples_to_collect == float('inf'):
+                            # No practical limit for streaming other than dataset size or time
+                            # For safety in a loop, one might add a very large number,
+                            # but direct iteration is usually fine if the stream ends.
+                            # Here, we rely on breaking once enough are collected if max_samples is finite.
+                            pass
+
+
+                        for i, sample_data in enumerate(streaming_dataset):
+                            # Check if we've already collected enough samples if max_samples is finite
+                            if samples_to_collect != float('inf') and len(temp_samples_for_split) >= samples_to_collect:
+                                print(f"Reached max_samples ({samples_to_collect}) while streaming '{split_name_to_try}'.")
                                 break
 
-                if text_content and text_content.strip():
-                    loaded_samples.append({'text': text_content})
-                    samples_processed += 1
+                            text_content = ""
+                            if isinstance(sample_data, dict):
+                                if 'text' in sample_data:
+                                    text_content = sample_data['text']
+                                elif 'content' in sample_data: # Add other common text fields if necessary
+                                    text_content = sample_data['content']
 
-                if (i + 1) % 1000 == 0:
-                    print(f"DataBuilder: Processed {i+1} raw items, extracted {samples_processed} valid samples...")
-            
-            print(f"DataBuilder: Successfully loaded {len(loaded_samples)} samples from {self.dataset_name}")
-            
+                            if text_content and text_content.strip():
+                                temp_samples_for_split.append({'text': text_content})
+
+                            if (i + 1) % 1000 == 0: # Log progress
+                                print(f"Streamed {i+1} items from '{split_name_to_try}', collected {len(temp_samples_for_split)} valid samples...")
+                        
+                        loaded_samples.extend(temp_samples_for_split)
+                        print(f"Collected {len(temp_samples_for_split)} samples from '{split_name_to_try}' split.")
+
+                        # If we got enough samples from 'train', we might not need 'validation' or other splits.
+                        if samples_to_collect != float('inf') and len(loaded_samples) >= samples_to_collect:
+                            print(f"Total collected samples ({len(loaded_samples)}) reached/exceeded max_samples ({samples_to_collect}).")
+                            break # Break from the loop over split_name_to_try
+
+                    except Exception as e:
+                        print(f"Failed to load or stream '{split_name_to_try}' split for {self.dataset_name}: {e}")
+                        continue # Try next split if current one fails
+                
+                if not loaded_samples:
+                    print(f"Warning: No samples collected via streaming for {self.dataset_name}. Will proceed to fallback if configured.")
+                else:
+                    print(f"Total samples collected via streaming for {self.dataset_name}: {len(loaded_samples)}")
+
+            else: # Fallback to existing logic for other datasets (non-C4)
+                print(f"DataBuilder: Using existing non-streaming/sliced logic for {self.dataset_name}")
+                # Original logic starts here
+                datasets.disable_caching() # This was part of the original non-C4 logic path
+                
+                if self.max_samples == float('inf'):
+                    chunk_size = 10000 # Original chunk_size logic
+                else:
+                    chunk_size = min(self.max_samples + 1000, 50000)
+                print(f"DataBuilder: Will load {chunk_size} samples using alternative method for {self.dataset_name}")
+
+                dataset_chunk = None
+                # Original loop for split_name in ['train', 'validation', 'test']
+                for split_name_orig in ['train', 'validation', 'test']:
+                    print(f"Attempting to load '{split_name_orig}' split for {self.dataset_name} (non-streaming)...")
+                    # Original attempt loop (simplified here as per prompt, but original had more tries)
+                    try:
+                        dataset_chunk = datasets.load_dataset(
+                            self.dataset_name,
+                            name=self.dataset_config,
+                            split=f'{split_name_orig}[:{chunk_size}]',
+                            streaming=False,
+                            trust_remote_code=True
+                        )
+                        print(f"DataBuilder: Dataset '{split_name_orig}' split loaded successfully for {self.dataset_name}")
+                        break # Break from split_name_orig loop if successful
+                    except Exception as e_non_c4_load:
+                        print(f"DataBuilder: Loading failed for {self.dataset_name} (split: {split_name_orig}): {e_non_c4_load}")
+                        dataset_chunk = None # Ensure it's None to try next split or fail
+
+                if dataset_chunk is not None:
+                    dataset_list = self._safe_convert_to_list(dataset_chunk, f"{self.dataset_name} main dataset")
+                    print(f"DataBuilder: Converted {self.dataset_name} dataset to list with {len(dataset_list)} items")
+
+                    samples_processed = 0
+                    for i, sample_data in enumerate(dataset_list):
+                        if self.max_samples != float('inf') and samples_processed >= self.max_samples:
+                            print(f"DataBuilder: Reached max_samples ({self.max_samples}) for {self.dataset_name}. Stopping.")
+                            break
+
+                        text_content = ""
+                        if isinstance(sample_data, dict):
+                            if 'text' in sample_data:
+                                text_content = sample_data['text']
+                            elif 'content' in sample_data:
+                                text_content = sample_data['content']
+                            # (add other text field checks as in original)
+                            else:
+                                for key, value in sample_data.items():
+                                    if isinstance(value, str) and value.strip():
+                                        text_content = value
+                                        break
+
+                        if text_content and text_content.strip():
+                            loaded_samples.append({'text': text_content})
+                            samples_processed += 1
+                    print(f"DataBuilder: Successfully loaded {len(loaded_samples)} samples from {self.dataset_name} using non-streaming logic.")
+                else:
+                    print(f"DataBuilder: Failed to load any split for {self.dataset_name} using non-streaming logic.")
+                    # loaded_samples would remain empty or as previously set if partial loading was possible before failure.
+                    # For this structure, it means loaded_samples is empty from this non-C4 path.
+
         except Exception as e_main_load:
             print(f"DataBuilder: Main dataset loading failed: {e_main_load}")
+            # Ensure loaded_samples is empty or cleared if a catastrophic error occurred
+            # The prompt implies loaded_samples = [] was here in original, keeping it for safety.
             loaded_samples = []
 
         # Ensure we have at least some data
