@@ -218,6 +218,10 @@ class DataBuilder:
             dataset_stream = load_dataset(
                 self.dataset_name, name=self.dataset_config, streaming=True, split='train', trust_remote_code=True
             )
+            # Convert generator to list to avoid 'len()' error
+            if isinstance(dataset_stream, (list, tuple)):
+                dataset_stream = list(dataset_stream)
+
             print("C4 'en' (streaming) load_dataset call succeeded. Processing samples...")
             loaded_samples = self._process_iterable_dataset(dataset_stream, "C4 'en' streaming")
             
@@ -243,6 +247,10 @@ class DataBuilder:
                     dataset_non_stream = load_dataset(
                         self.dataset_name, name=self.dataset_config, split=f'train[:{fetch_n}]', trust_remote_code=True
                     )
+                    # Ensure dataset_non_stream is also converted to list if needed
+                    if isinstance(dataset_non_stream, (list, tuple)):
+                        dataset_non_stream = list(dataset_non_stream)
+
                     print("C4 'en' (non-streaming) load_dataset call succeeded. Processing samples...")
                     loaded_samples = self._process_iterable_dataset(dataset_non_stream, "C4 'en' non-streaming")
                     if not loaded_samples and self.max_samples > 0:
