@@ -248,9 +248,10 @@ class GPTModel(nn.Module):
                 # Crop sequence if it gets too long
                 idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
                 
-                # Forward pass - update to expect three return values
+                # Forward pass - self.forward returns: logits, loss, predicted_distance_score, nsp_logits
+                # We only need logits for generation.
                 # Pass force_disable_prefix_attention based on not use_prefix_attention_in_prompt
-                logits, _, _ = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
+                logits, _, _, _ = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
                 logits = logits[:, -1, :] / temperature
                 
                 # Apply top-k filtering if specified
