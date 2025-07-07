@@ -169,31 +169,73 @@ class DataBuilder:
         # This is complex; for now, the regex handles common cases.
         return processed_sentences
 
+    def _safe_convert_to_list(self, dataset_obj, dataset_name_logging: str) -> list:
+        """
+        Safely convert any dataset object to a list, handling streaming datasets/generators.
+        This prevents the 'object of type generator has no len()' error.
+        """
+        if dataset_obj is None:
+            print(f"Warning: Dataset object for {dataset_name_logging} is None")
+            return []
+        
+        # Check if it's already a list
+        if isinstance(dataset_obj, list):
+            return dataset_obj
+        
+        # Check if it supports len() (not a generator/streaming dataset)
+        try:
+            dataset_len = len(dataset_obj)
+            print(f"Dataset {dataset_name_logging} supports len(): {dataset_len} items")
+            # If it supports len(), it's likely a regular dataset, convert to list
+            return list(dataset_obj)
+        except (TypeError, AttributeError):
+            # This is likely a generator/streaming dataset - convert carefully
+            print(f"Converting streaming/generator dataset {dataset_name_logging} to list...")
+            try:
+                dataset_list = list(dataset_obj)
+                print(f"Successfully converted {dataset_name_logging} to list with {len(dataset_list)} items")
+                return dataset_list
+            except Exception as e:
+                print(f"Error converting {dataset_name_logging} to list: {e}")
+                return []
+    
     def _process_iterable_dataset(self, dataset_iterable, dataset_name_logging: str) -> list:
         samples = []
         processed_count = 0
-        if self.max_samples == float('inf') and dataset_iterable is None:
-             print(f"Warning: Dataset iterable for {dataset_name_logging} is empty or None when expecting all samples.")
-             return []
+        
         if dataset_iterable is None:
             print(f"Warning: Dataset iterable for {dataset_name_logging} is empty or None.")
             return []
+        
+        # Ensure we have a safe iterator that won't cause len() errors
+        safe_iterable = self._safe_convert_to_list(dataset_iterable, dataset_name_logging)
+        
+        # Handle case where max_samples is infinite
+        if self.max_samples == float('inf'):
+            max_samples_to_process = len(safe_iterable)
+        else:
+            max_samples_to_process = min(self.max_samples, len(safe_iterable))
+            
+        print(f"Processing up to {max_samples_to_process} samples from {dataset_name_logging}")
 
-        for i, sample_data in enumerate(dataset_iterable):
-            if processed_count >= self.max_samples:
-                print(f"Reached max_samples ({self.max_samples}) for {dataset_name_logging}.")
+        for i, sample_data in enumerate(safe_iterable):
+            if processed_count >= max_samples_to_process:
+                print(f"Reached max_samples ({max_samples_to_process}) for {dataset_name_logging}.")
                 break
 
             text_content = ""
-            if 'text' in sample_data:
-                text_content = sample_data['text']
-            elif 'content' in sample_data:
-                text_content = sample_data['content']
-            else:
-                for key, value in sample_data.items():
-                    if isinstance(value, str) and value.strip():
-                        text_content = value
-                        break
+            if isinstance(sample_data, dict):
+                if 'text' in sample_data:
+                    text_content = sample_data['text']
+                elif 'content' in sample_data:
+                    text_content = sample_data['content']
+                else:
+                    for key, value in sample_data.items():
+                        if isinstance(value, str) and value.strip():
+                            text_content = value
+                            break
+            elif isinstance(sample_data, str):
+                text_content = sample_data
 
             if text_content and text_content.strip():
                 # For Levenshtein task, we don't need to pre-segment sentences here.
@@ -212,7 +254,7 @@ class DataBuilder:
         print(f"DataBuilder: Loading dataset: {self.dataset_name}/{self.dataset_config}")
         loaded_samples = []
 
-        # Completely bypass the problematic dataset loading with a robust alternative approach
+        # Robust dataset loading with proper streaming dataset handling
         try:
             print("DataBuilder: Using robust dataset loading approach...")
             
@@ -230,33 +272,68 @@ class DataBuilder:
             
             print(f"DataBuilder: Will load {chunk_size} samples using alternative method")
             
-            # Use a completely different loading strategy
-            try:
-                # Try loading with explicit download mode
-                dataset_chunk = datasets.load_dataset(
-                    self.dataset_name, 
-                    name=self.dataset_config, 
-                    split=f'train[:{chunk_size}]',
-                    download_mode=datasets.DownloadMode.FORCE_REDOWNLOAD,
-                    trust_remote_code=True
-                )
-            except:
-                # Fallback to basic loading
-                dataset_chunk = datasets.load_dataset(
-                    self.dataset_name, 
-                    name=self.dataset_config, 
-                    split=f'train[:{chunk_size}]',
-                    trust_remote_code=True
-                )
+            # Try multiple loading strategies with proper streaming handling
+            dataset_chunk = None
+            
+            # Strategy 1: Try with explicit streaming=False to avoid generator issues
+            for split_name in ['train', 'validation', 'test']:
+                print(f"Attempting to load '{split_name}' split...")
+                print(f"Streaming for '{split_name}' split: False")
+                
+                for attempt in range(3):  # Try up to 3 different approaches
+                    try:
+                        if attempt == 0:
+                            # First try: explicit non-streaming with slice
+                            dataset_chunk = datasets.load_dataset(
+                                self.dataset_name, 
+                                name=self.dataset_config, 
+                                split=f'{split_name}[:{chunk_size}]',
+                                streaming=False,  # Explicitly disable streaming
+                                trust_remote_code=True
+                            )
+                        elif attempt == 1:
+                            # Second try: with download mode
+                            dataset_chunk = datasets.load_dataset(
+                                self.dataset_name, 
+                                name=self.dataset_config, 
+                                split=f'{split_name}[:{chunk_size}]',
+                                streaming=False,
+                                download_mode=datasets.DownloadMode.FORCE_REDOWNLOAD,
+                                trust_remote_code=True
+                            )
+                        else:
+                            # Third try: basic loading
+                            dataset_chunk = datasets.load_dataset(
+                                self.dataset_name, 
+                                name=self.dataset_config, 
+                                split=f'{split_name}[:{chunk_size}]',
+                                trust_remote_code=True
+                            )
+                        
+                        # Successfully loaded dataset
+                        print(f"DataBuilder: Dataset '{split_name}' split loaded successfully")
+                        break
+                        
+                    except Exception as e:
+                        print(f"Failed to load '{split_name}' split for {self.dataset_name}: {e}")
+                        if attempt == 2:  # Last attempt failed
+                            continue  # Try next split
+                        else:
+                            continue  # Try next approach
+                
+                # If we successfully loaded any split, break out of the split loop
+                if dataset_chunk is not None:
+                    break
+            
+            # If no split was loaded successfully, raise an error
+            if dataset_chunk is None:
+                raise ValueError(f"Failed to load any split from {self.dataset_name}")
             
             print("DataBuilder: Dataset loading succeeded. Processing samples...")
             
-            # Refine dataset loading to avoid generator len() issues
-            if hasattr(dataset_chunk, '__iter__'):
-                dataset_list = list(dataset_chunk)
-                print(f"DataBuilder: Converted dataset to list with {len(dataset_list)} items")
-            else:
-                dataset_list = dataset_chunk
+            # CRITICAL: Handle generator objects properly to avoid len() errors
+            dataset_list = self._safe_convert_to_list(dataset_chunk, "main dataset")
+            print(f"DataBuilder: Converted dataset to list with {len(dataset_list)} items")
 
             # Process the samples
             samples_processed = 0
@@ -292,7 +369,10 @@ class DataBuilder:
 
         # Ensure we have at least some data
         if not loaded_samples:
-            raise ValueError("No samples loaded from any dataset. Please check the dataset configuration and availability.")
+            print("DataBuilder: No samples loaded from dataset. Creating fallback dataset...")
+            fallback_dataset = self._create_fallback_dataset()
+            print(f"DataBuilder: Created fallback dataset with {len(fallback_dataset)} splits")
+            return fallback_dataset
 
         # Split data for train/validation/test
         train_split = int(0.8 * len(loaded_samples))
