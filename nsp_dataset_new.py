@@ -102,6 +102,6 @@ class NSPDataset(Dataset):
         return (
             torch.tensor(input_tokens, dtype=torch.long),
             torch.tensor(lm_targets, dtype=torch.long),
-            torch.tensor(nsp_class, dtype=torch.long),  # NSP class label
+            torch.tensor(float(nsp_class), dtype=torch.float),  # NSP class label
             torch.tensor(2.0, dtype=torch.float),  # Task type flag (2.0 for NSP)
         )
