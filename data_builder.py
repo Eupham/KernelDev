@@ -512,16 +512,33 @@ class DataBuilder:
             print(f"collate_fn: None (using default)") # DataLoader uses default_collate if None
             print(f"pin_memory: {current_pin_memory}")
 
-            if not dataset_obj: # Re-check after prints, before DataLoader call
+            if dataset_obj is None: # Re-check after prints, before DataLoader call
                 print(f"Skipping DataLoader for {split_name} as dataset is None or invalid after attribute checks.")
                 print(f"--- {split_name}_dataloader preparation skipped ---")
                 continue
 
-            dataloaders[split_name] = DataLoader(
-                dataset_obj, batch_size=batch_size, shuffle=current_shuffle_status,
-                num_workers=num_workers, pin_memory=current_pin_memory
-            )
-            print(f"{split_name} dataloader created: {len(dataloaders[split_name])} batches")
+            try:
+                dataloaders[split_name] = DataLoader(
+                    dataset_obj, batch_size=batch_size, shuffle=current_shuffle_status,
+                    num_workers=num_workers, pin_memory=current_pin_memory
+                )
+            except (TypeError, ValueError) as e:
+                # Handle datasets that don't support shuffling (e.g., IterableDatasets)
+                if current_shuffle_status and ("shuffle" in str(e) or "len()" in str(e)):
+                    print(f"Warning: Dataset doesn't support shuffling. Creating DataLoader without shuffle.")
+                    dataloaders[split_name] = DataLoader(
+                        dataset_obj, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=current_pin_memory
+                    )
+                else:
+                    raise  # Re-raise if it's a different error
+                    
+            try:
+                batch_count = len(dataloaders[split_name])
+                print(f"{split_name} dataloader created: {batch_count} batches")
+            except TypeError:
+                # Handle datasets that don't support len() (e.g., generators, IterableDatasets)
+                print(f"{split_name} dataloader created: unknown number of batches (iterable dataset)")
             print(f"--- {split_name}_dataloader preparation complete ---")
         return dataloaders
 
