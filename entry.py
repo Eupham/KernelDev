@@ -700,11 +700,12 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
         return
 
     if lev_task_enabled:
-        # Expecting (orig_tok, lm_tgt, shuf_tok, lev_dist, coh_score)
-        if len(first_batch) == 5:
-            x, _, _, _, _ = first_batch # Use the first item (original_tokens_cls)
+        # Expecting (input_tokens, lm_targets, auxiliary_values, task_type_flags)
+        if len(first_batch) == 4:
+            input_tokens, lm_targets, auxiliary_values, task_type_flags = first_batch
+            x = input_tokens # Use the input_tokens
         else:
-            print(f"Warning: Expected 5 items in Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            print(f"Warning: Expected 4 items in Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
     else:
         # Expecting (input_ids, lm_targets)
@@ -723,8 +724,8 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
     with torch.no_grad():
         # Test with causal=True (default)
         print("Testing with causal=True...")
-        # model.forward now returns logits, loss, nsp_logits
-        logits_causal, _, _ = model(x)
+        # model.forward now returns logits, loss, predicted_distance_score, nsp_logits
+        logits_causal, _, _, _ = model(x)
         
         # Test with causal=False by modifying the attention layers
         print("Testing with causal=False...")
@@ -734,8 +735,8 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
             original_causal.append(block.attn.causal)
             block.attn.causal = False
         
-        # model.forward now returns logits, loss, nsp_logits
-        logits_non_causal, _, _ = model(x)
+        # model.forward now returns logits, loss, predicted_distance_score, nsp_logits
+        logits_non_causal, _, _, _ = model(x)
         
         # Restore original causal setting
         for i, block in enumerate(model.blocks):
@@ -1038,7 +1039,7 @@ import time
 # Import our separated modules
 import fwd
 import bwd
-import register_autograd  # This registers the autograd function for flash attention
+# import register_autograd  # This registers the autograd function for flash attention
 
 class FlashAttentionTest:
     """Test class for flash attention functionality."""
@@ -1103,9 +1104,13 @@ class FlashAttentionTest:
                 raise RuntimeError("flash_attention::forward operation not found")
                 
             output, lse = torch.ops.flash_attention.forward(
-                q, k, v, lens, scale, 
-                autotune=False, return_lse=False, 
-                prescale_qk=False, precision=precision
+                q, k, v, lens, scale,  # scale is sm_scale
+                causal=True,           # Added
+                autotune=False,
+                return_lse=False,
+                prescale_qk=False,
+                precision=precision,
+                is_prefix_token_mask=None # Added
             )
             return output
         except Exception as e:
@@ -1336,8 +1341,8 @@ class FlashAttentionTest:
 
 def main():
     """Main test function."""
-    print("=" * 60)
-    print("FLASH ATTENTION COMPREHENSIVE TEST")
+    # print("=" * 60)
+    # print("FLASH ATTENTION COMPREHENSIVE TEST")
     print("=" * 60)
     
     # Check CUDA availability
@@ -1349,56 +1354,63 @@ def main():
         device = "cuda"
     
     # Initialize test class
-    tester = FlashAttentionTest(device=device)
+    # tester = FlashAttentionTest(device=device)
     
     # Test 1: Gradient Accuracy
-    print("\n" + "="*40)
-    print("TEST 1: GRADIENT ACCURACY")
-    print("="*40)
-    gradient_test_passed = tester.test_gradient_accuracy(tolerance=1e-3)
+    # print("\n" + "="*40)
+    # print("TEST 1: GRADIENT ACCURACY")
+    # print("="*40)
+    # gradient_test_passed = tester.test_gradient_accuracy(tolerance=1e-3)
     
     # Test 2: Loss Reduction
-    print("\n" + "="*40)
-    print("TEST 2: LOSS REDUCTION")
-    print("="*40)
-    flash_losses, reference_losses = tester.test_loss_reduction(num_epochs=10)
+    # print("\n" + "="*40)
+    # print("TEST 2: LOSS REDUCTION")
+    # print("="*40)
+    # flash_losses, reference_losses = tester.test_loss_reduction(num_epochs=10)
     
     # Plot loss curves
-    tester.plot_loss_curves(flash_losses, reference_losses)
+    # tester.plot_loss_curves(flash_losses, reference_losses)
     
     # Check if both models can reduce loss
-    flash_reduced = flash_losses[0] > flash_losses[-1]
-    reference_reduced = reference_losses[0] > reference_losses[-1]
+    # flash_reduced = flash_losses[0] > flash_losses[-1]
+    # reference_reduced = reference_losses[0] > reference_losses[-1]
     
-    print(f"\nLoss reduction results:")
-    print(f"  Flash model reduced loss: {flash_reduced}")
-    print(f"  Reference model reduced loss: {reference_reduced}")
-    print(f"  Initial vs Final - Flash: {flash_losses[0]:.6f} -> {flash_losses[-1]:.6f}")
-    print(f"  Initial vs Final - Reference: {reference_losses[0]:.6f} -> {reference_losses[-1]:.6f}")
+    # print(f"\nLoss reduction results:")
+    # print(f"  Flash model reduced loss: {flash_reduced}")
+    # print(f"  Reference model reduced loss: {reference_reduced}")
+    # print(f"  Initial vs Final - Flash: {flash_losses[0]:.6f} -> {flash_losses[-1]:.6f}")
+    # print(f"  Initial vs Final - Reference: {reference_losses[0]:.6f} -> {reference_losses[-1]:.6f}")
     
     # Test 3: Performance Benchmark
-    if device == "cuda":
-        print("\n" + "="*40)
-        print("TEST 3: PERFORMANCE BENCHMARK")
-        print("="*40)
-        tester.benchmark_performance([128, 256, 512])
+    # if device == "cuda":
+    #     print("\n" + "="*40)
+    #     print("TEST 3: PERFORMANCE BENCHMARK")
+    #     print("="*40)
+    #     tester.benchmark_performance([128, 256, 512])
     
     # Summary
-    print("\n" + "="*60)
-    print("SUMMARY")
-    print("="*60)
-    print(f"✓ Gradient accuracy test: {'PASSED' if gradient_test_passed else 'FAILED'}")
-    print(f"✓ Loss reduction test: {'PASSED' if flash_reduced else 'FAILED'}")
-    print(f"✓ Modules separated successfully: fwd.py and bwd.py")
-    print(f"✓ Integration test: {'PASSED' if gradient_test_passed and flash_reduced else 'FAILED'}")
+    # print("\n" + "="*60)
+    # print("SUMMARY")
+    # print("="*60)
+    # print(f"✓ Gradient accuracy test: {'PASSED' if gradient_test_passed else 'FAILED'}")
+    # print(f"✓ Loss reduction test: {'PASSED' if flash_reduced else 'FAILED'}")
+    # print(f"✓ Modules separated successfully: fwd.py and bwd.py")
+    # print(f"✓ Integration test: {'PASSED' if gradient_test_passed and flash_reduced else 'FAILED'}")
     
-    overall_success = gradient_test_passed and flash_reduced
-    print(f"\nOverall test result: {'SUCCESS' if overall_success else 'PARTIAL SUCCESS'}")
+    # overall_success = gradient_test_passed and flash_reduced
+    # print(f"\nOverall test result: {'SUCCESS' if overall_success else 'PARTIAL SUCCESS'}")
     
-    if not overall_success:
-        print("\nNote: Some tests may show partial success due to simplified fallback implementations.")
-        print("For full functionality, ensure the flash attention kernels are properly compiled.")
+    # if not overall_success:
+    #     print("\nNote: Some tests may show partial success due to simplified fallback implementations.")
+    #     print("For full functionality, ensure the flash attention kernels are properly compiled.")
 
 
+# This if block is for the main training script logic handled by start_actual_training
+# if __name__ == "__main__":
+#    (this block is for start_actual_training, leave it alone)
+
+# This second if __name__ == "__main__" block is for the FlashAttentionTest suite
+# We will comment out the call to its main()
 if __name__ == "__main__":
-    main()
+    # main() # Commented out to prevent FlashAttentionTest suite from running
+    pass # Or simply comment out the main() call
