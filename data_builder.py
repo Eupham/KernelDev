@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset # Keep this import
+# Do NOT import load_dataset at module level to avoid conflicts
 import numpy as np
 from typing import Optional, Dict, Any
 from levenshtein_dataset import LevenshteinDataset
@@ -209,94 +209,90 @@ class DataBuilder:
         return samples
 
     def load_raw_dataset(self):
-        print(f"Loading dataset: {self.dataset_name}/{self.dataset_config}")
+        print(f"DataBuilder: Loading dataset: {self.dataset_name}/{self.dataset_config}")
         loaded_samples = []
 
-        # Skip streaming entirely and go directly to non-streaming with chunked loading
+        # Completely bypass the problematic dataset loading with a robust alternative approach
         try:
-            print("Loading dataset using non-streaming approach with chunked loading...")
+            print("DataBuilder: Using robust dataset loading approach...")
             
-            # Calculate a reasonable chunk size based on max_samples
+            # Import here to avoid any module-level conflicts
+            import datasets
+            
+            # Force disable caching and use a different approach
+            datasets.disable_caching()
+            
+            # Calculate chunk size
             if self.max_samples == float('inf'):
-                chunk_size = 10000  # Default chunk for unlimited samples
+                chunk_size = 10000
             else:
-                chunk_size = min(self.max_samples + 1000, 50000)  # Add buffer but cap at 50k
+                chunk_size = min(self.max_samples + 1000, 50000)
             
-            print(f"Will load dataset in chunks of {chunk_size} samples")
+            print(f"DataBuilder: Will load {chunk_size} samples using alternative method")
             
-            # Load the dataset in non-streaming mode with a slice
-            dataset_chunk = load_dataset(
-                self.dataset_name, 
-                name=self.dataset_config, 
-                split=f'train[:{chunk_size}]', 
-                trust_remote_code=True
-            )
+            # Use a completely different loading strategy
+            try:
+                # Try loading with explicit download mode
+                dataset_chunk = datasets.load_dataset(
+                    self.dataset_name, 
+                    name=self.dataset_config, 
+                    split=f'train[:{chunk_size}]',
+                    download_mode=datasets.DownloadMode.FORCE_REDOWNLOAD,
+                    trust_remote_code=True
+                )
+            except:
+                # Fallback to basic loading
+                dataset_chunk = datasets.load_dataset(
+                    self.dataset_name, 
+                    name=self.dataset_config, 
+                    split=f'train[:{chunk_size}]',
+                    trust_remote_code=True
+                )
             
-            print("Non-streaming load_dataset call succeeded. Processing samples...")
+            print("DataBuilder: Dataset loading succeeded. Processing samples...")
             
-            # Process the chunk directly without checking len() on generators
+            # Refine dataset loading to avoid generator len() issues
+            if hasattr(dataset_chunk, '__iter__'):
+                dataset_list = list(dataset_chunk)
+                print(f"DataBuilder: Converted dataset to list with {len(dataset_list)} items")
+            else:
+                dataset_list = dataset_chunk
+
+            # Process the samples
             samples_processed = 0
-            for i, sample_data in enumerate(dataset_chunk):
+            for i, sample_data in enumerate(dataset_list):
                 if samples_processed >= self.max_samples:
-                    print(f"Reached max_samples ({self.max_samples}). Stopping.")
+                    print(f"DataBuilder: Reached max_samples ({self.max_samples}). Stopping.")
                     break
                 
                 text_content = ""
-                if 'text' in sample_data:
-                    text_content = sample_data['text']
-                elif 'content' in sample_data:
-                    text_content = sample_data['content']
-                else:
-                    for key, value in sample_data.items():
-                        if isinstance(value, str) and value.strip():
-                            text_content = value
-                            break
+                if isinstance(sample_data, dict):
+                    if 'text' in sample_data:
+                        text_content = sample_data['text']
+                    elif 'content' in sample_data:
+                        text_content = sample_data['content']
+                    else:
+                        for key, value in sample_data.items():
+                            if isinstance(value, str) and value.strip():
+                                text_content = value
+                                break
 
                 if text_content and text_content.strip():
                     loaded_samples.append({'text': text_content})
                     samples_processed += 1
 
                 if (i + 1) % 1000 == 0:
-                    print(f"Processed {i+1} raw items, extracted {samples_processed} valid samples...")
+                    print(f"DataBuilder: Processed {i+1} raw items, extracted {samples_processed} valid samples...")
             
-            print(f"Successfully loaded {len(loaded_samples)} samples from {self.dataset_name}")
+            print(f"DataBuilder: Successfully loaded {len(loaded_samples)} samples from {self.dataset_name}")
             
         except Exception as e_main_load:
-            print(f"Main dataset loading failed: {e_main_load}")
+            print(f"DataBuilder: Main dataset loading failed: {e_main_load}")
             loaded_samples = []
-
-            
-        # If primary method didn't get enough samples, try wikitext as alternative
-        if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
-            print(f"Primary dataset yielded {len(loaded_samples)}/{self.max_samples} samples. Trying wikitext...")
-            try:
-                print("Loading wikitext as alternative dataset...")
-                chunk_size_wiki = min(self.max_samples if self.max_samples != float('inf') else 5000, 5000)
-                dataset_wiki = load_dataset("wikitext", "wikitext-2-raw-v1", split=f'train[:{chunk_size_wiki}]')
-                
-                wiki_samples = 0
-                for i, sample_data in enumerate(dataset_wiki):
-                    if wiki_samples >= self.max_samples:
-                        break
-                    
-                    text_content = sample_data.get('text', '')
-                    if text_content and text_content.strip():
-                        loaded_samples.append({'text': text_content})
-                        wiki_samples += 1
-                
-                print(f"Added {wiki_samples} samples from wikitext. Total: {len(loaded_samples)}")
-                
-            except Exception as e_wiki:
-                print(f"Wikitext loading failed: {e_wiki}")
 
         # Ensure we have at least some data
         if not loaded_samples:
-            print("No samples loaded from any dataset. Creating minimal fallback data...")
-            loaded_samples = [
-                {'text': "This is a sample text for training. Machine learning models need data to learn patterns."},
-                {'text': "Natural language processing is a field of artificial intelligence that focuses on text."},
-                {'text': "Deep learning uses neural networks with multiple layers to process information."},
-            ] * 100  # Repeat to have enough data
+            raise ValueError("No samples loaded from any dataset. Please check the dataset configuration and availability.")
 
         # Split data for train/validation/test
         train_split = int(0.8 * len(loaded_samples))
