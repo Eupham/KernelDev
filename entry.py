@@ -700,11 +700,12 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
         return
 
     if lev_task_enabled:
-        # Expecting (orig_tok, lm_tgt, shuf_tok, lev_dist, coh_score)
-        if len(first_batch) == 5:
-            x, _, _, _, _ = first_batch # Use the first item (original_tokens_cls)
+        # Expecting (input_tokens, lm_targets, auxiliary_values, task_type_flags)
+        if len(first_batch) == 4:
+            input_tokens, lm_targets, auxiliary_values, task_type_flags = first_batch
+            x = input_tokens # Use the input_tokens
         else:
-            print(f"Warning: Expected 5 items in Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            print(f"Warning: Expected 4 items in Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
     else:
         # Expecting (input_ids, lm_targets)
