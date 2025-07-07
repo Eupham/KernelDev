@@ -496,7 +496,7 @@ class DataBuilder:
                     try:
                         dataset_len = len(dataset_obj)
                         print(f"len(dataset): {dataset_len}")
-                    except TypeError:
+                    except (TypeError, AttributeError):
                         # Handle datasets that don't support len() (e.g., generators, IterableDatasets)
                         print(f"len(dataset): unknown (iterable dataset)")
                     
@@ -542,7 +542,7 @@ class DataBuilder:
             try:
                 batch_count = len(dataloaders[split_name])
                 print(f"{split_name} dataloader created: {batch_count} batches")
-            except TypeError:
+            except (TypeError, AttributeError):
                 # Handle datasets that don't support len() (e.g., generators, IterableDatasets)
                 print(f"{split_name} dataloader created: unknown number of batches (iterable dataset)")
             print(f"--- {split_name}_dataloader preparation complete ---")
