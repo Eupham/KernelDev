@@ -250,7 +250,7 @@ class GPTModel(nn.Module):
                 
                 # Forward pass - update to expect three return values
                 # Pass force_disable_prefix_attention based on not use_prefix_attention_in_prompt
-                logits, _, _ = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
+                logits, _, _, _ = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
                 logits = logits[:, -1, :] / temperature
                 
                 # Apply top-k filtering if specified
