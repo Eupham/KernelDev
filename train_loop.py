@@ -80,37 +80,64 @@ class TrainingConfig:
         self.is_distributed = False
 
 def init_distributed(trainer_instance: 'Trainer'):
+    # Check if already initialized (e.g., by DeepSpeed or another launcher)
     if dist.is_available() and dist.is_initialized():
         trainer_instance.is_distributed = True
-        if hasattr(trainer_instance.config, 'local_rank') and trainer_instance.config.local_rank == -1:
-             trainer_instance.config.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        # Attempt to get local_rank if not already set in config, common for some launchers
+        if not hasattr(trainer_instance.config, 'local_rank') or trainer_instance.config.local_rank == -1:
+            trainer_instance.config.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        # Assume device is already set correctly by the external launcher or will be handled
+        # For example, if DDP is used, device is often set based on local_rank
+        if torch.cuda.is_available():
+            if hasattr(trainer_instance.config, 'local_rank') and trainer_instance.config.local_rank != -1:
+                 trainer_instance.config.device = torch.device(f"cuda:{trainer_instance.config.local_rank}")
+            else: # Fallback if local_rank couldn't be determined but dist is initialized
+                 trainer_instance.config.device = torch.device('cuda')
+        else:
+            trainer_instance.config.device = torch.device('cpu')
+        print(f"Distributed training already initialized. Using rank: {dist.get_rank()}, world_size: {dist.get_world_size()}, device: {trainer_instance.config.device}")
         return
+
+    # Standard environment variable check for torch.distributed.launch or similar
     rank_env = os.environ.get('RANK')
     world_size_env = os.environ.get('WORLD_SIZE')
     local_rank_env = os.environ.get('LOCAL_RANK')
+
     if rank_env is not None and world_size_env is not None:
         try:
             rank = int(rank_env)
             world_size = int(world_size_env)
-            local_rank = int(local_rank_env) if local_rank_env is not None else rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
-            trainer_instance.config.local_rank = local_rank
-            if torch.cuda.is_available():
+
+            if world_size > 1 and torch.cuda.is_available(): # Only init if world_size > 1 and CUDA is present
+                local_rank = int(local_rank_env) if local_rank_env is not None else rank % torch.cuda.device_count()
+                trainer_instance.config.local_rank = local_rank
+
                 backend = 'nccl'
                 torch.cuda.set_device(local_rank)
+                # MASTER_ADDR and MASTER_PORT must be set in the environment for this to succeed
                 dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
                 trainer_instance.is_distributed = True
                 trainer_instance.config.device = torch.device(f"cuda:{local_rank}")
-            else:
+                print(f"Distributed training initialized by train_loop. Rank: {rank}, World Size: {world_size}, Device: {trainer_instance.config.device}")
+            elif world_size > 1 and not torch.cuda.is_available():
+                print("Warning: Distributed training requested (world_size > 1) but CUDA is not available. Falling back to non-distributed CPU mode.")
+                trainer_instance.is_distributed = False
+            else: # world_size is 1 or less
                 trainer_instance.is_distributed = False
         except Exception as e:
-            print(f"Error initializing distributed group: {e}")
+            print(f"Error initializing distributed group: {e}. Falling back to non-distributed mode.")
             trainer_instance.is_distributed = False
     else:
         trainer_instance.is_distributed = False
+
     if not trainer_instance.is_distributed:
-        if trainer_instance.config.device == "auto" or not isinstance(trainer_instance.config.device, torch.device):
-             trainer_instance.config.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        trainer_instance.config.local_rank = 0
+        # Set device for non-distributed mode
+        if torch.cuda.is_available():
+            trainer_instance.config.device = torch.device('cuda')
+            trainer_instance.config.local_rank = 0 # Default local_rank for single GPU
+        else:
+            trainer_instance.config.device = torch.device('cpu')
+            trainer_instance.config.local_rank = 0
         print(f"Running in non-distributed mode on device: {trainer_instance.config.device}")
 
 class TrainingMetrics:
