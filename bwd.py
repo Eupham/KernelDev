@@ -840,16 +840,35 @@ def attention_backward_adapter(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    lens: torch.Tensor,
+    lens: torch.Tensor | None, # Make Optional if it can be None
     o: torch.Tensor,
     lse: torch.Tensor,
     do: torch.Tensor,
     sm_scale: float,
+    causal: bool,             # Added
     autotune: bool,
     prescale_qk: bool,
     precision: str,
+    is_prefix_token_mask: torch.Tensor | None = None # Added, make Optional
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
+
+    # Add default for sm_scale if None, though schema implies it's provided
+    if sm_scale is None and HEAD_DIM is not None : sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    # Handle None is_prefix_token_mask for backward pass
+    if is_prefix_token_mask is None:
+        # Create a dummy all-False mask if None is provided.
+        # The kernel might expect this tensor to always exist.
+        prefix_mask_tensor_bwd = torch.zeros(T, dtype=torch.bool, device=q.device)
+    else:
+        prefix_mask_tensor_bwd = is_prefix_token_mask
+
+    # Assertions for the mask (optional but good practice)
+    # assert prefix_mask_tensor_bwd.shape == (T,), f"is_prefix_token_mask must have shape ({T},) but got {prefix_mask_tensor_bwd.shape}"
+    # assert prefix_mask_tensor_bwd.device == q.device, "is_prefix_token_mask must be on the same device as q"
+    # assert prefix_mask_tensor_bwd.dtype == torch.bool, "is_prefix_token_mask must be of dtype torch.bool"
+
 
     delta = torch.empty(o.shape[:-1], dtype=torch.float32, device=o.device)
     grid = lambda args: (
@@ -891,6 +910,7 @@ def attention_backward_adapter(
         DQ,
         DK,
         DV,
+        prefix_mask_tensor_bwd, # Added tensor
         *strides(q, 4),
         *strides(k, 4),
         *strides(v, 4),
@@ -900,9 +920,12 @@ def attention_backward_adapter(
         *strides(DQ, 4),
         *strides(DK, 4),
         *strides(DV, 4),
-        *(strides(lens, 1) if lens is not None else [0]),
+        prefix_mask_tensor_bwd.stride(0) if prefix_mask_tensor_bwd.ndim > 0 else 0, # Added stride for prefix_mask
+        *(strides(lens, 1) if lens is not None else [0]), # lens_stride
         T=T,
         HEAD_DIM=HEAD_DIM,
+        CAUSAL=causal, # Added
+        TIME_BUCKET=triton.next_power_of_2(T), # Added
         INPUT_PRECISION=precision,
         DTYPE=q.dtype,
         SM_SCALE=sm_scale,
@@ -921,10 +944,12 @@ def attention_backward_adapter_abstract(
     o: torch.Tensor,
     lse: torch.Tensor,
     do: torch.Tensor,
-    sm_scale: float | None,
+    sm_scale: float | None, # sm_scale can be None in abstract
+    causal: bool,             # Added
     autotune: bool,
     prescale_qk: bool,
     precision: str,
+    is_prefix_token_mask: torch.Tensor | None = None # Added
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
     DK = torch.empty_like(k, memory_format=torch.contiguous_format)
