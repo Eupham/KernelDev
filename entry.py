@@ -1039,7 +1039,7 @@ import time
 # Import our separated modules
 import fwd
 import bwd
-import register_autograd  # This registers the autograd function for flash attention
+# import register_autograd  # This registers the autograd function for flash attention
 
 class FlashAttentionTest:
     """Test class for flash attention functionality."""
