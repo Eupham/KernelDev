@@ -355,27 +355,42 @@ class Trainer:
                          accum_lm_loss_component += current_batch_lm_loss_tensor.item()
                          num_lm_batches += 1
 
+                if self.config.use_levenshtein_task and predicted_lev_distances is not None and task_type_flags is not None and auxiliary_values is not None:
+                    lev_task_mask_eval = (task_type_flags == 1.0)  # Levenshtein task items
+                    original_item_mask_eval = (task_type_flags == 0.0) # Original LM task items
 
-                if self.config.use_levenshtein_task and predicted_lev_distances is not None and true_lev_distances is not None:
-                    loss_fn_dist = torch.nn.MSELoss()
-                    # Compare model's predicted distances with the true distances from the batch
-                    aux_loss_for_batch = loss_fn_dist(predicted_lev_distances.float(), true_lev_distances.float())
-                    current_batch_aux_loss_tensor = aux_loss_for_batch
-                    if not torch.isnan(current_batch_aux_loss_tensor) and not torch.isinf(current_batch_aux_loss_tensor):
-                        accum_lev_aux_loss += current_batch_aux_loss_tensor.item()
-                        num_lev_batches +=1
+                    # Levenshtein Loss Calculation for Levenshtein task items
+                    if lev_task_mask_eval.any():
+                        true_lev_distances_current = auxiliary_values[lev_task_mask_eval]
+                        predicted_lev_distances_current = predicted_lev_distances[lev_task_mask_eval]
 
-                    # For monitoring: mean predicted distance on original items
-                    if is_shuffled_flags is not None:
-                         original_item_mask_eval = (is_shuffled_flags == 0.0)
-                         if original_item_mask_eval.any() and predicted_lev_distances[original_item_mask_eval].numel() > 0:
-                             mean_pred_dist_orig_batch = predicted_lev_distances[original_item_mask_eval].mean().item()
-                             if not math.isnan(mean_pred_dist_orig_batch) and not math.isinf(mean_pred_dist_orig_batch):
-                                 accum_pred_dist_orig_mean += mean_pred_dist_orig_batch
-                                 num_pred_dist_orig_batches +=1
+                        if true_lev_distances_current.numel() > 0 and predicted_lev_distances_current.numel() == true_lev_distances_current.numel():
+                            loss_fn_dist = torch.nn.MSELoss()
+                            aux_loss_for_batch = loss_fn_dist(predicted_lev_distances_current.float(), true_lev_distances_current.float())
+                            # Ensure current_batch_aux_loss_tensor is defined for the combined loss calculation later
+                            # If not already defined, initialize it. It should be defined before this block.
+                            # Assuming current_batch_aux_loss_tensor was initialized to torch.tensor(0.0, ...) earlier in the loop.
+                            current_batch_aux_loss_tensor = aux_loss_for_batch
+                            if not torch.isnan(current_batch_aux_loss_tensor) and not torch.isinf(current_batch_aux_loss_tensor):
+                                accum_lev_aux_loss += current_batch_aux_loss_tensor.item()
+                                num_lev_batches += 1
+                        else:
+                            # Handle cases where there are no Levenshtein items or shapes mismatch if necessary
+                            # current_batch_aux_loss_tensor should retain its default (e.g., 0.0) if no Lev loss calculated
+                            pass
+
+
+                    # For monitoring: mean predicted distance on original items (pure LM task)
+                    if original_item_mask_eval.any():
+                        predicted_dist_on_original = predicted_lev_distances[original_item_mask_eval]
+                        if predicted_dist_on_original.numel() > 0:
+                            mean_pred_dist_orig_batch = predicted_dist_on_original.mean().item()
+                            if not math.isnan(mean_pred_dist_orig_batch) and not math.isinf(mean_pred_dist_orig_batch):
+                                accum_pred_dist_orig_mean += mean_pred_dist_orig_batch
+                                num_pred_dist_orig_batches += 1
 
                 batch_total_loss = current_batch_lm_loss_tensor
-                if self.config.use_levenshtein_task:
+                if self.config.use_levenshtein_task and not torch.isnan(current_batch_aux_loss_tensor) and not torch.isinf(current_batch_aux_loss_tensor): # also check if aux loss is valid
                     batch_total_loss = batch_total_loss + (self.config.levenshtein_loss_weight * current_batch_aux_loss_tensor)
                 total_combined_loss_epoch += batch_total_loss.item()
                 num_batches_processed +=1
