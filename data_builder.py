@@ -172,10 +172,10 @@ class DataBuilder:
     def _process_iterable_dataset(self, dataset_iterable, dataset_name_logging: str) -> list:
         samples = []
         processed_count = 0
-        if self.max_samples == float('inf') and not dataset_iterable:
+        if self.max_samples == float('inf') and dataset_iterable is None:
              print(f"Warning: Dataset iterable for {dataset_name_logging} is empty or None when expecting all samples.")
              return []
-        if not dataset_iterable:
+        if dataset_iterable is None:
             print(f"Warning: Dataset iterable for {dataset_name_logging} is empty or None.")
             return []
 
