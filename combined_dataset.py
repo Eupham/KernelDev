@@ -62,6 +62,43 @@ class CombinedMultiTaskDataset(Dataset):
         
         # Length is based on the document count
         self.length = len(raw_documents)
+
+        # Initialize and populate task-specific index lists
+        self.lm_indices = []
+        self.lev_indices = []
+        self.nsp_indices = []
+
+        # Ratios from task_distribution: (lev_ratio, nsp_ratio, lm_ratio)
+        # self.lev_ratio = task_distribution[0] (e.g. 0.25)
+        # self.nsp_ratio = task_distribution[1] (e.g. 0.25)
+        # self.lm_ratio  = task_distribution[2] (e.g. 0.50)
+
+        # The current __getitem__ logic determines task type based on index in a cycle:
+        # NSP tasks first, then Levenshtein, then LM.
+        cycle_length = 8 # Matches existing logic
+
+        # Calculate number of items for each task in a cycle based on ratios
+        # These are used to determine which indices belong to which task type
+        num_nsp_in_cycle = round(cycle_length * self.nsp_ratio)
+        num_lev_in_cycle = round(cycle_length * self.lev_ratio)
+        # num_lm_in_cycle = cycle_length - num_nsp_in_cycle - num_lev_in_cycle # Implicit
+
+        # Boundaries for assigning indices to task types based on their position in the cycle
+        nsp_boundary_calc = num_nsp_in_cycle
+        lev_boundary_calc = num_nsp_in_cycle + num_lev_in_cycle
+
+        for i in range(self.length):
+            position_in_cycle = i % cycle_length
+            if position_in_cycle < nsp_boundary_calc: # Indices for NSP task
+                self.nsp_indices.append(i)
+            elif position_in_cycle < lev_boundary_calc: # Indices for Levenshtein task
+                self.lev_indices.append(i)
+            else: # Indices for LM task
+                self.lm_indices.append(i)
+
+        random.shuffle(self.lm_indices)
+        random.shuffle(self.lev_indices)
+        random.shuffle(self.nsp_indices)
         
     def _create_lm_sample(self, text: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Create a standard language modeling sample."""

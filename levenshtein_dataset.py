@@ -46,6 +46,7 @@ class LevenshteinDataset(Dataset):
         if not 0.0 <= shuffle_percentage <= 1.0:
             raise ValueError("shuffle_percentage must be between 0.0 and 1.0")
         self.shuffle_percentage = shuffle_percentage
+        self.shuffle_probabilities = [0.25, 0.50, 0.75, 1.0] # Added shuffle probabilities
 
         self.sentences = raw_documents_or_sentences # Store raw data directly
         # self.examples list and call to _prepare_examples are removed
@@ -66,7 +67,8 @@ class LevenshteinDataset(Dataset):
         create_valid_lm_targets = False
 
         if is_shuffled_item_flag_val == 1.0:
-            shuffled_sentence_text, original_words, shuffled_words = shuffle_words_in_sentence(original_sentence_text)
+            selected_probability = random.choice(self.shuffle_probabilities) # Select a probability
+            shuffled_sentence_text, original_words, shuffled_words = shuffle_words_in_sentence(original_sentence_text, selected_probability) # Pass probability
             input_text_to_tokenize = shuffled_sentence_text
             num_original_words = len(original_words)
             if num_original_words > 0:

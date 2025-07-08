@@ -83,8 +83,8 @@ class NSPDataset(Dataset):
             first_sent = sent_b
             second_sent = sent_a
         else:  # nsp_class == 2: Garbled/shuffled
-            first_sent, _, _ = shuffle_words_in_sentence(sent_a)
-            second_sent, _, _ = shuffle_words_in_sentence(sent_b)
+            first_sent, _, _ = shuffle_words_in_sentence(sent_a, shuffle_probability=1.0)
+            second_sent, _, _ = shuffle_words_in_sentence(sent_b, shuffle_probability=1.0)
         
         # Tokenize sentences
         first_tokens = self.tokenizer_fn(first_sent)
