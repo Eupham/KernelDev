@@ -1,12 +1,11 @@
 import random
 import re
 
-def shuffle_words_in_sentence(sentence_text: str) -> tuple[str, list[str], list[str]]:
+def shuffle_words_in_sentence(sentence_text: str, shuffle_probability: float) -> tuple[str, list[str], list[str]]:
     """
-    Splits a sentence into words, shuffles them, and rejoins.
-    Returns the shuffled sentence, original word list, and shuffled word list.
-    Uses regex \s+ to split by any whitespace and handles multiple spaces.
-    Filters out empty strings that might result from multiple spaces.
+    Splits a sentence into words. Based on shuffle_probability, selects a subset
+    of words to shuffle among their original positions.
+    Returns the shuffled sentence, original word list, and the new word list.
     """
     if not sentence_text.strip():
         return "", [], []
@@ -15,18 +14,40 @@ def shuffle_words_in_sentence(sentence_text: str) -> tuple[str, list[str], list[
     if not original_words:
         return "", [], []
 
-    shuffled_words = original_words[:] # Create a copy
+    if shuffle_probability <= 0: # No shuffling if probability is zero or less
+        return sentence_text, original_words, original_words[:]
+    if shuffle_probability >= 1: # Full shuffle if probability is one or more
+        # This can revert to the simpler full shuffle logic for p=1.0
+        # For consistency with the subset logic, let's ensure it still works.
+        # All indices will be selected.
+        pass
 
-    # Shuffle only if there's more than one word to avoid infinite loop with single word
-    if len(shuffled_words) > 1:
-        # Keep shuffling until it's different from original or max attempts
-        # This is to ensure the shuffled version is actually different for meaningful training examples.
-        # However, for very short sentences or sentences with repeated words, it might always be the same.
-        # A simpler approach for now: just shuffle once. If it's the same, the Levenshtein distance will be 0.
-        random.shuffle(shuffled_words)
 
-    shuffled_sentence = " ".join(shuffled_words)
-    return shuffled_sentence, original_words, shuffled_words
+    indices_to_shuffle = []
+    for i in range(len(original_words)):
+        if random.random() < shuffle_probability:
+            indices_to_shuffle.append(i)
+
+    if len(indices_to_shuffle) <= 1:
+        # If 0 or 1 word is selected, no shuffle occurs / is meaningful for the subset
+        final_shuffled_word_list = original_words[:]
+    else:
+        subset_to_shuffle = [original_words[i] for i in indices_to_shuffle]
+
+        # Ensure the shuffled subset is actually different if possible (optional, can be complex)
+        # For now, a simple shuffle of the subset:
+        shuffled_subset = subset_to_shuffle[:] # Copy
+        random.shuffle(shuffled_subset)
+        # A loop to ensure difference might be too slow if subset is hard to change
+        # while shuffled_subset == subset_to_shuffle and len(set(subset_to_shuffle)) > 1:
+        #    random.shuffle(shuffled_subset)
+
+        final_shuffled_word_list = original_words[:]
+        for original_idx_in_sentence, new_word_for_pos in zip(indices_to_shuffle, shuffled_subset):
+            final_shuffled_word_list[original_idx_in_sentence] = new_word_for_pos
+
+    shuffled_sentence_text = " ".join(final_shuffled_word_list)
+    return shuffled_sentence_text, original_words, final_shuffled_word_list
 
 def word_levenshtein_distance(s1_words: list[str], s2_words: list[str]) -> int:
     """
@@ -56,45 +77,44 @@ def word_levenshtein_distance(s1_words: list[str], s2_words: list[str]) -> int:
 
 if __name__ == '__main__':
     # Test shuffle_words_in_sentence
-    sentence1 = "This is a sample sentence."
-    shuffled_s1, orig_w1, shuf_w1 = shuffle_words_in_sentence(sentence1)
-    print(f"Original: '{sentence1}' -> Shuffled: '{shuffled_s1}'")
-    print(f"Original words: {orig_w1}")
-    print(f"Shuffled words: {shuf_w1}")
+    sentence1 = "This is a sample sentence for testing the new shuffle logic."
+    probs = [0.0, 0.25, 0.5, 0.75, 1.0]
+    print(f"Original: '{sentence1}'")
+    for p in probs:
+        shuffled_s1, orig_w1, shuf_w1 = shuffle_words_in_sentence(sentence1, p)
+        dist = word_levenshtein_distance(orig_w1, shuf_w1)
+        print(f"  p={p:.2f} -> Shuffled: '{shuffled_s1}' (Dist: {dist})")
 
     sentence2 = "  Another   example with   multiple spaces  "
-    shuffled_s2, orig_w2, shuf_w2 = shuffle_words_in_sentence(sentence2)
-    print(f"Original: '{sentence2.strip()}' -> Shuffled: '{shuffled_s2}'")
+    shuffled_s2, _, _ = shuffle_words_in_sentence(sentence2, 0.5)
+    print(f"Original: '{sentence2.strip()}' -> Shuffled (p=0.5): '{shuffled_s2}'")
 
-    sentence3 = "Test"
-    shuffled_s3, orig_w3, shuf_w3 = shuffle_words_in_sentence(sentence3)
-    print(f"Original: '{sentence3}' -> Shuffled: '{shuffled_s3}'")
+    sentence3 = "Test" # Single word
+    shuffled_s3, _, _ = shuffle_words_in_sentence(sentence3, 1.0)
+    print(f"Original: '{sentence3}' -> Shuffled (p=1.0): '{shuffled_s3}'")
 
     sentence4 = ""
-    shuffled_s4, orig_w4, shuf_w4 = shuffle_words_in_sentence(sentence4)
-    print(f"Original: '{sentence4}' -> Shuffled: '{shuffled_s4}'")
+    shuffled_s4, _, _ = shuffle_words_in_sentence(sentence4, 1.0)
+    print(f"Original: '{sentence4}' -> Shuffled (p=1.0): '{shuffled_s4}'")
 
     # Test word_levenshtein_distance
     words1 = ["the", "quick", "brown", "fox"]
     words2 = ["the", "fast", "brown", "foxes"]
     dist1 = word_levenshtein_distance(words1, words2)
-    print(f"Distance between {words1} and {words2}: {dist1}") # Expected: 2 (fast!=quick, foxes!=fox)
+    print(f"Distance between {words1} and {words2}: {dist1}")
 
     words3 = ["apple", "banana", "cherry"]
     words4 = ["apple", "cherry", "banana"]
-    dist2 = word_levenshtein_distance(words3, words4) # Should be 2 (banana/cherry swap requires 2 ops: del banana, ins banana or 2 subs)
+    dist2 = word_levenshtein_distance(words3, words4)
     print(f"Distance between {words3} and {words4}: {dist2}")
 
-    dist3 = word_levenshtein_distance(orig_w1, shuf_w1)
-    print(f"Distance for shuffled sentence 1 ('{sentence1}'): {dist3}")
-
-    # Test with identical shuffled (e.g. single word)
-    if orig_w3 and shuf_w3: # only if not empty
-        dist_s3 = word_levenshtein_distance(orig_w3, shuf_w3)
-        print(f"Distance for shuffled sentence 3 ('{sentence3}'): {dist_s3}")
-
+    # Example with one of the shuffled sentences from above
+    # Note: orig_w1 and shuf_w1 are from the last iteration of the loop (p=1.0)
+    if orig_w1 and shuf_w1 : # Check if they are not empty
+      dist_shuffled_example = word_levenshtein_distance(orig_w1, shuf_w1)
+      print(f"Distance for p=1.0 shuffled sentence 1 ('{sentence1}'): {dist_shuffled_example}")
 
     words5 = ["a", "b", "c"]
     words6 = ["a", "d", "c", "e"]
     dist5 = word_levenshtein_distance(words5, words6)
-    print(f"Distance between {words5} and {words6}: {dist5}") # Expected: 2 (sub b->d, ins e)
+    print(f"Distance between {words5} and {words6}: {dist5}")
