@@ -34,7 +34,7 @@ training:
 
   # Levenshtein task parameters
   use_levenshtein_task: true # Enable Levenshtein distance auxiliary task
-  levenshtein_loss_weight: 0.1 # Weight for Levenshtein loss
+  levenshtein_loss_weight: 0.5 # Weight for Levenshtein loss
 
   # Plateau detection parameters
   plateau_monitor_metric: 'val_loss'
@@ -58,7 +58,7 @@ data:
   seq_len: 1024
   
   # Maximum number of samples to use from dataset
-  max_samples: 5000
+  max_samples: 500000
   
   # Maximum tokens for evaluation
   max_eval_tokens: 50000
