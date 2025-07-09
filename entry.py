@@ -397,6 +397,12 @@ def start_actual_training(cli_args):
 
     # Instantiate TrainingConfig *after* model, setup_precision, and device determination
     print(f"\n=== Initializing Training Configuration ===")
+    default_inference_prompts = [
+        {'task': 'lm', 'prompt': ''},
+        {'task': 'lm', 'prompt': 'The'},
+        {'task': 'lm', 'prompt': 'In a world where'}
+        # Add other default prompts if desired, e.g., for CLS or unshuffle
+    ]
     training_config_params = {
         'num_epochs': training_cfg.get('epochs', 1),
         'learning_rate': training_cfg.get('learning_rate', 3e-4),
@@ -413,7 +419,7 @@ def start_actual_training(cli_args):
         'scaler': scaler,
         'use_amp': use_amp,
         # Inference params from gen_cfg (defined earlier)
-        'inference_prompts': gen_cfg.get('prompts', ["", "The", "In", "Once upon a time"]),
+        'inference_prompts': gen_cfg.get('test_prompts', default_inference_prompts),
         'inference_max_length': gen_cfg.get('max_length', 100),
         'inference_temperature': gen_cfg.get('temperature', 0.8),
         'inference_top_k': gen_cfg.get('top_k', 50),
