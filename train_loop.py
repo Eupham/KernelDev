@@ -14,6 +14,11 @@ import math
 from pathlib import Path
 import contextlib
 
+# Task ID Bytes (using ord() for clarity on origin)
+TASK_ID_LM = ord('0')           # For Language Modeling tasks
+TASK_ID_UNSHUFFLE = ord('1')    # For the Unshuffle Seq2Seq task (formerly Levenshtein)
+TASK_ID_NSP = ord('2')          # For Next Sentence Prediction tasks
+
 class TrainingConfig:
     """Configuration class for training parameters."""
     
@@ -671,33 +676,27 @@ class Trainer:
         if save_path: plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.show()
     
-    def generate_sample(self, prompt="", max_length=100, temperature=0.8, top_k=50, top_p=None):
+    def generate_sample(self, prompt: str = "", task_id_byte: int = TASK_ID_LM,
+                        max_length: int = 100, temperature: float = 0.8,
+                        top_k: int = 50, top_p: float | None = None):
+        # TASK_ID_LM should be defined at module level now
+
         if not self.data_builder:
             print("Warning: DataBuilder not available in Trainer, cannot generate sample.")
             return ""
         if not hasattr(self.data_builder, 'cls_token_id') or self.data_builder.cls_token_id is None:
-            # This check is important because the model's forward pass and prefix logic rely on CLS.
-            print("Warning: DataBuilder does not have a CLS token ID; cannot generate sample with required TaskID/CLS prefix.")
-            # Depending on strictness, could return "" or raise error.
-            # For now, let's try to proceed if possible, but model.forward might still have issues
-            # if it expects cls_representation from index 1.
-            # Given the error, cls_token_id IS essential.
-            raise ValueError("DataBuilder does not have a CLS token ID, which is needed for generation prefix logic.")
-
+            raise ValueError("DataBuilder does not have a CLS token ID, which is needed for generation prefix.")
         if not hasattr(self.data_builder, '_tokenize_text'):
             print("Warning: DataBuilder does not have _tokenize_text method; cannot generate sample.")
             return ""
 
-        TASK_ID_LM = ord('0') # Standard LM task
         cls_id = self.data_builder.cls_token_id
 
         prompt_tokens = self.data_builder._tokenize_text(prompt) if prompt else []
 
-        # Always start with [TASK_ID_LM, CLS_ID], then add prompt tokens
-        # This ensures the sequence passed to model.generate() has the expected prefix.
-        final_initial_tokens = [TASK_ID_LM, cls_id] + prompt_tokens
+        # Use the provided task_id_byte (defaults to TASK_ID_LM if not given)
+        final_initial_tokens = [task_id_byte, cls_id] + prompt_tokens
 
-        # Create tensor x with a batch dimension, e.g., shape (1, seq_len)
         x = torch.tensor([final_initial_tokens], dtype=torch.long).to(self.config.device)
 
         self.model.eval()
@@ -705,8 +704,6 @@ class Trainer:
         with torch.no_grad():
             autocast_context = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
             with autocast_context:
-                # Call to model.generate should not have use_prefix_attention_in_prompt argument
-                # as it was removed from GPTModel.generate()
                 generated_ids = model_to_generate_from.generate(
                     idx=x,
                     max_new_tokens=max_length,
@@ -714,7 +711,6 @@ class Trainer:
                     top_k=top_k,
                     top_p=top_p
                 )
-            # Assuming generated_ids[0] is the sequence to decode
             generated_text = self.data_builder.decode_tokens(generated_ids[0])
         self.model.train()
         return generated_text
@@ -762,53 +758,82 @@ class Trainer:
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
         return math.exp(avg_loss) if avg_loss != float('inf') else float('inf')
     
-    def generate_inference_sample(self, prompts=None, max_length=100, temperature=0.8, top_k=50, top_p=0.9):
-        if not self.data_builder: return [{"type": "error", "prompt": "N/A", "text": "No data_builder provided."}]
-        standard_prompts = prompts or ["", "The", "In", "Once upon a time"]
-        cls_test_prompts_text = ["What is the capital of France?", "Tell me a short story about a robot."]
-        self.model.eval()
-        model_to_generate_from = self.model.module if isinstance(self.model, DDP) else self.model
+    def generate_inference_sample(self, prompts: Optional[List[Dict[str, Any]]] = None,
+                                max_length: Optional[int] = None,
+                                temperature: Optional[float] = None,
+                                top_k: Optional[int] = None,
+                                top_p: Optional[float | None] = None):
+        # Ensure module-level TASK_ID constants are accessible: TASK_ID_LM, TASK_ID_UNSHUFFLE, TASK_ID_NSP
+
+        if not self.data_builder:
+            return [{"type": "error", "prompt": "N/A", "text": "No data_builder provided."}]
+
+        # Use prompts from config if not provided, otherwise use provided prompts
+        # self.config.inference_prompts is now expected to be a list of dicts
+        prompts_to_use = prompts if prompts is not None else self.config.inference_prompts
+
+        # Use generation parameters from config if not overridden by method arguments
+        max_len = max_length if max_length is not None else self.config.inference_max_length
+        temp = temperature if temperature is not None else self.config.inference_temperature
+        tk = top_k if top_k is not None else self.config.inference_top_k
+        tp = top_p if top_p is not None else self.config.inference_top_p # top_p from config can be None
+
         all_generated_outputs = []
-        autocast_context = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
-        with torch.no_grad():
-            for prompt_text in standard_prompts:
-                try:
-                    tokens = self.data_builder._tokenize_text(prompt_text) if prompt_text else []
-                    x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device) if tokens else \
-                        torch.randint(0, self.data_builder.vocab_size, (1,1)).to(self.config.device)
-                    with autocast_context:
-                        generated_ids = model_to_generate_from.generate(x, max_new_tokens=max_length, temperature=temperature, top_k=top_k, top_p=top_p, use_prefix_attention_in_prompt=False)
-                    decoded_text = self.data_builder.decode_tokens(generated_ids[0])
-                    all_generated_outputs.append({'type': 'standard', 'prompt': prompt_text, 'text': decoded_text})
-                except Exception as e:
-                    all_generated_outputs.append({'type': 'error', 'prompt': prompt_text, 'text': f"Generation failed: {str(e)}"})
 
-            model_is_lev_task_and_configured_for_cls_prefix = \
-                self.config.use_levenshtein_task and \
-                hasattr(model_to_generate_from, 'use_cls_prefix_attention') and \
-                model_to_generate_from.use_cls_prefix_attention and \
-                hasattr(self.data_builder, 'cls_token_id') and \
-                self.data_builder.cls_token_id is not None
+        # Task string to byte ID mapping
+        task_to_id_map = {
+            "lm": TASK_ID_LM,
+            "unshuffle": TASK_ID_UNSHUFFLE,
+            "nsp": TASK_ID_NSP
+            # Add other task string identifiers if they are used in config
+        }
 
-            if model_is_lev_task_and_configured_for_cls_prefix:
-                print(f"  Running CLS prefix attention inference tests (cls_id: {self.data_builder.cls_token_id})...")
-                for prompt_text in cls_test_prompts_text:
-                    try:
-                        text_tokens = self.data_builder._tokenize_text(prompt_text)
-                        input_tokens_with_cls = [self.data_builder.cls_token_id] + text_tokens
-                        x_cls = torch.tensor(input_tokens_with_cls, dtype=torch.long).unsqueeze(0).to(self.config.device)
-                        with autocast_context:
-                            generated_on_ids = model_to_generate_from.generate(x_cls.clone(), max_new_tokens=max_length, temperature=temperature,top_k=top_k, top_p=top_p, use_prefix_attention_in_prompt=True)
-                            generated_off_ids = model_to_generate_from.generate(x_cls.clone(), max_new_tokens=max_length, temperature=temperature,top_k=top_k, top_p=top_p, use_prefix_attention_in_prompt=False)
-                        decoded_text_on = self.data_builder.decode_tokens(generated_on_ids[0])
-                        all_generated_outputs.append({'type': 'CLS_Prefix_ON', 'prompt': f"[CLS] {prompt_text}", 'text': decoded_text_on})
-                        decoded_text_off = self.data_builder.decode_tokens(generated_off_ids[0])
-                        all_generated_outputs.append({'type': 'CLS_Prefix_OFF', 'prompt': f"[CLS] {prompt_text}", 'text': decoded_text_off})
-                    except Exception as e:
-                        all_generated_outputs.append({'type': 'error', 'prompt': f"[CLS] {prompt_text}", 'text': f"CLS Generation failed: {str(e)}"})
-            else:
-                 print(f"  Skipping CLS prefix attention inference tests based on model/data_builder configuration for Levenshtein task.")
-        self.model.train()
+        self.model.eval() # Ensure model is in eval mode
+
+        for prompt_entry in prompts_to_use:
+            if not isinstance(prompt_entry, dict) or "prompt" not in prompt_entry or "task" not in prompt_entry:
+                all_generated_outputs.append({
+                    'type': 'error',
+                    'prompt': str(prompt_entry),
+                    'text': 'Invalid prompt entry format in config. Expected {"task": "name", "prompt": "text"}.'
+                })
+                continue
+
+            prompt_text = prompt_entry["prompt"]
+            task_str = prompt_entry["task"].lower() # Ensure lowercase for map lookup
+            prompt_type = prompt_entry.get("type", "standard") # Get type, default to "standard"
+
+            task_id_byte = task_to_id_map.get(task_str)
+            if task_id_byte is None:
+                all_generated_outputs.append({
+                    'type': prompt_type,
+                    'prompt': prompt_text,
+                    'text': f"Generation failed: Unknown task type '{task_str}' in prompt entry."
+                })
+                continue
+
+            try:
+                generated_text = self.generate_sample(
+                    prompt=prompt_text,
+                    task_id_byte=task_id_byte, # Pass the determined task_id_byte
+                    max_length=max_len,
+                    temperature=temp,
+                    top_k=tk,
+                    top_p=tp
+                )
+                all_generated_outputs.append({
+                    'type': prompt_type,
+                    'prompt': prompt_text,
+                    'text': generated_text
+                })
+            except Exception as e:
+                all_generated_outputs.append({
+                    'type': prompt_type,
+                    'prompt': prompt_text,
+                    'text': f"Generation failed: {str(e)}"
+                })
+
+        self.model.train() # Return model to train mode
         return all_generated_outputs
     
     def save_inference_sample(self, step, val_loss, perplexity, generated_outputs, prompts=None ):

@@ -125,9 +125,26 @@ generation:
   
   # Test prompts
   test_prompts:
-    - ""      # Empty prompt
-    - "The"   # Simple prompt
-    - "In a world where"  # Creative prompt
+    - task: "lm"  # Language Model task
+      prompt: ""
+    - task: "lm"
+      prompt: "The"
+    - task: "lm"
+      prompt: "In a world where"
+    - task: "unshuffle" # New Unshuffle/Seq2Seq task
+      prompt: "robot a about story short me Tell" # Example of a manually shuffled prompt
+    - task: "lm" # CLS prompts usually for LM-style completion/QA
+      type: "CLS_Prefix_ON" # Keep existing type for special handling if any in generate_inference_sample
+      prompt: "[CLS] What is the capital of France?"
+    - task: "lm"
+      type: "CLS_Prefix_OFF"
+      prompt: "[CLS] What is the capital of France?"
+    - task: "lm"
+      type: "CLS_Prefix_ON"
+      prompt: "[CLS] Tell me a short story about a robot."
+    - task: "lm"
+      type: "CLS_Prefix_OFF"
+      prompt: "[CLS] Tell me a short story about a robot."
 
 # Logging Configuration
 logging:
