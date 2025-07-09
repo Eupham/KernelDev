@@ -104,7 +104,7 @@ class GPTModel(nn.Module):
         self.cls_token_id = cls_token_id
         # self.nsp_task = nsp_task # Removed
         self.use_cls_prefix_attention = use_cls_prefix_attention
-        print(f"GPTModel.__init__: cls_token_id={self.cls_token_id}, use_cls_prefix_attention={self.use_cls_prefix_attention}. Levenshtein head added.")
+        print(f"GPTModel.__init__: cls_token_id={self.cls_token_id}, use_cls_prefix_attention={self.use_cls_prefix_attention}. NSP head present for CLS token.")
         self.max_seq_len = max_seq_len
         
         # Token and position embeddings (no bias)
@@ -243,9 +243,9 @@ class GPTModel(nn.Module):
                 # Crop sequence if it gets too long
                 idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
                 
-                # Forward pass - update to expect three return values
+                # Forward pass - update to expect three return values from self.forward()
                 # Pass force_disable_prefix_attention based on not use_prefix_attention_in_prompt
-                logits, _, _, _ = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
+                logits, _, _ = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
                 logits = logits[:, -1, :] / temperature
                 
                 # Apply top-k filtering if specified
