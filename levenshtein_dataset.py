@@ -56,42 +56,41 @@ class LevenshteinDataset(Dataset):
         return len(self.sentences)
 
     def __getitem__(self, idx):
-        original_sentence_text = self.sentences[idx]
-        if not original_sentence_text.strip(): # Handle empty strings
-            original_sentence_text = " " # Use a space to avoid issues with empty tokenization
+        # TASK_ID_LEV_UNSHUFFLE = 49 # Define or import
 
-        # When used by CombinedMultiTaskDataset, shuffle_percentage is 1.0,
-        # so is_shuffled_item_flag_val will be 1.0.
-        # This dataset is now specialized for the "unshuffling" task (type 1).
+        original_sentence_text = self.sentences[idx]
+        if not original_sentence_text.strip():
+            original_sentence_text = " " # Avoid empty tokenization issues
 
         selected_probability = random.choice(self.shuffle_probabilities)
-        shuffled_sentence_text, _, _ = shuffle_words_in_sentence(original_sentence_text, selected_probability)
+        shuffled_sentence_text, original_words_list_for_lev_metric_only, _ = \
+            shuffle_words_in_sentence(original_sentence_text, selected_probability)
+        # Note: original_words_list_for_lev_metric_only and the third return from shuffle_words_in_sentence
+        # are not directly used in the returned tensors if we are removing scalar Lev distance.
 
-        # 1. Prepare input_tokens with Task ID
-        tokens = self.tokenizer_fn(shuffled_sentence_text)
-        # Sequence: [TASK_ID, CLS_ID] + content_tokens
-        # Truncate tokens if too long for content part: self.seq_len - 2
-        max_content_len = self.seq_len - 2
-        if len(tokens) > max_content_len:
-            tokens = tokens[:max_content_len]
-
-        final_input_tokens_list = [TASK_ID_LEV_UNSHUFFLE, self.cls_token_id] + tokens
+        # 1. Prepare input_tokens with Task ID (shuffled content)
+        tokens_shuffled_content = self.tokenizer_fn(shuffled_sentence_text)
+        max_content_len = self.seq_len - 2 # For TASK_ID and CLS
+        if len(tokens_shuffled_content) > max_content_len:
+            tokens_shuffled_content = tokens_shuffled_content[:max_content_len]
+        final_input_tokens_list = [TASK_ID_LEV_UNSHUFFLE, self.cls_token_id] + tokens_shuffled_content
         padded_input_tokens = _truncate_or_pad_tokens(final_input_tokens_list, self.seq_len, self.input_pad_id)
 
-        # 2. Prepare next_token_lm_targets (all ignore_idx for this task type)
+        # 2. Prepare next_token_lm_targets (all ignore_idx for this task type 1)
         next_token_lm_targets_list = [self.lm_ignore_idx] * self.seq_len
 
-        # 3. Prepare unshuffle_target_tokens (original sentence, tokenized and padded)
-        original_tokens = self.tokenizer_fn(original_sentence_text)
-        max_target_len = self.seq_len # Target sequence can be full length
-        if len(original_tokens) > max_target_len:
-            original_tokens = original_tokens[:max_target_len]
-        unshuffle_target_tokens_list = _truncate_or_pad_tokens(original_tokens, self.seq_len, self.lm_ignore_idx)
+        # 3. Prepare unshuffle_target_tokens (shifted original sentence)
+        original_tokens = self.tokenizer_fn(original_sentence_text) # Tokenize the original sentence
+
+        # Shift for next-token prediction style target:
+        if not original_tokens: # Handle case where original_sentence_text tokenizes to empty
+            shifted_original_tokens = [self.lm_ignore_idx]
+        else:
+            shifted_original_tokens = original_tokens[1:] + [self.lm_ignore_idx]
+
+        unshuffle_target_tokens_list = _truncate_or_pad_tokens(shifted_original_tokens, self.seq_len, self.lm_ignore_idx)
 
         # 4. Auxiliary scalar value (placeholder)
-        # The old scalar Levenshtein distance isn't the primary target for loss anymore.
-        # We can use 0.0 as a placeholder. If a scalar metric is still desired for logging,
-        # it could be computed here but not used for training.
         auxiliary_scalar_value = torch.tensor(0.0, dtype=torch.float32)
 
         # 5. Task type flag
