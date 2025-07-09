@@ -694,8 +694,13 @@ class Trainer:
 
         prompt_tokens = self.data_builder._tokenize_text(prompt) if prompt else []
 
-        # Use the provided task_id_byte (defaults to TASK_ID_LM if not given)
-        final_initial_tokens = [task_id_byte, cls_id] + prompt_tokens
+        # Check if prompt_tokens already starts with cls_id
+        if prompt_tokens and prompt_tokens[0] == cls_id:
+            # Prompt already has CLS, just prepend Task ID
+            final_initial_tokens = [task_id_byte] + prompt_tokens
+        else:
+            # Prepend Task ID and CLS ID
+            final_initial_tokens = [task_id_byte, cls_id] + prompt_tokens
 
         x = torch.tensor([final_initial_tokens], dtype=torch.long).to(self.config.device)
 
