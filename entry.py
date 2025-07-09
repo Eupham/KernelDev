@@ -572,9 +572,10 @@ def start_actual_training(cli_args):
         print("\n=== Data Sample ===")
         # Adjust for LevenshteinDataset or standard output
         if lev_task_enabled:
-            # CombinedMultiTaskDataset yields: input_tokens, lm_targets, auxiliary_value, task_type_flag
-            for input_tokens, lm_targets, auxiliary_values, task_type_flags in dataloaders['train']:
-                print(f"Multi-task Batch shapes: Input Toks-{input_tokens.shape}, LM Targets-{lm_targets.shape}, Aux-{auxiliary_values.shape}, TaskType-{task_type_flags.shape}")
+            # CombinedMultiTaskDataset now yields 5 items:
+            # input_tokens, next_token_lm_targets, unshuffle_seq_targets, auxiliary_values, task_type_flags
+            for input_tokens, next_token_lm_targets, unshuffle_seq_targets, auxiliary_values, task_type_flags in dataloaders['train']:
+                print(f"Multi-task Batch shapes: Input Toks-{input_tokens.shape}, NextLM Targets-{next_token_lm_targets.shape}, Unshuffle Targets-{unshuffle_seq_targets.shape}, Aux-{auxiliary_values.shape}, TaskType-{task_type_flags.shape}")
                 print(f"Sample multi-task input tokens: {input_tokens[0][:20].tolist()}")
                 # Determine task type for the first item in the batch
                 task_type = task_type_flags[0].item()

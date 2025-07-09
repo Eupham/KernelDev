@@ -44,6 +44,9 @@ class TrainingConfig:
         scheduler_T_mult: int = 1,
         use_levenshtein_task: bool = False,
         levenshtein_loss_weight: float = 0.1,
+        # Add nsp_loss_weight if it's to be configurable
+        # nsp_loss_weight: float = 0.1,
+        lm_ignore_idx: int = -1 # Added for consistency
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -69,6 +72,7 @@ class TrainingConfig:
         self.scheduler_T_mult = scheduler_T_mult
         self.use_levenshtein_task = use_levenshtein_task
         self.levenshtein_loss_weight = levenshtein_loss_weight
+        self.lm_ignore_idx = lm_ignore_idx
         
         if device == "auto":
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -87,18 +91,16 @@ def init_distributed(trainer_instance: 'Trainer'):
         if not hasattr(trainer_instance.config, 'local_rank') or trainer_instance.config.local_rank == -1:
             trainer_instance.config.local_rank = int(os.environ.get('LOCAL_RANK', 0))
         # Assume device is already set correctly by the external launcher or will be handled
-        # For example, if DDP is used, device is often set based on local_rank
         if torch.cuda.is_available():
             if hasattr(trainer_instance.config, 'local_rank') and trainer_instance.config.local_rank != -1:
                  trainer_instance.config.device = torch.device(f"cuda:{trainer_instance.config.local_rank}")
-            else: # Fallback if local_rank couldn't be determined but dist is initialized
+            else:
                  trainer_instance.config.device = torch.device('cuda')
         else:
             trainer_instance.config.device = torch.device('cpu')
         print(f"Distributed training already initialized. Using rank: {dist.get_rank()}, world_size: {dist.get_world_size()}, device: {trainer_instance.config.device}")
         return
 
-    # Standard environment variable check for torch.distributed.launch or similar
     rank_env = os.environ.get('RANK')
     world_size_env = os.environ.get('WORLD_SIZE')
     local_rank_env = os.environ.get('LOCAL_RANK')
@@ -108,13 +110,11 @@ def init_distributed(trainer_instance: 'Trainer'):
             rank = int(rank_env)
             world_size = int(world_size_env)
 
-            if world_size > 1 and torch.cuda.is_available(): # Only init if world_size > 1 and CUDA is present
+            if world_size > 1 and torch.cuda.is_available():
                 local_rank = int(local_rank_env) if local_rank_env is not None else rank % torch.cuda.device_count()
                 trainer_instance.config.local_rank = local_rank
-
                 backend = 'nccl'
                 torch.cuda.set_device(local_rank)
-                # MASTER_ADDR and MASTER_PORT must be set in the environment for this to succeed
                 dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
                 trainer_instance.is_distributed = True
                 trainer_instance.config.device = torch.device(f"cuda:{local_rank}")
@@ -122,7 +122,7 @@ def init_distributed(trainer_instance: 'Trainer'):
             elif world_size > 1 and not torch.cuda.is_available():
                 print("Warning: Distributed training requested (world_size > 1) but CUDA is not available. Falling back to non-distributed CPU mode.")
                 trainer_instance.is_distributed = False
-            else: # world_size is 1 or less
+            else:
                 trainer_instance.is_distributed = False
         except Exception as e:
             print(f"Error initializing distributed group: {e}. Falling back to non-distributed mode.")
@@ -131,10 +131,9 @@ def init_distributed(trainer_instance: 'Trainer'):
         trainer_instance.is_distributed = False
 
     if not trainer_instance.is_distributed:
-        # Set device for non-distributed mode
         if torch.cuda.is_available():
             trainer_instance.config.device = torch.device('cuda')
-            trainer_instance.config.local_rank = 0 # Default local_rank for single GPU
+            trainer_instance.config.local_rank = 0
         else:
             trainer_instance.config.device = torch.device('cpu')
             trainer_instance.config.local_rank = 0
@@ -151,18 +150,18 @@ class TrainingMetrics:
         self.best_step = 0
 
         self.lm_losses = []
-        self.lev_aux_losses = []
+        self.lev_aux_losses = [] # Will store unshuffle_loss for training
         self.nsp_losses = []
-        self.pred_dist_orig_means = []
+        # self.pred_dist_orig_means = [] # Removed
 
         self.val_lm_losses = []
-        self.val_lev_aux_losses = []
+        self.val_lev_aux_losses = [] # Will store unshuffle_loss for validation
         self.val_nsp_losses = []
-        self.val_pred_dist_orig_means = []
+        # self.val_pred_dist_orig_means = [] # Removed
 
     def update(self, train_loss=None, val_loss=None, learning_rate=None, step_time=None,
-                 lm_loss_component=None, lev_aux_loss=None, nsp_loss=None, pred_dist_orig_mean=None,
-                 val_lm_loss_component=None, val_lev_aux_loss=None, val_nsp_loss=None, val_pred_dist_orig_mean=None):
+                 lm_loss_component=None, lev_aux_loss=None, nsp_loss=None, # pred_dist_orig_mean removed
+                 val_lm_loss_component=None, val_lev_aux_loss=None, val_nsp_loss=None): # val_pred_dist_orig_mean removed
         if train_loss is not None: self.train_losses.append(train_loss)
         if val_loss is not None:
             self.val_losses.append(val_loss)
@@ -172,14 +171,14 @@ class TrainingMetrics:
         if learning_rate is not None: self.learning_rates.append(learning_rate)
         if step_time is not None: self.step_times.append(step_time)
         if lm_loss_component is not None: self.lm_losses.append(lm_loss_component)
-        if lev_aux_loss is not None: self.lev_aux_losses.append(lev_aux_loss)
+        if lev_aux_loss is not None: self.lev_aux_losses.append(lev_aux_loss) # For unshuffle loss
         if nsp_loss is not None: self.nsp_losses.append(nsp_loss)
-        if pred_dist_orig_mean is not None: self.pred_dist_orig_means.append(pred_dist_orig_mean)
+        # pred_dist_orig_mean update removed
 
         if val_lm_loss_component is not None: self.val_lm_losses.append(val_lm_loss_component)
-        if val_lev_aux_loss is not None: self.val_lev_aux_losses.append(val_lev_aux_loss)
+        if val_lev_aux_loss is not None: self.val_lev_aux_losses.append(val_lev_aux_loss) # For unshuffle loss
         if val_nsp_loss is not None: self.val_nsp_losses.append(val_nsp_loss)
-        if val_pred_dist_orig_mean is not None: self.val_pred_dist_orig_means.append(val_pred_dist_orig_mean)
+        # val_pred_dist_orig_mean update removed
         self.total_steps += 1
     
     def get_avg_step_time(self, last_n=100):
@@ -219,38 +218,33 @@ class Trainer:
         Train step with multi-task support.
         Returns: (combined_loss_val, lm_loss_item, unshuffle_loss_item, nsp_loss_item)
         """
-        # Metrics initialization
         mean_lm_loss_component_item = None
         unshuffle_loss_item = None
         mean_nsp_loss_item = None
-        # mean_pred_dist_orig_item removed
 
-        # 1. Batch Unpacking (now 5 items)
-        if self.config.use_levenshtein_task: # Indicates multi-task mode and presence of all 5 items
+        if self.config.use_levenshtein_task:
             input_tokens, next_token_lm_targets, unshuffle_seq_targets, auxiliary_values, task_type_flags = batch
             input_tokens = input_tokens.to(self.config.device)
             next_token_lm_targets = next_token_lm_targets.to(self.config.device)
             unshuffle_seq_targets = unshuffle_seq_targets.to(self.config.device)
-            auxiliary_values = auxiliary_values.to(self.config.device) # NSP labels for type 2
+            auxiliary_values = auxiliary_values.to(self.config.device)
             task_type_flags = task_type_flags.to(self.config.device)
-        else: # Standard LM task (single task mode)
-            if len(batch) == 2: # Original single LM task format
+        else:
+            if len(batch) == 2:
                 input_tokens, next_token_lm_targets = batch
-            elif len(batch) == 5: # If data pipeline provides 5 items even for single task
-                 input_tokens, next_token_lm_targets, _, _, _ = batch # unshuffle_seq_targets and aux_values are ignored
+            elif len(batch) == 5:
+                 input_tokens, next_token_lm_targets, _, _, _ = batch
             else:
                 raise ValueError(f"Unexpected batch structure with {len(batch)} items in single-task mode.")
-            # Create dummy/default values for other components for consistent code paths
             unshuffle_seq_targets = None
             auxiliary_values = None
-            task_type_flags = None # Handled as pure LM task by logic below
+            task_type_flags = None
 
             input_tokens = input_tokens.to(self.config.device)
             next_token_lm_targets = next_token_lm_targets.to(self.config.device)
 
         self.optimizer.zero_grad()
         
-        # Initialize loss components
         final_batch_lm_loss_component = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
         unshuffle_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
         mean_nsp_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
@@ -258,73 +252,58 @@ class Trainer:
         autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
 
         with autocast_context:
-            # 2. Model Call - model now returns (lm_logits, per_item_lm_loss, nsp_logits)
-            # per_item_lm_loss is calculated by the model using next_token_lm_targets
             lm_logits_all, per_item_lm_loss_all, nsp_logits_all = self.model(
                 input_tokens,
                 next_token_lm_targets,
-                force_disable_prefix_attention=False # Keep prefix attention enabled by default
+                force_disable_prefix_attention=False
             )
 
-            # 3. Loss Calculation
-            if self.config.use_levenshtein_task and task_type_flags is not None: # Multi-task mode
-                lm_task_mask = (task_type_flags == 0.0)  # Pure LM task
-                lev_task_mask = (task_type_flags == 1.0) # Levenshtein/Unshuffle task
-                nsp_task_mask = (task_type_flags == 2.0)  # NSP task
+            if self.config.use_levenshtein_task and task_type_flags is not None:
+                lm_task_mask = (task_type_flags == 0.0)
+                lev_task_mask = (task_type_flags == 1.0)
+                nsp_task_mask = (task_type_flags == 2.0)
                 
-                # LM Loss Component (Task Type 0)
                 if lm_task_mask.any() and per_item_lm_loss_all is not None:
-                    # per_item_lm_loss_all is already calculated based on next_token_lm_targets
-                    # and should be valid only for non-ignored indices.
                     valid_lm_losses = per_item_lm_loss_all[lm_task_mask]
-                    if valid_lm_losses.numel() > 0: # Ensure there are actual values after masking
+                    if valid_lm_losses.numel() > 0:
                         final_batch_lm_loss_component = valid_lm_losses.float().mean()
                 
-                # Unshuffle Seq2Seq Loss (Task Type 1)
                 if lev_task_mask.any() and unshuffle_seq_targets is not None:
                     predictions_for_unshuffle = lm_logits_all[lev_task_mask]
                     targets_for_unshuffle = unshuffle_seq_targets[lev_task_mask]
 
                     if predictions_for_unshuffle.numel() > 0 and targets_for_unshuffle.numel() > 0:
                         vocab_size = predictions_for_unshuffle.size(-1)
-                        # lm_ignore_idx is typically -1, consistent with dataset implementations
                         unshuffle_loss_tensor = F.cross_entropy(
                             predictions_for_unshuffle.reshape(-1, vocab_size),
                             targets_for_unshuffle.reshape(-1),
-                            ignore_index= -1
+                            ignore_index= getattr(self.config, 'lm_ignore_idx', -1)
                         )
                         unshuffle_loss_item = unshuffle_loss_tensor.item()
                 
-                # NSP Loss (Task Type 2)
                 if nsp_task_mask.any() and nsp_logits_all is not None:
                     nsp_predicted = nsp_logits_all[nsp_task_mask]
-                    nsp_targets = auxiliary_values[nsp_task_mask].long() # NSP labels are in auxiliary_values
+                    nsp_targets = auxiliary_values[nsp_task_mask].long()
                     if nsp_predicted.numel() > 0 and nsp_targets.numel() > 0:
                         loss_fn_nsp = torch.nn.CrossEntropyLoss()
                         mean_nsp_loss_tensor = loss_fn_nsp(nsp_predicted, nsp_targets)
                         mean_nsp_loss_item = mean_nsp_loss_tensor.item()
                 
-                # Combined Loss for multi-task
                 combined_loss = final_batch_lm_loss_component
                 combined_loss = combined_loss + (self.config.levenshtein_loss_weight * unshuffle_loss_tensor)
                 nsp_loss_weight = getattr(self.config, 'nsp_loss_weight', 0.1)
                 combined_loss = combined_loss + (nsp_loss_weight * mean_nsp_loss_tensor)
                 
-            else: # Standard LM task (single task mode)
+            else:
                 if per_item_lm_loss_all is not None:
                      final_batch_lm_loss_component = per_item_lm_loss_all.float().mean()
                 combined_loss = final_batch_lm_loss_component
 
-            # For logging the LM component if it's a valid tensor
             if isinstance(final_batch_lm_loss_component, torch.Tensor) and final_batch_lm_loss_component.numel() > 0 :
                  mean_lm_loss_component_item = final_batch_lm_loss_component.item()
 
-
-        # --- End of autocast_context for AMP ---
-
         combined_loss_val = combined_loss.item()
 
-        # Handle cases where loss might not require grad (e.g., batch with no valid labels for any active task)
         if not combined_loss.requires_grad and combined_loss.abs().item() < 1e-9:
              return 0.0, mean_lm_loss_component_item, unshuffle_loss_item, mean_nsp_loss_item
 
@@ -347,15 +326,14 @@ class Trainer:
         self.model.eval()
         total_combined_loss_epoch = 0.0
         accum_lm_loss_component = 0.0
-        accum_unshuffle_loss = 0.0 # Renamed from accum_lev_aux_loss
-        accum_nsp_loss = 0.0       # For NSP specific metric
+        accum_unshuffle_loss = 0.0
+        accum_nsp_loss = 0.0
 
         num_batches_processed = 0
         num_lm_batches = 0
-        num_unshuffle_batches = 0  # Renamed from num_lev_batches
-        num_nsp_batches = 0        # For NSP specific metric
+        num_unshuffle_batches = 0
+        num_nsp_batches = 0
 
-        # Default lm_ignore_idx to -1 if not in config, for consistency
         lm_ignore_idx = getattr(self.config, 'lm_ignore_idx', -1)
 
         with torch.no_grad():
@@ -364,50 +342,43 @@ class Trainer:
                     print(f"Evaluation limited to {max_batches} batches for speed")
                     break
                 
-                # 1. Batch Unpacking (5-tuple)
-                if self.config.use_levenshtein_task: # Multi-task mode
+                if self.config.use_levenshtein_task:
                     input_tokens, next_token_lm_targets, unshuffle_seq_targets, auxiliary_values, task_type_flags = batch
                     input_tokens = input_tokens.to(self.config.device)
                     next_token_lm_targets = next_token_lm_targets.to(self.config.device)
                     unshuffle_seq_targets = unshuffle_seq_targets.to(self.config.device)
                     auxiliary_values = auxiliary_values.to(self.config.device)
                     task_type_flags = task_type_flags.to(self.config.device)
-                else: # Standard LM task
+                else:
                     if len(batch) == 2:
                         input_tokens, next_token_lm_targets = batch
-                    elif len(batch) == 5: # If dataset still provides 5 items
+                    elif len(batch) == 5:
                         input_tokens, next_token_lm_targets, _, _, _ = batch
                     else:
                         raise ValueError("Unexpected batch structure in single-task mode during eval.")
-
                     input_tokens = input_tokens.to(self.config.device)
                     next_token_lm_targets = next_token_lm_targets.to(self.config.device)
-                    # Placeholders for multi-task components
                     batch_dim_size = input_tokens.size(0)
                     unshuffle_seq_targets = torch.full_like(next_token_lm_targets, lm_ignore_idx)
                     auxiliary_values = torch.zeros(batch_dim_size, device=self.config.device, dtype=torch.float)
-                    task_type_flags = torch.zeros(batch_dim_size, device=self.config.device, dtype=torch.float) # All LM type
+                    task_type_flags = torch.zeros(batch_dim_size, device=self.config.device, dtype=torch.float)
 
-                # Initialize per-batch losses for combining
-                current_batch_lm_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-                current_batch_unshuffle_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-                current_batch_nsp_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+                current_batch_lm_component_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+                current_batch_unshuffle_component_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+                current_batch_nsp_component_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
 
                 autocast_context_eval = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
                 with autocast_context_eval:
-                    # 2. Model Call (model uses next_token_lm_targets for its internal per_item_lm_loss)
                     lm_logits_all, per_item_lm_loss_all, nsp_logits_all = self.model(
                         input_tokens,
-                        next_token_lm_targets, # Model calculates LM loss based on this
-                        force_disable_prefix_attention=False # Allow prefix attention based on model config
+                        next_token_lm_targets,
+                        force_disable_prefix_attention=False
                     )
 
-                # 3. Metric Calculation
                 lm_task_mask_eval = (task_type_flags == 0.0)
-                lev_task_mask_eval = (task_type_flags == 1.0) # Unshuffle task
+                lev_task_mask_eval = (task_type_flags == 1.0)
                 nsp_task_mask_eval = (task_type_flags == 2.0)
 
-                # LM Loss Component (Val LM Comp) - for Type 0
                 if lm_task_mask_eval.any() and per_item_lm_loss_all is not None:
                     lm_loss_for_lm_items = per_item_lm_loss_all[lm_task_mask_eval]
                     if lm_loss_for_lm_items.numel() > 0:
@@ -417,50 +388,38 @@ class Trainer:
                             if not math.isnan(current_lm_loss_value) and not math.isinf(current_lm_loss_value):
                                 accum_lm_loss_component += current_lm_loss_value
                                 num_lm_batches += 1
-                                current_batch_lm_loss = torch.tensor(current_lm_loss_value, device=self.config.device)
+                                current_batch_lm_component_loss = torch.tensor(current_lm_loss_value, device=self.config.device)
 
-
-                # Unshuffle Seq2Seq Loss Component (Val Unshuffle Aux) - for Type 1
                 if self.config.use_levenshtein_task and lev_task_mask_eval.any() and lm_logits_all is not None and unshuffle_seq_targets is not None:
                     predictions_for_unshuffle_eval = lm_logits_all[lev_task_mask_eval]
                     targets_for_unshuffle_eval = unshuffle_seq_targets[lev_task_mask_eval]
-
                     if predictions_for_unshuffle_eval.numel() > 0 and targets_for_unshuffle_eval.numel() > 0:
                         vocab_size = predictions_for_unshuffle_eval.size(-1)
-                        current_unshuffle_loss_tensor_calc = F.cross_entropy(
+                        unshuffle_loss_tensor_calc = F.cross_entropy(
                             predictions_for_unshuffle_eval.reshape(-1, vocab_size),
                             targets_for_unshuffle_eval.reshape(-1),
                             ignore_index=lm_ignore_idx
                         )
-                        current_batch_unshuffle_loss = current_unshuffle_loss_tensor_calc # Store for combined loss
-                        if not torch.isnan(current_unshuffle_loss_tensor_calc) and not torch.isinf(current_unshuffle_loss_tensor_calc):
-                            accum_unshuffle_loss += current_unshuffle_loss_tensor_calc.item()
+                        current_batch_unshuffle_component_loss = unshuffle_loss_tensor_calc
+                        if not torch.isnan(unshuffle_loss_tensor_calc) and not torch.isinf(unshuffle_loss_tensor_calc):
+                            accum_unshuffle_loss += unshuffle_loss_tensor_calc.item()
                             num_unshuffle_batches += 1
 
-                # NSP Loss Component (Val NSP) - for Type 2
                 if self.config.use_levenshtein_task and nsp_task_mask_eval.any() and nsp_logits_all is not None:
                     nsp_predicted_eval = nsp_logits_all[nsp_task_mask_eval]
                     nsp_targets_eval = auxiliary_values[nsp_task_mask_eval].long()
                     if nsp_predicted_eval.numel() > 0 and nsp_targets_eval.numel() > 0:
-                        current_nsp_loss_tensor_calc = F.cross_entropy(nsp_predicted_eval, nsp_targets_eval)
-                        current_batch_nsp_loss = current_nsp_loss_tensor_calc # Store for combined loss
-                        if not torch.isnan(current_nsp_loss_tensor_calc) and not torch.isinf(current_nsp_loss_tensor_calc):
-                            accum_nsp_loss += current_nsp_loss_tensor_calc.item()
+                        nsp_loss_tensor_calc = F.cross_entropy(nsp_predicted_eval, nsp_targets_eval)
+                        current_batch_nsp_component_loss = nsp_loss_tensor_calc
+                        if not torch.isnan(nsp_loss_tensor_calc) and not torch.isinf(nsp_loss_tensor_calc):
+                            accum_nsp_loss += nsp_loss_tensor_calc.item()
                             num_nsp_batches +=1
 
-                # Combined Validation Loss for the batch
-                # This logic needs to be robust to batches containing only one type of task.
-                # The combined loss should reflect the average of losses present in the batch, weighted.
-                # For evaluation, it's often just the primary task loss (LM), or a sum if others are comparable.
-                # Given train_step combines them, evaluate should too for consistency of "val_loss".
-
-                # A simple sum of components present in the batch, then average over num_batches_processed.
-                # If a component is not present, its tensor (e.g. current_batch_lm_loss) remains 0.
-                batch_total_loss_val = current_batch_lm_loss # Start with LM loss (if any)
+                batch_total_loss_val = current_batch_lm_component_loss
                 if self.config.use_levenshtein_task:
                     batch_total_loss_val = batch_total_loss_val + \
-                                           (self.config.levenshtein_loss_weight * current_batch_unshuffle_loss) + \
-                                           (getattr(self.config, 'nsp_loss_weight', 0.1) * current_batch_nsp_loss)
+                                           (self.config.levenshtein_loss_weight * current_batch_unshuffle_component_loss) + \
+                                           (getattr(self.config, 'nsp_loss_weight', 0.1) * current_batch_nsp_component_loss)
 
                 total_combined_loss_epoch += batch_total_loss_val.item()
                 num_batches_processed +=1
@@ -468,13 +427,13 @@ class Trainer:
         self.model.train()
         avg_combined_loss = total_combined_loss_epoch / num_batches_processed if num_batches_processed > 0 else float('inf')
         avg_lm_loss_component = accum_lm_loss_component / num_lm_batches if num_lm_batches > 0 else 0.0
-        avg_unshuffle_loss = accum_unshuffle_loss / num_unshuffle_batches if num_unshuffle_batches > 0 else 0.0 # New avg metric
-        avg_nsp_loss = accum_nsp_loss / num_nsp_batches if num_nsp_batches > 0 else 0.0 # New avg metric
+        avg_unshuffle_loss = accum_unshuffle_loss / num_unshuffle_batches if num_unshuffle_batches > 0 else 0.0
+        avg_nsp_loss = accum_nsp_loss / num_nsp_batches if num_nsp_batches > 0 else 0.0
 
         self.metrics.update(
             val_loss=avg_combined_loss,
             val_lm_loss_component=avg_lm_loss_component,
-            val_lev_aux_loss=avg_unshuffle_loss, # Store avg_unshuffle_loss in val_lev_aux_loss slot
+            val_lev_aux_loss=avg_unshuffle_loss,
             val_nsp_loss=avg_nsp_loss
             # val_pred_dist_orig_mean removed
         )
@@ -543,7 +502,7 @@ class Trainer:
                 learning_rate=current_lr,
                 step_time=time.time() - step_start,
                 lm_loss_component=current_lm_loss_item,
-                lev_aux_loss=current_unshuffle_loss_item, # Use lev_aux_loss field for unshuffle_loss_item
+                lev_aux_loss=current_unshuffle_loss_item, # Store unshuffle_loss_item in lev_aux_loss metric slot
                 nsp_loss=current_nsp_loss_item
                 # pred_dist_orig_mean is removed
             )
@@ -552,7 +511,7 @@ class Trainer:
                self.metrics.total_steps % self.config.log_every == 0:
                 avg_step_time = self.metrics.get_avg_step_time()
                 log_msg = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, Loss: {combined_loss_item:.4f}"
-                if self.config.use_levenshtein_task: # This means multi-task is active
+                if self.config.use_levenshtein_task: # This means multi-task
                     if current_lm_loss_item is not None: log_msg += f", LM Comp: {current_lm_loss_item:.4f}"
                     if current_unshuffle_loss_item is not None: log_msg += f", Unshuffle Aux: {current_unshuffle_loss_item:.4f}"
                     if current_nsp_loss_item is not None: log_msg += f", NSP: {current_nsp_loss_item:.4f}"
@@ -567,8 +526,8 @@ class Trainer:
                 print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
                 if self.config.use_levenshtein_task: # This means multi-task
                     if self.metrics.val_lm_losses: print(f"  Val LM Comp: {self.metrics.val_lm_losses[-1]:.4f}")
-                    if self.metrics.val_lev_aux_losses: print(f"  Val Unshuffle Aux: {self.metrics.val_lev_aux_losses[-1]:.4f}") # Updated log
-                    if self.metrics.val_nsp_losses: print(f"  Val NSP: {self.metrics.val_nsp_losses[-1]:.4f}") # Log NSP
+                    if self.metrics.val_lev_aux_losses: print(f"  Val Unshuffle Aux: {self.metrics.val_lev_aux_losses[-1]:.4f}")
+                    if self.metrics.val_nsp_losses: print(f"  Val NSP: {self.metrics.val_nsp_losses[-1]:.4f}")
                     # val_pred_dist_orig_means is removed from metrics and logging
                 if is_best: self.save_checkpoint(self.metrics.total_steps, is_best=True)
                 current_metric_val = val_loss
@@ -836,3 +795,5 @@ class Trainer:
 
 def create_trainer(model, config, data_builder=None): return Trainer(model, config, data_builder)
 if __name__ == "__main__": print("Trainer module loaded successfully!")
+
+[end of train_loop.py]
