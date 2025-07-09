@@ -44,6 +44,8 @@ class TrainingConfig:
         scheduler_T_mult: int = 1,
         use_levenshtein_task: bool = False,
         levenshtein_loss_weight: float = 0.1,
+        nsp_loss_weight: float = 0.1, # Added for consistency
+        lm_ignore_idx: int = -1
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -69,6 +71,8 @@ class TrainingConfig:
         self.scheduler_T_mult = scheduler_T_mult
         self.use_levenshtein_task = use_levenshtein_task
         self.levenshtein_loss_weight = levenshtein_loss_weight
+        self.nsp_loss_weight = nsp_loss_weight
+        self.lm_ignore_idx = lm_ignore_idx
         
         if device == "auto":
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -82,35 +86,54 @@ class TrainingConfig:
 def init_distributed(trainer_instance: 'Trainer'):
     if dist.is_available() and dist.is_initialized():
         trainer_instance.is_distributed = True
-        if hasattr(trainer_instance.config, 'local_rank') and trainer_instance.config.local_rank == -1:
-             trainer_instance.config.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        if not hasattr(trainer_instance.config, 'local_rank') or trainer_instance.config.local_rank == -1:
+            trainer_instance.config.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        if torch.cuda.is_available():
+            if hasattr(trainer_instance.config, 'local_rank') and trainer_instance.config.local_rank != -1:
+                 trainer_instance.config.device = torch.device(f"cuda:{trainer_instance.config.local_rank}")
+            else:
+                 trainer_instance.config.device = torch.device('cuda')
+        else:
+            trainer_instance.config.device = torch.device('cpu')
+        print(f"Distributed training already initialized. Using rank: {dist.get_rank()}, world_size: {dist.get_world_size()}, device: {trainer_instance.config.device}")
         return
+
     rank_env = os.environ.get('RANK')
     world_size_env = os.environ.get('WORLD_SIZE')
     local_rank_env = os.environ.get('LOCAL_RANK')
+
     if rank_env is not None and world_size_env is not None:
         try:
             rank = int(rank_env)
             world_size = int(world_size_env)
-            local_rank = int(local_rank_env) if local_rank_env is not None else rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
-            trainer_instance.config.local_rank = local_rank
-            if torch.cuda.is_available():
+
+            if world_size > 1 and torch.cuda.is_available():
+                local_rank = int(local_rank_env) if local_rank_env is not None else rank % torch.cuda.device_count()
+                trainer_instance.config.local_rank = local_rank
                 backend = 'nccl'
                 torch.cuda.set_device(local_rank)
                 dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
                 trainer_instance.is_distributed = True
                 trainer_instance.config.device = torch.device(f"cuda:{local_rank}")
+                print(f"Distributed training initialized by train_loop. Rank: {rank}, World Size: {world_size}, Device: {trainer_instance.config.device}")
+            elif world_size > 1 and not torch.cuda.is_available():
+                print("Warning: Distributed training requested (world_size > 1) but CUDA is not available. Falling back to non-distributed CPU mode.")
+                trainer_instance.is_distributed = False
             else:
                 trainer_instance.is_distributed = False
         except Exception as e:
-            print(f"Error initializing distributed group: {e}")
+            print(f"Error initializing distributed group: {e}. Falling back to non-distributed mode.")
             trainer_instance.is_distributed = False
     else:
         trainer_instance.is_distributed = False
+
     if not trainer_instance.is_distributed:
-        if trainer_instance.config.device == "auto" or not isinstance(trainer_instance.config.device, torch.device):
-             trainer_instance.config.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        trainer_instance.config.local_rank = 0
+        if torch.cuda.is_available():
+            trainer_instance.config.device = torch.device('cuda')
+            trainer_instance.config.local_rank = 0
+        else:
+            trainer_instance.config.device = torch.device('cpu')
+            trainer_instance.config.local_rank = 0
         print(f"Running in non-distributed mode on device: {trainer_instance.config.device}")
 
 class TrainingMetrics:
@@ -124,18 +147,18 @@ class TrainingMetrics:
         self.best_step = 0
 
         self.lm_losses = []
-        self.lev_aux_losses = []
+        self.lev_aux_losses = [] # Stores unshuffle_loss for training
         self.nsp_losses = []
-        self.pred_dist_orig_means = []
+        # self.pred_dist_orig_means = [] # Removed
 
         self.val_lm_losses = []
-        self.val_lev_aux_losses = []
+        self.val_lev_aux_losses = [] # Stores unshuffle_loss for validation
         self.val_nsp_losses = []
-        self.val_pred_dist_orig_means = []
+        # self.val_pred_dist_orig_means = [] # Removed
 
     def update(self, train_loss=None, val_loss=None, learning_rate=None, step_time=None,
-                 lm_loss_component=None, lev_aux_loss=None, nsp_loss=None, pred_dist_orig_mean=None,
-                 val_lm_loss_component=None, val_lev_aux_loss=None, val_nsp_loss=None, val_pred_dist_orig_mean=None):
+                 lm_loss_component=None, lev_aux_loss=None, nsp_loss=None, # pred_dist_orig_mean removed
+                 val_lm_loss_component=None, val_lev_aux_loss=None, val_nsp_loss=None): # val_pred_dist_orig_mean removed
         if train_loss is not None: self.train_losses.append(train_loss)
         if val_loss is not None:
             self.val_losses.append(val_loss)
@@ -147,12 +170,10 @@ class TrainingMetrics:
         if lm_loss_component is not None: self.lm_losses.append(lm_loss_component)
         if lev_aux_loss is not None: self.lev_aux_losses.append(lev_aux_loss)
         if nsp_loss is not None: self.nsp_losses.append(nsp_loss)
-        if pred_dist_orig_mean is not None: self.pred_dist_orig_means.append(pred_dist_orig_mean)
 
         if val_lm_loss_component is not None: self.val_lm_losses.append(val_lm_loss_component)
         if val_lev_aux_loss is not None: self.val_lev_aux_losses.append(val_lev_aux_loss)
         if val_nsp_loss is not None: self.val_nsp_losses.append(val_nsp_loss)
-        if val_pred_dist_orig_mean is not None: self.val_pred_dist_orig_means.append(val_pred_dist_orig_mean)
         self.total_steps += 1
     
     def get_avg_step_time(self, last_n=100):
@@ -187,79 +208,74 @@ class Trainer:
         )
         print(f"Trainer initialized on device: {self.config.device}. Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
-    def train_step(self, batch: Tuple[torch.Tensor, ...]) -> Tuple[float, Optional[float], Optional[float], Optional[float], Optional[float]]:
+    def train_step(self, batch: Tuple[torch.Tensor, ...]) -> Tuple[float, Optional[float], Optional[float], Optional[float]]:
         """
         Train step with multi-task support.
-        Returns: (combined_loss, lm_loss, lev_aux_loss, nsp_loss, pred_dist_orig)
+        Returns: (combined_loss_val, lm_loss_item, unshuffle_loss_item, nsp_loss_item)
         """
-        # Metrics initialization
         mean_lm_loss_component_item = None
-        mean_lev_aux_loss_item = None
+        unshuffle_loss_item = None
         mean_nsp_loss_item = None
-        mean_pred_dist_orig_item = None # For monitoring pred_dist on original items
 
-        # 1. Batch Unpacking - Updated for multi-task format
         if self.config.use_levenshtein_task:
-            # Multi-task format: (input_tokens, lm_targets, auxiliary_value, task_type_flag)
-            input_tokens, lm_targets, auxiliary_values, task_type_flags = batch
+            input_tokens, next_token_lm_targets, unshuffle_seq_targets, auxiliary_values, task_type_flags = batch
             input_tokens = input_tokens.to(self.config.device)
-            lm_targets = lm_targets.to(self.config.device)
+            next_token_lm_targets = next_token_lm_targets.to(self.config.device)
+            unshuffle_seq_targets = unshuffle_seq_targets.to(self.config.device)
             auxiliary_values = auxiliary_values.to(self.config.device)
             task_type_flags = task_type_flags.to(self.config.device)
-        else: # Standard LM task
-            input_tokens, lm_targets = batch
-            input_tokens = input_tokens.to(self.config.device)
-            lm_targets = lm_targets.to(self.config.device)
+        else:
+            if len(batch) == 2:
+                input_tokens, next_token_lm_targets = batch
+            elif len(batch) == 5:
+                 input_tokens, next_token_lm_targets, _, _, _ = batch
+            else:
+                raise ValueError(f"Unexpected batch structure with {len(batch)} items in single-task mode.")
+            unshuffle_seq_targets = None
             auxiliary_values = None
             task_type_flags = None
 
+            input_tokens = input_tokens.to(self.config.device)
+            next_token_lm_targets = next_token_lm_targets.to(self.config.device)
+
         self.optimizer.zero_grad()
         
-        combined_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
         final_batch_lm_loss_component = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+        unshuffle_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+        mean_nsp_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
 
         autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
 
         with autocast_context:
-            # 2. Single Main Forward Pass
-            lm_logits_all, per_item_lm_loss_all, predicted_lev_distances_all, nsp_logits_all = self.model(
+            lm_logits_all, per_item_lm_loss_all, nsp_logits_all = self.model(
                 input_tokens,
-                lm_targets,
+                next_token_lm_targets,
                 force_disable_prefix_attention=False
             )
 
-            # 3. Multi-task Loss Calculation
             if self.config.use_levenshtein_task and task_type_flags is not None:
-                # Calculate task-specific losses
-                lm_task_mask = (task_type_flags == 0.0)  # LM task
-                lev_task_mask = (task_type_flags == 1.0)  # Levenshtein task
-                nsp_task_mask = (task_type_flags == 2.0)  # NSP task
+                lm_task_mask = (task_type_flags == 0.0)
+                lev_task_mask = (task_type_flags == 1.0)
+                nsp_task_mask = (task_type_flags == 2.0)
                 
-                # LM Loss (from LM and Levenshtein tasks, not NSP)
-                lm_valid_mask = lm_task_mask | lev_task_mask
-                if lm_valid_mask.any() and per_item_lm_loss_all is not None:
-                    per_item_lm_loss_valid = per_item_lm_loss_all[lm_valid_mask]
-                    if per_item_lm_loss_valid.numel() > 0:
-                        final_batch_lm_loss_component = per_item_lm_loss_valid.float().mean()
+                if lm_task_mask.any() and per_item_lm_loss_all is not None:
+                    valid_lm_losses = per_item_lm_loss_all[lm_task_mask]
+                    if valid_lm_losses.numel() > 0:
+                        final_batch_lm_loss_component = valid_lm_losses.float().mean()
                 
-                # Levenshtein Auxiliary Loss
-                mean_lev_aux_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-                if lev_task_mask.any() and predicted_lev_distances_all is not None:
-                    lev_predicted = predicted_lev_distances_all[lev_task_mask]
-                    lev_targets = auxiliary_values[lev_task_mask]
-                    if lev_predicted.numel() > 0 and lev_targets.numel() > 0:
-                        loss_fn_dist = torch.nn.MSELoss()
-                        mean_lev_aux_loss_tensor = loss_fn_dist(lev_predicted.float(), lev_targets.float())
-                        mean_lev_aux_loss_item = mean_lev_aux_loss_tensor.item()
-                        
-                        # Monitor predicted distance on original items (task_type=0.0)
-                        if lm_task_mask.any():
-                            orig_predicted = predicted_lev_distances_all[lm_task_mask]
-                            if orig_predicted.numel() > 0:
-                                mean_pred_dist_orig_item = orig_predicted.mean().item()
+                if lev_task_mask.any() and unshuffle_seq_targets is not None:
+                    predictions_for_unshuffle = lm_logits_all[lev_task_mask]
+                    targets_for_unshuffle = unshuffle_seq_targets[lev_task_mask]
+
+                    if predictions_for_unshuffle.numel() > 0 and targets_for_unshuffle.numel() > 0:
+                        vocab_size = predictions_for_unshuffle.size(-1)
+                        unshuffle_loss_tensor = F.cross_entropy(
+                            predictions_for_unshuffle.reshape(-1, vocab_size),
+                            targets_for_unshuffle.reshape(-1),
+                            ignore_index= getattr(self.config, 'lm_ignore_idx', -1)
+                        )
+                        unshuffle_loss_item = unshuffle_loss_tensor.item()
                 
-                # NSP Loss
-                mean_nsp_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
                 if nsp_task_mask.any() and nsp_logits_all is not None:
                     nsp_predicted = nsp_logits_all[nsp_task_mask]
                     nsp_targets = auxiliary_values[nsp_task_mask].long()
@@ -268,27 +284,23 @@ class Trainer:
                         mean_nsp_loss_tensor = loss_fn_nsp(nsp_predicted, nsp_targets)
                         mean_nsp_loss_item = mean_nsp_loss_tensor.item()
                 
-                # Combined Loss
                 combined_loss = final_batch_lm_loss_component
-                if self.config.use_levenshtein_task:
-                    combined_loss = combined_loss + (self.config.levenshtein_loss_weight * mean_lev_aux_loss_tensor)
-                    combined_loss = combined_loss + (0.1 * mean_nsp_loss_tensor)  # NSP loss weight
+                combined_loss = combined_loss + (self.config.levenshtein_loss_weight * unshuffle_loss_tensor)
+                nsp_loss_weight = getattr(self.config, 'nsp_loss_weight', 0.1)
+                combined_loss = combined_loss + (nsp_loss_weight * mean_nsp_loss_tensor)
                 
-            else: # Standard LM task
+            else:
                 if per_item_lm_loss_all is not None:
                      final_batch_lm_loss_component = per_item_lm_loss_all.float().mean()
                 combined_loss = final_batch_lm_loss_component
 
-            mean_lm_loss_component_item = final_batch_lm_loss_component.item() if final_batch_lm_loss_component.requires_grad else None
+            if isinstance(final_batch_lm_loss_component, torch.Tensor) and final_batch_lm_loss_component.numel() > 0 :
+                 mean_lm_loss_component_item = final_batch_lm_loss_component.item()
 
-        # --- End of autocast_context for AMP ---
-
-        # Store combined loss value before operations that might detach gradients
         combined_loss_val = combined_loss.item()
 
-        # Handle cases where loss might not require grad (e.g. all items were shuffled, no LM loss)
-        if not combined_loss.requires_grad and combined_loss.abs().item() < 1e-9 : # If loss is effectively zero and has no grad
-             return 0.0, None, mean_lev_aux_loss_item, mean_nsp_loss_item, mean_pred_dist_orig_item
+        if not combined_loss.requires_grad and combined_loss.abs().item() < 1e-9:
+             return 0.0, mean_lm_loss_component_item, unshuffle_loss_item, mean_nsp_loss_item
 
         if self.config.use_amp and self.config.scaler is not None:
             self.config.scaler.scale(combined_loss).backward()
@@ -303,18 +315,21 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
 
-        # 8. Return values for metrics
-        return combined_loss_val, mean_lm_loss_component_item, mean_lev_aux_loss_item, mean_nsp_loss_item, mean_pred_dist_orig_item    
+        return combined_loss_val, mean_lm_loss_component_item, unshuffle_loss_item, mean_nsp_loss_item
+
     def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
         self.model.eval()
-        total_combined_loss_epoch = 0
+        total_combined_loss_epoch = 0.0
         accum_lm_loss_component = 0.0
-        accum_lev_aux_loss = 0.0
-        accum_pred_dist_orig_mean = 0.0
+        accum_unshuffle_loss = 0.0
+        accum_nsp_loss = 0.0
+
         num_batches_processed = 0
         num_lm_batches = 0
-        num_lev_batches = 0
-        num_pred_dist_orig_batches = 0
+        num_unshuffle_batches = 0
+        num_nsp_batches = 0
+
+        lm_ignore_idx = getattr(self.config, 'lm_ignore_idx', -1)
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
@@ -322,89 +337,99 @@ class Trainer:
                     print(f"Evaluation limited to {max_batches} batches for speed")
                     break
                 
-                # Unpack batch according to multi-task format
                 if self.config.use_levenshtein_task:
-                    input_tokens, lm_targets, auxiliary_values, task_type_flags = batch
+                    input_tokens, next_token_lm_targets, unshuffle_seq_targets, auxiliary_values, task_type_flags = batch
                     input_tokens = input_tokens.to(self.config.device)
-                    lm_targets = lm_targets.to(self.config.device)
+                    next_token_lm_targets = next_token_lm_targets.to(self.config.device)
+                    unshuffle_seq_targets = unshuffle_seq_targets.to(self.config.device)
                     auxiliary_values = auxiliary_values.to(self.config.device)
                     task_type_flags = task_type_flags.to(self.config.device)
-                else: # Standard LM task
-                    input_tokens, lm_targets = batch
+                else:
+                    if len(batch) == 2:
+                        input_tokens, next_token_lm_targets = batch
+                    elif len(batch) == 5:
+                        input_tokens, next_token_lm_targets, _, _, _ = batch
+                    else:
+                        raise ValueError("Unexpected batch structure in single-task mode during eval.")
                     input_tokens = input_tokens.to(self.config.device)
-                    lm_targets = lm_targets.to(self.config.device)
-                    auxiliary_values, task_type_flags = None, None # Not applicable
+                    next_token_lm_targets = next_token_lm_targets.to(self.config.device)
+                    batch_dim_size = input_tokens.size(0)
+                    unshuffle_seq_targets = torch.full_like(next_token_lm_targets, lm_ignore_idx)
+                    auxiliary_values = torch.zeros(batch_dim_size, device=self.config.device, dtype=torch.float)
+                    task_type_flags = torch.zeros(batch_dim_size, device=self.config.device, dtype=torch.float)
 
-                current_batch_lm_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-                current_batch_aux_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-
-                per_item_lm_loss, predicted_lev_distances, nsp_logits = None, None, None # Model returns auxiliary outputs
+                current_batch_lm_component_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+                current_batch_unshuffle_component_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+                current_batch_nsp_component_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
 
                 autocast_context_eval = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
                 with autocast_context_eval:
-                    # Model's forward pass; lm_targets are already masked for shuffled items by the dataset
-                    _, per_item_lm_loss, predicted_lev_distances, nsp_logits = self.model(
+                    lm_logits_all, per_item_lm_loss_all, nsp_logits_all = self.model(
                         input_tokens,
-                        lm_targets,
+                        next_token_lm_targets,
                         force_disable_prefix_attention=False
                     )
 
-                if per_item_lm_loss is not None:
-                    current_batch_lm_loss_tensor = per_item_lm_loss.mean().float() # per_item_lm_loss can be empty if batch has only fully masked items
-                    if not torch.isnan(current_batch_lm_loss_tensor) and not torch.isinf(current_batch_lm_loss_tensor):
-                         accum_lm_loss_component += current_batch_lm_loss_tensor.item()
-                         num_lm_batches += 1
+                lm_task_mask_eval = (task_type_flags == 0.0)
+                lev_task_mask_eval = (task_type_flags == 1.0)
+                nsp_task_mask_eval = (task_type_flags == 2.0)
 
-                if self.config.use_levenshtein_task and predicted_lev_distances is not None and task_type_flags is not None and auxiliary_values is not None:
-                    lev_task_mask_eval = (task_type_flags == 1.0)  # Levenshtein task items
-                    original_item_mask_eval = (task_type_flags == 0.0) # Original LM task items
+                if lm_task_mask_eval.any() and per_item_lm_loss_all is not None:
+                    lm_loss_for_lm_items = per_item_lm_loss_all[lm_task_mask_eval]
+                    if lm_loss_for_lm_items.numel() > 0:
+                        valid_lm_items = lm_loss_for_lm_items[lm_loss_for_lm_items != float('inf')]
+                        if valid_lm_items.numel() > 0:
+                            current_lm_loss_value = valid_lm_items.float().mean().item()
+                            if not math.isnan(current_lm_loss_value) and not math.isinf(current_lm_loss_value):
+                                accum_lm_loss_component += current_lm_loss_value
+                                num_lm_batches += 1
+                                current_batch_lm_component_loss = torch.tensor(current_lm_loss_value, device=self.config.device)
 
-                    # Levenshtein Loss Calculation for Levenshtein task items
-                    if lev_task_mask_eval.any():
-                        true_lev_distances_current = auxiliary_values[lev_task_mask_eval]
-                        predicted_lev_distances_current = predicted_lev_distances[lev_task_mask_eval]
+                if self.config.use_levenshtein_task and lev_task_mask_eval.any() and lm_logits_all is not None and unshuffle_seq_targets is not None:
+                    predictions_for_unshuffle_eval = lm_logits_all[lev_task_mask_eval]
+                    targets_for_unshuffle_eval = unshuffle_seq_targets[lev_task_mask_eval]
+                    if predictions_for_unshuffle_eval.numel() > 0 and targets_for_unshuffle_eval.numel() > 0:
+                        vocab_size = predictions_for_unshuffle_eval.size(-1)
+                        unshuffle_loss_tensor_calc = F.cross_entropy(
+                            predictions_for_unshuffle_eval.reshape(-1, vocab_size),
+                            targets_for_unshuffle_eval.reshape(-1),
+                            ignore_index=lm_ignore_idx
+                        )
+                        current_batch_unshuffle_component_loss = unshuffle_loss_tensor_calc
+                        if not torch.isnan(unshuffle_loss_tensor_calc) and not torch.isinf(unshuffle_loss_tensor_calc):
+                            accum_unshuffle_loss += unshuffle_loss_tensor_calc.item()
+                            num_unshuffle_batches += 1
 
-                        if true_lev_distances_current.numel() > 0 and predicted_lev_distances_current.numel() == true_lev_distances_current.numel():
-                            loss_fn_dist = torch.nn.MSELoss()
-                            aux_loss_for_batch = loss_fn_dist(predicted_lev_distances_current.float(), true_lev_distances_current.float())
-                            # Ensure current_batch_aux_loss_tensor is defined for the combined loss calculation later
-                            # If not already defined, initialize it. It should be defined before this block.
-                            # Assuming current_batch_aux_loss_tensor was initialized to torch.tensor(0.0, ...) earlier in the loop.
-                            current_batch_aux_loss_tensor = aux_loss_for_batch
-                            if not torch.isnan(current_batch_aux_loss_tensor) and not torch.isinf(current_batch_aux_loss_tensor):
-                                accum_lev_aux_loss += current_batch_aux_loss_tensor.item()
-                                num_lev_batches += 1
-                        else:
-                            # Handle cases where there are no Levenshtein items or shapes mismatch if necessary
-                            # current_batch_aux_loss_tensor should retain its default (e.g., 0.0) if no Lev loss calculated
-                            pass
+                if self.config.use_levenshtein_task and nsp_task_mask_eval.any() and nsp_logits_all is not None:
+                    nsp_predicted_eval = nsp_logits_all[nsp_task_mask_eval]
+                    nsp_targets_eval = auxiliary_values[nsp_task_mask_eval].long()
+                    if nsp_predicted_eval.numel() > 0 and nsp_targets_eval.numel() > 0:
+                        nsp_loss_tensor_calc = F.cross_entropy(nsp_predicted_eval, nsp_targets_eval)
+                        current_batch_nsp_component_loss = nsp_loss_tensor_calc
+                        if not torch.isnan(nsp_loss_tensor_calc) and not torch.isinf(nsp_loss_tensor_calc):
+                            accum_nsp_loss += nsp_loss_tensor_calc.item()
+                            num_nsp_batches +=1
 
+                batch_total_loss_val = current_batch_lm_component_loss
+                if self.config.use_levenshtein_task:
+                    batch_total_loss_val = batch_total_loss_val + \
+                                           (self.config.levenshtein_loss_weight * current_batch_unshuffle_component_loss) + \
+                                           (getattr(self.config, 'nsp_loss_weight', 0.1) * current_batch_nsp_component_loss)
 
-                    # For monitoring: mean predicted distance on original items (pure LM task)
-                    if original_item_mask_eval.any():
-                        predicted_dist_on_original = predicted_lev_distances[original_item_mask_eval]
-                        if predicted_dist_on_original.numel() > 0:
-                            mean_pred_dist_orig_batch = predicted_dist_on_original.mean().item()
-                            if not math.isnan(mean_pred_dist_orig_batch) and not math.isinf(mean_pred_dist_orig_batch):
-                                accum_pred_dist_orig_mean += mean_pred_dist_orig_batch
-                                num_pred_dist_orig_batches += 1
-
-                batch_total_loss = current_batch_lm_loss_tensor
-                if self.config.use_levenshtein_task and not torch.isnan(current_batch_aux_loss_tensor) and not torch.isinf(current_batch_aux_loss_tensor): # also check if aux loss is valid
-                    batch_total_loss = batch_total_loss + (self.config.levenshtein_loss_weight * current_batch_aux_loss_tensor)
-                total_combined_loss_epoch += batch_total_loss.item()
+                total_combined_loss_epoch += batch_total_loss_val.item()
                 num_batches_processed +=1
 
         self.model.train()
         avg_combined_loss = total_combined_loss_epoch / num_batches_processed if num_batches_processed > 0 else float('inf')
         avg_lm_loss_component = accum_lm_loss_component / num_lm_batches if num_lm_batches > 0 else 0.0
-        avg_lev_aux_loss = accum_lev_aux_loss / num_lev_batches if num_lev_batches > 0 else 0.0
-        avg_pred_dist_orig_mean = accum_pred_dist_orig_mean / num_pred_dist_orig_batches if num_pred_dist_orig_batches > 0 else 0.0
+        avg_unshuffle_loss = accum_unshuffle_loss / num_unshuffle_batches if num_unshuffle_batches > 0 else 0.0
+        avg_nsp_loss = accum_nsp_loss / num_nsp_batches if num_nsp_batches > 0 else 0.0
+
         self.metrics.update(
             val_loss=avg_combined_loss,
             val_lm_loss_component=avg_lm_loss_component,
-            val_lev_aux_loss=avg_lev_aux_loss,
-            val_pred_dist_orig_mean=avg_pred_dist_orig_mean
+            val_lev_aux_loss=avg_unshuffle_loss,
+            val_nsp_loss=avg_nsp_loss
         )
         return avg_combined_loss
     
@@ -460,8 +485,8 @@ class Trainer:
         
         for batch_idx, batch in enumerate(train_loader):
             step_start = time.time()
-            combined_loss_item, current_lm_loss_item, current_lev_loss_item, \
-                current_nsp_loss_item, current_pred_dist_orig_item = self.train_step(batch)
+            combined_loss_item, current_lm_loss_item, current_unshuffle_loss_item, \
+                current_nsp_loss_item = self.train_step(batch)
             epoch_losses.append(combined_loss_item)
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
@@ -470,9 +495,8 @@ class Trainer:
                 learning_rate=current_lr,
                 step_time=time.time() - step_start,
                 lm_loss_component=current_lm_loss_item,
-                lev_aux_loss=current_lev_loss_item,
-                nsp_loss=current_nsp_loss_item,
-                pred_dist_orig_mean=current_pred_dist_orig_item
+                lev_aux_loss=current_unshuffle_loss_item,
+                nsp_loss=current_nsp_loss_item
             )
             
             if (not self.is_distributed or dist.get_rank() == 0) and \
@@ -481,9 +505,8 @@ class Trainer:
                 log_msg = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, Loss: {combined_loss_item:.4f}"
                 if self.config.use_levenshtein_task:
                     if current_lm_loss_item is not None: log_msg += f", LM Comp: {current_lm_loss_item:.4f}"
-                    if current_lev_loss_item is not None: log_msg += f", Lev Aux: {current_lev_loss_item:.4f}"
+                    if current_unshuffle_loss_item is not None: log_msg += f", Unshuffle Aux: {current_unshuffle_loss_item:.4f}"
                     if current_nsp_loss_item is not None: log_msg += f", NSP: {current_nsp_loss_item:.4f}"
-                    if current_pred_dist_orig_item is not None: log_msg += f", Pred Dist (orig): {current_pred_dist_orig_item:.4f}"
                 log_msg += f", LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_msg)
             
@@ -495,8 +518,8 @@ class Trainer:
                 print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
                 if self.config.use_levenshtein_task:
                     if self.metrics.val_lm_losses: print(f"  Val LM Comp: {self.metrics.val_lm_losses[-1]:.4f}")
-                    if self.metrics.val_lev_aux_losses: print(f"  Val Lev Aux (shuf): {self.metrics.val_lev_aux_losses[-1]:.4f}")
-                    if self.metrics.val_pred_dist_orig_means: print(f"  Val Pred Dist (orig): {self.metrics.val_pred_dist_orig_means[-1]:.4f}")
+                    if self.metrics.val_lev_aux_losses: print(f"  Val Unshuffle Aux: {self.metrics.val_lev_aux_losses[-1]:.4f}")
+                    if self.metrics.val_nsp_losses: print(f"  Val NSP: {self.metrics.val_nsp_losses[-1]:.4f}")
                 if is_best: self.save_checkpoint(self.metrics.total_steps, is_best=True)
                 current_metric_val = val_loss
                 improved = False
@@ -613,33 +636,28 @@ class Trainer:
         plot_idx += 1
 
         if self.config.use_levenshtein_task:
-            if self.metrics.lev_aux_losses:
-                 ax_flat[plot_idx].plot(self.metrics.lev_aux_losses, 'c-', alpha=0.7, label='Lev Aux Loss (Shuf, Train)')
-            ax_flat[plot_idx].set_title('Aux Losses (Train)')
+            if self.metrics.lev_aux_losses: # This now stores unshuffle loss
+                 ax_flat[plot_idx].plot(self.metrics.lev_aux_losses, 'c-', alpha=0.7, label='Unshuffle Aux Loss (Train)')
+            if self.metrics.nsp_losses:
+                 ax_flat[plot_idx].plot(self.metrics.nsp_losses, 'y-', alpha=0.7, label='NSP Aux Loss (Train)')
+            ax_flat[plot_idx].set_title('Auxiliary Task Losses (Training)')
             ax_flat[plot_idx].set_xlabel('Step'); ax_flat[plot_idx].set_ylabel('Loss'); ax_flat[plot_idx].grid(True, alpha=0.3); ax_flat[plot_idx].legend()
         plot_idx += 1
 
-        if self.config.use_levenshtein_task and \
-           (self.metrics.val_lm_losses or self.metrics.val_lev_aux_losses or self.metrics.val_pred_dist_orig_means):
+        if self.config.use_levenshtein_task: # For validation metrics as well
             val_steps = np.arange(len(self.metrics.val_losses)) * self.config.eval_every
-            ax_val_main = ax_flat[plot_idx]
+            ax_val_main = ax_flat[plot_idx] # Use a new subplot area for validation aux losses
+
             if self.metrics.val_lm_losses:
                  ax_val_main.plot(val_steps[:len(self.metrics.val_lm_losses)], self.metrics.val_lm_losses, 'r--', alpha=0.7, label='LM Loss Comp (Val)')
-            if self.metrics.val_lev_aux_losses:
-                ax_val_main.plot(val_steps[:len(self.metrics.val_lev_aux_losses)], self.metrics.val_lev_aux_losses, 'm--', alpha=0.7, label='Lev Aux Loss (Shuf, Val)')
+            if self.metrics.val_lev_aux_losses: # This is now unshuffle loss
+                ax_val_main.plot(val_steps[:len(self.metrics.val_lev_aux_losses)], self.metrics.val_lev_aux_losses, 'm--', alpha=0.7, label='Unshuffle Aux Loss (Val)')
+            if self.metrics.val_nsp_losses:
+                 ax_val_main.plot(val_steps[:len(self.metrics.val_nsp_losses)], self.metrics.val_nsp_losses, 'orange', linestyle='--', alpha=0.7, label='NSP Aux Loss (Val)')
+
             ax_val_main.set_title('Validation Loss Components')
             ax_val_main.set_xlabel('Step'); ax_val_main.set_ylabel('Loss'); ax_val_main.grid(True, alpha=0.3)
-
-            if self.metrics.val_pred_dist_orig_means:
-                ax_val_sec = ax_val_main.twinx()
-                ax_val_sec.plot(val_steps[:len(self.metrics.val_pred_dist_orig_means)], self.metrics.val_pred_dist_orig_means, 'k:', alpha=0.6, label='Mean Pred Dist (Orig, Val)')
-                ax_val_sec.set_ylabel('Mean Pred Dist (Val)', color='k')
-                ax_val_sec.tick_params(axis='y', labelcolor='k')
-                lines, labels = ax_val_main.get_legend_handles_labels()
-                lines2, labels2 = ax_val_sec.get_legend_handles_labels()
-                ax_val_main.legend(lines + lines2, labels + labels2, loc='best')
-            else:
-                ax_val_main.legend(loc='best')
+            ax_val_main.legend(loc='best')
         plot_idx += 1
         
         if self.metrics.learning_rates:
@@ -648,51 +666,88 @@ class Trainer:
             ax_flat[plot_idx].set_xlabel('Step'); ax_flat[plot_idx].set_ylabel('LR'); ax_flat[plot_idx].grid(True, alpha=0.3); ax_flat[plot_idx].legend()
         plot_idx += 1
         
-        for i in range(plot_idx, len(ax_flat)): fig.delaxes(ax_flat[i])
+        for i in range(plot_idx, len(ax_flat)): fig.delaxes(ax_flat[i]) # Remove unused subplots
         plt.tight_layout()
         if save_path: plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.show()
     
     def generate_sample(self, prompt="", max_length=100, temperature=0.8, top_k=50, top_p=None):
-        if not self.data_builder: return ""
+        if not self.data_builder:
+            print("Warning: DataBuilder not available in Trainer, cannot generate sample.")
+            return ""
+        if not hasattr(self.data_builder, 'cls_token_id') or self.data_builder.cls_token_id is None:
+            print("Warning: DataBuilder does not have a CLS token ID; cannot generate sample with required prefix.")
+            return ""
+        if not hasattr(self.data_builder, '_tokenize_text'): # Check for tokenizer method
+            print("Warning: DataBuilder does not have _tokenize_text method; cannot generate sample.")
+            return ""
+
+        TASK_ID_LM = ord('0') # Standard LM task
+        cls_id = self.data_builder.cls_token_id
+
+        prompt_tokens = self.data_builder._tokenize_text(prompt) if prompt else []
+
+        # Always start with [TASK_ID_LM, CLS_ID], then add prompt tokens
+        final_initial_tokens = [TASK_ID_LM, cls_id] + prompt_tokens
+
+        x = torch.tensor([final_initial_tokens], dtype=torch.long).to(self.config.device)
+
+        # The rest of the method (model.eval(), with torch.no_grad(), actual generation loop) remains unchanged.
         self.model.eval()
         model_to_generate_from = self.model.module if isinstance(self.model, DDP) else self.model
         with torch.no_grad():
-            tokens = self.data_builder._tokenize_text(prompt) if prompt else []
-            x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device) if tokens else \
-                torch.randint(0, self.data_builder.vocab_size, (1, 1)).to(self.config.device)
             autocast_context = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
             with autocast_context:
-                generated = model_to_generate_from.generate(x, max_new_tokens=max_length, temperature=temperature, top_k=top_k, top_p=top_p)
-            generated_text = self.data_builder.decode_tokens(generated[0])
+                # Call to model.generate should not have use_prefix_attention_in_prompt
+                generated_ids = model_to_generate_from.generate(
+                    idx=x,
+                    max_new_tokens=max_length,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p
+                )
+            generated_text = self.data_builder.decode_tokens(generated_ids[0])
         self.model.train()
         return generated_text
     
     def calculate_perplexity(self, dataloader, max_batches=None):
         self.model.eval()
         total_loss, num_batches = 0, 0
+        # lm_ignore_idx for perplexity calculation should be consistent with training
+        lm_ignore_idx_ppl = getattr(self.config, 'lm_ignore_idx', -1)
+
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
                 if max_batches is not None and batch_idx >= max_batches: break
 
-                # Updated batch unpacking for perplexity
-                if self.config.use_levenshtein_task :
-                    input_ids, lm_targets, _, _ = batch # Original text and its LM targets
-                elif hasattr(self.config, 'nsp_task') and self.config.nsp_task: # old check, for safety
-                    input_ids, lm_targets, _ = batch
-                else:
-                    input_ids, lm_targets = batch
-                input_ids, lm_targets = input_ids.to(self.config.device), lm_targets.to(self.config.device)
+                if self.config.use_levenshtein_task : # Multi-task batch
+                    input_ids, next_token_lm_targets, _, _, task_type_flags = batch
+                    # For perplexity, only consider pure LM task items (type 0)
+                    lm_mask = (task_type_flags == 0.0)
+                    if not lm_mask.any(): continue # Skip batch if no LM items
+                    input_ids = input_ids[lm_mask]
+                    # For perplexity, targets are next_token_lm_targets for pure LM items
+                    targets_for_ppl = next_token_lm_targets[lm_mask]
+                else: # Single-task LM batch
+                    input_ids, targets_for_ppl = batch
+
+                input_ids = input_ids.to(self.config.device)
+                targets_for_ppl = targets_for_ppl.to(self.config.device)
                 
-                per_item_lm_loss_for_ppl = None # Initialize to None
                 autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
                 with autocast_context:
-                    # Model's forward for perplexity should focus on LM loss from original_tokens_cls
-                    # It returns: lm_logits, per_item_lm_loss, predicted_lev_distances, nsp_logits
-                    _, per_item_lm_loss_for_ppl, _, _ = self.model(input_ids, lm_targets, force_disable_prefix_attention=True) # Force disable prefix for pure LM perplexity
+                    # Model's forward for perplexity should use next_token_lm_targets
+                    lm_logits, _, _ = self.model(input_ids, targets=None, force_disable_prefix_attention=True)
 
-                if per_item_lm_loss_for_ppl is not None:
-                    total_loss += per_item_lm_loss_for_ppl.mean().item()
+                # Calculate loss for perplexity using the logits and targets_for_ppl
+                # Ensure ignore_index is correctly applied
+                loss = F.cross_entropy(
+                    lm_logits.view(-1, lm_logits.size(-1)),
+                    targets_for_ppl.view(-1),
+                    ignore_index=lm_ignore_idx_ppl
+                )
+                if not torch.isnan(loss) and not torch.isinf(loss):
+                    total_loss += loss.item()
                     num_batches += 1
         self.model.train()
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
@@ -726,7 +781,7 @@ class Trainer:
                 hasattr(self.data_builder, 'cls_token_id') and \
                 self.data_builder.cls_token_id is not None
 
-            if model_is_lev_task_and_configured_for_cls_prefix: # Check if model is configured for this
+            if model_is_lev_task_and_configured_for_cls_prefix:
                 print(f"  Running CLS prefix attention inference tests (cls_id: {self.data_builder.cls_token_id})...")
                 for prompt_text in cls_test_prompts_text:
                     try:
