@@ -14,6 +14,7 @@ except ImportError:
         random.shuffle(shuffled_words)
         return ' '.join(shuffled_words), words, shuffled_words
 
+TASK_ID_NSP = 50 # ord('2')
 
 def _truncate_or_pad_tokens(tokens: list[int], max_len: int, pad_id: int) -> list[int]:
     """Truncate or pad tokens to max_len."""
@@ -83,25 +84,38 @@ class NSPDataset(Dataset):
             first_sent = sent_b
             second_sent = sent_a
         else:  # nsp_class == 2: Garbled/shuffled
-            first_sent, _, _ = shuffle_words_in_sentence(sent_a)
-            second_sent, _, _ = shuffle_words_in_sentence(sent_b)
+            first_sent, _, _ = shuffle_words_in_sentence(sent_a, shuffle_probability=1.0)
+            second_sent, _, _ = shuffle_words_in_sentence(sent_b, shuffle_probability=1.0)
         
         # Tokenize sentences
         first_tokens = self.tokenizer_fn(first_sent)
         second_tokens = self.tokenizer_fn(second_sent)
         
-        # Create input sequence: [CLS] first_sent [SEP] second_sent [SEP]
-        input_tokens = [self.cls_token_id] + first_tokens + [self.sep_token_id] + second_tokens + [self.sep_token_id]
+        # 1. Prepare input_tokens (with TASK_ID_NSP and CLS)
+        content_tokens = first_tokens + [self.sep_token_id] + second_tokens + [self.sep_token_id]
+        max_content_len = self.seq_len - 2 # Account for TASK_ID and CLS
+        if len(content_tokens) > max_content_len:
+            content_tokens = content_tokens[:max_content_len]
         
-        # Truncate and pad
-        input_tokens = _truncate_or_pad_tokens(input_tokens, self.seq_len, self.input_pad_id)
-        
-        # Create targets - all ignored for NSP task (no LM loss)
-        lm_targets = [self.lm_ignore_idx] * self.seq_len
-        
+        final_input_tokens_list = [TASK_ID_NSP, self.cls_token_id] + content_tokens
+        padded_input_tokens = _truncate_or_pad_tokens(final_input_tokens_list, self.seq_len, self.input_pad_id)
+
+        # 2. Prepare next_token_lm_targets (all ignore_idx)
+        next_token_lm_targets_list = [self.lm_ignore_idx] * self.seq_len
+
+        # 3. Prepare unshuffle_seq_targets (placeholder: all ignore_idx)
+        unshuffle_seq_targets_list = [self.lm_ignore_idx] * self.seq_len
+
+        # 4. Auxiliary scalar value (NSP class label)
+        auxiliary_scalar_value_tensor = torch.tensor(float(nsp_class), dtype=torch.float)
+
+        # 5. Task type flag
+        task_type_flag_tensor = torch.tensor(2.0, dtype=torch.float) # Type 2 for NSP
+
         return (
-            torch.tensor(input_tokens, dtype=torch.long),
-            torch.tensor(lm_targets, dtype=torch.long),
-            torch.tensor(float(nsp_class), dtype=torch.float),  # NSP class label
-            torch.tensor(2.0, dtype=torch.float),  # Task type flag (2.0 for NSP)
+            torch.tensor(padded_input_tokens, dtype=torch.long),
+            torch.tensor(next_token_lm_targets_list, dtype=torch.long),
+            torch.tensor(unshuffle_seq_targets_list, dtype=torch.long),
+            auxiliary_scalar_value_tensor,
+            task_type_flag_tensor
         )
