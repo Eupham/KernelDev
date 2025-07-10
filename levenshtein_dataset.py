@@ -13,6 +13,7 @@ except ImportError:
     def shuffle_words_in_sentence(s): return s, s.split(), s.split()
     def word_levenshtein_distance(s1, s2): return len(s1) + len(s2)
 
+TASK_ID_LEV_UNSHUFFLE = 49 # ord('1')
 
 def _truncate_or_pad_tokens(tokens: list[int], max_len: int, pad_id: int) -> list[int]:
     if len(tokens) > max_len:
@@ -46,6 +47,8 @@ class LevenshteinDataset(Dataset):
         if not 0.0 <= shuffle_percentage <= 1.0:
             raise ValueError("shuffle_percentage must be between 0.0 and 1.0")
         self.shuffle_percentage = shuffle_percentage
+        self.current_min_shuffle_p: float = 0.05
+        self.current_max_shuffle_p: float = 0.05 # Start with a narrow range at the minimum
 
         self.sentences = raw_documents_or_sentences # Store raw data directly
         # self.examples list and call to _prepare_examples are removed
@@ -53,67 +56,65 @@ class LevenshteinDataset(Dataset):
     def __len__(self):
         return len(self.sentences)
 
+    def update_shuffle_range(self, min_p: float, max_p: float):
+        # Clamp probabilities to be between 0.0 and 1.0
+        min_p_clamped = max(0.0, min(min_p, 1.0))
+        max_p_clamped = max(0.0, min(max_p, 1.0))
+
+        # Ensure min_p is not greater than max_p after clamping
+        self.current_min_shuffle_p = min(min_p_clamped, max_p_clamped)
+        self.current_max_shuffle_p = max(min_p_clamped, max_p_clamped)
+
+        # Optional: print for confirmation, can be removed later
+        # print(f"LevenshteinDataset: Shuffle prob range updated to [{self.current_min_shuffle_p:.4f}, {self.current_max_shuffle_p:.4f}]")
+
     def __getitem__(self, idx):
+        # TASK_ID_LEV_UNSHUFFLE = 49 # Define or import
+
         original_sentence_text = self.sentences[idx]
-        if not original_sentence_text.strip(): # Handle empty strings
-            original_sentence_text = ""
+        if not original_sentence_text.strip():
+            original_sentence_text = " " # Avoid empty tokenization issues
 
-        # Decide if this item should be shuffled
-        is_shuffled_item_flag_val = 1.0 if random.random() < self.shuffle_percentage else 0.0
+        selected_probability = random.uniform(self.current_min_shuffle_p, self.current_max_shuffle_p)
+        shuffled_sentence_text, original_words_list_for_lev_metric_only, _ = \
+            shuffle_words_in_sentence(original_sentence_text, selected_probability)
+        # Note: original_words_list_for_lev_metric_only and the third return from shuffle_words_in_sentence
+        # are not directly used in the returned tensors if we are removing scalar Lev distance.
 
-        input_text_to_tokenize = ""
-        target_lev_distance_for_item = 0.0
-        create_valid_lm_targets = False
+        # 1. Prepare input_tokens with Task ID (shuffled content)
+        tokens_shuffled_content = self.tokenizer_fn(shuffled_sentence_text)
+        max_content_len = self.seq_len - 2 # For TASK_ID and CLS
+        if len(tokens_shuffled_content) > max_content_len:
+            tokens_shuffled_content = tokens_shuffled_content[:max_content_len]
+        final_input_tokens_list = [TASK_ID_LEV_UNSHUFFLE, self.cls_token_id] + tokens_shuffled_content
+        padded_input_tokens = _truncate_or_pad_tokens(final_input_tokens_list, self.seq_len, self.input_pad_id)
 
-        if is_shuffled_item_flag_val == 1.0:
-            shuffled_sentence_text, original_words, shuffled_words = shuffle_words_in_sentence(original_sentence_text)
-            input_text_to_tokenize = shuffled_sentence_text
-            num_original_words = len(original_words)
-            if num_original_words > 0:
-                raw_lev_dist = word_levenshtein_distance(original_words, shuffled_words)
-                target_lev_distance_for_item = float(raw_lev_dist) / num_original_words
-            else:
-                target_lev_distance_for_item = 0.0
-            create_valid_lm_targets = False # No LM loss for shuffled items
-        else: # Original item
-            input_text_to_tokenize = original_sentence_text
-            target_lev_distance_for_item = 0.0 # Target for Levenshtein head on original is 0
-            create_valid_lm_targets = True # Calculate LM loss for original items
+        # 2. Prepare next_token_lm_targets (all ignore_idx for this task type 1)
+        next_token_lm_targets_list = [self.lm_ignore_idx] * self.seq_len
 
-        # Tokenize, Prepend CLS, Truncate/Pad the chosen input_text_to_tokenize
-        tokens = self.tokenizer_fn(input_text_to_tokenize)
-        tokens_cls_list = [self.cls_token_id] + tokens
-        if len(tokens_cls_list) > self.seq_len:
-            final_tokens_list = [self.cls_token_id] + tokens_cls_list[1:self.seq_len]
+        # 3. Prepare unshuffle_target_tokens (shifted original sentence)
+        original_tokens = self.tokenizer_fn(original_sentence_text) # Tokenize the original sentence
+
+        # Shift for next-token prediction style target:
+        if not original_tokens: # Handle case where original_sentence_text tokenizes to empty
+            shifted_original_tokens = [self.lm_ignore_idx]
         else:
-            final_tokens_list = tokens_cls_list
-        padded_input_tokens = _truncate_or_pad_tokens(final_tokens_list, self.seq_len, self.input_pad_id)
+            shifted_original_tokens = original_tokens[1:] + [self.lm_ignore_idx]
 
-        # Create LM Targets
-        lm_targets_padded_list = []
-        if create_valid_lm_targets:
-            temp_lm_targets = []
-            for i in range(self.seq_len):
-                if i < len(padded_input_tokens) - 1:
-                    is_cls_at_start = (i == 0 and padded_input_tokens[i] == self.cls_token_id)
-                    is_input_padding = (padded_input_tokens[i] == self.input_pad_id)
+        unshuffle_target_tokens_list = _truncate_or_pad_tokens(shifted_original_tokens, self.seq_len, self.lm_ignore_idx)
 
-                    if is_cls_at_start or is_input_padding or padded_input_tokens[i+1] == self.input_pad_id:
-                        temp_lm_targets.append(self.lm_ignore_idx)
-                    else:
-                        temp_lm_targets.append(padded_input_tokens[i+1])
-                else:
-                    temp_lm_targets.append(self.lm_ignore_idx)
-            lm_targets_padded_list = _truncate_or_pad_tokens(temp_lm_targets[:self.seq_len], self.seq_len, self.lm_ignore_idx)
-        else: # For shuffled items, LM targets are all ignored
-            lm_targets_padded_list = [self.lm_ignore_idx] * self.seq_len
+        # 4. Auxiliary scalar value (placeholder)
+        auxiliary_scalar_value = torch.tensor(0.0, dtype=torch.float32)
 
-        # Return 4 Tensors
+        # 5. Task type flag
+        task_type_flag_tensor = torch.tensor(1.0, dtype=torch.float32) # Type 1 for Levenshtein/Unshuffle
+
         return (
             torch.tensor(padded_input_tokens, dtype=torch.long),
-            torch.tensor(lm_targets_padded_list, dtype=torch.long),
-            torch.tensor(target_lev_distance_for_item, dtype=torch.float32),
-            torch.tensor(is_shuffled_item_flag_val, dtype=torch.float32)
+            torch.tensor(next_token_lm_targets_list, dtype=torch.long),
+            torch.tensor(unshuffle_target_tokens_list, dtype=torch.long),
+            auxiliary_scalar_value,
+            task_type_flag_tensor
         )
 
 if __name__ == '__main__':
