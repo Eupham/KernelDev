@@ -483,6 +483,40 @@ class Trainer:
         epoch: int = 0
     ):
         self.model.train()
+
+        # Curriculum learning for shuffle probability
+        if self.config.use_levenshtein_task and hasattr(train_loader, 'dataset'):
+            dataset_instance = train_loader.dataset # This is CombinedMultiTaskDataset
+
+            if hasattr(dataset_instance, 'update_lev_shuffle_parameters') and \
+               callable(getattr(dataset_instance, 'update_lev_shuffle_parameters')):
+
+                total_epochs = self.config.num_epochs
+                # Calculate progress: 0.0 at epoch 0, towards 1.0 at final epoch
+                # Ensure no division by zero if total_epochs is 1
+                progress = epoch / max(1, total_epochs - 1) if total_epochs > 1 else 0.0
+                progress = min(max(progress, 0.0), 1.0) # Clamp progress to [0,1]
+
+                start_min_p = 0.05  # Minimum shuffle probability always
+                initial_max_p = 0.05 # Max shuffle probability at the start of training
+                end_max_p = 0.5     # Max shuffle probability at the end of training curriculum
+
+                # Interpolate current_max_p for the epoch
+                current_max_p_for_epoch = initial_max_p + (end_max_p - initial_max_p) * progress
+
+                # Clamp the calculated max_p to be within [start_min_p, end_max_p]
+                # and also ensure it's not less than start_min_p itself.
+                current_max_p_for_epoch = max(start_min_p, min(current_max_p_for_epoch, end_max_p))
+
+                min_p_for_epoch = start_min_p
+
+                # print(f"Epoch {epoch+1}/{total_epochs}: Updating shuffle range to [{min_p_for_epoch:.4f}, {current_max_p_for_epoch:.4f}]")
+                dataset_instance.update_lev_shuffle_parameters(min_p_for_epoch, current_max_p_for_epoch)
+            else:
+                if not self.is_distributed or dist.get_rank() == 0:
+                    print("Warning: Training dataset does not support shuffle parameter updates for curriculum.")
+
+        # Existing train_epoch logic starts here
         epoch_losses = []
         start_time = time.time()
         if self.is_distributed and hasattr(train_loader.sampler, 'set_epoch') and dist.get_world_size() > 1:

@@ -184,3 +184,12 @@ class CombinedMultiTaskDataset(Dataset):
             # LM task - positions 4,5,6,7
             doc_idx = idx % len(self.raw_documents)
             return self._create_lm_sample(self.raw_documents[doc_idx])
+
+    def update_lev_shuffle_parameters(self, min_p: float, max_p: float):
+        if hasattr(self, 'levenshtein_dataset') and \
+           hasattr(self.levenshtein_dataset, 'update_shuffle_range') and \
+           callable(getattr(self.levenshtein_dataset, 'update_shuffle_range')):
+            self.levenshtein_dataset.update_shuffle_range(min_p, max_p)
+        else:
+            # This warning helps if LevenshteinDataset's structure changes or is missing
+            print("Warning: CombinedMultiTaskDataset's Levenshtein dataset not found or does not support shuffle range update.")

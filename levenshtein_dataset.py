@@ -47,13 +47,26 @@ class LevenshteinDataset(Dataset):
         if not 0.0 <= shuffle_percentage <= 1.0:
             raise ValueError("shuffle_percentage must be between 0.0 and 1.0")
         self.shuffle_percentage = shuffle_percentage
-        self.shuffle_probabilities = [0.25, 0.50, 0.75, 1.0] # Added shuffle probabilities
+        self.current_min_shuffle_p: float = 0.05
+        self.current_max_shuffle_p: float = 0.05 # Start with a narrow range at the minimum
 
         self.sentences = raw_documents_or_sentences # Store raw data directly
         # self.examples list and call to _prepare_examples are removed
 
     def __len__(self):
         return len(self.sentences)
+
+    def update_shuffle_range(self, min_p: float, max_p: float):
+        # Clamp probabilities to be between 0.0 and 1.0
+        min_p_clamped = max(0.0, min(min_p, 1.0))
+        max_p_clamped = max(0.0, min(max_p, 1.0))
+
+        # Ensure min_p is not greater than max_p after clamping
+        self.current_min_shuffle_p = min(min_p_clamped, max_p_clamped)
+        self.current_max_shuffle_p = max(min_p_clamped, max_p_clamped)
+
+        # Optional: print for confirmation, can be removed later
+        # print(f"LevenshteinDataset: Shuffle prob range updated to [{self.current_min_shuffle_p:.4f}, {self.current_max_shuffle_p:.4f}]")
 
     def __getitem__(self, idx):
         # TASK_ID_LEV_UNSHUFFLE = 49 # Define or import
@@ -62,7 +75,7 @@ class LevenshteinDataset(Dataset):
         if not original_sentence_text.strip():
             original_sentence_text = " " # Avoid empty tokenization issues
 
-        selected_probability = random.choice(self.shuffle_probabilities)
+        selected_probability = random.uniform(self.current_min_shuffle_p, self.current_max_shuffle_p)
         shuffled_sentence_text, original_words_list_for_lev_metric_only, _ = \
             shuffle_words_in_sentence(original_sentence_text, selected_probability)
         # Note: original_words_list_for_lev_metric_only and the third return from shuffle_words_in_sentence
