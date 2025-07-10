@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
+from custom_samplers import StrictRatioBatchSampler # Added
 # Do NOT import load_dataset at module level to avoid conflicts
 import numpy as np
 from typing import Optional, Dict, Any
@@ -669,34 +670,58 @@ class DataBuilder:
             current_shuffle_status = shuffle_train if split_name == 'train' else False
             current_pin_memory = torch.cuda.is_available()
 
-            print(f"batch_size: {batch_size}")
-            print(f"shuffle: {current_shuffle_status}")
-            print(f"num_workers: {num_workers}")
-            print(f"collate_fn: None (using default)") # DataLoader uses default_collate if None
-            print(f"pin_memory: {current_pin_memory}")
-
             if dataset_obj is None: # Re-check after prints, before DataLoader call
                 print(f"Skipping DataLoader for {split_name} as dataset is None or invalid after attribute checks.")
                 print(f"--- {split_name}_dataloader preparation skipped ---")
                 continue
 
-            try:
-                dataloaders[split_name] = DataLoader(
-                    dataset_obj, batch_size=batch_size, shuffle=current_shuffle_status,
-                    num_workers=num_workers, pin_memory=current_pin_memory
+            if split_name == 'train' and self.use_levenshtein_task: # Use custom sampler only for train and if multi-task
+                print(f"--- Preparing train_dataloader (using StrictRatioBatchSampler) ---")
+                # Ratios: (lev_ratio, nsp_ratio, lm_ratio) - matching CombinedMultiTaskDataset defaults
+                task_ratios = (0.25, 0.25, 0.5)
+
+                train_batch_sampler = StrictRatioBatchSampler(
+                    dataset=dataset_obj,
+                    batch_size=batch_size, # This is the effective batch size
+                    ratios=task_ratios,
+                    drop_last=True # drop_last for training is typical
                 )
-            except (TypeError, ValueError) as e:
-                # Handle datasets that don't support shuffling (e.g., IterableDatasets)
-                if current_shuffle_status and ("shuffle" in str(e) or "len()" in str(e)):
-                    print(f"Warning: Dataset doesn't support shuffling. Creating DataLoader without shuffle.")
+
+                dataloaders[split_name] = DataLoader(
+                    dataset_obj,
+                    batch_sampler=train_batch_sampler,
+                    num_workers=num_workers,
+                    pin_memory=current_pin_memory
+                    # When batch_sampler is provided, batch_size, shuffle, sampler, and drop_last are ignored.
+                    # DataLoader's batch_size should be None or 1 in this case, but it's implicitly handled.
+                )
+                print(f"batch_sampler: StrictRatioBatchSampler instance")
+                print(f"num_workers: {num_workers}")
+                print(f"pin_memory: {current_pin_memory}")
+
+            else: # Standard DataLoader for validation, test, or non-multi-task training
+                print(f"batch_size: {batch_size}")
+                print(f"shuffle: {current_shuffle_status}")
+                print(f"num_workers: {num_workers}")
+                print(f"collate_fn: None (using default)")
+                print(f"pin_memory: {current_pin_memory}")
+                try:
                     dataloaders[split_name] = DataLoader(
-                        dataset_obj, batch_size=batch_size, shuffle=False,
+                        dataset_obj, batch_size=batch_size, shuffle=current_shuffle_status,
                         num_workers=num_workers, pin_memory=current_pin_memory
                     )
-                else:
-                    raise  # Re-raise if it's a different error
-                    
+                except (TypeError, ValueError) as e:
+                    if current_shuffle_status and ("shuffle" in str(e) or "len()" in str(e)):
+                        print(f"Warning: Dataset doesn't support shuffling. Creating DataLoader without shuffle.")
+                        dataloaders[split_name] = DataLoader(
+                            dataset_obj, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=current_pin_memory
+                        )
+                    else:
+                        raise
+
             try:
+                # For BatchSampler, len(dataloader) gives number of batches.
                 batch_count = len(dataloaders[split_name])
                 print(f"{split_name} dataloader created: {batch_count} batches")
             except (TypeError, AttributeError):
