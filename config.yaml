@@ -36,6 +36,11 @@ training:
   use_levenshtein_task: true # Enable Levenshtein distance auxiliary task
   levenshtein_loss_weight: 0.5 # Weight for Levenshtein loss
 
+  # Dynamic Loss Adjustment Parameters
+  long_term_loss_window: 1000       # Window for long-term average loss
+  short_term_loss_window: 100      # Window for short-term average loss
+  dynamic_loss_adjustment_factor: 0.1 # Factor for penalty/reward calculation
+
   # Plateau detection parameters
   plateau_monitor_metric: 'val_loss'
   plateau_patience: 10

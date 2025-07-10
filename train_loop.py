@@ -49,8 +49,11 @@ class TrainingConfig:
         scheduler_T_mult: int = 1,
         use_levenshtein_task: bool = False,
         levenshtein_loss_weight: float = 0.1,
-        nsp_loss_weight: float = 0.1, # Added for consistency
-        lm_ignore_idx: int = -1
+        nsp_loss_weight: float = 0.1,
+        lm_ignore_idx: int = -1,
+        long_term_loss_window: int = 1000,  # New
+        short_term_loss_window: int = 100, # New
+        dynamic_loss_adjustment_factor: float = 0.1 # New
     ):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -76,8 +79,11 @@ class TrainingConfig:
         self.scheduler_T_mult = scheduler_T_mult
         self.use_levenshtein_task = use_levenshtein_task
         self.levenshtein_loss_weight = levenshtein_loss_weight
-        self.nsp_loss_weight = nsp_loss_weight
-        self.lm_ignore_idx = lm_ignore_idx
+        self.nsp_loss_weight = nsp_loss_weight # Ensure this is present from previous changes
+        self.lm_ignore_idx = lm_ignore_idx     # Ensure this is present
+        self.long_term_loss_window = long_term_loss_window
+        self.short_term_loss_window = short_term_loss_window
+        self.dynamic_loss_adjustment_factor = dynamic_loss_adjustment_factor
         
         if device == "auto":
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -160,10 +166,12 @@ class TrainingMetrics:
         self.val_lev_aux_losses = [] # Stores unshuffle_loss for validation
         self.val_nsp_losses = []
         # self.val_pred_dist_orig_means = [] # Removed
+        self.penalty_rewards = []
 
     def update(self, train_loss=None, val_loss=None, learning_rate=None, step_time=None,
-                 lm_loss_component=None, lev_aux_loss=None, nsp_loss=None, # pred_dist_orig_mean removed
-                 val_lm_loss_component=None, val_lev_aux_loss=None, val_nsp_loss=None): # val_pred_dist_orig_mean removed
+                 lm_loss_component=None, lev_aux_loss=None, nsp_loss=None,
+                 val_lm_loss_component=None, val_lev_aux_loss=None, val_nsp_loss=None,
+                 penalty_reward=None): # New parameter
         if train_loss is not None: self.train_losses.append(train_loss)
         if val_loss is not None:
             self.val_losses.append(val_loss)
@@ -179,6 +187,8 @@ class TrainingMetrics:
         if val_lm_loss_component is not None: self.val_lm_losses.append(val_lm_loss_component)
         if val_lev_aux_loss is not None: self.val_lev_aux_losses.append(val_lev_aux_loss)
         if val_nsp_loss is not None: self.val_nsp_losses.append(val_nsp_loss)
+        if penalty_reward is not None:
+            self.penalty_rewards.append(penalty_reward)
         self.total_steps += 1
     
     def get_avg_step_time(self, last_n=100):
@@ -221,6 +231,16 @@ class TrainingMetrics:
         if not relevant_losses:
             return None
         return np.mean(relevant_losses)
+
+    def get_avg_penalty_reward(self, last_n: int) -> Optional[float]:
+        if not self.penalty_rewards:
+            return None
+        relevant_values = self.penalty_rewards[-last_n:]
+        # Filter out None values, though penalty_reward should always be float (even 0.0)
+        relevant_values = [v for v in relevant_values if v is not None]
+        if not relevant_values:
+            return None
+        return np.mean(relevant_values)
     
     def save_metrics(self, filepath):
         metrics_dict = {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
@@ -343,33 +363,41 @@ class Trainer:
         # Store the original combined_loss value for metrics and logging
         raw_combined_loss_val = combined_loss.item()
 
-        # --- Dynamic Loss Adjustment ---
-        final_loss_for_backward = combined_loss # Start with the raw combined loss tensor
+        # --- New Dynamic Loss Adjustment ---
+        final_loss_for_backward = combined_loss # Default to raw loss
+        current_penalty_reward_val = 0.0 # Initialize for potential logging if not applied
 
-        averaging_window = self.config.log_every
-        if hasattr(self.config, 'loss_avg_window') and self.config.loss_avg_window > 0: # Optional: new config param
-            averaging_window = self.config.loss_avg_window
+        # Check if dynamic adjustment parameters are available in config
+        use_dynamic_adjustment = hasattr(self.config, 'long_term_loss_window') and \
+                                 hasattr(self.config, 'short_term_loss_window') and \
+                                 hasattr(self.config, 'dynamic_loss_adjustment_factor')
 
-        if averaging_window > 0:
-            average_combined_loss_val = self.metrics.get_avg_combined_loss(last_n=averaging_window)
+        if use_dynamic_adjustment and self.config.long_term_loss_window > 0 and self.config.short_term_loss_window > 0:
+            avg_loss_long = self.metrics.get_avg_combined_loss(last_n=self.config.long_term_loss_window)
+            avg_loss_short = self.metrics.get_avg_combined_loss(last_n=self.config.short_term_loss_window)
 
-            if average_combined_loss_val is not None and self.metrics.total_steps >= averaging_window:
-                avg_loss_tensor = torch.tensor(average_combined_loss_val,
-                                               device=combined_loss.device,
-                                               dtype=combined_loss.dtype).detach()
+            # Apply adjustment only if both averages are available and we've had enough steps for the long window
+            if avg_loss_long is not None and avg_loss_short is not None and \
+               self.metrics.total_steps >= self.config.long_term_loss_window:
 
-                deviation = combined_loss - avg_loss_tensor
-                penalty_reward_component = deviation * 0.1
-                final_loss_for_backward = combined_loss + penalty_reward_component
+                signal_val = avg_loss_short - avg_loss_long
+                current_penalty_reward_val = signal_val * self.config.dynamic_loss_adjustment_factor
 
-                # Optional: Log the adjustment for debugging
-                # print(f"Step {self.metrics.total_steps}: Raw Loss: {raw_combined_loss_val:.4f}, Avg Loss: {average_combined_loss_val:.4f}, Adjusted Loss: {final_loss_for_backward.item():.4f}")
-        # --- End of Dynamic Loss Adjustment ---
+                penalty_reward_tensor = torch.tensor(current_penalty_reward_val,
+                                                     device=combined_loss.device,
+                                                     dtype=combined_loss.dtype).detach() # Detach, as it's based on prior steps
+
+                final_loss_for_backward = combined_loss + penalty_reward_tensor
+                # Optional: print for debugging
+                # print(f"Step {self.metrics.total_steps}: RawLoss={raw_combined_loss_val:.4f}, AvgL={avg_loss_long:.4f}, AvgS={avg_loss_short:.4f}, PR={current_penalty_reward_val:.4f}, FinalLoss={final_loss_for_backward.item():.4f}")
+
+        # --- End of New Dynamic Loss Adjustment ---
 
         if not final_loss_for_backward.requires_grad and final_loss_for_backward.abs().item() < 1e-9:
              # If the final loss (after potential adjustment) is effectively zero and has no grad,
              # return the raw loss values as if no step was taken for loss calculation.
-             return 0.0, mean_lm_loss_component_item, unshuffle_loss_item, mean_nsp_loss_item
+             # Also, the penalty/reward would be effectively 0 or not meaningful to record.
+             return 0.0, mean_lm_loss_component_item, unshuffle_loss_item, mean_nsp_loss_item, 0.0
 
         if self.config.use_amp and self.config.scaler is not None:
             self.config.scaler.scale(final_loss_for_backward).backward()
@@ -384,8 +412,8 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
 
-        # Return raw_combined_loss_val for consistent metric tracking
-        return raw_combined_loss_val, mean_lm_loss_component_item, unshuffle_loss_item, mean_nsp_loss_item
+        # Return raw_combined_loss_val for metrics, and current_penalty_reward_val for new metric tracking
+        return raw_combined_loss_val, mean_lm_loss_component_item, unshuffle_loss_item, mean_nsp_loss_item, current_penalty_reward_val
 
     def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
         self.model.eval()
@@ -590,43 +618,51 @@ class Trainer:
         for batch_idx, batch in enumerate(train_loader):
             step_start = time.time()
             combined_loss_item, current_lm_loss_item, current_unshuffle_loss_item, \
-                current_nsp_loss_item = self.train_step(batch)
+                current_nsp_loss_item, current_penalty_reward = self.train_step(batch) # Added current_penalty_reward
             epoch_losses.append(combined_loss_item)
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
             self.metrics.update(
-                train_loss=combined_loss_item,
+                train_loss=combined_loss_item, # This is raw combined loss
                 learning_rate=current_lr,
                 step_time=time.time() - step_start,
                 lm_loss_component=current_lm_loss_item,
-                lev_aux_loss=current_unshuffle_loss_item,
-                nsp_loss=current_nsp_loss_item
+                lev_aux_loss=current_unshuffle_loss_item, # Stores unshuffle_loss_item
+                nsp_loss=current_nsp_loss_item,
+                penalty_reward=current_penalty_reward # New
             )
             
             if (not self.is_distributed or dist.get_rank() == 0) and \
                self.metrics.total_steps % self.config.log_every == 0:
 
-                log_window = self.config.log_every
+                long_window = self.config.long_term_loss_window
+                log_interval_window = self.config.log_every # For penalty reward and step time avg to match log freq
 
-                avg_combined_loss = self.metrics.get_avg_combined_loss(last_n=log_window)
-                avg_lm_comp = self.metrics.get_avg_lm_loss(last_n=log_window)
-                avg_unshuffle_aux = self.metrics.get_avg_unshuffle_loss(last_n=log_window)
-                avg_nsp_loss = self.metrics.get_avg_nsp_loss(last_n=log_window)
+                avg_combined_loss = self.metrics.get_avg_combined_loss(last_n=long_window)
+                avg_lm_comp = self.metrics.get_avg_lm_loss(last_n=long_window)
+                avg_unshuffle_aux = self.metrics.get_avg_unshuffle_loss(last_n=long_window)
+                avg_nsp_loss = self.metrics.get_avg_nsp_loss(last_n=long_window)
+                avg_penalty_reward = self.metrics.get_avg_penalty_reward(last_n=log_interval_window)
 
-                avg_step_time = self.metrics.get_avg_step_time(last_n=log_window)
+                avg_step_time = self.metrics.get_avg_step_time(last_n=log_interval_window)
 
                 log_msg = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}"
-                log_msg += f", Avg Loss: {avg_combined_loss:.4f}" if avg_combined_loss is not None else f", Loss: {combined_loss_item:.4f}"
+                # Display raw current combined loss, then the long-term average
+                log_msg += f", Loss: {combined_loss_item:.4f}" # Current raw loss for this step
+                log_msg += f", AvgLoss(L): {avg_combined_loss:.4f}" if avg_combined_loss is not None else ""
 
-                if self.config.use_levenshtein_task: # This implies multi-task mode
-                    lm_log = f"{avg_lm_comp:.4f}" if avg_lm_comp is not None else (f"{current_lm_loss_item:.4f}" if current_lm_loss_item is not None else "N/A")
-                    log_msg += f", Avg LM Comp: {lm_log}"
+                if self.config.use_levenshtein_task: # Multi-task mode
+                    lm_log = f"{avg_lm_comp:.4f}" if avg_lm_comp is not None else "N/A"
+                    log_msg += f", AvgLM(L): {lm_log}"
 
-                    unshuffle_log = f"{avg_unshuffle_aux:.4f}" if avg_unshuffle_aux is not None else (f"{current_unshuffle_loss_item:.4f}" if current_unshuffle_loss_item is not None else "N/A")
-                    log_msg += f", Avg Unshuffle Aux: {unshuffle_log}"
+                    unshuffle_log = f"{avg_unshuffle_aux:.4f}" if avg_unshuffle_aux is not None else "N/A"
+                    log_msg += f", AvgUnshuffle(L): {unshuffle_log}"
 
-                    nsp_log = f"{avg_nsp_loss:.4f}" if avg_nsp_loss is not None else (f"{current_nsp_loss_item:.4f}" if current_nsp_loss_item is not None else "N/A")
-                    log_msg += f", Avg NSP: {nsp_log}"
+                    nsp_log = f"{avg_nsp_loss:.4f}" if avg_nsp_loss is not None else "N/A"
+                    log_msg += f", AvgNSP(L): {nsp_log}"
+
+                    penalty_log = f"{avg_penalty_reward:.4f}" if avg_penalty_reward is not None else (f"{current_penalty_reward:.4f}" if current_penalty_reward is not None else "N/A")
+                    log_msg += f", AvgPenalty: {penalty_log}" # Avg of penalty over log_interval_window
 
                 log_msg += f", LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_msg)
