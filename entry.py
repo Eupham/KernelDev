@@ -706,25 +706,24 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
         print("Warning: Train dataloader is empty in test_causal_attention. Skipping test.")
         return
 
-    if lev_task_enabled:
-        # Expecting (input_tokens, lm_targets, auxiliary_values, task_type_flags)
-        if len(first_batch) == 4:
-            input_tokens, lm_targets, auxiliary_values, task_type_flags = first_batch
-            x = input_tokens # Use the input_tokens
+    if lev_task_enabled: # This means multi-task is enabled, datasets return 5 items
+        # New 5-item tuple: (input_tokens, next_token_lm_targets, rank_targets, aux_scalar, task_flags)
+        if len(first_batch) == 5:
+            # We only need input_tokens for this test.
+            input_tokens, _, _, _, _ = first_batch
+            x = input_tokens
         else:
-            print(f"Warning: Expected 4 items in Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            print(f"Warning: Expected 5 items in multi-task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
-    else:
+    else: # Standard LM task
         # Expecting (input_ids, lm_targets)
         if len(first_batch) == 2:
-            x, _ = first_batch # y (lm_targets) is not used in this function
+            x, _ = first_batch
         else:
-            print(f"Warning: Expected 2 items in non-Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            print(f"Warning: Expected 2 items in single-task LM batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
 
     x = x.to(device)
-    # The rest of the function uses 'x'
-
     model.to(device)
     model.eval()
     

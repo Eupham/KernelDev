@@ -928,8 +928,9 @@ class Trainer:
                 
                 autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
                 with autocast_context:
-                    # Model's forward for perplexity should use next_token_lm_targets
-                    lm_logits, _, _ = self.model(input_ids, targets=None, force_disable_prefix_attention=True)
+                    # Model's forward now returns 4 values: lm_logits, loss, nsp_logits, rank_regression_outputs
+                    # We only need lm_logits for perplexity.
+                    lm_logits, _, _, _ = self.model(input_ids, targets=None, force_disable_prefix_attention=True)
 
                 # Calculate loss for perplexity using the logits and targets_for_ppl
                 # Ensure ignore_index is correctly applied
