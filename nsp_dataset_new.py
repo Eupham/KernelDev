@@ -104,8 +104,11 @@ class NSPDataset(Dataset):
         # 2. Prepare next_token_lm_targets (all ignore_idx)
         next_token_lm_targets_list = [self.lm_ignore_idx] * self.seq_len
 
-        # 3. Prepare unshuffle_seq_targets (placeholder: all ignore_idx)
-        unshuffle_seq_targets_list = [self.lm_ignore_idx] * self.seq_len
+        # 3. Prepare placeholder for sequence targets (float, all ignore_idx)
+        # This corresponds to rank_regression_targets from LevenshteinDataset
+        # Needs to be float32 to match the dtype from LevenshteinDataset's rank targets
+        rank_ignore_val_float = float(self.lm_ignore_idx)
+        aux_sequence_targets_list = [rank_ignore_val_float] * self.seq_len
 
         # 4. Auxiliary scalar value (NSP class label)
         auxiliary_scalar_value_tensor = torch.tensor(float(nsp_class), dtype=torch.float)
@@ -116,7 +119,7 @@ class NSPDataset(Dataset):
         return (
             torch.tensor(padded_input_tokens, dtype=torch.long),
             torch.tensor(next_token_lm_targets_list, dtype=torch.long),
-            torch.tensor(unshuffle_seq_targets_list, dtype=torch.long),
+            torch.tensor(aux_sequence_targets_list, dtype=torch.float32), # Changed to float32
             auxiliary_scalar_value_tensor,
             task_type_flag_tensor
         )
