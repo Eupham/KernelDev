@@ -158,20 +158,18 @@ class TrainingMetrics:
         self.best_step = 0
 
         self.lm_losses = []
-        self.lev_aux_losses = [] # Stores unshuffle_loss for training
+        self.rank_aux_losses = [] # Stores rank_regression_loss for training (formerly lev_aux_losses)
         self.nsp_losses = []
-        # self.pred_dist_orig_means = [] # Removed
 
         self.val_lm_losses = []
-        self.val_lev_aux_losses = [] # Stores unshuffle_loss for validation
+        self.val_rank_aux_losses = [] # Stores rank_regression_loss for validation (formerly val_lev_aux_losses)
         self.val_nsp_losses = []
-        # self.val_pred_dist_orig_means = [] # Removed
         self.penalty_rewards = []
 
     def update(self, train_loss=None, val_loss=None, learning_rate=None, step_time=None,
-                 lm_loss_component=None, lev_aux_loss=None, nsp_loss=None,
-                 val_lm_loss_component=None, val_lev_aux_loss=None, val_nsp_loss=None,
-                 penalty_reward=None): # New parameter
+                 lm_loss_component=None, rank_aux_loss=None, nsp_loss=None, # Renamed lev_aux_loss
+                 val_lm_loss_component=None, val_rank_aux_loss=None, val_nsp_loss=None, # Renamed val_lev_aux_loss
+                 penalty_reward=None):
         if train_loss is not None: self.train_losses.append(train_loss)
         if val_loss is not None:
             self.val_losses.append(val_loss)
@@ -181,11 +179,11 @@ class TrainingMetrics:
         if learning_rate is not None: self.learning_rates.append(learning_rate)
         if step_time is not None: self.step_times.append(step_time)
         if lm_loss_component is not None: self.lm_losses.append(lm_loss_component)
-        if lev_aux_loss is not None: self.lev_aux_losses.append(lev_aux_loss)
+        if rank_aux_loss is not None: self.rank_aux_losses.append(rank_aux_loss) # Renamed
         if nsp_loss is not None: self.nsp_losses.append(nsp_loss)
 
         if val_lm_loss_component is not None: self.val_lm_losses.append(val_lm_loss_component)
-        if val_lev_aux_loss is not None: self.val_lev_aux_losses.append(val_lev_aux_loss)
+        if val_rank_aux_loss is not None: self.val_rank_aux_losses.append(val_rank_aux_loss) # Renamed
         if val_nsp_loss is not None: self.val_nsp_losses.append(val_nsp_loss)
         if penalty_reward is not None:
             self.penalty_rewards.append(penalty_reward)
@@ -214,10 +212,10 @@ class TrainingMetrics:
             return None
         return np.mean(relevant_losses)
 
-    def get_avg_unshuffle_loss(self, last_n: int) -> Optional[float]: # Uses self.lev_aux_losses
-        if not self.lev_aux_losses:
+    def get_avg_rank_loss(self, last_n: int) -> Optional[float]: # Renamed, uses self.rank_aux_losses
+        if not self.rank_aux_losses:
             return None
-        relevant_losses = self.lev_aux_losses[-last_n:]
+        relevant_losses = self.rank_aux_losses[-last_n:]
         relevant_losses = [l for l in relevant_losses if l is not None]
         if not relevant_losses:
             return None
@@ -274,29 +272,34 @@ class Trainer:
     def train_step(self, batch: Tuple[torch.Tensor, ...]) -> Tuple[float, Optional[float], Optional[float], Optional[float]]:
         """
         Train step with multi-task support.
-        Returns: (combined_loss_val, lm_loss_item, unshuffle_loss_item, nsp_loss_item)
+        Returns: (combined_loss_val, lm_loss_item, rank_loss_item, nsp_loss_item, penalty_reward_item)
         """
         mean_lm_loss_component_item = None
-        unshuffle_loss_item = None
+        rank_loss_item = None # Renamed from unshuffle_loss_item
         mean_nsp_loss_item = None
 
-        if self.config.use_levenshtein_task:
-            input_tokens, next_token_lm_targets, unshuffle_seq_targets, auxiliary_values, task_type_flags = batch
+        # The model's forward method now returns:
+        # lm_logits, per_item_lm_loss (if targets provided), nsp_logits, rank_regression_outputs
+        # The batch structure for multi-task is:
+        # input_tokens, next_token_lm_targets, rank_regression_targets (formerly unshuffle_seq_targets), auxiliary_values, task_type_flags
+
+        if self.config.use_levenshtein_task: # This flag now means "use multi-task including rank regression"
+            input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags = batch
             input_tokens = input_tokens.to(self.config.device)
             next_token_lm_targets = next_token_lm_targets.to(self.config.device)
-            unshuffle_seq_targets = unshuffle_seq_targets.to(self.config.device)
+            rank_targets = rank_targets.to(self.config.device) # These are float targets for ranks
             auxiliary_values = auxiliary_values.to(self.config.device)
             task_type_flags = task_type_flags.to(self.config.device)
-        else:
+        else: # Single-task LM mode
             if len(batch) == 2:
                 input_tokens, next_token_lm_targets = batch
-            elif len(batch) == 5:
+            elif len(batch) == 5: # If data loader still yields 5 items even in single task mode
                  input_tokens, next_token_lm_targets, _, _, _ = batch
             else:
                 raise ValueError(f"Unexpected batch structure with {len(batch)} items in single-task mode.")
-            unshuffle_seq_targets = None
+            rank_targets = None
             auxiliary_values = None
-            task_type_flags = None
+            task_type_flags = None # Indicates pure LM task if None or all 0.0
 
             input_tokens = input_tokens.to(self.config.device)
             next_token_lm_targets = next_token_lm_targets.to(self.config.device)
@@ -304,41 +307,52 @@ class Trainer:
         self.optimizer.zero_grad()
         
         final_batch_lm_loss_component = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-        unshuffle_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+        rank_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32) # Renamed
         mean_nsp_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
 
         autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
 
         with autocast_context:
-            lm_logits_all, per_item_lm_loss_all, nsp_logits_all = self.model(
+            # Model returns: lm_logits, per_item_lm_loss, nsp_logits, rank_regression_outputs
+            lm_logits_all, per_item_lm_loss_all, nsp_logits_all, rank_regression_outputs_all = self.model(
                 input_tokens,
-                next_token_lm_targets,
+                next_token_lm_targets, # Pass LM targets for model to calculate per_item_lm_loss if needed
                 force_disable_prefix_attention=False
             )
 
-            if self.config.use_levenshtein_task and task_type_flags is not None:
-                lm_task_mask = (task_type_flags == 0.0)
-                lev_task_mask = (task_type_flags == 1.0)
-                nsp_task_mask = (task_type_flags == 2.0)
+            if self.config.use_levenshtein_task and task_type_flags is not None: # Multi-task logic
+                lm_task_mask = (task_type_flags == 0.0)  # Task ID for LM
+                rank_task_mask = (task_type_flags == 1.0) # Task ID for Rank Regression
+                nsp_task_mask = (task_type_flags == 2.0) # Task ID for NSP
                 
+                # LM Loss component (from items marked as LM task)
                 if lm_task_mask.any() and per_item_lm_loss_all is not None:
                     valid_lm_losses = per_item_lm_loss_all[lm_task_mask]
                     if valid_lm_losses.numel() > 0:
                         final_batch_lm_loss_component = valid_lm_losses.float().mean()
                 
-                if lev_task_mask.any() and unshuffle_seq_targets is not None:
-                    predictions_for_unshuffle = lm_logits_all[lev_task_mask]
-                    targets_for_unshuffle = unshuffle_seq_targets[lev_task_mask]
+                # Rank Regression Loss component (from items marked as Rank task)
+                if rank_task_mask.any() and rank_targets is not None and rank_regression_outputs_all is not None:
+                    # rank_regression_outputs_all are (batch, seq_len, 1)
+                    # rank_targets are (batch, seq_len)
+                    predictions_for_rank = rank_regression_outputs_all[rank_task_mask].squeeze(-1) # -> (n_rank_items, seq_len)
+                    targets_for_rank = rank_targets[rank_task_mask] # -> (n_rank_items, seq_len)
 
-                    if predictions_for_unshuffle.numel() > 0 and targets_for_unshuffle.numel() > 0:
-                        vocab_size = predictions_for_unshuffle.size(-1)
-                        unshuffle_loss_tensor = F.cross_entropy(
-                            predictions_for_unshuffle.reshape(-1, vocab_size),
-                            targets_for_unshuffle.reshape(-1),
-                            ignore_index= getattr(self.config, 'lm_ignore_idx', -1)
-                        )
-                        unshuffle_loss_item = unshuffle_loss_tensor.item()
+                    if predictions_for_rank.numel() > 0 and targets_for_rank.numel() > 0:
+                        # Mask ignored positions (where target is ignore_idx_float)
+                        # Use self.config.lm_ignore_idx as the basis for the float ignore value.
+                        # Dataset uses rank_ignore_idx_float which is float(lm_ignore_idx).
+                        rank_ignore_val = float(getattr(self.config, 'lm_ignore_idx', -1.0))
+                        valid_rank_mask = (targets_for_rank != rank_ignore_val)
+
+                        if valid_rank_mask.any(): # Only compute loss if there are valid targets
+                            rank_loss_tensor = F.mse_loss(
+                                predictions_for_rank[valid_rank_mask],
+                                targets_for_rank[valid_rank_mask]
+                            )
+                            rank_loss_item = rank_loss_tensor.item()
                 
+                # NSP Loss component (from items marked as NSP task)
                 if nsp_task_mask.any() and nsp_logits_all is not None:
                     nsp_predicted = nsp_logits_all[nsp_task_mask]
                     nsp_targets = auxiliary_values[nsp_task_mask].long()
@@ -347,27 +361,35 @@ class Trainer:
                         mean_nsp_loss_tensor = loss_fn_nsp(nsp_predicted, nsp_targets)
                         mean_nsp_loss_item = mean_nsp_loss_tensor.item()
                 
+                # Combine losses for multi-task items
+                # Start with LM loss component (which could be 0 if no LM items in batch or all ignored)
                 combined_loss = final_batch_lm_loss_component
-                combined_loss = combined_loss + (self.config.levenshtein_loss_weight * unshuffle_loss_tensor)
-                nsp_loss_weight = getattr(self.config, 'nsp_loss_weight', 0.1)
+                # Add weighted Rank Regression loss
+                combined_loss = combined_loss + (self.config.levenshtein_loss_weight * rank_loss_tensor) # Re-use levenshtein_loss_weight for rank task
+                # Add weighted NSP loss
+                nsp_loss_weight = getattr(self.config, 'nsp_loss_weight', 0.1) # Default if not in config
                 combined_loss = combined_loss + (nsp_loss_weight * mean_nsp_loss_tensor)
                 
-            else:
-                if per_item_lm_loss_all is not None:
+            else: # Single-task LM mode
+                if per_item_lm_loss_all is not None: # Should contain losses for all items
                      final_batch_lm_loss_component = per_item_lm_loss_all.float().mean()
-                combined_loss = final_batch_lm_loss_component
+                combined_loss = final_batch_lm_loss_component # Only LM loss
 
+            # Ensure lm_loss_component_item is a float for metrics
             if isinstance(final_batch_lm_loss_component, torch.Tensor) and final_batch_lm_loss_component.numel() > 0 :
                  mean_lm_loss_component_item = final_batch_lm_loss_component.item()
+            elif isinstance(final_batch_lm_loss_component, float): # If it was already a float (e.g. from .mean().item())
+                 mean_lm_loss_component_item = final_batch_lm_loss_component
+
 
         # Store the original combined_loss value for metrics and logging
-        raw_combined_loss_val = combined_loss.item()
+        raw_combined_loss_val = combined_loss.item() if isinstance(combined_loss, torch.Tensor) else float(combined_loss)
 
-        # --- New Dynamic Loss Adjustment ---
-        final_loss_for_backward = combined_loss # Default to raw loss
-        current_penalty_reward_val = 0.0 # Initialize for potential logging if not applied
 
-        # Check if dynamic adjustment parameters are available in config
+        # --- Dynamic Loss Adjustment (remains the same) ---
+        final_loss_for_backward = combined_loss
+        current_penalty_reward_val = 0.0
+
         use_dynamic_adjustment = hasattr(self.config, 'long_term_loss_window') and \
                                  hasattr(self.config, 'short_term_loss_window') and \
                                  hasattr(self.config, 'dynamic_loss_adjustment_factor')
@@ -376,31 +398,26 @@ class Trainer:
             avg_loss_long = self.metrics.get_avg_combined_loss(last_n=self.config.long_term_loss_window)
             avg_loss_short = self.metrics.get_avg_combined_loss(last_n=self.config.short_term_loss_window)
 
-            # Apply adjustment only if both averages are available and we've had enough steps for the long window
             if avg_loss_long is not None and avg_loss_short is not None and \
                self.metrics.total_steps >= self.config.long_term_loss_window:
-
                 signal_val = avg_loss_short - avg_loss_long
                 current_penalty_reward_val = signal_val * self.config.dynamic_loss_adjustment_factor
-
                 penalty_reward_tensor = torch.tensor(current_penalty_reward_val,
                                                      device=combined_loss.device,
-                                                     dtype=combined_loss.dtype).detach() # Detach, as it's based on prior steps
-
+                                                     dtype=combined_loss.dtype).detach()
                 final_loss_for_backward = combined_loss + penalty_reward_tensor
-                # Optional: print for debugging
-                # print(f"Step {self.metrics.total_steps}: RawLoss={raw_combined_loss_val:.4f}, AvgL={avg_loss_long:.4f}, AvgS={avg_loss_short:.4f}, PR={current_penalty_reward_val:.4f}, FinalLoss={final_loss_for_backward.item():.4f}")
+        # --- End of Dynamic Loss Adjustment ---
 
-        # --- End of New Dynamic Loss Adjustment ---
-
-        if not final_loss_for_backward.requires_grad and final_loss_for_backward.abs().item() < 1e-9:
-             # If the final loss (after potential adjustment) is effectively zero and has no grad,
-             # return the raw loss values as if no step was taken for loss calculation.
-             # Also, the penalty/reward would be effectively 0 or not meaningful to record.
-             return 0.0, mean_lm_loss_component_item, unshuffle_loss_item, mean_nsp_loss_item, 0.0
+        # Handle cases where loss might be effectively zero or non-finite before backward pass
+        if not isinstance(final_loss_for_backward, torch.Tensor) or \
+           not final_loss_for_backward.requires_grad or \
+           not torch.isfinite(final_loss_for_backward) or \
+           final_loss_for_backward.abs().item() < 1e-9 : # If loss is ~0 and no grad
+             # Return raw loss values; penalty/reward also effectively 0 or not meaningful.
+             return raw_combined_loss_val, mean_lm_loss_component_item, rank_loss_item, mean_nsp_loss_item, 0.0
 
         if self.config.use_amp and self.config.scaler is not None:
-            self.config.scaler.scale(final_loss_for_backward).backward()
+            self.config.scaler.scale(final_loss_for_backward).backward() # final_loss_for_backward is used for gradient calculation
             if self.config.max_grad_norm > 0:
                 self.config.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
@@ -413,21 +430,23 @@ class Trainer:
             self.optimizer.step()
 
         # Return raw_combined_loss_val for metrics, and current_penalty_reward_val for new metric tracking
-        return raw_combined_loss_val, mean_lm_loss_component_item, unshuffle_loss_item, mean_nsp_loss_item, current_penalty_reward_val
+        return raw_combined_loss_val, mean_lm_loss_component_item, rank_loss_item, mean_nsp_loss_item, current_penalty_reward_val
 
     def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
         self.model.eval()
         total_combined_loss_epoch = 0.0
         accum_lm_loss_component = 0.0
-        accum_unshuffle_loss = 0.0
+        accum_rank_loss = 0.0 # Renamed from accum_unshuffle_loss
         accum_nsp_loss = 0.0
 
         num_batches_processed = 0
         num_lm_batches = 0
-        num_unshuffle_batches = 0
+        num_rank_batches = 0 # Renamed from num_unshuffle_batches
         num_nsp_batches = 0
 
+        # Use lm_ignore_idx for LM loss and as basis for rank_ignore_idx_float
         lm_ignore_idx = getattr(self.config, 'lm_ignore_idx', -1)
+        rank_ignore_val = float(lm_ignore_idx) # For rank targets
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
@@ -435,99 +454,105 @@ class Trainer:
                     print(f"Evaluation limited to {max_batches} batches for speed")
                     break
                 
-                if self.config.use_levenshtein_task:
-                    input_tokens, next_token_lm_targets, unshuffle_seq_targets, auxiliary_values, task_type_flags = batch
+                # Batch unpacking, similar to train_step
+                if self.config.use_levenshtein_task: # Multi-task mode
+                    input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags = batch
                     input_tokens = input_tokens.to(self.config.device)
                     next_token_lm_targets = next_token_lm_targets.to(self.config.device)
-                    unshuffle_seq_targets = unshuffle_seq_targets.to(self.config.device)
+                    rank_targets = rank_targets.to(self.config.device) # Float tensor for ranks
                     auxiliary_values = auxiliary_values.to(self.config.device)
                     task_type_flags = task_type_flags.to(self.config.device)
-                else:
-                    if len(batch) == 2:
-                        input_tokens, next_token_lm_targets = batch
-                    elif len(batch) == 5:
-                        input_tokens, next_token_lm_targets, _, _, _ = batch
-                    else:
-                        raise ValueError("Unexpected batch structure in single-task mode during eval.")
+                else: # Single-task LM mode
+                    if len(batch) == 2: input_tokens, next_token_lm_targets = batch
+                    elif len(batch) == 5: input_tokens, next_token_lm_targets, _, _, _ = batch
+                    else: raise ValueError("Unexpected batch structure in single-task mode during eval.")
+
                     input_tokens = input_tokens.to(self.config.device)
                     next_token_lm_targets = next_token_lm_targets.to(self.config.device)
+                    # Create dummy tensors for other components if in single-task mode
                     batch_dim_size = input_tokens.size(0)
-                    unshuffle_seq_targets = torch.full_like(next_token_lm_targets, lm_ignore_idx)
+                    rank_targets = torch.full_like(next_token_lm_targets, rank_ignore_val, dtype=torch.float32)
                     auxiliary_values = torch.zeros(batch_dim_size, device=self.config.device, dtype=torch.float)
-                    task_type_flags = torch.zeros(batch_dim_size, device=self.config.device, dtype=torch.float)
+                    task_type_flags = torch.zeros(batch_dim_size, device=self.config.device, dtype=torch.float) # All LM task
 
-                current_batch_lm_component_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-                current_batch_unshuffle_component_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-                current_batch_nsp_component_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+                current_batch_lm_component_loss_val = 0.0
+                current_batch_rank_component_loss_val = 0.0
+                current_batch_nsp_component_loss_val = 0.0
 
                 autocast_context_eval = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
                 with autocast_context_eval:
-                    lm_logits_all, per_item_lm_loss_all, nsp_logits_all = self.model(
+                    # Model returns: lm_logits, per_item_lm_loss, nsp_logits, rank_regression_outputs
+                    lm_logits_all, per_item_lm_loss_all, nsp_logits_all, rank_regression_outputs_all = self.model(
                         input_tokens,
-                        next_token_lm_targets,
-                        force_disable_prefix_attention=False
+                        next_token_lm_targets, # Pass LM targets
+                        force_disable_prefix_attention=False # Or True if evaluation should always be causal for LM parts
                     )
 
                 lm_task_mask_eval = (task_type_flags == 0.0)
-                lev_task_mask_eval = (task_type_flags == 1.0)
+                rank_task_mask_eval = (task_type_flags == 1.0) # For Rank Regression
                 nsp_task_mask_eval = (task_type_flags == 2.0)
 
+                # LM Loss
                 if lm_task_mask_eval.any() and per_item_lm_loss_all is not None:
-                    lm_loss_for_lm_items = per_item_lm_loss_all[lm_task_mask_eval]
-                    if lm_loss_for_lm_items.numel() > 0:
-                        valid_lm_items = lm_loss_for_lm_items[lm_loss_for_lm_items != float('inf')]
-                        if valid_lm_items.numel() > 0:
-                            current_lm_loss_value = valid_lm_items.float().mean().item()
-                            if not math.isnan(current_lm_loss_value) and not math.isinf(current_lm_loss_value):
-                                accum_lm_loss_component += current_lm_loss_value
-                                num_lm_batches += 1
-                                current_batch_lm_component_loss = torch.tensor(current_lm_loss_value, device=self.config.device)
+                    lm_losses_for_lm_items = per_item_lm_loss_all[lm_task_mask_eval]
+                    if lm_losses_for_lm_items.numel() > 0:
+                        valid_lm_losses = lm_losses_for_lm_items[torch.isfinite(lm_losses_for_lm_items)]
+                        if valid_lm_losses.numel() > 0:
+                            current_batch_lm_component_loss_val = valid_lm_losses.float().mean().item()
+                            accum_lm_loss_component += current_batch_lm_component_loss_val
+                            num_lm_batches += 1
 
-                if self.config.use_levenshtein_task and lev_task_mask_eval.any() and lm_logits_all is not None and unshuffle_seq_targets is not None:
-                    predictions_for_unshuffle_eval = lm_logits_all[lev_task_mask_eval]
-                    targets_for_unshuffle_eval = unshuffle_seq_targets[lev_task_mask_eval]
-                    if predictions_for_unshuffle_eval.numel() > 0 and targets_for_unshuffle_eval.numel() > 0:
-                        vocab_size = predictions_for_unshuffle_eval.size(-1)
-                        unshuffle_loss_tensor_calc = F.cross_entropy(
-                            predictions_for_unshuffle_eval.reshape(-1, vocab_size),
-                            targets_for_unshuffle_eval.reshape(-1),
-                            ignore_index=lm_ignore_idx
-                        )
-                        current_batch_unshuffle_component_loss = unshuffle_loss_tensor_calc
-                        if not torch.isnan(unshuffle_loss_tensor_calc) and not torch.isinf(unshuffle_loss_tensor_calc):
-                            accum_unshuffle_loss += unshuffle_loss_tensor_calc.item()
-                            num_unshuffle_batches += 1
+                # Rank Regression Loss
+                if self.config.use_levenshtein_task and rank_task_mask_eval.any() and \
+                   rank_regression_outputs_all is not None and rank_targets is not None:
 
+                    preds_for_rank_eval = rank_regression_outputs_all[rank_task_mask_eval].squeeze(-1)
+                    targets_for_rank_eval = rank_targets[rank_task_mask_eval]
+
+                    if preds_for_rank_eval.numel() > 0 and targets_for_rank_eval.numel() > 0:
+                        valid_rank_mask_eval = (targets_for_rank_eval != rank_ignore_val)
+                        if valid_rank_mask_eval.any():
+                            rank_loss_val = F.mse_loss(
+                                preds_for_rank_eval[valid_rank_mask_eval],
+                                targets_for_rank_eval[valid_rank_mask_eval]
+                            ).item()
+                            if not math.isnan(rank_loss_val) and not math.isinf(rank_loss_val):
+                                current_batch_rank_component_loss_val = rank_loss_val
+                                accum_rank_loss += rank_loss_val
+                                num_rank_batches +=1
+
+                # NSP Loss
                 if self.config.use_levenshtein_task and nsp_task_mask_eval.any() and nsp_logits_all is not None:
                     nsp_predicted_eval = nsp_logits_all[nsp_task_mask_eval]
                     nsp_targets_eval = auxiliary_values[nsp_task_mask_eval].long()
                     if nsp_predicted_eval.numel() > 0 and nsp_targets_eval.numel() > 0:
-                        nsp_loss_tensor_calc = F.cross_entropy(nsp_predicted_eval, nsp_targets_eval)
-                        current_batch_nsp_component_loss = nsp_loss_tensor_calc
-                        if not torch.isnan(nsp_loss_tensor_calc) and not torch.isinf(nsp_loss_tensor_calc):
-                            accum_nsp_loss += nsp_loss_tensor_calc.item()
+                        nsp_loss_val = F.cross_entropy(nsp_predicted_eval, nsp_targets_eval).item()
+                        if not math.isnan(nsp_loss_val) and not math.isinf(nsp_loss_val):
+                            current_batch_nsp_component_loss_val = nsp_loss_val
+                            accum_nsp_loss += nsp_loss_val
                             num_nsp_batches +=1
 
-                batch_total_loss_val = current_batch_lm_component_loss
-                if self.config.use_levenshtein_task:
-                    batch_total_loss_val = batch_total_loss_val + \
-                                           (self.config.levenshtein_loss_weight * current_batch_unshuffle_component_loss) + \
-                                           (getattr(self.config, 'nsp_loss_weight', 0.1) * current_batch_nsp_component_loss)
+                # Combine component losses for the batch (as float values)
+                # This mirrors the logic in train_step for how combined_loss is formed before dynamic adjustment.
+                batch_combined_loss_val = current_batch_lm_component_loss_val
+                if self.config.use_levenshtein_task: # If multi-tasking
+                    batch_combined_loss_val += (self.config.levenshtein_loss_weight * current_batch_rank_component_loss_val)
+                    batch_combined_loss_val += (getattr(self.config, 'nsp_loss_weight', 0.1) * current_batch_nsp_component_loss_val)
 
-                total_combined_loss_epoch += batch_total_loss_val.item()
+                total_combined_loss_epoch += batch_combined_loss_val
                 num_batches_processed +=1
 
         self.model.train()
         avg_combined_loss = total_combined_loss_epoch / num_batches_processed if num_batches_processed > 0 else float('inf')
         avg_lm_loss_component = accum_lm_loss_component / num_lm_batches if num_lm_batches > 0 else 0.0
-        avg_unshuffle_loss = accum_unshuffle_loss / num_unshuffle_batches if num_unshuffle_batches > 0 else 0.0
-        avg_nsp_loss = accum_nsp_loss / num_nsp_batches if num_nsp_batches > 0 else 0.0
+        avg_rank_loss_component = accum_rank_loss / num_rank_batches if num_rank_batches > 0 else 0.0 # Renamed
+        avg_nsp_loss_component = accum_nsp_loss / num_nsp_batches if num_nsp_batches > 0 else 0.0
 
         self.metrics.update(
             val_loss=avg_combined_loss,
             val_lm_loss_component=avg_lm_loss_component,
-            val_lev_aux_loss=avg_unshuffle_loss,
-            val_nsp_loss=avg_nsp_loss
+            val_rank_aux_loss=avg_rank_loss_component, # Renamed from val_lev_aux_loss
+            val_nsp_loss=avg_nsp_loss_component
         )
         return avg_combined_loss
     
@@ -640,23 +665,22 @@ class Trainer:
 
                 avg_combined_loss = self.metrics.get_avg_combined_loss(last_n=long_window)
                 avg_lm_comp = self.metrics.get_avg_lm_loss(last_n=long_window)
-                avg_unshuffle_aux = self.metrics.get_avg_unshuffle_loss(last_n=long_window)
+                avg_rank_aux = self.metrics.get_avg_rank_loss(last_n=long_window) # Renamed
                 avg_nsp_loss = self.metrics.get_avg_nsp_loss(last_n=long_window)
                 avg_penalty_reward = self.metrics.get_avg_penalty_reward(last_n=log_interval_window)
 
                 avg_step_time = self.metrics.get_avg_step_time(last_n=log_interval_window)
 
                 log_msg = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}"
-                # Display raw current combined loss, then the long-term average
-                log_msg += f", Loss: {combined_loss_item:.4f}" # Current raw loss for this step
+                log_msg += f", Loss: {combined_loss_item:.4f}"
                 log_msg += f", AvgLoss(L): {avg_combined_loss:.4f}" if avg_combined_loss is not None else ""
 
-                if self.config.use_levenshtein_task: # Multi-task mode
+                if self.config.use_levenshtein_task: # Multi-task mode (levenshtein_task flag now means multi-task with rank)
                     lm_log = f"{avg_lm_comp:.4f}" if avg_lm_comp is not None else "N/A"
                     log_msg += f", AvgLM(L): {lm_log}"
 
-                    unshuffle_log = f"{avg_unshuffle_aux:.4f}" if avg_unshuffle_aux is not None else "N/A"
-                    log_msg += f", AvgUnshuffle(L): {unshuffle_log}"
+                    rank_log = f"{avg_rank_aux:.4f}" if avg_rank_aux is not None else "N/A" # Renamed
+                    log_msg += f", AvgRankReg(L): {rank_log}" # Changed log key
 
                     nsp_log = f"{avg_nsp_loss:.4f}" if avg_nsp_loss is not None else "N/A"
                     log_msg += f", AvgNSP(L): {nsp_log}"
@@ -673,9 +697,9 @@ class Trainer:
                 val_loss = self.evaluate(val_loader)
                 is_best = val_loss < self.metrics.best_val_loss
                 print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
-                if self.config.use_levenshtein_task:
+                if self.config.use_levenshtein_task: # Multi-task mode
                     if self.metrics.val_lm_losses: print(f"  Val LM Comp: {self.metrics.val_lm_losses[-1]:.4f}")
-                    if self.metrics.val_lev_aux_losses: print(f"  Val Unshuffle Aux: {self.metrics.val_lev_aux_losses[-1]:.4f}")
+                    if self.metrics.val_rank_aux_losses: print(f"  Val RankReg Aux: {self.metrics.val_rank_aux_losses[-1]:.4f}") # Renamed
                     if self.metrics.val_nsp_losses: print(f"  Val NSP: {self.metrics.val_nsp_losses[-1]:.4f}")
                 if is_best: self.save_checkpoint(self.metrics.total_steps, is_best=True)
                 current_metric_val = val_loss
@@ -792,9 +816,9 @@ class Trainer:
             ax_flat[plot_idx].set_xlabel('Step'); ax_flat[plot_idx].set_ylabel('Loss'); ax_flat[plot_idx].grid(True, alpha=0.3); ax_flat[plot_idx].legend()
         plot_idx += 1
 
-        if self.config.use_levenshtein_task:
-            if self.metrics.lev_aux_losses: # This now stores unshuffle loss
-                 ax_flat[plot_idx].plot(self.metrics.lev_aux_losses, 'c-', alpha=0.7, label='Unshuffle Aux Loss (Train)')
+        if self.config.use_levenshtein_task: # Multi-task mode
+            if self.metrics.rank_aux_losses: # Renamed from lev_aux_losses
+                 ax_flat[plot_idx].plot(self.metrics.rank_aux_losses, 'c-', alpha=0.7, label='RankReg Aux Loss (Train)') # Renamed label
             if self.metrics.nsp_losses:
                  ax_flat[plot_idx].plot(self.metrics.nsp_losses, 'y-', alpha=0.7, label='NSP Aux Loss (Train)')
             ax_flat[plot_idx].set_title('Auxiliary Task Losses (Training)')
@@ -803,12 +827,12 @@ class Trainer:
 
         if self.config.use_levenshtein_task: # For validation metrics as well
             val_steps = np.arange(len(self.metrics.val_losses)) * self.config.eval_every
-            ax_val_main = ax_flat[plot_idx] # Use a new subplot area for validation aux losses
+            ax_val_main = ax_flat[plot_idx]
 
             if self.metrics.val_lm_losses:
                  ax_val_main.plot(val_steps[:len(self.metrics.val_lm_losses)], self.metrics.val_lm_losses, 'r--', alpha=0.7, label='LM Loss Comp (Val)')
-            if self.metrics.val_lev_aux_losses: # This is now unshuffle loss
-                ax_val_main.plot(val_steps[:len(self.metrics.val_lev_aux_losses)], self.metrics.val_lev_aux_losses, 'm--', alpha=0.7, label='Unshuffle Aux Loss (Val)')
+            if self.metrics.val_rank_aux_losses: # Renamed from val_lev_aux_losses
+                ax_val_main.plot(val_steps[:len(self.metrics.val_rank_aux_losses)], self.metrics.val_rank_aux_losses, 'm--', alpha=0.7, label='RankReg Aux Loss (Val)') # Renamed label
             if self.metrics.val_nsp_losses:
                  ax_val_main.plot(val_steps[:len(self.metrics.val_nsp_losses)], self.metrics.val_nsp_losses, 'orange', linestyle='--', alpha=0.7, label='NSP Aux Loss (Val)')
 

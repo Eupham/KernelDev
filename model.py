@@ -131,6 +131,9 @@ class GPTModel(nn.Module):
 
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
+
+        # Head for Auxiliary Task 1: Rank Regression (1 scalar per token, sigmoid output)
+        self.rank_regression_head = nn.Linear(self.dim, 1)
         
         self.apply(self._init_weights)
     
@@ -147,8 +150,8 @@ class GPTModel(nn.Module):
         
         # Initialize loss and auxiliary output
         loss = None
-        # predicted_distance_score = None # Removed for Levenshtein task
         nsp_logits = None # For NSP task
+        rank_regression_outputs = None # For Rank Regression task (Aux Task 1)
 
         # Create current_is_prefix_token_mask based on cls_token_id and use_cls_prefix_attention
         current_is_prefix_token_mask = None
@@ -182,18 +185,21 @@ class GPTModel(nn.Module):
         # processed_x is hidden states (batch_size, seq_len, dim)
         processed_x = self.norm_out(processed_x)
 
-        # Language model logits
+        # Language model logits (Primary Task)
         logits = self.head(processed_x) # (batch_size, seq_len, vocab_size)
 
-        # Auxiliary heads using CLS token representation
+        # Auxiliary Task 1: Rank Regression Head
+        # Takes all hidden states and predicts a rank (0-1) for each token position.
+        rank_regression_logits = self.rank_regression_head(processed_x) # (batch_size, seq_len, 1)
+        rank_regression_outputs = torch.sigmoid(rank_regression_logits) # (batch_size, seq_len, 1)
+
+        # Auxiliary Task (NSP-like, using CLS token representation)
         if self.cls_token_id is not None: # Indicates CLS token processing is relevant
-            cls_representation = processed_x[:, 1, :] # CLS is now at index 1
-            # predicted_distance_score calculation removed
-            # NSP logits for 3-class classification
+            cls_representation = processed_x[:, 1, :] # CLS is at index 1
             nsp_logits = self.nsp_head(cls_representation) # Output shape: (batch_size, 3)
 
         if targets is not None:
-            # Calculate raw per-token loss, without reduction
+            # Calculate raw per-token loss for the primary LM task, without reduction
             raw_lm_loss_per_token = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
@@ -214,9 +220,10 @@ class GPTModel(nn.Module):
             lm_loss_per_item = per_item_lm_loss_sum / per_item_valid_token_count
             loss = lm_loss_per_item
         else:
-            loss = None
+            loss = None # Loss is None if targets are not provided (e.g., during inference)
 
-        return logits, loss, nsp_logits # Return NSP logits, predicted_distance_score removed
+        # Return all relevant outputs
+        return logits, loss, nsp_logits, rank_regression_outputs
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_prefix_attention_in_prompt: bool = False):
         """
@@ -243,9 +250,10 @@ class GPTModel(nn.Module):
                 # Crop sequence if it gets too long
                 idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
                 
-                # Forward pass - update to expect three return values from self.forward()
+                # Forward pass - now expects four return values from self.forward()
                 # Pass force_disable_prefix_attention based on not use_prefix_attention_in_prompt
-                logits, _, _ = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
+                # We only need 'logits' for generation.
+                logits, _, _, _ = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
                 logits = logits[:, -1, :] / temperature
                 
                 # Apply top-k filtering if specified

@@ -1,29 +1,34 @@
 import random
 import re
 
-def shuffle_words_in_sentence(sentence_text: str, shuffle_probability: float) -> tuple[str, list[str], list[str]]:
+def shuffle_words_in_sentence(sentence_text: str, shuffle_probability: float) -> tuple[str, list[str], list[str], list[int]]:
     """
     Splits a sentence into words. Based on shuffle_probability, selects a subset
     of words to shuffle among their original positions.
-    Returns the shuffled sentence, original word list, and the new word list.
+    Returns the shuffled sentence, original word list, the new word list (final_shuffled_word_list),
+    and permuted_word_source_indices.
+    permuted_word_source_indices[i] is the original index in original_words of the word
+    that is now at final_shuffled_word_list[i].
     """
-    if not sentence_text.strip():
-        return "", [], []
+    stripped_sentence = sentence_text.strip()
+    if not stripped_sentence:
+        return "", [], [], []
 
-    original_words = [word for word in re.split(r'\s+', sentence_text.strip()) if word]
-    if not original_words:
-        return "", [], []
+    original_words = [word for word in re.split(r'\s+', stripped_sentence) if word]
+    if not original_words: # Handles cases like sentence_text being just spaces
+        return "", [], [], []
+
+    # Initialize permuted_word_source_indices as identity mapping
+    # This list tracks the original index of the word at each position in the (eventually) shuffled list.
+    permuted_word_source_indices = list(range(len(original_words)))
 
     if shuffle_probability <= 0: # No shuffling if probability is zero or less
-        return sentence_text, original_words, original_words[:]
-    if shuffle_probability >= 1: # Full shuffle if probability is one or more
-        # This can revert to the simpler full shuffle logic for p=1.0
-        # For consistency with the subset logic, let's ensure it still works.
-        # All indices will be selected.
-        pass
+        return stripped_sentence, original_words, original_words[:], permuted_word_source_indices
 
+    # For shuffle_probability >= 1, all words are candidates for shuffling.
+    # The logic below naturally handles this by selecting all indices if random.random() < 1.0 always true.
 
-    indices_to_shuffle = []
+    indices_to_shuffle = [] # These are indices *within original_words* that are chosen to be part of the shuffle
     for i in range(len(original_words)):
         if random.random() < shuffle_probability:
             indices_to_shuffle.append(i)
@@ -31,23 +36,34 @@ def shuffle_words_in_sentence(sentence_text: str, shuffle_probability: float) ->
     if len(indices_to_shuffle) <= 1:
         # If 0 or 1 word is selected, no shuffle occurs / is meaningful for the subset
         final_shuffled_word_list = original_words[:]
+        # permuted_word_source_indices remains identity, which is correct
     else:
+        # subset_to_shuffle contains the actual word strings
         subset_to_shuffle = [original_words[i] for i in indices_to_shuffle]
 
-        # Ensure the shuffled subset is actually different if possible (optional, can be complex)
-        # For now, a simple shuffle of the subset:
-        shuffled_subset = subset_to_shuffle[:] # Copy
-        random.shuffle(shuffled_subset)
-        # A loop to ensure difference might be too slow if subset is hard to change
-        # while shuffled_subset == subset_to_shuffle and len(set(subset_to_shuffle)) > 1:
-        #    random.shuffle(shuffled_subset)
+        # original_indices_of_subset_words contains the original indices of these words
+        # These are the values from permuted_word_source_indices at the chosen positions
+        original_indices_of_subset_words = [permuted_word_source_indices[i] for i in indices_to_shuffle]
 
-        final_shuffled_word_list = original_words[:]
-        for original_idx_in_sentence, new_word_for_pos in zip(indices_to_shuffle, shuffled_subset):
-            final_shuffled_word_list[original_idx_in_sentence] = new_word_for_pos
+        # Shuffle the subset of words and their corresponding original indices together
+        # to maintain their association after shuffling.
+        zipped_subset_and_indices = list(zip(subset_to_shuffle, original_indices_of_subset_words))
+        random.shuffle(zipped_subset_and_indices)
+
+        # Unzip back into separate lists
+        shuffled_subset_words_only, shuffled_original_indices_for_subset = [], []
+        if zipped_subset_and_indices: # Ensure not empty before trying to unzip
+             shuffled_subset_words_only, shuffled_original_indices_for_subset = zip(*zipped_subset_and_indices)
+
+        final_shuffled_word_list = original_words[:] # Start with a copy of original words
+
+        # Place the shuffled words and their tracked original indices back into the full list context
+        for i, target_position_in_sentence in enumerate(indices_to_shuffle):
+            final_shuffled_word_list[target_position_in_sentence] = shuffled_subset_words_only[i]
+            permuted_word_source_indices[target_position_in_sentence] = shuffled_original_indices_for_subset[i]
 
     shuffled_sentence_text = " ".join(final_shuffled_word_list)
-    return shuffled_sentence_text, original_words, final_shuffled_word_list
+    return shuffled_sentence_text, original_words, final_shuffled_word_list, permuted_word_source_indices
 
 def word_levenshtein_distance(s1_words: list[str], s2_words: list[str]) -> int:
     """
