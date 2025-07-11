@@ -642,19 +642,20 @@ class Trainer:
         
         for batch_idx, batch in enumerate(train_loader):
             step_start = time.time()
-            combined_loss_item, current_lm_loss_item, current_unshuffle_loss_item, \
-                current_nsp_loss_item, current_penalty_reward = self.train_step(batch) # Added current_penalty_reward
+            # Correctly unpack to current_rank_loss_item
+            combined_loss_item, current_lm_loss_item, current_rank_loss_item, \
+                current_nsp_loss_item, current_penalty_reward = self.train_step(batch)
             epoch_losses.append(combined_loss_item)
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
             self.metrics.update(
-                train_loss=combined_loss_item, # This is raw combined loss
+                train_loss=combined_loss_item,
                 learning_rate=current_lr,
                 step_time=time.time() - step_start,
                 lm_loss_component=current_lm_loss_item,
-                lev_aux_loss=current_unshuffle_loss_item, # Stores unshuffle_loss_item
+                rank_aux_loss=current_rank_loss_item, # Pass as rank_aux_loss
                 nsp_loss=current_nsp_loss_item,
-                penalty_reward=current_penalty_reward # New
+                penalty_reward=current_penalty_reward
             )
             
             if (not self.is_distributed or dist.get_rank() == 0) and \
