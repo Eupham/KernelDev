@@ -47,7 +47,8 @@ class LevenshteinDataset(Dataset):
         if not 0.0 <= shuffle_percentage <= 1.0:
             raise ValueError("shuffle_percentage must be between 0.0 and 1.0")
         self.shuffle_percentage = shuffle_percentage
-        self.shuffle_probabilities = [0.25, 0.50, 0.75, 1.0] # Added shuffle probabilities
+        self.current_min_shuffle_p: float = 0.05
+        self.current_max_shuffle_p: float = 0.05 # Start with a narrow range at the minimum
 
         self.sentences = raw_documents_or_sentences # Store raw data directly
         # self.examples list and call to _prepare_examples are removed
@@ -55,52 +56,110 @@ class LevenshteinDataset(Dataset):
     def __len__(self):
         return len(self.sentences)
 
+    def update_shuffle_range(self, min_p: float, max_p: float):
+        # Clamp probabilities to be between 0.0 and 1.0
+        min_p_clamped = max(0.0, min(min_p, 1.0))
+        max_p_clamped = max(0.0, min(max_p, 1.0))
+
+        # Ensure min_p is not greater than max_p after clamping
+        self.current_min_shuffle_p = min(min_p_clamped, max_p_clamped)
+        self.current_max_shuffle_p = max(min_p_clamped, max_p_clamped)
+
+        # Optional: print for confirmation, can be removed later
+        # print(f"LevenshteinDataset: Shuffle prob range updated to [{self.current_min_shuffle_p:.4f}, {self.current_max_shuffle_p:.4f}]")
+
     def __getitem__(self, idx):
+        # TASK_ID_LEV_UNSHUFFLE should be defined at module level or imported
+        # RANK_TARGET_PADDING_VALUE can be defined here or at module level
+        RANK_TARGET_PADDING_VALUE = -1.0
+
         original_sentence_text = self.sentences[idx]
-        if not original_sentence_text.strip(): # Handle empty strings
-            original_sentence_text = " " # Use a space to avoid issues with empty tokenization
+        if not original_sentence_text.strip():
+            original_sentence_text = " " # Avoid issues with completely empty strings for tokenizer_fn
 
-        # When used by CombinedMultiTaskDataset, shuffle_percentage is 1.0,
-        # so is_shuffled_item_flag_val will be 1.0.
-        # This dataset is now specialized for the "unshuffling" task (type 1).
+        # Select a shuffle probability for the current item
+        selected_probability = random.uniform(self.current_min_shuffle_p, self.current_max_shuffle_p)
 
-        selected_probability = random.choice(self.shuffle_probabilities)
-        shuffled_sentence_text, _, _ = shuffle_words_in_sentence(original_sentence_text, selected_probability)
+        # Call the new shuffle_words_in_sentence from text_utils
+        # It returns (shuffled_byte_sequence, target_rank_scores)
+        # The tokenizer_fn is NOT passed to the new text_utils.shuffle_words_in_sentence
+        shuffled_byte_sequence, target_rank_scores = shuffle_words_in_sentence(
+            original_sentence_text,
+            selected_probability
+        )
 
-        # 1. Prepare input_tokens with Task ID
-        tokens = self.tokenizer_fn(shuffled_sentence_text)
-        # Sequence: [TASK_ID, CLS_ID] + content_tokens
-        # Truncate tokens if too long for content part: self.seq_len - 2
-        max_content_len = self.seq_len - 2
-        if len(tokens) > max_content_len:
-            tokens = tokens[:max_content_len]
+        # 1. Prepare padded_input_tokens (model input)
+        # Prepend Task ID and CLS ID to the shuffled_byte_sequence
+        # shuffled_byte_sequence is already a list of ints (byte values)
+        max_content_len = self.seq_len - 2 # For TASK_ID and CLS
+        current_content_for_input = shuffled_byte_sequence # Use directly
+        if len(current_content_for_input) > max_content_len:
+            current_content_for_input = current_content_for_input[:max_content_len]
 
-        final_input_tokens_list = [TASK_ID_LEV_UNSHUFFLE, self.cls_token_id] + tokens
+        final_input_tokens_list = [TASK_ID_LEV_UNSHUFFLE, self.cls_token_id] + current_content_for_input
         padded_input_tokens = _truncate_or_pad_tokens(final_input_tokens_list, self.seq_len, self.input_pad_id)
 
-        # 2. Prepare next_token_lm_targets (all ignore_idx for this task type)
+        # 2. Prepare next_token_lm_targets (all ignore_idx for this task type 1)
         next_token_lm_targets_list = [self.lm_ignore_idx] * self.seq_len
 
-        # 3. Prepare unshuffle_target_tokens (original sentence, tokenized and padded)
-        original_tokens = self.tokenizer_fn(original_sentence_text)
-        max_target_len = self.seq_len # Target sequence can be full length
-        if len(original_tokens) > max_target_len:
-            original_tokens = original_tokens[:max_target_len]
-        unshuffle_target_tokens_list = _truncate_or_pad_tokens(original_tokens, self.seq_len, self.lm_ignore_idx)
+        # 3. Prepare unshuffle_seq_targets (this will now be target_rank_scores, padded)
+        # target_rank_scores is already a list of floats. Pad it to self.seq_len.
+        # If shuffle_words_in_sentence returned empty (e.g. for empty input string), handle it.
+        if not target_rank_scores: # target_rank_scores could be empty if input was empty
+             padded_target_rank_scores = [RANK_TARGET_PADDING_VALUE] * self.seq_len
+        else:
+            # Ensure target_rank_scores corresponds to the content part of the input,
+            # which is 'current_content_for_input' before it's prefixed and padded.
+            # The ranks should align with the bytes in 'current_content_for_input'.
+            # The length of target_rank_scores should be len(shuffled_byte_sequence) from text_utils.
+            # If shuffled_byte_sequence was truncated to max_content_len, target_rank_scores
+            # must also be truncated to correspond to only those bytes.
+            # The current logic for input prepends task_id, cls_id *after* content truncation.
+            # So, the target ranks should correspond to the *final content* in padded_input_tokens.
+            # This means ranks for task_id and cls_id need padding, and then ranks for content, then padding.
+            # This is complex. A simpler approach: target ranks correspond to the *original* shuffled_byte_sequence,
+            # up to seq_len. The model's loss function will need to handle alignment if input/target differ in effective length
+            # due to prefix tokens.
+            # For now, let's assume target_rank_scores should be padded/truncated to self.seq_len directly.
+            # This matches the previous seq2seq target length.
+
+            # Truncate target_rank_scores if it's longer than seq_len
+            # (can happen if original sentence is very long, shuffle_words_in_sentence returns ranks for all original bytes)
+            # However, shuffle_words_in_sentence output length is tied to the (potentially space-joined) words from stripped sentence.
+            # The model input `padded_input_tokens` has length `self.seq_len`.
+            # The `unshuffle_target_tokens_list` should also have length `self.seq_len`.
+            # The ranks should correspond to the bytes in `padded_input_tokens`.
+            # The first two tokens are TASK_ID and CLS, they should have rank -1.0.
+            # The content part's ranks come from `target_rank_scores`, truncated if needed.
+
+            # Revised logic for padded_target_rank_scores:
+            # Length of content in input is len(current_content_for_input)
+            # These content tokens start at index 2 in padded_input_tokens
+
+            actual_content_ranks = target_rank_scores[:len(current_content_for_input)] # Ranks for the content that made it into the input
+
+            padded_target_rank_scores = \
+                [RANK_TARGET_PADDING_VALUE, RANK_TARGET_PADDING_VALUE] + \
+                actual_content_ranks + \
+                [RANK_TARGET_PADDING_VALUE] * (self.seq_len - 2 - len(actual_content_ranks))
+
+            # Ensure final length is exactly self.seq_len if something went wrong (e.g. actual_content_ranks was too long)
+            if len(padded_target_rank_scores) > self.seq_len:
+                 padded_target_rank_scores = padded_target_rank_scores[:self.seq_len]
+            elif len(padded_target_rank_scores) < self.seq_len: # Should be caught by padding logic above
+                 padded_target_rank_scores.extend([RANK_TARGET_PADDING_VALUE] * (self.seq_len - len(padded_target_rank_scores)))
+
 
         # 4. Auxiliary scalar value (placeholder)
-        # The old scalar Levenshtein distance isn't the primary target for loss anymore.
-        # We can use 0.0 as a placeholder. If a scalar metric is still desired for logging,
-        # it could be computed here but not used for training.
         auxiliary_scalar_value = torch.tensor(0.0, dtype=torch.float32)
 
         # 5. Task type flag
-        task_type_flag_tensor = torch.tensor(1.0, dtype=torch.float32) # Type 1 for Levenshtein/Unshuffle
+        task_type_flag_tensor = torch.tensor(1.0, dtype=torch.float32) # Type 1 for Rank Regression Unshuffle
 
         return (
             torch.tensor(padded_input_tokens, dtype=torch.long),
             torch.tensor(next_token_lm_targets_list, dtype=torch.long),
-            torch.tensor(unshuffle_target_tokens_list, dtype=torch.long),
+            torch.tensor(padded_target_rank_scores, dtype=torch.float), # Changed to float for ranks
             auxiliary_scalar_value,
             task_type_flag_tensor
         )

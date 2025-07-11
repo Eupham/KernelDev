@@ -34,7 +34,12 @@ training:
 
   # Levenshtein task parameters
   use_levenshtein_task: true # Enable Levenshtein distance auxiliary task
-  levenshtein_loss_weight: 0.1 # Weight for Levenshtein loss
+  levenshtein_loss_weight: 0.5 # Weight for Levenshtein loss
+
+  # Dynamic Loss Adjustment Parameters
+  long_term_loss_window: 1000       # Window for long-term average loss
+  short_term_loss_window: 100      # Window for short-term average loss
+  dynamic_loss_adjustment_factor: 0.1 # Factor for penalty/reward calculation
 
   # Plateau detection parameters
   plateau_monitor_metric: 'val_loss'
@@ -125,9 +130,26 @@ generation:
   
   # Test prompts
   test_prompts:
-    - ""      # Empty prompt
-    - "The"   # Simple prompt
-    - "In a world where"  # Creative prompt
+    - task: "lm"  # Language Model task
+      prompt: ""
+    - task: "lm"
+      prompt: "The"
+    - task: "lm"
+      prompt: "In a world where"
+    - task: "unshuffle" # New Unshuffle/Seq2Seq task
+      prompt: "robot a about story short me Tell" # Example of a manually shuffled prompt
+    - task: "lm" # CLS prompts usually for LM-style completion/QA
+      type: "CLS_Prefix_ON" # Keep existing type for special handling if any in generate_inference_sample
+      prompt: "[CLS] What is the capital of France?"
+    - task: "lm"
+      type: "CLS_Prefix_OFF"
+      prompt: "[CLS] What is the capital of France?"
+    - task: "lm"
+      type: "CLS_Prefix_ON"
+      prompt: "[CLS] Tell me a short story about a robot."
+    - task: "lm"
+      type: "CLS_Prefix_OFF"
+      prompt: "[CLS] Tell me a short story about a robot."
 
 # Logging Configuration
 logging:
