@@ -32,8 +32,10 @@ class DataBuilder:
         vocab_size: int = 256,
         max_eval_tokens: Optional[Any] = 50000,
         use_levenshtein_task: bool = False,
+        use_span_selection_task: bool = False,
+        n_candidates_span_selection: int = 4,
         levenshtein_shuffle_percentage: float = 0.25,
-        max_train_tokens: Optional[Any] = None, # New parameter
+        max_train_tokens: Optional[Any] = None,
     ):
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
@@ -741,10 +743,12 @@ class DataBuilder:
 
 def create_data_builder(
     dataset_name: str = "allenai/c4", dataset_config: str = "en",
-    seq_len: Optional[Any] = 512, # Keep Optional[Any] as it's passed to DataBuilder constructor
+    seq_len: Optional[Any] = 512,
     max_samples: Optional[int] = 2000,
     max_eval_tokens: Optional[Any] = 50000,
     use_levenshtein_task: bool = False,
+    use_span_selection_task: bool = False, # New
+    n_candidates_span_selection: int = 4, # New
     levenshtein_shuffle_percentage: float = 0.25,
     max_train_tokens: Optional[Any] = None,
 ) -> DataBuilder:
@@ -753,6 +757,8 @@ def create_data_builder(
         seq_len=seq_len, max_samples=max_samples,
         max_eval_tokens=max_eval_tokens,
         use_levenshtein_task=use_levenshtein_task,
+        use_span_selection_task=use_span_selection_task, # New
+        n_candidates_span_selection=n_candidates_span_selection, # New
         levenshtein_shuffle_percentage=levenshtein_shuffle_percentage,
         max_train_tokens=max_train_tokens
     )
