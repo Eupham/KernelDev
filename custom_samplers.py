@@ -45,13 +45,15 @@ class StrictRatioBatchSampler(Sampler[List[int]]):
             raise ValueError("Calculated number of LM samples per batch is negative. Check ratios and batch size.")
 
         # Sanity check if total numbers make sense with batch size
-        if (self.num_lev_per_batch + self.num_nsp_per_batch + self.num_lm_per_batch) != self.batch_size:
+        if (self.num_rank_per_batch + self.num_nsp_per_batch + self.num_span_per_batch + self.num_lm_per_batch) != self.batch_size:
             # This can happen due to flooring if not careful.
-            # A robust way is to calculate for two, and the third gets the remainder.
-            # Re-calculate num_lm_per_batch to ensure sum matches batch_size
-            self.num_lm_per_batch = self.batch_size - (self.num_lev_per_batch + self.num_nsp_per_batch)
-            if self.num_lm_per_batch < 0: # If this happens, something is very wrong or batch_size too small for ratios
-                 raise ValueError(f"Cannot meet batch_size {self.batch_size} with ratios {ratios}. Calculated LM samples: {self.num_lm_per_batch}")
+            # A robust way is to calculate for all but one, and the last gets the remainder.
+            # The current logic of assigning remainder to lm_task is sufficient.
+            # This check is more of a safeguard against logic errors.
+            total_calculated = self.num_rank_per_batch + self.num_nsp_per_batch + self.num_span_per_batch + self.num_lm_per_batch
+            if total_calculated != self.batch_size:
+                 # This path indicates a logic error in the above calculations.
+                 print(f"Warning: Batch composition numbers do not sum to batch_size. Sum={total_calculated}, BS={self.batch_size}")
 
 
         # These are pointers to the lists in the dataset, which are already shuffled
