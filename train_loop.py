@@ -1004,7 +1004,8 @@ class Trainer:
                 if max_batches is not None and batch_idx >= max_batches: break
 
                 if self.config.use_levenshtein_task : # Multi-task batch
-                    input_ids, next_token_lm_targets, _, _, task_type_flags = batch
+                    # Unpack 6 items, ignoring the ones not needed for perplexity
+                    input_ids, next_token_lm_targets, _, _, task_type_flags, _ = batch
                     # For perplexity, only consider pure LM task items (type 0)
                     lm_mask = (task_type_flags == 0.0)
                     if not lm_mask.any(): continue # Skip batch if no LM items
