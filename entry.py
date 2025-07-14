@@ -171,6 +171,13 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     if hasattr(args, 'levenshtein_loss_weight') and args.levenshtein_loss_weight is not None:
         config.setdefault('training', {})['levenshtein_loss_weight'] = args.levenshtein_loss_weight
 
+    # Handle Span Selection task arguments
+    if hasattr(args, 'use_span_selection_task') and args.use_span_selection_task is not None:
+        config.setdefault('training', {})['use_span_selection_task'] = args.use_span_selection_task
+    if hasattr(args, 'span_selection_loss_weight') and args.span_selection_loss_weight is not None:
+        config.setdefault('training', {})['span_selection_loss_weight'] = args.span_selection_loss_weight
+    if hasattr(args, 'n_candidates_span_selection') and args.n_candidates_span_selection is not None:
+        config.setdefault('data', {})['n_candidates_span_selection'] = args.n_candidates_span_selection
 
 
     # Handle Levenshtein shuffle percentage
@@ -340,7 +347,8 @@ def start_actual_training(cli_args):
         'n_heads': model_cfg.get('n_heads', 16),
         'max_seq_len': model_cfg.get('max_seq_len', 2048),
         'mlp_ratio': model_cfg.get('mlp_ratio', 4),
-        'causal': model_cfg.get('causal', True)
+        'causal': model_cfg.get('causal', True),
+        'n_candidates_span_selection': data_cfg.get('n_candidates_span_selection', 4) # Get from data config
     }
     
     # Model configuration is prepared (model_cfg)
@@ -536,8 +544,10 @@ def start_actual_training(cli_args):
     data_config_for_builder = {
         **data_config,
         'use_levenshtein_task': lev_task_enabled,
-        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage'), # Pass as None if not in data_cfg
-        'max_train_tokens': data_cfg.get('max_train_tokens') # Pass as None if not in data_cfg (already fetched into data_config)
+        'use_span_selection_task': training_cfg.get('use_span_selection_task', False), # New
+        'n_candidates_span_selection': data_cfg.get('n_candidates_span_selection', 4), # New
+        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage'),
+        'max_train_tokens': data_cfg.get('max_train_tokens')
     }
     data_builder = create_data_builder(**data_config_for_builder)
 
@@ -921,6 +931,24 @@ if __name__ == "__main__":
         type=float,
         default=None, # Default handled by TrainingConfig or YAML
         help='Weight for Levenshtein auxiliary loss component (overrides config, e.g., 0.1).'
+    )
+    parser.add_argument(
+        '--use-span-selection-task',
+        type=lambda x: (str(x).lower() == 'true'),
+        default=None,
+        help='Enable/disable Span Selection auxiliary task (True/False). Overrides config.'
+    )
+    parser.add_argument(
+        '--span-selection-loss-weight',
+        type=float,
+        default=None,
+        help='Weight for Span Selection auxiliary loss component (overrides config, e.g., 0.1).'
+    )
+    parser.add_argument(
+        '--n-candidates-span-selection',
+        type=int,
+        default=None,
+        help='Number of candidates for the span selection task (overrides config).'
     )
     parser.add_argument(
         '--levenshtein-shuffle-percentage',

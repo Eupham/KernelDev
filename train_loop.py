@@ -18,6 +18,7 @@ import contextlib
 TASK_ID_LM = ord('0')           # For Language Modeling tasks
 TASK_ID_UNSHUFFLE = ord('1')    # For the Unshuffle Seq2Seq task (formerly Levenshtein)
 TASK_ID_NSP = ord('2')          # For Next Sentence Prediction tasks
+TASK_ID_SPAN_SELECT = ord('3')  # New task for Span Selection
 
 class TrainingConfig:
     """Configuration class for training parameters."""
@@ -50,9 +51,10 @@ class TrainingConfig:
         use_levenshtein_task: bool = False,
         levenshtein_loss_weight: float = 0.1,
         nsp_loss_weight: float = 0.1,
-        rl_loss_weight: float = 0.1, # New weight for self-critique RL loss
+        rl_loss_weight: float = 0.1,
+        span_selection_loss_weight: float = 0.1, # New
         lm_ignore_idx: int = -1,
-        long_term_loss_window: int = 1000,  # New
+        long_term_loss_window: int = 1000,
         short_term_loss_window: int = 100, # New
         dynamic_loss_adjustment_factor: float = 0.1 # New
     ):
@@ -81,7 +83,8 @@ class TrainingConfig:
         self.use_levenshtein_task = use_levenshtein_task
         self.levenshtein_loss_weight = levenshtein_loss_weight
         self.nsp_loss_weight = nsp_loss_weight
-        self.rl_loss_weight = rl_loss_weight # New
+        self.rl_loss_weight = rl_loss_weight
+        self.span_selection_loss_weight = span_selection_loss_weight # New
         self.lm_ignore_idx = lm_ignore_idx
         self.long_term_loss_window = long_term_loss_window
         self.short_term_loss_window = short_term_loss_window
@@ -160,19 +163,21 @@ class TrainingMetrics:
         self.best_step = 0
 
         self.lm_losses = []
-        self.rank_aux_losses = [] # Stores rank_regression_loss for training (formerly lev_aux_losses)
+        self.rank_aux_losses = []
         self.nsp_losses = []
+        self.span_selection_losses = [] # New
 
         self.val_lm_losses = []
-        self.val_rank_aux_losses = [] # Stores rank_regression_loss for validation (formerly val_lev_aux_losses)
+        self.val_rank_aux_losses = []
         self.val_nsp_losses = []
+        self.val_span_selection_losses = [] # New
         self.penalty_rewards = []
-        self.rl_rewards = [] # New: For tracking self-critique rewards
+        self.rl_rewards = []
 
     def update(self, train_loss=None, val_loss=None, learning_rate=None, step_time=None,
-                 lm_loss_component=None, rank_aux_loss=None, nsp_loss=None, # Renamed lev_aux_loss
-                 val_lm_loss_component=None, val_rank_aux_loss=None, val_nsp_loss=None, # Renamed val_lev_aux_loss
-                 penalty_reward=None, rl_reward=None): # Added rl_reward
+                 lm_loss_component=None, rank_aux_loss=None, nsp_loss=None, span_selection_loss=None, # New
+                 val_lm_loss_component=None, val_rank_aux_loss=None, val_nsp_loss=None, val_span_selection_loss=None, # New
+                 penalty_reward=None, rl_reward=None):
         if train_loss is not None: self.train_losses.append(train_loss)
         if val_loss is not None:
             self.val_losses.append(val_loss)
@@ -182,13 +187,15 @@ class TrainingMetrics:
         if learning_rate is not None: self.learning_rates.append(learning_rate)
         if step_time is not None: self.step_times.append(step_time)
         if lm_loss_component is not None: self.lm_losses.append(lm_loss_component)
-        if rank_aux_loss is not None: self.rank_aux_losses.append(rank_aux_loss) # Renamed
+        if rank_aux_loss is not None: self.rank_aux_losses.append(rank_aux_loss)
         if nsp_loss is not None: self.nsp_losses.append(nsp_loss)
-        if rl_reward is not None: self.rl_rewards.append(rl_reward) # New
+        if span_selection_loss is not None: self.span_selection_losses.append(span_selection_loss)
+        if rl_reward is not None: self.rl_rewards.append(rl_reward)
 
         if val_lm_loss_component is not None: self.val_lm_losses.append(val_lm_loss_component)
-        if val_rank_aux_loss is not None: self.val_rank_aux_losses.append(val_rank_aux_loss) # Renamed
+        if val_rank_aux_loss is not None: self.val_rank_aux_losses.append(val_rank_aux_loss)
         if val_nsp_loss is not None: self.val_nsp_losses.append(val_nsp_loss)
+        if val_span_selection_loss is not None: self.val_span_selection_losses.append(val_span_selection_loss)
         if penalty_reward is not None:
             self.penalty_rewards.append(penalty_reward)
         self.total_steps += 1
@@ -220,6 +227,15 @@ class TrainingMetrics:
         if not self.rank_aux_losses:
             return None
         relevant_losses = self.rank_aux_losses[-last_n:]
+        relevant_losses = [l for l in relevant_losses if l is not None]
+        if not relevant_losses:
+            return None
+        return np.mean(relevant_losses)
+
+    def get_avg_span_selection_loss(self, last_n: int) -> Optional[float]:
+        if not self.span_selection_losses:
+            return None
+        relevant_losses = self.span_selection_losses[-last_n:]
         relevant_losses = [l for l in relevant_losses if l is not None]
         if not relevant_losses:
             return None
@@ -288,11 +304,12 @@ class Trainer:
         Returns: (combined_loss_val, lm_loss_item, rank_loss_item, nsp_loss_item, penalty_reward_item)
         """
         mean_lm_loss_component_item = None
-        rank_loss_item = None # Renamed from unshuffle_loss_item
+        rank_loss_item = None
         mean_nsp_loss_item = None
+        span_selection_loss_item = None # New
+        rl_reward_item = 0.0 # New
 
-        # The model's forward method now returns:
-        # lm_logits, per_item_lm_loss (if targets provided), nsp_logits, rank_regression_outputs
+        # The model's forward method now returns a dictionary of outputs.
         # The batch structure for multi-task is:
         # input_tokens, next_token_lm_targets, rank_regression_targets (formerly unshuffle_seq_targets), auxiliary_values, task_type_flags
 
@@ -323,23 +340,27 @@ class Trainer:
         self.optimizer.zero_grad()
         
         final_batch_lm_loss_component = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
-        rank_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32) # Renamed
+        rank_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
         mean_nsp_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+        span_selection_loss_tensor = torch.tensor(0.0, device=self.config.device, dtype=torch.float32) # New
 
         autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
 
         with autocast_context:
-            # Model returns: lm_logits, per_item_lm_loss, nsp_logits, rank_regression_outputs
-            lm_logits_all, per_item_lm_loss_all, nsp_logits_all, rank_regression_outputs_all = self.model(
+            # Model now returns a dictionary of outputs
+            model_outputs = self.model(
                 input_tokens,
-                next_token_lm_targets, # Pass LM targets for model to calculate per_item_lm_loss if needed
+                next_token_lm_targets,
                 force_disable_prefix_attention=False
             )
 
+            per_item_lm_loss_all = model_outputs.get('lm_loss')
+
             if self.config.use_levenshtein_task and task_type_flags is not None: # Multi-task logic
-                lm_task_mask = (task_type_flags == 0.0)  # Task ID for LM
-                rank_task_mask = (task_type_flags == 1.0) # Task ID for Rank Regression
-                nsp_task_mask = (task_type_flags == 2.0) # Task ID for NSP
+                lm_task_mask = (task_type_flags == 0.0)
+                rank_task_mask = (task_type_flags == 1.0)
+                nsp_task_mask = (task_type_flags == 2.0)
+                span_task_mask = (task_type_flags == 3.0) # New
                 
                 # LM Loss component (from items marked as LM task)
                 pg_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
@@ -352,12 +373,13 @@ class Trainer:
 
                     # --- RL Self-Critique Step ---
                     # 1. Greedy decode to get generated sequence (action)
-                    lm_logits_for_rl = lm_logits_all[lm_task_mask]
+                    lm_logits_for_rl = model_outputs['lm_logits'][lm_task_mask]
                     generated_tokens = torch.argmax(lm_logits_for_rl.detach(), dim=-1)
 
                     # 2. Get reward by passing generated sequence back through model
                     with torch.no_grad():
-                        _, _, _, predicted_ranks_for_gen = self.model(generated_tokens)
+                        critique_outputs = self.model(generated_tokens)
+                        predicted_ranks_for_gen = critique_outputs['rank_outputs']
 
                     # 3. Calculate reward = -MSE(predicted_ranks, true_ranks)
                     true_ranks_for_rl = true_original_ranks[lm_task_mask]
@@ -406,43 +428,51 @@ class Trainer:
                     # It will be passed to metrics.update later.
 
                 # Rank Regression Loss component (from items marked as Rank task)
-                if rank_task_mask.any() and rank_targets is not None and rank_regression_outputs_all is not None:
-                    # rank_regression_outputs_all are (batch, seq_len, 1)
-                    # rank_targets are (batch, seq_len)
-                    predictions_for_rank = rank_regression_outputs_all[rank_task_mask].squeeze(-1) # -> (n_rank_items, seq_len)
-                    targets_for_rank = rank_targets[rank_task_mask] # -> (n_rank_items, seq_len)
-
-                    if predictions_for_rank.numel() > 0 and targets_for_rank.numel() > 0:
-                        # Mask ignored positions (where target is ignore_idx_float)
-                        # Use self.config.lm_ignore_idx as the basis for the float ignore value.
-                        # Dataset uses rank_ignore_idx_float which is float(lm_ignore_idx).
-                        rank_ignore_val = float(getattr(self.config, 'lm_ignore_idx', -1.0))
-                        valid_rank_mask = (targets_for_rank != rank_ignore_val)
-
-                        if valid_rank_mask.any(): # Only compute loss if there are valid targets
-                            rank_loss_tensor = F.mse_loss(
-                                predictions_for_rank[valid_rank_mask],
-                                targets_for_rank[valid_rank_mask]
-                            )
-                            rank_loss_item = rank_loss_tensor.item()
+                if rank_task_mask.any() and rank_targets is not None:
+                    rank_outputs = model_outputs['rank_outputs']
+                    if rank_outputs is not None:
+                        predictions_for_rank = rank_outputs[rank_task_mask].squeeze(-1)
+                        targets_for_rank = rank_targets[rank_task_mask]
+                        if predictions_for_rank.numel() > 0 and targets_for_rank.numel() > 0:
+                            rank_ignore_val = float(getattr(self.config, 'lm_ignore_idx', -1.0))
+                            valid_rank_mask = (targets_for_rank != rank_ignore_val)
+                            if valid_rank_mask.any():
+                                rank_loss_tensor = F.mse_loss(
+                                    predictions_for_rank[valid_rank_mask],
+                                    targets_for_rank[valid_rank_mask]
+                                )
+                                rank_loss_item = rank_loss_tensor.item()
                 
                 # NSP Loss component (from items marked as NSP task)
-                if nsp_task_mask.any() and nsp_logits_all is not None:
-                    nsp_predicted = nsp_logits_all[nsp_task_mask]
-                    nsp_targets = auxiliary_values[nsp_task_mask].long()
-                    if nsp_predicted.numel() > 0 and nsp_targets.numel() > 0:
-                        loss_fn_nsp = torch.nn.CrossEntropyLoss()
-                        mean_nsp_loss_tensor = loss_fn_nsp(nsp_predicted, nsp_targets)
-                        mean_nsp_loss_item = mean_nsp_loss_tensor.item()
+                if nsp_task_mask.any():
+                    nsp_logits = model_outputs['nsp_logits']
+                    if nsp_logits is not None:
+                        nsp_predicted = nsp_logits[nsp_task_mask]
+                        nsp_targets = auxiliary_values[nsp_task_mask].long()
+                        if nsp_predicted.numel() > 0 and nsp_targets.numel() > 0:
+                            loss_fn_nsp = torch.nn.CrossEntropyLoss()
+                            mean_nsp_loss_tensor = loss_fn_nsp(nsp_predicted, nsp_targets)
+                            mean_nsp_loss_item = mean_nsp_loss_tensor.item()
+
+                # Span Selection Loss component (from items marked as Span task)
+                if span_task_mask.any():
+                    span_logits = model_outputs['span_selection_logits']
+                    if span_logits is not None:
+                        span_predicted = span_logits[span_task_mask]
+                        span_targets = auxiliary_values[span_task_mask].long()
+                        if span_predicted.numel() > 0 and span_targets.numel() > 0:
+                            span_selection_loss_tensor = F.cross_entropy(span_predicted, span_targets)
+                            span_selection_loss_item = span_selection_loss_tensor.item()
                 
                 # Combine losses for multi-task items
                 # Start with LM loss component (which could be 0 if no LM items in batch or all ignored)
                 combined_loss = final_batch_lm_loss_component + (self.config.rl_loss_weight * pg_loss)
                 # Add weighted Rank Regression loss
-                combined_loss = combined_loss + (self.config.levenshtein_loss_weight * rank_loss_tensor) # Re-use levenshtein_loss_weight for rank task
+                combined_loss = combined_loss + (self.config.levenshtein_loss_weight * rank_loss_tensor)
                 # Add weighted NSP loss
-                nsp_loss_weight = getattr(self.config, 'nsp_loss_weight', 0.1) # Default if not in config
-                combined_loss = combined_loss + (nsp_loss_weight * mean_nsp_loss_tensor)
+                combined_loss = combined_loss + (self.config.nsp_loss_weight * mean_nsp_loss_tensor)
+                # Add weighted Span Selection loss
+                combined_loss = combined_loss + (self.config.span_selection_loss_weight * span_selection_loss_tensor)
                 
             else: # Single-task LM mode
                 if per_item_lm_loss_all is not None: # Should contain losses for all items
@@ -514,13 +544,15 @@ class Trainer:
         self.model.eval()
         total_combined_loss_epoch = 0.0
         accum_lm_loss_component = 0.0
-        accum_rank_loss = 0.0 # Renamed from accum_unshuffle_loss
+        accum_rank_loss = 0.0
         accum_nsp_loss = 0.0
+        accum_span_selection_loss = 0.0 # New
 
         num_batches_processed = 0
         num_lm_batches = 0
-        num_rank_batches = 0 # Renamed from num_unshuffle_batches
+        num_rank_batches = 0
         num_nsp_batches = 0
+        num_span_selection_batches = 0 # New
 
         # Use lm_ignore_idx for LM loss and as basis for rank_ignore_idx_float
         lm_ignore_idx = getattr(self.config, 'lm_ignore_idx', -1)
@@ -557,19 +589,26 @@ class Trainer:
                 current_batch_lm_component_loss_val = 0.0
                 current_batch_rank_component_loss_val = 0.0
                 current_batch_nsp_component_loss_val = 0.0
+                current_batch_span_selection_loss_val = 0.0 # New
 
                 autocast_context_eval = torch.amp.autocast('cuda') if self.config.use_amp else contextlib.suppress()
                 with autocast_context_eval:
-                    # Model returns: lm_logits, per_item_lm_loss, nsp_logits, rank_regression_outputs
-                    lm_logits_all, per_item_lm_loss_all, nsp_logits_all, rank_regression_outputs_all = self.model(
+                    # Model returns a dictionary of outputs
+                    model_outputs = self.model(
                         input_tokens,
-                        next_token_lm_targets, # Pass LM targets
-                        force_disable_prefix_attention=False # Or True if evaluation should always be causal for LM parts
+                        next_token_lm_targets,
+                        force_disable_prefix_attention=False
                     )
+                    per_item_lm_loss_all = model_outputs.get('lm_loss')
+                    rank_regression_outputs_all = model_outputs.get('rank_outputs')
+                    nsp_logits_all = model_outputs.get('nsp_logits')
+                    span_selection_logits_all = model_outputs.get('span_selection_logits')
+
 
                 lm_task_mask_eval = (task_type_flags == 0.0)
-                rank_task_mask_eval = (task_type_flags == 1.0) # For Rank Regression
+                rank_task_mask_eval = (task_type_flags == 1.0)
                 nsp_task_mask_eval = (task_type_flags == 2.0)
+                span_task_mask_eval = (task_type_flags == 3.0) # New
 
                 # LM Loss
                 if lm_task_mask_eval.any() and per_item_lm_loss_all is not None:
@@ -611,12 +650,23 @@ class Trainer:
                             accum_nsp_loss += nsp_loss_val
                             num_nsp_batches +=1
 
+                # Span Selection Loss
+                if self.config.use_levenshtein_task and span_task_mask_eval.any() and span_selection_logits_all is not None:
+                    span_predicted_eval = span_selection_logits_all[span_task_mask_eval]
+                    span_targets_eval = auxiliary_values[span_task_mask_eval].long()
+                    if span_predicted_eval.numel() > 0 and span_targets_eval.numel() > 0:
+                        span_loss_val = F.cross_entropy(span_predicted_eval, span_targets_eval).item()
+                        if not math.isnan(span_loss_val) and not math.isinf(span_loss_val):
+                            current_batch_span_selection_loss_val = span_loss_val
+                            accum_span_selection_loss += span_loss_val
+                            num_span_selection_batches += 1
+
                 # Combine component losses for the batch (as float values)
-                # This mirrors the logic in train_step for how combined_loss is formed before dynamic adjustment.
                 batch_combined_loss_val = current_batch_lm_component_loss_val
                 if self.config.use_levenshtein_task: # If multi-tasking
                     batch_combined_loss_val += (self.config.levenshtein_loss_weight * current_batch_rank_component_loss_val)
-                    batch_combined_loss_val += (getattr(self.config, 'nsp_loss_weight', 0.1) * current_batch_nsp_component_loss_val)
+                    batch_combined_loss_val += (self.config.nsp_loss_weight * current_batch_nsp_component_loss_val)
+                    batch_combined_loss_val += (self.config.span_selection_loss_weight * current_batch_span_selection_loss_val)
 
                 total_combined_loss_epoch += batch_combined_loss_val
                 num_batches_processed +=1
@@ -624,14 +674,16 @@ class Trainer:
         self.model.train()
         avg_combined_loss = total_combined_loss_epoch / num_batches_processed if num_batches_processed > 0 else float('inf')
         avg_lm_loss_component = accum_lm_loss_component / num_lm_batches if num_lm_batches > 0 else 0.0
-        avg_rank_loss_component = accum_rank_loss / num_rank_batches if num_rank_batches > 0 else 0.0 # Renamed
+        avg_rank_loss_component = accum_rank_loss / num_rank_batches if num_rank_batches > 0 else 0.0
         avg_nsp_loss_component = accum_nsp_loss / num_nsp_batches if num_nsp_batches > 0 else 0.0
+        avg_span_selection_loss_component = accum_span_selection_loss / num_span_selection_batches if num_span_selection_batches > 0 else 0.0 # New
 
         self.metrics.update(
             val_loss=avg_combined_loss,
             val_lm_loss_component=avg_lm_loss_component,
-            val_rank_aux_loss=avg_rank_loss_component, # Renamed from val_lev_aux_loss
-            val_nsp_loss=avg_nsp_loss_component
+            val_rank_aux_loss=avg_rank_loss_component,
+            val_nsp_loss=avg_nsp_loss_component,
+            val_span_selection_loss=avg_span_selection_loss_component # New
         )
         return avg_combined_loss
     
@@ -748,8 +800,9 @@ class Trainer:
                 avg_lm_comp = self.metrics.get_avg_lm_loss(last_n=long_window)
                 avg_rank_aux = self.metrics.get_avg_rank_loss(last_n=long_window)
                 avg_nsp_loss = self.metrics.get_avg_nsp_loss(last_n=long_window)
+                avg_span_loss = self.metrics.get_avg_span_selection_loss(last_n=long_window) # New
                 avg_penalty_reward = self.metrics.get_avg_penalty_reward(last_n=log_interval_window)
-                avg_rl_reward = self.metrics.get_avg_rl_reward(last_n=log_interval_window) # Get avg RL reward
+                avg_rl_reward = self.metrics.get_avg_rl_reward(last_n=log_interval_window)
 
                 avg_step_time = self.metrics.get_avg_step_time(last_n=log_interval_window)
 
@@ -766,6 +819,9 @@ class Trainer:
 
                     nsp_log = f"{avg_nsp_loss:.4f}" if avg_nsp_loss is not None else "N/A"
                     log_msg += f", AvgNSP(L): {nsp_log}"
+
+                    span_log = f"{avg_span_loss:.4f}" if avg_span_loss is not None else "N/A" # New
+                    log_msg += f", AvgSpan(L): {span_log}" # New
 
                     # Add RL reward to log message
                     rl_reward_log = f"{avg_rl_reward:.4f}" if avg_rl_reward is not None else "N/A"
@@ -785,8 +841,9 @@ class Trainer:
                 print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
                 if self.config.use_levenshtein_task: # Multi-task mode
                     if self.metrics.val_lm_losses: print(f"  Val LM Comp: {self.metrics.val_lm_losses[-1]:.4f}")
-                    if self.metrics.val_rank_aux_losses: print(f"  Val RankReg Aux: {self.metrics.val_rank_aux_losses[-1]:.4f}") # Renamed
+                    if self.metrics.val_rank_aux_losses: print(f"  Val RankReg Aux: {self.metrics.val_rank_aux_losses[-1]:.4f}")
                     if self.metrics.val_nsp_losses: print(f"  Val NSP: {self.metrics.val_nsp_losses[-1]:.4f}")
+                    if self.metrics.val_span_selection_losses: print(f"  Val SpanSelect: {self.metrics.val_span_selection_losses[-1]:.4f}") # New
                 if is_best: self.save_checkpoint(self.metrics.total_steps, is_best=True)
                 current_metric_val = val_loss
                 improved = False
@@ -903,10 +960,12 @@ class Trainer:
         plot_idx += 1
 
         if self.config.use_levenshtein_task: # Multi-task mode
-            if self.metrics.rank_aux_losses: # Renamed from lev_aux_losses
-                 ax_flat[plot_idx].plot(self.metrics.rank_aux_losses, 'c-', alpha=0.7, label='RankReg Aux Loss (Train)') # Renamed label
+            if self.metrics.rank_aux_losses:
+                 ax_flat[plot_idx].plot(self.metrics.rank_aux_losses, 'c-', alpha=0.7, label='RankReg Aux Loss (Train)')
             if self.metrics.nsp_losses:
                  ax_flat[plot_idx].plot(self.metrics.nsp_losses, 'y-', alpha=0.7, label='NSP Aux Loss (Train)')
+            if self.metrics.span_selection_losses:
+                 ax_flat[plot_idx].plot(self.metrics.span_selection_losses, 'brown', linestyle='-', alpha=0.7, label='SpanSelect Aux Loss (Train)')
             ax_flat[plot_idx].set_title('Auxiliary Task Losses (Training)')
             ax_flat[plot_idx].set_xlabel('Step'); ax_flat[plot_idx].set_ylabel('Loss'); ax_flat[plot_idx].grid(True, alpha=0.3); ax_flat[plot_idx].legend()
         plot_idx += 1
@@ -917,10 +976,12 @@ class Trainer:
 
             if self.metrics.val_lm_losses:
                  ax_val_main.plot(val_steps[:len(self.metrics.val_lm_losses)], self.metrics.val_lm_losses, 'r--', alpha=0.7, label='LM Loss Comp (Val)')
-            if self.metrics.val_rank_aux_losses: # Renamed from val_lev_aux_losses
-                ax_val_main.plot(val_steps[:len(self.metrics.val_rank_aux_losses)], self.metrics.val_rank_aux_losses, 'm--', alpha=0.7, label='RankReg Aux Loss (Val)') # Renamed label
+            if self.metrics.val_rank_aux_losses:
+                ax_val_main.plot(val_steps[:len(self.metrics.val_rank_aux_losses)], self.metrics.val_rank_aux_losses, 'm--', alpha=0.7, label='RankReg Aux Loss (Val)')
             if self.metrics.val_nsp_losses:
                  ax_val_main.plot(val_steps[:len(self.metrics.val_nsp_losses)], self.metrics.val_nsp_losses, 'orange', linestyle='--', alpha=0.7, label='NSP Aux Loss (Val)')
+            if self.metrics.val_span_selection_losses:
+                 ax_val_main.plot(val_steps[:len(self.metrics.val_span_selection_losses)], self.metrics.val_span_selection_losses, 'brown', linestyle='--', alpha=0.7, label='SpanSelect Aux Loss (Val)')
 
             ax_val_main.set_title('Validation Loss Components')
             ax_val_main.set_xlabel('Step'); ax_val_main.set_ylabel('Loss'); ax_val_main.grid(True, alpha=0.3)
@@ -1007,7 +1068,7 @@ class Trainer:
                     # Unpack 6 items, ignoring the ones not needed for perplexity
                     input_ids, next_token_lm_targets, _, _, task_type_flags, _ = batch
                     # For perplexity, only consider pure LM task items (type 0)
-                    lm_mask = (task_type_flags == 0.0)
+                    lm_mask = (task_type_flags == TASK_ID_LM)
                     if not lm_mask.any(): continue # Skip batch if no LM items
                     input_ids = input_ids[lm_mask]
                     # For perplexity, targets are next_token_lm_targets for pure LM items
@@ -1020,9 +1081,9 @@ class Trainer:
                 
                 autocast_context = torch.amp.autocast('cuda') if self.config.use_amp and self.config.scaler is not None else contextlib.suppress()
                 with autocast_context:
-                    # Model's forward now returns 4 values: lm_logits, loss, nsp_logits, rank_regression_outputs
-                    # We only need lm_logits for perplexity.
-                    lm_logits, _, _, _ = self.model(input_ids, targets=None, force_disable_prefix_attention=True)
+                    # Model's forward now returns a dictionary.
+                    model_outputs = self.model(input_ids, targets=None, force_disable_prefix_attention=True)
+                    lm_logits = model_outputs['lm_logits']
 
                 # Calculate loss for perplexity using the logits and targets_for_ppl
                 # Ensure ignore_index is correctly applied

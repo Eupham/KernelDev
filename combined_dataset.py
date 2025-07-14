@@ -4,6 +4,7 @@ import random
 from typing import List, Tuple, Union
 from levenshtein_dataset import LevenshteinDataset
 from nsp_dataset_new import NSPDataset
+from span_selection_dataset import SpanSelectionDataset
 
 TASK_ID_LM = 48 # ord('0')
 
@@ -23,7 +24,7 @@ class CombinedMultiTaskDataset(Dataset):
                  sep_token_id: int,
                  lm_ignore_idx: int = -1,
                  input_pad_id: int = 0,
-                 task_distribution: Tuple[float, float, float] = (0.25, 0.25, 0.5)):
+                 task_distribution: Tuple[float, float, float, float] = (0.20, 0.20, 0.40, 0.20)):
         """
         Args:
             raw_documents: List of documents/sentences
@@ -33,7 +34,7 @@ class CombinedMultiTaskDataset(Dataset):
             sep_token_id: ID for SEP token
             lm_ignore_idx: Token ID to use for ignoring positions in LM loss
             input_pad_id: Token ID for padding input sequences
-            task_distribution: (levenshtein_ratio, nsp_ratio, lm_ratio)
+            task_distribution: (rank_ratio, nsp_ratio, lm_ratio, span_selection_ratio)
         """
         self.tokenizer_fn = tokenizer_fn
         self.seq_len = seq_len
@@ -43,19 +44,32 @@ class CombinedMultiTaskDataset(Dataset):
         self.input_pad_id = input_pad_id
         
         # Task distribution
-        self.lev_ratio, self.nsp_ratio, self.lm_ratio = task_distribution
+        self.rank_ratio, self.nsp_ratio, self.lm_ratio, self.span_ratio = task_distribution
         if abs(sum(task_distribution) - 1.0) > 1e-6:
             raise ValueError("Task distribution must sum to 1.0")
         
         # Create individual datasets
         self.levenshtein_dataset = LevenshteinDataset(
             raw_documents, tokenizer_fn, seq_len, cls_token_id, 
-            lm_ignore_idx, input_pad_id, shuffle_percentage=1.0  # All shuffled for Lev task
+            lm_ignore_idx, input_pad_id, shuffle_percentage=1.0
         )
         
         self.nsp_dataset = NSPDataset(
             raw_documents, tokenizer_fn, seq_len, cls_token_id, sep_token_id,
             lm_ignore_idx, input_pad_id
+        )
+
+        # TODO: Need to get mask_token_id from data_builder
+        # For now, let's assume a placeholder value that will be updated.
+        # This will require a change in data_builder.py to create and pass this ID.
+        placeholder_mask_id = 258
+        self.span_selection_dataset = SpanSelectionDataset(
+            raw_documents, tokenizer_fn, seq_len,
+            mask_token_id=placeholder_mask_id,
+            cls_token_id=cls_token_id,
+            sep_token_id=sep_token_id,
+            lm_ignore_idx=lm_ignore_idx,
+            input_pad_id=input_pad_id
         )
         
         # Standard LM dataset (sentences without shuffling)
@@ -74,32 +88,24 @@ class CombinedMultiTaskDataset(Dataset):
         # self.nsp_ratio = task_distribution[1] (e.g. 0.25)
         # self.lm_ratio  = task_distribution[2] (e.g. 0.50)
         
-        # The current __getitem__ logic determines task type based on index in a cycle:
-        # NSP tasks first, then Levenshtein, then LM.
-        cycle_length = 8 # Matches existing logic
+        # The current __getitem__ logic determines task type based on index in a cycle.
+        # To accommodate (0.2, 0.2, 0.4, 0.2), a cycle length of 10 works well.
+        cycle_length = 10
         
         # Calculate number of items for each task in a cycle based on ratios
-        # These are used to determine which indices belong to which task type
-        num_nsp_in_cycle = round(cycle_length * self.nsp_ratio)
-        num_lev_in_cycle = round(cycle_length * self.lev_ratio)
-        # num_lm_in_cycle = cycle_length - num_nsp_in_cycle - num_lev_in_cycle # Implicit
-
-        # Boundaries for assigning indices to task types based on their position in the cycle
-        nsp_boundary_calc = num_nsp_in_cycle
-        lev_boundary_calc = num_nsp_in_cycle + num_lev_in_cycle
-
-        for i in range(self.length):
-            position_in_cycle = i % cycle_length
-            if position_in_cycle < nsp_boundary_calc: # Indices for NSP task
-                self.nsp_indices.append(i)
-            elif position_in_cycle < lev_boundary_calc: # Indices for Levenshtein task
-                self.lev_indices.append(i)
-            else: # Indices for LM task
-                self.lm_indices.append(i)
+        num_rank_in_cycle = round(cycle_length * self.rank_ratio) # 2
+        num_nsp_in_cycle = round(cycle_length * self.nsp_ratio)   # 2
+        num_span_in_cycle = round(cycle_length * self.span_ratio) # 2
+        # num_lm_in_cycle = cycle_length - num_rank_in_cycle - num_nsp_in_cycle - num_span_in_cycle # 4
         
-        random.shuffle(self.lm_indices)
-        random.shuffle(self.lev_indices)
-        random.shuffle(self.nsp_indices)
+        # Boundaries for assigning indices to task types
+        rank_boundary = num_rank_in_cycle
+        nsp_boundary = rank_boundary + num_nsp_in_cycle
+        span_boundary = nsp_boundary + num_span_in_cycle
+
+        # This part of the code that pre-calculates index lists is no longer needed
+        # as the task is determined dynamically in __getitem__. We can remove it.
+        # self.lm_indices = [] ... etc.
         
     def _create_lm_sample(self, text: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Create a standard language modeling sample with task ID and 5-tuple output."""
@@ -172,41 +178,35 @@ class CombinedMultiTaskDataset(Dataset):
         return self.length
     
     def __getitem__(self, idx):
-        # Deterministic task selection based on index to ensure proper batch composition
-        # This creates a repeating pattern that ensures the correct distribution
-        # For default distribution (0.25, 0.25, 0.5), every 8 samples will have:
-        # - 2 NSP samples (positions 0,1)
-        # - 2 Levenshtein samples (positions 2,3)  
-        # - 4 LM samples (positions 4,5,6,7)
+        # Deterministic task selection based on index to ensure proper batch composition.
+        # This creates a repeating pattern that ensures the correct distribution.
+        # For (0.2, 0.2, 0.4, 0.2) on a cycle of 10:
+        # Rank: 0, 1 | NSP: 2, 3 | Span: 4, 5 | LM: 6, 7, 8, 9
         
-        # Calculate the cycle length to ensure integer number of samples per task
-        cycle_length = 8  # This works for (0.25, 0.25, 0.5) distribution
+        cycle_length = 10
         position_in_cycle = idx % cycle_length
         
-        # Calculate boundaries for each task type
-        nsp_boundary = int(cycle_length * self.nsp_ratio)  # 2 for default ratios
-        lev_boundary = nsp_boundary + int(cycle_length * self.lev_ratio)  # 4 for default ratios
+        rank_boundary = int(cycle_length * self.rank_ratio)
+        nsp_boundary = rank_boundary + int(cycle_length * self.nsp_ratio)
+        span_boundary = nsp_boundary + int(cycle_length * self.span_ratio)
+
+        if position_in_cycle < rank_boundary:
+            # Rank Regression Task
+            if len(self.levenshtein_dataset) > 0:
+                return self.levenshtein_dataset[idx % len(self.levenshtein_dataset)]
         
-        if position_in_cycle < nsp_boundary:
-            # NSP task - positions 0,1
-            if len(self.nsp_dataset) == 0:
-                # Fallback to LM if NSP dataset is empty
-                doc_idx = idx % len(self.raw_documents)
-                return self._create_lm_sample(self.raw_documents[doc_idx])
-            nsp_idx = idx % len(self.nsp_dataset)
-            return self.nsp_dataset[nsp_idx]
-        elif position_in_cycle < lev_boundary:
-            # Levenshtein task - positions 2,3
-            if len(self.levenshtein_dataset) == 0:
-                # Fallback to LM if Levenshtein dataset is empty
-                doc_idx = idx % len(self.raw_documents)
-                return self._create_lm_sample(self.raw_documents[doc_idx])
-            lev_idx = idx % len(self.levenshtein_dataset)
-            return self.levenshtein_dataset[lev_idx]
-        else:
-            # LM task - positions 4,5,6,7
-            doc_idx = idx % len(self.raw_documents)
-            return self._create_lm_sample(self.raw_documents[doc_idx])
+        elif position_in_cycle < nsp_boundary:
+            # NSP Task
+            if len(self.nsp_dataset) > 0:
+                return self.nsp_dataset[idx % len(self.nsp_dataset)]
+
+        elif position_in_cycle < span_boundary:
+            # Span Selection Task
+            if len(self.span_selection_dataset) > 0:
+                return self.span_selection_dataset[idx % len(self.span_selection_dataset)]
+
+        # Default to LM task, which also serves as a fallback
+        return self._create_lm_sample(self.raw_documents[idx % len(self.raw_documents)])
 
     def update_lev_shuffle_parameters(self, min_p: float, max_p: float):
         if hasattr(self, 'levenshtein_dataset') and \
