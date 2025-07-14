@@ -690,14 +690,14 @@ class DataBuilder:
 
             if split_name == 'train' and self.use_levenshtein_task: # Use custom sampler only for train and if multi-task
                 print(f"--- Preparing train_dataloader (using StrictRatioBatchSampler) ---")
-                # Ratios: (lev_ratio, nsp_ratio, lm_ratio) - matching CombinedMultiTaskDataset defaults
-                task_ratios = (0.25, 0.25, 0.5)
+                # Ratios must now be a 4-element tuple: (rank, nsp, span, lm)
+                task_ratios = (0.20, 0.20, 0.20, 0.40)
 
                 train_batch_sampler = StrictRatioBatchSampler(
                     dataset=dataset_obj,
-                    batch_size=batch_size, # This is the effective batch size
+                    batch_size=batch_size,
                     ratios=task_ratios,
-                    drop_last=True # drop_last for training is typical
+                    drop_last=True
                 )
 
                 dataloaders[split_name] = DataLoader(
