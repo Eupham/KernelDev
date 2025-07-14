@@ -119,10 +119,16 @@ class StrictRatioBatchSampler(Sampler[List[int]]):
                 if nsp_ptr < len(current_nsp_indices):
                     batch_indices.append(current_nsp_indices[nsp_ptr])
                     nsp_ptr += 1
-                elif not self.drop_last:
-                    pass
                 else:
                      break
+
+            # Collect Span Selection indices
+            for _ in range(self.num_span_per_batch):
+                if span_ptr < len(current_span_indices):
+                    batch_indices.append(current_span_indices[span_ptr])
+                    span_ptr += 1
+                else:
+                    break
 
             # Collect Span Selection indices
             for _ in range(self.num_span_per_batch):

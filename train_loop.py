@@ -303,11 +303,11 @@ class Trainer:
         Train step with multi-task support.
         Returns: (combined_loss_val, lm_loss_item, rank_loss_item, nsp_loss_item, penalty_reward_item)
         """
-        mean_lm_loss_component_item = None
-        rank_loss_item = None
-        mean_nsp_loss_item = None
-        span_selection_loss_item = None # New
-        rl_reward_item = 0.0 # New
+        mean_lm_loss_component_item = 0.0
+        rank_loss_item = 0.0
+        mean_nsp_loss_item = 0.0
+        span_selection_loss_item = 0.0
+        rl_reward_item = 0.0
 
         # The model's forward method now returns a dictionary of outputs.
         # The batch structure for multi-task is:
