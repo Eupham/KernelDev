@@ -740,8 +740,8 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
     with torch.no_grad():
         # Test with causal=True (default)
         print("Testing with causal=True...")
-        # model.forward now returns logits, loss, predicted_distance_score, nsp_logits
-        logits_causal, _, _, _ = model(x)
+        outputs_causal = model(x)
+        logits_causal = outputs_causal['lm_logits']
         
         # Test with causal=False by modifying the attention layers
         print("Testing with causal=False...")
@@ -751,8 +751,8 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
             original_causal.append(block.attn.causal)
             block.attn.causal = False
         
-        # model.forward now returns logits, loss, predicted_distance_score, nsp_logits
-        logits_non_causal, _, _, _ = model(x)
+        outputs_non_causal = model(x)
+        logits_non_causal = outputs_non_causal['lm_logits']
         
         # Restore original causal setting
         for i, block in enumerate(model.blocks):

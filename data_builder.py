@@ -128,6 +128,11 @@ class DataBuilder:
                         string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
                         current_byte_sequence = []
                     string_parts.append("[SEP]")
+                elif self.mask_token_id is not None and token == self.mask_token_id:
+                    if current_byte_sequence:
+                        string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
+                        current_byte_sequence = []
+                    string_parts.append("[MASK]")
                 elif 0 <= token <= 255:
                     current_byte_sequence.append(token)
                 else: # Special tokens other than CLS (e.g., padding -1) or unknown tokens
