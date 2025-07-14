@@ -576,12 +576,12 @@ def start_actual_training(cli_args):
     # Test a batch
     if 'train' in dataloaders:
         print("\n=== Data Sample ===")
-        # Adjust for LevenshteinDataset or standard output
+        # Adjust for the new 6-item tuple from the dataset
         if lev_task_enabled:
-            # CombinedMultiTaskDataset now yields 5 items:
-            # input_tokens, next_token_lm_targets, unshuffle_seq_targets, auxiliary_values, task_type_flags
-            for input_tokens, next_token_lm_targets, unshuffle_seq_targets, auxiliary_values, task_type_flags in dataloaders['train']:
-                print(f"Multi-task Batch shapes: Input Toks-{input_tokens.shape}, NextLM Targets-{next_token_lm_targets.shape}, Unshuffle Targets-{unshuffle_seq_targets.shape}, Aux-{auxiliary_values.shape}, TaskType-{task_type_flags.shape}")
+            # CombinedMultiTaskDataset now yields 6 items:
+            # input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags, true_original_ranks
+            for input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags, true_original_ranks in dataloaders['train']:
+                print(f"Multi-task Batch shapes: Input Toks-{input_tokens.shape}, NextLM Targets-{next_token_lm_targets.shape}, Rank Targets-{rank_targets.shape}, Aux-{auxiliary_values.shape}, TaskType-{task_type_flags.shape}, TrueRanks-{true_original_ranks.shape}")
                 print(f"Sample multi-task input tokens: {input_tokens[0][:20].tolist()}")
                 # Determine task type for the first item in the batch
                 task_type = task_type_flags[0].item()
@@ -706,14 +706,14 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
         print("Warning: Train dataloader is empty in test_causal_attention. Skipping test.")
         return
 
-    if lev_task_enabled: # This means multi-task is enabled, datasets return 5 items
-        # New 5-item tuple: (input_tokens, next_token_lm_targets, rank_targets, aux_scalar, task_flags)
-        if len(first_batch) == 5:
+    if lev_task_enabled: # This means multi-task is enabled, datasets return 6 items
+        # New 6-item tuple: (input_tokens, next_token_lm_targets, rank_targets, aux_scalar, task_flags, true_original_ranks)
+        if len(first_batch) == 6:
             # We only need input_tokens for this test.
-            input_tokens, _, _, _, _ = first_batch
+            input_tokens, _, _, _, _, _ = first_batch
             x = input_tokens
         else:
-            print(f"Warning: Expected 5 items in multi-task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            print(f"Warning: Expected 6 items in multi-task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
     else: # Standard LM task
         # Expecting (input_ids, lm_targets)

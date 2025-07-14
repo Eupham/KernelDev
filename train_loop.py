@@ -50,6 +50,7 @@ class TrainingConfig:
         use_levenshtein_task: bool = False,
         levenshtein_loss_weight: float = 0.1,
         nsp_loss_weight: float = 0.1,
+        rl_loss_weight: float = 0.1, # New weight for self-critique RL loss
         lm_ignore_idx: int = -1,
         long_term_loss_window: int = 1000,  # New
         short_term_loss_window: int = 100, # New
@@ -79,8 +80,9 @@ class TrainingConfig:
         self.scheduler_T_mult = scheduler_T_mult
         self.use_levenshtein_task = use_levenshtein_task
         self.levenshtein_loss_weight = levenshtein_loss_weight
-        self.nsp_loss_weight = nsp_loss_weight # Ensure this is present from previous changes
-        self.lm_ignore_idx = lm_ignore_idx     # Ensure this is present
+        self.nsp_loss_weight = nsp_loss_weight
+        self.rl_loss_weight = rl_loss_weight # New
+        self.lm_ignore_idx = lm_ignore_idx
         self.long_term_loss_window = long_term_loss_window
         self.short_term_loss_window = short_term_loss_window
         self.dynamic_loss_adjustment_factor = dynamic_loss_adjustment_factor
@@ -165,11 +167,12 @@ class TrainingMetrics:
         self.val_rank_aux_losses = [] # Stores rank_regression_loss for validation (formerly val_lev_aux_losses)
         self.val_nsp_losses = []
         self.penalty_rewards = []
+        self.rl_rewards = [] # New: For tracking self-critique rewards
 
     def update(self, train_loss=None, val_loss=None, learning_rate=None, step_time=None,
                  lm_loss_component=None, rank_aux_loss=None, nsp_loss=None, # Renamed lev_aux_loss
                  val_lm_loss_component=None, val_rank_aux_loss=None, val_nsp_loss=None, # Renamed val_lev_aux_loss
-                 penalty_reward=None):
+                 penalty_reward=None, rl_reward=None): # Added rl_reward
         if train_loss is not None: self.train_losses.append(train_loss)
         if val_loss is not None:
             self.val_losses.append(val_loss)
@@ -181,6 +184,7 @@ class TrainingMetrics:
         if lm_loss_component is not None: self.lm_losses.append(lm_loss_component)
         if rank_aux_loss is not None: self.rank_aux_losses.append(rank_aux_loss) # Renamed
         if nsp_loss is not None: self.nsp_losses.append(nsp_loss)
+        if rl_reward is not None: self.rl_rewards.append(rl_reward) # New
 
         if val_lm_loss_component is not None: self.val_lm_losses.append(val_lm_loss_component)
         if val_rank_aux_loss is not None: self.val_rank_aux_losses.append(val_rank_aux_loss) # Renamed
@@ -239,6 +243,15 @@ class TrainingMetrics:
         if not relevant_values:
             return None
         return np.mean(relevant_values)
+
+    def get_avg_rl_reward(self, last_n: int) -> Optional[float]:
+        if not self.rl_rewards:
+            return None
+        relevant_rewards = [r.item() if isinstance(r, torch.Tensor) else r for r in self.rl_rewards[-last_n:]]
+        relevant_rewards = [r for r in relevant_rewards if r is not None]
+        if not relevant_rewards:
+            return None
+        return np.mean(relevant_rewards)
     
     def save_metrics(self, filepath):
         metrics_dict = {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
@@ -284,22 +297,25 @@ class Trainer:
         # input_tokens, next_token_lm_targets, rank_regression_targets (formerly unshuffle_seq_targets), auxiliary_values, task_type_flags
 
         if self.config.use_levenshtein_task: # This flag now means "use multi-task including rank regression"
-            input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags = batch
+            # Unpack the new 6-item tuple
+            input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags, true_original_ranks = batch
             input_tokens = input_tokens.to(self.config.device)
             next_token_lm_targets = next_token_lm_targets.to(self.config.device)
             rank_targets = rank_targets.to(self.config.device) # These are float targets for ranks
             auxiliary_values = auxiliary_values.to(self.config.device)
             task_type_flags = task_type_flags.to(self.config.device)
+            true_original_ranks = true_original_ranks.to(self.config.device) # New item for RL reward
         else: # Single-task LM mode
             if len(batch) == 2:
                 input_tokens, next_token_lm_targets = batch
-            elif len(batch) == 5: # If data loader still yields 5 items even in single task mode
-                 input_tokens, next_token_lm_targets, _, _, _ = batch
+            elif len(batch) == 6: # If data loader still yields 6 items even in single task mode
+                 input_tokens, next_token_lm_targets, _, _, _, _ = batch
             else:
                 raise ValueError(f"Unexpected batch structure with {len(batch)} items in single-task mode.")
             rank_targets = None
             auxiliary_values = None
             task_type_flags = None # Indicates pure LM task if None or all 0.0
+            true_original_ranks = None
 
             input_tokens = input_tokens.to(self.config.device)
             next_token_lm_targets = next_token_lm_targets.to(self.config.device)
@@ -326,11 +342,69 @@ class Trainer:
                 nsp_task_mask = (task_type_flags == 2.0) # Task ID for NSP
                 
                 # LM Loss component (from items marked as LM task)
-                if lm_task_mask.any() and per_item_lm_loss_all is not None:
-                    valid_lm_losses = per_item_lm_loss_all[lm_task_mask]
-                    if valid_lm_losses.numel() > 0:
-                        final_batch_lm_loss_component = valid_lm_losses.float().mean()
-                
+                pg_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
+                if lm_task_mask.any():
+                    # Standard CE Loss
+                    if per_item_lm_loss_all is not None:
+                        valid_lm_losses = per_item_lm_loss_all[lm_task_mask]
+                        if valid_lm_losses.numel() > 0:
+                            final_batch_lm_loss_component = valid_lm_losses.float().mean()
+
+                    # --- RL Self-Critique Step ---
+                    # 1. Greedy decode to get generated sequence (action)
+                    lm_logits_for_rl = lm_logits_all[lm_task_mask]
+                    generated_tokens = torch.argmax(lm_logits_for_rl.detach(), dim=-1)
+
+                    # 2. Get reward by passing generated sequence back through model
+                    with torch.no_grad():
+                        _, _, _, predicted_ranks_for_gen = self.model(generated_tokens)
+
+                    # 3. Calculate reward = -MSE(predicted_ranks, true_ranks)
+                    true_ranks_for_rl = true_original_ranks[lm_task_mask]
+                    predicted_ranks_for_gen = predicted_ranks_for_gen.squeeze(-1)
+
+                    rank_ignore_val = float(getattr(self.config, 'lm_ignore_idx', -1.0))
+                    reward_mask = (true_ranks_for_rl != rank_ignore_val)
+
+                    # Ensure shapes match for masking
+                    if predicted_ranks_for_gen.shape != true_ranks_for_rl.shape:
+                         # This can happen if generation is shorter than seq_len, pad preds
+                         pad_shape = (predicted_ranks_for_gen.shape[0], true_ranks_for_rl.shape[1] - predicted_ranks_for_gen.shape[1])
+                         padding = torch.full(pad_shape, rank_ignore_val, device=self.config.device)
+                         predicted_ranks_for_gen = torch.cat([predicted_ranks_for_gen, padding], dim=1)
+
+                    if reward_mask.any():
+                        reward = -F.mse_loss(
+                            predicted_ranks_for_gen[reward_mask],
+                            true_ranks_for_rl[reward_mask]
+                        )
+                    else:
+                        reward = torch.tensor(0.0, device=self.config.device)
+
+                    # 4. Calculate Policy Gradient loss
+                    log_probs = F.log_softmax(lm_logits_for_rl, dim=-1)
+                    # Gather the log_probs of the generated tokens
+                    action_log_probs = log_probs.gather(dim=-1, index=generated_tokens.unsqueeze(-1)).squeeze(-1)
+
+                    # Apply mask from lm_targets to only consider loss on valid (non-padded) tokens
+                    lm_targets_for_rl = next_token_lm_targets[lm_task_mask]
+                    policy_loss_mask = (lm_targets_for_rl != self.config.lm_ignore_idx)
+
+                    # REINFORCE loss: -reward * log_prob(action)
+                    # We want to minimize this, so we use -reward.
+                    # The reward is already negative MSE, so we are minimizing -(-MSE) * log_prob = MSE * log_prob
+                    # This seems off. Let's make reward positive: higher reward = lower MSE
+                    reward = -reward # Now reward is positive (or zero)
+
+                    # PG loss for minimization is -E[R * log(pi)]. So -reward * action_log_probs
+                    pg_loss_unmasked = -reward.detach() * action_log_probs
+
+                    # Sum loss only for valid tokens and average over batch
+                    pg_loss = (pg_loss_unmasked * policy_loss_mask).sum() / policy_loss_mask.sum()
+
+                    # The reward is now positive, so we can log it directly.
+                    # It will be passed to metrics.update later.
+
                 # Rank Regression Loss component (from items marked as Rank task)
                 if rank_task_mask.any() and rank_targets is not None and rank_regression_outputs_all is not None:
                     # rank_regression_outputs_all are (batch, seq_len, 1)
@@ -363,7 +437,7 @@ class Trainer:
                 
                 # Combine losses for multi-task items
                 # Start with LM loss component (which could be 0 if no LM items in batch or all ignored)
-                combined_loss = final_batch_lm_loss_component
+                combined_loss = final_batch_lm_loss_component + (self.config.rl_loss_weight * pg_loss)
                 # Add weighted Rank Regression loss
                 combined_loss = combined_loss + (self.config.levenshtein_loss_weight * rank_loss_tensor) # Re-use levenshtein_loss_weight for rank task
                 # Add weighted NSP loss
@@ -414,7 +488,9 @@ class Trainer:
            not torch.isfinite(final_loss_for_backward) or \
            final_loss_for_backward.abs().item() < 1e-9 : # If loss is ~0 and no grad
              # Return raw loss values; penalty/reward also effectively 0 or not meaningful.
-             return raw_combined_loss_val, mean_lm_loss_component_item, rank_loss_item, mean_nsp_loss_item, 0.0
+             # The reward from the RL step is now also returned.
+             rl_reward_item = reward.item() if 'reward' in locals() and isinstance(reward, torch.Tensor) else 0.0
+             return raw_combined_loss_val, mean_lm_loss_component_item, rank_loss_item, mean_nsp_loss_item, 0.0, rl_reward_item
 
         if self.config.use_amp and self.config.scaler is not None:
             self.config.scaler.scale(final_loss_for_backward).backward() # final_loss_for_backward is used for gradient calculation
@@ -429,8 +505,10 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
 
+        # The reward from the RL step is now also returned.
+        rl_reward_item = reward.item() if 'reward' in locals() and isinstance(reward, torch.Tensor) else 0.0
         # Return raw_combined_loss_val for metrics, and current_penalty_reward_val for new metric tracking
-        return raw_combined_loss_val, mean_lm_loss_component_item, rank_loss_item, mean_nsp_loss_item, current_penalty_reward_val
+        return raw_combined_loss_val, mean_lm_loss_component_item, rank_loss_item, mean_nsp_loss_item, current_penalty_reward_val, rl_reward_item
 
     def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
         self.model.eval()
@@ -456,7 +534,8 @@ class Trainer:
                 
                 # Batch unpacking, similar to train_step
                 if self.config.use_levenshtein_task: # Multi-task mode
-                    input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags = batch
+                    # Unpack 6 items, ignoring the 6th (true_original_ranks) as it's not used in evaluation
+                    input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags, _ = batch
                     input_tokens = input_tokens.to(self.config.device)
                     next_token_lm_targets = next_token_lm_targets.to(self.config.device)
                     rank_targets = rank_targets.to(self.config.device) # Float tensor for ranks
@@ -464,7 +543,7 @@ class Trainer:
                     task_type_flags = task_type_flags.to(self.config.device)
                 else: # Single-task LM mode
                     if len(batch) == 2: input_tokens, next_token_lm_targets = batch
-                    elif len(batch) == 5: input_tokens, next_token_lm_targets, _, _, _ = batch
+                    elif len(batch) == 6: input_tokens, next_token_lm_targets, _, _, _, _ = batch
                     else: raise ValueError("Unexpected batch structure in single-task mode during eval.")
 
                     input_tokens = input_tokens.to(self.config.device)
@@ -642,9 +721,9 @@ class Trainer:
         
         for batch_idx, batch in enumerate(train_loader):
             step_start = time.time()
-            # Correctly unpack to current_rank_loss_item
+            # Unpack the new 6-item tuple from train_step, which now includes rl_reward_item
             combined_loss_item, current_lm_loss_item, current_rank_loss_item, \
-                current_nsp_loss_item, current_penalty_reward = self.train_step(batch)
+                current_nsp_loss_item, current_penalty_reward, rl_reward_item = self.train_step(batch)
             epoch_losses.append(combined_loss_item)
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
@@ -653,22 +732,24 @@ class Trainer:
                 learning_rate=current_lr,
                 step_time=time.time() - step_start,
                 lm_loss_component=current_lm_loss_item,
-                rank_aux_loss=current_rank_loss_item, # Pass as rank_aux_loss
+                rank_aux_loss=current_rank_loss_item,
                 nsp_loss=current_nsp_loss_item,
-                penalty_reward=current_penalty_reward
+                penalty_reward=current_penalty_reward,
+                rl_reward=rl_reward_item # Log the new reward
             )
             
             if (not self.is_distributed or dist.get_rank() == 0) and \
                self.metrics.total_steps % self.config.log_every == 0:
 
                 long_window = self.config.long_term_loss_window
-                log_interval_window = self.config.log_every # For penalty reward and step time avg to match log freq
+                log_interval_window = self.config.log_every
 
                 avg_combined_loss = self.metrics.get_avg_combined_loss(last_n=long_window)
                 avg_lm_comp = self.metrics.get_avg_lm_loss(last_n=long_window)
-                avg_rank_aux = self.metrics.get_avg_rank_loss(last_n=long_window) # Renamed
+                avg_rank_aux = self.metrics.get_avg_rank_loss(last_n=long_window)
                 avg_nsp_loss = self.metrics.get_avg_nsp_loss(last_n=long_window)
                 avg_penalty_reward = self.metrics.get_avg_penalty_reward(last_n=log_interval_window)
+                avg_rl_reward = self.metrics.get_avg_rl_reward(last_n=log_interval_window) # Get avg RL reward
 
                 avg_step_time = self.metrics.get_avg_step_time(last_n=log_interval_window)
 
@@ -676,18 +757,22 @@ class Trainer:
                 log_msg += f", Loss: {combined_loss_item:.4f}"
                 log_msg += f", AvgLoss(L): {avg_combined_loss:.4f}" if avg_combined_loss is not None else ""
 
-                if self.config.use_levenshtein_task: # Multi-task mode (levenshtein_task flag now means multi-task with rank)
+                if self.config.use_levenshtein_task:
                     lm_log = f"{avg_lm_comp:.4f}" if avg_lm_comp is not None else "N/A"
                     log_msg += f", AvgLM(L): {lm_log}"
 
-                    rank_log = f"{avg_rank_aux:.4f}" if avg_rank_aux is not None else "N/A" # Renamed
-                    log_msg += f", AvgRankReg(L): {rank_log}" # Changed log key
+                    rank_log = f"{avg_rank_aux:.4f}" if avg_rank_aux is not None else "N/A"
+                    log_msg += f", AvgRankReg(L): {rank_log}"
 
                     nsp_log = f"{avg_nsp_loss:.4f}" if avg_nsp_loss is not None else "N/A"
                     log_msg += f", AvgNSP(L): {nsp_log}"
 
+                    # Add RL reward to log message
+                    rl_reward_log = f"{avg_rl_reward:.4f}" if avg_rl_reward is not None else "N/A"
+                    log_msg += f", AvgRLReward: {rl_reward_log}"
+
                     penalty_log = f"{avg_penalty_reward:.4f}" if avg_penalty_reward is not None else (f"{current_penalty_reward:.4f}" if current_penalty_reward is not None else "N/A")
-                    log_msg += f", AvgPenalty: {penalty_log}" # Avg of penalty over log_interval_window
+                    log_msg += f", AvgPenalty: {penalty_log}"
 
                 log_msg += f", LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_msg)
@@ -846,6 +931,12 @@ class Trainer:
             ax_flat[plot_idx].plot(self.metrics.learning_rates, 'darkorange', alpha=0.7, label='Learning Rate')
             ax_flat[plot_idx].set_title('Learning Rate')
             ax_flat[plot_idx].set_xlabel('Step'); ax_flat[plot_idx].set_ylabel('LR'); ax_flat[plot_idx].grid(True, alpha=0.3); ax_flat[plot_idx].legend()
+        plot_idx += 1
+
+        if self.metrics.rl_rewards:
+            ax_flat[plot_idx].plot(self.metrics.rl_rewards, 'purple', alpha=0.7, label='RL Self-Critique Reward')
+            ax_flat[plot_idx].set_title('RL Reward (Higher is Better)')
+            ax_flat[plot_idx].set_xlabel('Step'); ax_flat[plot_idx].set_ylabel('Reward (-MSE)'); ax_flat[plot_idx].grid(True, alpha=0.3); ax_flat[plot_idx].legend()
         plot_idx += 1
         
         for i in range(plot_idx, len(ax_flat)): fig.delaxes(ax_flat[i]) # Remove unused subplots

@@ -145,12 +145,16 @@ class LevenshteinDataset(Dataset):
         # 7. Task type flag (identifies this as auxiliary task type 1)
         task_type_flag_tensor = torch.tensor(1.0, dtype=torch.float32)
 
+        # 8. Add dummy placeholder for original text ranks (for 6-tuple consistency)
+        original_text_ranks_placeholder = torch.full((self.seq_len,), self.rank_ignore_idx_float, dtype=torch.float32)
+
         return (
             torch.tensor(padded_input_tokens, dtype=torch.long),
-            torch.tensor(next_token_lm_targets_list, dtype=torch.long), # For main LM head (all ignored)
-            torch.tensor(rank_regression_targets, dtype=torch.float32), # For rank regression head
-            auxiliary_scalar_value, # Dummy scalar
-            task_type_flag_tensor   # Task type identifier
+            torch.tensor(next_token_lm_targets_list, dtype=torch.long),
+            torch.tensor(rank_regression_targets, dtype=torch.float32),
+            auxiliary_scalar_value,
+            task_type_flag_tensor,
+            original_text_ranks_placeholder # New 6th item
         )
 
 if __name__ == '__main__':

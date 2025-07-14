@@ -116,10 +116,14 @@ class NSPDataset(Dataset):
         # 5. Task type flag
         task_type_flag_tensor = torch.tensor(2.0, dtype=torch.float) # Type 2 for NSP
 
+        # 6. Add dummy placeholder for original text ranks (for 6-tuple consistency)
+        original_text_ranks_placeholder = torch.full((self.seq_len,), rank_ignore_val_float, dtype=torch.float32)
+
         return (
             torch.tensor(padded_input_tokens, dtype=torch.long),
             torch.tensor(next_token_lm_targets_list, dtype=torch.long),
-            torch.tensor(aux_sequence_targets_list, dtype=torch.float32), # Changed to float32
+            torch.tensor(aux_sequence_targets_list, dtype=torch.float32),
             auxiliary_scalar_value_tensor,
-            task_type_flag_tensor
+            task_type_flag_tensor,
+            original_text_ranks_placeholder # New 6th item
         )

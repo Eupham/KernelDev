@@ -134,12 +134,32 @@ class CombinedMultiTaskDataset(Dataset):
         # 5. Task type flag
         task_type_flag_tensor = torch.tensor(0.0, dtype=torch.float) # Type 0 for LM
 
+        # 6. Prepare true ranks of the original text for the RL self-critique step
+        # This needs to align with the *input* tokens, not the target tokens.
+        # The ranks are for the characters in `final_input_tokens_list`.
+        true_ranks_of_original = []
+        if len(text) > 0:
+            # The first two tokens are [TASK_ID, CLS], they don't have a rank from the text.
+            # We can assign them an ignore value.
+            true_ranks_of_original.append(rank_ignore_val_float) # Rank for TASK_ID
+            true_ranks_of_original.append(rank_ignore_val_float) # Rank for CLS
+
+            # Ranks for the actual content tokens
+            for i in range(len(content_tokens)):
+                rank = (i + 1.0) / len(text) # 1-based normalized rank
+                true_ranks_of_original.append(rank)
+
+        # Pad the ranks list to seq_len
+        padded_true_ranks = true_ranks_of_original + [rank_ignore_val_float] * (self.seq_len - len(true_ranks_of_original))
+        original_text_ranks_tensor = torch.tensor(padded_true_ranks, dtype=torch.float32)
+
         return (
             torch.tensor(padded_input_tokens, dtype=torch.long),
             torch.tensor(next_token_lm_targets_list, dtype=torch.long),
-            torch.tensor(aux_sequence_targets_list, dtype=torch.float32), # Changed to float32
+            torch.tensor(aux_sequence_targets_list, dtype=torch.float32),
             auxiliary_scalar_value_tensor,
-            task_type_flag_tensor
+            task_type_flag_tensor,
+            original_text_ranks_tensor # New 6th item
         )
     
     def _pad_tokens(self, tokens: List[int], max_len: int, pad_id: int) -> List[int]:
