@@ -609,8 +609,9 @@ class DataBuilder:
                     cls_token_id=self.cls_token_id,
                     sep_token_id=self.sep_token_id,
                     lm_ignore_idx=-1,
-                    input_pad_id=0,    # Assuming 0 is a safe padding ID not overlapping with CLS/SEP
-                    task_distribution=(0.25, 0.25, 0.5)  # 25% Lev, 25% NSP, 50% LM
+                    input_pad_id=0,
+                    # New 4-way task distribution
+                    task_distribution=(0.20, 0.20, 0.40, 0.20)
                 )
                 print(f"{split_name} Combined multi-task dataset: {len(datasets[split_name])} examples")
             else: # Standard TokenizedDataset for LM
