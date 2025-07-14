@@ -22,9 +22,10 @@ class CombinedMultiTaskDataset(Dataset):
                  seq_len: int,
                  cls_token_id: int,
                  sep_token_id: int,
+                 mask_token_id: int, # New
                  lm_ignore_idx: int = -1,
                  input_pad_id: int = 0,
-                 task_distribution: Tuple[float, float, float, float] = (0.20, 0.20, 0.40, 0.20)):
+                 task_distribution: Tuple[float, float, float, float] = (0.20, 0.20, 0.20, 0.40)):
         """
         Args:
             raw_documents: List of documents/sentences
@@ -32,19 +33,21 @@ class CombinedMultiTaskDataset(Dataset):
             seq_len: Maximum sequence length
             cls_token_id: ID for CLS token
             sep_token_id: ID for SEP token
+            mask_token_id: ID for MASK token
             lm_ignore_idx: Token ID to use for ignoring positions in LM loss
             input_pad_id: Token ID for padding input sequences
-            task_distribution: (rank_ratio, nsp_ratio, lm_ratio, span_selection_ratio)
+            task_distribution: (rank_ratio, nsp_ratio, span_ratio, lm_ratio)
         """
         self.tokenizer_fn = tokenizer_fn
         self.seq_len = seq_len
         self.cls_token_id = cls_token_id
         self.sep_token_id = sep_token_id
+        self.mask_token_id = mask_token_id # New
         self.lm_ignore_idx = lm_ignore_idx
         self.input_pad_id = input_pad_id
         
         # Task distribution
-        self.rank_ratio, self.nsp_ratio, self.lm_ratio, self.span_ratio = task_distribution
+        self.rank_ratio, self.nsp_ratio, self.span_ratio, self.lm_ratio = task_distribution
         if abs(sum(task_distribution) - 1.0) > 1e-6:
             raise ValueError("Task distribution must sum to 1.0")
         
@@ -59,13 +62,9 @@ class CombinedMultiTaskDataset(Dataset):
             lm_ignore_idx, input_pad_id
         )
 
-        # TODO: Need to get mask_token_id from data_builder
-        # For now, let's assume a placeholder value that will be updated.
-        # This will require a change in data_builder.py to create and pass this ID.
-        placeholder_mask_id = 258
         self.span_selection_dataset = SpanSelectionDataset(
             raw_documents, tokenizer_fn, seq_len,
-            mask_token_id=placeholder_mask_id,
+            mask_token_id=self.mask_token_id,
             cls_token_id=cls_token_id,
             sep_token_id=sep_token_id,
             lm_ignore_idx=lm_ignore_idx,
@@ -88,24 +87,36 @@ class CombinedMultiTaskDataset(Dataset):
         # self.nsp_ratio = task_distribution[1] (e.g. 0.25)
         # self.lm_ratio  = task_distribution[2] (e.g. 0.50)
         
-        # The current __getitem__ logic determines task type based on index in a cycle.
-        # To accommodate (0.2, 0.2, 0.4, 0.2), a cycle length of 10 works well.
-        cycle_length = 10
-        
-        # Calculate number of items for each task in a cycle based on ratios
-        num_rank_in_cycle = round(cycle_length * self.rank_ratio) # 2
-        num_nsp_in_cycle = round(cycle_length * self.nsp_ratio)   # 2
-        num_span_in_cycle = round(cycle_length * self.span_ratio) # 2
-        # num_lm_in_cycle = cycle_length - num_rank_in_cycle - num_nsp_in_cycle - num_span_in_cycle # 4
-        
-        # Boundaries for assigning indices to task types
-        rank_boundary = num_rank_in_cycle
-        nsp_boundary = rank_boundary + num_nsp_in_cycle
-        span_boundary = nsp_boundary + num_span_in_cycle
+        # This logic is restored and updated for 4 tasks.
+        # It is required by the StrictRatioBatchSampler.
+        self.rank_indices = []
+        self.nsp_indices = []
+        self.span_indices = []
+        self.lm_indices = []
 
-        # This part of the code that pre-calculates index lists is no longer needed
-        # as the task is determined dynamically in __getitem__. We can remove it.
-        # self.lm_indices = [] ... etc.
+        cycle_length = 10 # (0.2, 0.2, 0.2, 0.4) sums nicely
+
+        # Calculate boundaries for assigning indices to task types
+        rank_boundary = int(cycle_length * self.rank_ratio)
+        nsp_boundary = rank_boundary + int(cycle_length * self.nsp_ratio)
+        span_boundary = nsp_boundary + int(cycle_length * self.span_ratio)
+
+        for i in range(self.length):
+            position_in_cycle = i % cycle_length
+            if position_in_cycle < rank_boundary:
+                self.rank_indices.append(i)
+            elif position_in_cycle < nsp_boundary:
+                self.nsp_indices.append(i)
+            elif position_in_cycle < span_boundary:
+                self.span_indices.append(i)
+            else:
+                self.lm_indices.append(i)
+        
+        # Shuffle indices to ensure randomness within each task type
+        random.shuffle(self.rank_indices)
+        random.shuffle(self.nsp_indices)
+        random.shuffle(self.span_indices)
+        random.shuffle(self.lm_indices)
         
     def _create_lm_sample(self, text: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Create a standard language modeling sample with task ID and 5-tuple output."""
@@ -178,35 +189,22 @@ class CombinedMultiTaskDataset(Dataset):
         return self.length
     
     def __getitem__(self, idx):
-        # Deterministic task selection based on index to ensure proper batch composition.
-        # This creates a repeating pattern that ensures the correct distribution.
-        # For (0.2, 0.2, 0.4, 0.2) on a cycle of 10:
-        # Rank: 0, 1 | NSP: 2, 3 | Span: 4, 5 | LM: 6, 7, 8, 9
+        # This method is not called directly when using StrictRatioBatchSampler,
+        # but it's good practice to have a fallback or default behavior.
+        # The sampler will provide indices from the specific task lists.
+        # This implementation can serve as a simple, non-ratio-based fallback.
         
-        cycle_length = 10
-        position_in_cycle = idx % cycle_length
+        # Simple modulo-based task selection for fallback
+        task_type = idx % 4
         
-        rank_boundary = int(cycle_length * self.rank_ratio)
-        nsp_boundary = rank_boundary + int(cycle_length * self.nsp_ratio)
-        span_boundary = nsp_boundary + int(cycle_length * self.span_ratio)
-
-        if position_in_cycle < rank_boundary:
-            # Rank Regression Task
-            if len(self.levenshtein_dataset) > 0:
-                return self.levenshtein_dataset[idx % len(self.levenshtein_dataset)]
-        
-        elif position_in_cycle < nsp_boundary:
-            # NSP Task
-            if len(self.nsp_dataset) > 0:
-                return self.nsp_dataset[idx % len(self.nsp_dataset)]
-
-        elif position_in_cycle < span_boundary:
-            # Span Selection Task
-            if len(self.span_selection_dataset) > 0:
-                return self.span_selection_dataset[idx % len(self.span_selection_dataset)]
-
-        # Default to LM task, which also serves as a fallback
-        return self._create_lm_sample(self.raw_documents[idx % len(self.raw_documents)])
+        if task_type == 0 and self.rank_indices:
+            return self.levenshtein_dataset[idx % len(self.levenshtein_dataset)]
+        elif task_type == 1 and self.nsp_indices:
+            return self.nsp_dataset[idx % len(self.nsp_dataset)]
+        elif task_type == 2 and self.span_indices:
+            return self.span_selection_dataset[idx % len(self.span_selection_dataset)]
+        else: # Fallback to LM
+            return self._create_lm_sample(self.raw_documents[idx % len(self.raw_documents)])
 
     def update_lev_shuffle_parameters(self, min_p: float, max_p: float):
         if hasattr(self, 'levenshtein_dataset') and \

@@ -15,31 +15,30 @@ CombinedMultiTaskDataset = 'CombinedMultiTaskDataset'
 
 class StrictRatioBatchSampler(Sampler[List[int]]):
     def __init__(self,
-                 dataset: Dataset, # Use general Dataset, but expect it to have lm_indices etc.
+                 dataset: Dataset,
                  batch_size: int,
-                 ratios: Tuple[float, float, float], # (lev_ratio, nsp_ratio, lm_ratio)
+                 ratios: Tuple[float, float, float, float], # (rank, nsp, span, lm)
                  drop_last: bool = True):
 
-        super().__init__(dataset) # Pass dataset to parent Sampler
+        super().__init__(dataset)
 
-        if not hasattr(dataset, 'lev_indices') or \
-           not hasattr(dataset, 'nsp_indices') or \
-           not hasattr(dataset, 'lm_indices'):
-            raise ValueError("Dataset must have 'lev_indices', 'nsp_indices', and 'lm_indices' attributes.")
+        if not all(hasattr(dataset, attr) for attr in ['rank_indices', 'nsp_indices', 'span_indices', 'lm_indices']):
+            raise ValueError("Dataset must have 'rank_indices', 'nsp_indices', 'span_indices', and 'lm_indices' attributes.")
 
         self.dataset = dataset
         self.batch_size = batch_size
-        self.ratios = ratios # (lev_ratio, nsp_ratio, lm_ratio)
+        self.ratios = ratios
         self.drop_last = drop_last
 
-        self.lev_ratio, self.nsp_ratio, self.lm_ratio = ratios
+        self.rank_ratio, self.nsp_ratio, self.span_ratio, self.lm_ratio = ratios
 
         # Calculate number of samples per task type in each batch
-        self.num_lev_per_batch = math.floor(self.batch_size * self.lev_ratio)
+        self.num_rank_per_batch = math.floor(self.batch_size * self.rank_ratio)
         self.num_nsp_per_batch = math.floor(self.batch_size * self.nsp_ratio)
+        self.num_span_per_batch = math.floor(self.batch_size * self.span_ratio)
 
         # Assign remainder to the LM task to ensure batch_size is met
-        current_sum = self.num_lev_per_batch + self.num_nsp_per_batch
+        current_sum = self.num_rank_per_batch + self.num_nsp_per_batch + self.num_span_per_batch
         self.num_lm_per_batch = self.batch_size - current_sum
 
         if self.num_lm_per_batch < 0 : # Should not happen if ratios sum to 1 and are positive
@@ -56,35 +55,36 @@ class StrictRatioBatchSampler(Sampler[List[int]]):
 
 
         # These are pointers to the lists in the dataset, which are already shuffled
-        self.lev_indices = self.dataset.lev_indices
+        self.rank_indices = self.dataset.rank_indices
         self.nsp_indices = self.dataset.nsp_indices
+        self.span_indices = self.dataset.span_indices # New
         self.lm_indices = self.dataset.lm_indices
 
-        if not self.lev_indices or not self.nsp_indices or not self.lm_indices:
+        if not self.rank_indices or not self.nsp_indices or not self.lm_indices or not self.span_indices:
             print("Warning: One or more task-specific index lists in the dataset are empty.")
-            # This might lead to issues in __len__ or __iter__ if counts per batch are > 0
 
     def __iter__(self) -> Iterator[List[int]]:
         # Create fresh copies and shuffle them for this epoch/iteration
-        # The dataset's lists are already shuffled once at init.
-        # Shuffling here again ensures different epoch orderings.
-        current_lev_indices = self.lev_indices[:] # Create a copy
-        random.shuffle(current_lev_indices)
+        current_rank_indices = self.rank_indices[:]
+        random.shuffle(current_rank_indices)
         current_nsp_indices = self.nsp_indices[:]
         random.shuffle(current_nsp_indices)
+        current_span_indices = self.span_indices[:] # New
+        random.shuffle(current_span_indices)
         current_lm_indices = self.lm_indices[:]
         random.shuffle(current_lm_indices)
 
         # Pointers for where we are in each list
-        lev_ptr, nsp_ptr, lm_ptr = 0, 0, 0
+        rank_ptr, nsp_ptr, span_ptr, lm_ptr = 0, 0, 0, 0
 
         while True:
             batch_indices = []
 
             # Check if we have enough samples for a full batch, if drop_last is True
             can_form_batch = True
-            if (lev_ptr + self.num_lev_per_batch > len(current_lev_indices)) or \
+            if (rank_ptr + self.num_rank_per_batch > len(current_rank_indices)) or \
                (nsp_ptr + self.num_nsp_per_batch > len(current_nsp_indices)) or \
+               (span_ptr + self.num_span_per_batch > len(current_span_indices)) or \
                (lm_ptr + self.num_lm_per_batch > len(current_lm_indices)):
                 can_form_batch = False
 
@@ -104,15 +104,13 @@ class StrictRatioBatchSampler(Sampler[List[int]]):
                     break
 
 
-            # Collect Levenshtein indices
-            for _ in range(self.num_lev_per_batch):
-                if lev_ptr < len(current_lev_indices):
-                    batch_indices.append(current_lev_indices[lev_ptr])
-                    lev_ptr += 1
-                elif not self.drop_last: # Should have been caught by can_form_batch if drop_last
-                    pass # Or break, or handle exhaustion
-                else: # Should not be reached if can_form_batch was true
-                     break
+            # Collect Rank indices
+            for _ in range(self.num_rank_per_batch):
+                if rank_ptr < len(current_rank_indices):
+                    batch_indices.append(current_rank_indices[rank_ptr])
+                    rank_ptr += 1
+                else:
+                    break
 
             # Collect NSP indices
             for _ in range(self.num_nsp_per_batch):
@@ -124,17 +122,23 @@ class StrictRatioBatchSampler(Sampler[List[int]]):
                 else:
                      break
 
+            # Collect Span Selection indices
+            for _ in range(self.num_span_per_batch):
+                if span_ptr < len(current_span_indices):
+                    batch_indices.append(current_span_indices[span_ptr])
+                    span_ptr += 1
+                else:
+                    break
+
             # Collect LM indices
             for _ in range(self.num_lm_per_batch):
                 if lm_ptr < len(current_lm_indices):
                     batch_indices.append(current_lm_indices[lm_ptr])
                     lm_ptr += 1
-                elif not self.drop_last:
-                    pass
                 else:
                     break
 
-            if not batch_indices: # No indices collected, stop.
+            if not batch_indices:
                 break
 
             # If, due to not self.drop_last and exhaustion, the batch is smaller than intended
@@ -156,35 +160,24 @@ class StrictRatioBatchSampler(Sampler[List[int]]):
 
     def __len__(self) -> int:
         # Calculate how many full batches can be formed
-        # This is limited by the task that runs out of samples first, given its per-batch quota.
-        if self.drop_last:
-            len_lev = len(self.lev_indices) // self.num_lev_per_batch if self.num_lev_per_batch > 0 else float('inf')
-            len_nsp = len(self.nsp_indices) // self.num_nsp_per_batch if self.num_nsp_per_batch > 0 else float('inf')
-            len_lm = len(self.lm_indices) // self.num_lm_per_batch if self.num_lm_per_batch > 0 else float('inf')
-            return min(len_lev, len_nsp, len_lm)
-        else:
-            # If not drop_last, length is total samples / batch_size, rounded up,
-            # but this sampler's __iter__ currently behaves like drop_last=True.
-            # For a more accurate non-drop_last length, one would sum all indices
-            # and divide by batch_size, but the iteration logic needs to match.
-            # For now, returning a length consistent with drop_last=True behavior.
-            len_lev = len(self.lev_indices) // self.num_lev_per_batch if self.num_lev_per_batch > 0 else float('inf')
-            len_nsp = len(self.nsp_indices) // self.num_nsp_per_batch if self.num_nsp_per_batch > 0 else float('inf')
-            len_lm = len(self.lm_indices) // self.num_lm_per_batch if self.num_lm_per_batch > 0 else float('inf')
-            # If any num_per_batch is 0, that task shouldn't limit the length unless its list is also empty.
-            # If num_per_batch is 0 for a task, it provides infinite batches from its perspective.
+        # This is limited by the task that runs out of samples first.
+        if not self.drop_last:
+            # A simple approximation for non-drop_last
+            total_samples = len(self.rank_indices) + len(self.nsp_indices) + len(self.span_indices) + len(self.lm_indices)
+            return (total_samples + self.batch_size - 1) // self.batch_size
 
-            min_batches = float('inf')
-            if self.num_lev_per_batch > 0:
-                min_batches = min(min_batches, len(self.dataset.lev_indices) // self.num_lev_per_batch)
-            if self.num_nsp_per_batch > 0:
-                min_batches = min(min_batches, len(self.dataset.nsp_indices) // self.num_nsp_per_batch)
-            if self.num_lm_per_batch > 0:
-                min_batches = min(min_batches, len(self.dataset.lm_indices) // self.num_lm_per_batch)
+        # If drop_last=True, calculate based on the limiting task
+        min_batches = float('inf')
+        if self.num_rank_per_batch > 0:
+            min_batches = min(min_batches, len(self.rank_indices) // self.num_rank_per_batch)
+        if self.num_nsp_per_batch > 0:
+            min_batches = min(min_batches, len(self.nsp_indices) // self.num_nsp_per_batch)
+        if self.num_span_per_batch > 0:
+            min_batches = min(min_batches, len(self.span_indices) // self.num_span_per_batch)
+        if self.num_lm_per_batch > 0:
+            min_batches = min(min_batches, len(self.lm_indices) // self.num_lm_per_batch)
 
-            if min_batches == float('inf'): # Happens if all num_per_batch are 0 (e.g. batch_size 0)
-                return 0
-            return int(min_batches)
+        return 0 if min_batches == float('inf') else int(min_batches)
 
 if __name__ == '__main__':
     # Example Usage (requires a mock CombinedMultiTaskDataset)
@@ -217,20 +210,19 @@ if __name__ == '__main__':
 
     mock_dataset = MockDataset(num_samples_per_type=(1000, 500, 500)) # lm, lev, nsp
 
-    # Ratios: (lev_ratio, nsp_ratio, lm_ratio)
-    # User wants: 50% LM, 25% Lev, 25% NSP
-    # So ratios tuple should be (0.25, 0.25, 0.5)
-    batch_size = 16
-    ratios = (0.25, 0.25, 0.5) # lev, nsp, lm
+    # Ratios: (rank_ratio, nsp_ratio, span_ratio, lm_ratio)
+    batch_size = 20 # Use a size divisible by 10 for easy ratio checking
+    ratios = (0.2, 0.2, 0.2, 0.4)
 
     sampler = StrictRatioBatchSampler(mock_dataset, batch_size, ratios, drop_last=True)
 
     print(f"StrictRatioBatchSampler demo:")
     print(f"  Dataset size: {len(mock_dataset)}")
     print(f"  Batch size: {batch_size}")
-    print(f"  Ratios (Lev, NSP, LM): {ratios}")
-    print(f"  Num Lev/batch: {sampler.num_lev_per_batch}")
+    print(f"  Ratios (Rank, NSP, Span, LM): {ratios}")
+    print(f"  Num Rank/batch: {sampler.num_rank_per_batch}")
     print(f"  Num NSP/batch: {sampler.num_nsp_per_batch}")
+    print(f"  Num Span/batch: {sampler.num_span_per_batch}")
     print(f"  Num LM/batch: {sampler.num_lm_per_batch}")
     print(f"  Expected num batches (__len__): {len(sampler)}")
 

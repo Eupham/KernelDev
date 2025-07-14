@@ -63,22 +63,32 @@ class DataBuilder:
         else:
             self.levenshtein_shuffle_percentage = levenshtein_shuffle_percentage
 
-        self.cls_token_id = None # Default to None
-        self.sep_token_id = None # Default to None
-        if self.use_levenshtein_task:
-            self.cls_token_id = 256 # Fixed ID for Levenshtein task's CLS
-            self.sep_token_id = 257 # Fixed ID for SEP token (for NSP task)
-            original_vocab_size_param = vocab_size
-            if original_vocab_size_param == 256: # Default byte vocab size
-                self.vocab_size = 258 # Accommodate CLS (256) and SEP (257)
-            elif self.sep_token_id >= original_vocab_size_param: # If SEP ID is outside original range
-                print(f"Warning: vocab_size {original_vocab_size_param} from config might be too small for sep_token_id {self.sep_token_id}. Adjusting vocab_size.")
-                self.vocab_size = self.sep_token_id + 1
-            else: # tokens are within original vocab, assume it's accounted for (user configured)
-                self.vocab_size = original_vocab_size_param
-            print(f"Levenshtein task active: cls_token_id={self.cls_token_id}, sep_token_id={self.sep_token_id}, effective vocab_size={self.vocab_size}")
-        else: # Not using Levenshtein task
-            self.vocab_size = vocab_size # Use vocab_size as passed
+        self.cls_token_id = None
+        self.sep_token_id = None
+        self.mask_token_id = None
+
+        # Define special tokens if any multi-tasking is enabled
+        if self.use_levenshtein_task or use_span_selection_task:
+            self.cls_token_id = 256
+            self.sep_token_id = 257
+            self.mask_token_id = 258
+
+            # Recalculate vocab_size to include all special tokens
+            # Assumes base vocab is 0-255 (standard bytes)
+            base_vocab_size = 256
+            all_special_tokens = [self.cls_token_id, self.sep_token_id, self.mask_token_id]
+            # Filter out None values in case some tasks are disabled
+            valid_special_tokens = [t for t in all_special_tokens if t is not None]
+
+            if valid_special_tokens:
+                highest_token_id = max(valid_special_tokens)
+                self.vocab_size = max(base_vocab_size, highest_token_id + 1)
+            else:
+                self.vocab_size = base_vocab_size
+
+            print(f"Multi-tasking active. CLS={self.cls_token_id}, SEP={self.sep_token_id}, MASK={self.mask_token_id}. Effective vocab_size={self.vocab_size}")
+        else: # Not using any special tasks
+            self.vocab_size = vocab_size
 
         self.max_eval_tokens = max_eval_tokens if max_eval_tokens is not None else float('inf')
 
@@ -608,9 +618,9 @@ class DataBuilder:
                     seq_len=self.seq_len,
                     cls_token_id=self.cls_token_id,
                     sep_token_id=self.sep_token_id,
+                    mask_token_id=self.mask_token_id, # Pass the new ID
                     lm_ignore_idx=-1,
                     input_pad_id=0,
-                    # New 4-way task distribution
                     task_distribution=(0.20, 0.20, 0.40, 0.20)
                 )
                 print(f"{split_name} Combined multi-task dataset: {len(datasets[split_name])} examples")
