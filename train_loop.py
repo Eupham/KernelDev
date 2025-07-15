@@ -482,11 +482,13 @@ class Trainer:
                         span_predicted_index = span_outputs[span_task_mask].squeeze(-1)
                         span_target_index = auxiliary_values[span_task_mask]
                         if span_predicted_index.numel() > 0 and span_target_index.numel() > 0:
+                            span_predicted_index = torch.clamp(span_predicted_index, -100.0, 100.0)
+                            span_target_index = torch.clamp(span_target_index, -100.0, 100.0)
                             print(f"span_predicted_index dtype: {span_predicted_index.dtype}")
                             print(f"span_target_index dtype: {span_target_index.dtype}")
                             print(f"span_predicted_index values: {span_predicted_index}")
                             print(f"span_target_index values: {span_target_index}")
-                            span_selection_loss_tensor = F.mse_loss(span_predicted_index, span_target_index)
+                            span_selection_loss_tensor = F.smooth_l1_loss(span_predicted_index, span_target_index)
                             print(f"span_selection_loss_tensor value: {span_selection_loss_tensor}")
                             span_selection_loss_item = span_selection_loss_tensor.item()
                 
