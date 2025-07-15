@@ -193,22 +193,55 @@ class CombinedMultiTaskDataset(Dataset):
         return self.length
     
     def __getitem__(self, idx):
-        # This method is not called directly when using StrictRatioBatchSampler,
-        # but it's good practice to have a fallback or default behavior.
-        # The sampler will provide indices from the specific task lists.
-        # This implementation can serve as a simple, non-ratio-based fallback.
+        # Determine which task to use based on the index and task ratios
+        # This is a simplified approach for demonstration. A more robust
+        # implementation would use the pre-calculated indices.
         
-        # Simple modulo-based task selection for fallback
-        task_type = idx % 4
-        
-        if task_type == 0 and self.rank_indices:
-            return self.levenshtein_dataset[idx % len(self.levenshtein_dataset)]
-        elif task_type == 1 and self.nsp_indices:
-            return self.nsp_dataset[idx % len(self.nsp_dataset)]
-        elif task_type == 2 and self.span_indices:
-            return self.span_selection_dataset[idx % len(self.span_selection_dataset)]
-        else: # Fallback to LM
+        # Find which task list the index belongs to
+        # This is inefficient, but clear for demonstration.
+        # A real implementation would use a pre-computed map or ranges.
+        task_type = None
+        original_idx = idx
+        if idx in self.lm_indices:
+            task_type = 'lm'
+        elif idx in self.span_indices:
+            task_type = 'span_selection'
+        elif idx in self.nsp_indices:
+            task_type = 'nsp'
+        elif idx in self.rank_indices:
+            task_type = 'levenshtein'
+        else:
+            # Fallback for safety, though this shouldn't be reached with StrictRatioBatchSampler
             return self._create_lm_sample(self.raw_documents[idx % len(self.raw_documents)])
+
+        if task_type == 'lm':
+            return self._create_lm_sample(self.raw_documents[original_idx])
+        elif task_type == 'span_selection':
+            return self.span_selection_dataset[original_idx]
+        elif task_type == 'nsp':
+            return self.nsp_dataset[original_idx]
+        elif task_type == 'levenshtein':
+            return self.levenshtein_dataset[original_idx]
+        else:
+            # Should not be reached
+            raise RuntimeError("Invalid task type selected")
+
+    def collate_fn(self, batch):
+        # batch is a list of tuples, where each tuple is a sample from __getitem__
+        # Each sample is (input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags, true_original_ranks)
+
+        # Unzip the batch into separate lists
+        input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags, true_original_ranks = zip(*batch)
+
+        # Stack the tensors
+        input_tokens = torch.stack(input_tokens)
+        next_token_lm_targets = torch.stack(next_token_lm_targets)
+        rank_targets = torch.stack(rank_targets)
+        auxiliary_values = torch.stack(auxiliary_values)
+        task_type_flags = torch.stack(task_type_flags)
+        true_original_ranks = torch.stack(true_original_ranks)
+
+        return input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags, true_original_ranks
 
     def update_lev_shuffle_parameters(self, min_p: float, max_p: float):
         if hasattr(self, 'levenshtein_dataset') and \
