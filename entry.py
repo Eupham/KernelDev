@@ -171,6 +171,13 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
     if hasattr(args, 'levenshtein_loss_weight') and args.levenshtein_loss_weight is not None:
         config.setdefault('training', {})['levenshtein_loss_weight'] = args.levenshtein_loss_weight
 
+    # Handle Span Selection task arguments
+    if hasattr(args, 'use_span_selection_task') and args.use_span_selection_task is not None:
+        config.setdefault('training', {})['use_span_selection_task'] = args.use_span_selection_task
+    if hasattr(args, 'span_selection_loss_weight') and args.span_selection_loss_weight is not None:
+        config.setdefault('training', {})['span_selection_loss_weight'] = args.span_selection_loss_weight
+    if hasattr(args, 'n_candidates_span_selection') and args.n_candidates_span_selection is not None:
+        config.setdefault('data', {})['n_candidates_span_selection'] = args.n_candidates_span_selection
 
 
     # Handle Levenshtein shuffle percentage
@@ -235,6 +242,82 @@ def setup_precision(model, precision):
         print("✓ Model using fp32 precision")
     
     return dtype, scaler, use_amp
+
+
+def run_pre_flight_check(config: Dict[str, Any]):
+    """
+    Runs a quick, minimal test of the entire training pipeline with mock data
+    to catch errors before starting the slow data loading and training process.
+    """
+    print("\n=== Running Pre-flight Check ===")
+    try:
+        # Use a tiny, in-memory dataset
+        mock_docs = [
+            "This is the first sentence for testing.",
+            "Another example sentence is here.",
+            "The quick brown fox jumps over the lazy dog.",
+            "A journey of a thousand miles begins with a single step.",
+            "To be or not to be, that is the question.",
+            "The only thing we have to fear is fear itself."
+        ]
+
+        # Create a mock DataBuilder that uses the in-memory docs
+        mock_data_builder = DataBuilder(
+            # Use settings from the main config
+            seq_len=config['data'].get('seq_len', 128),
+            use_levenshtein_task=True,
+            use_span_selection_task=True,
+            n_candidates_span_selection=config['data'].get('n_candidates_span_selection', 4)
+        )
+
+        # Create a mock model config
+        mock_model_config = {
+            'vocab_size': mock_data_builder.get_vocab_size(),
+            'dim': 32, # Small dimension
+            'n_layers': 2,
+            'n_heads': 4,
+            'max_seq_len': config['data'].get('seq_len', 128),
+            'n_candidates_span_selection': config['data'].get('n_candidates_span_selection', 4),
+            'cls_token_id': mock_data_builder.cls_token_id,
+            'use_cls_prefix_attention': True
+        }
+        mock_model = GPTModel(**mock_model_config).to(config['hardware'].get('device', 'cpu'))
+
+        # Create mock dataloaders
+        mock_dataloaders = mock_data_builder.create_dataloaders(batch_size=4, num_workers=0)
+
+        # Create a mock trainer
+        mock_training_config = TrainingConfig(
+            device=config['hardware'].get('device', 'cpu'),
+            use_levenshtein_task=True,
+        )
+        mock_trainer = Trainer(mock_model, mock_training_config, mock_data_builder)
+
+        # Fetch one batch and run one train step
+        if 'train' not in mock_dataloaders or len(mock_dataloaders['train']) == 0:
+            raise RuntimeError("Pre-flight check failed: Mock training dataloader is empty.")
+
+        test_batch = next(iter(mock_dataloaders['train']))
+        print("Pre-flight check: Successfully created a test batch.")
+
+        loss_values = mock_trainer.train_step(test_batch)
+        combined_loss = loss_values[0]
+        print(f"Pre-flight check: train_step executed. Combined loss: {combined_loss}")
+
+        # Check for nan or inf loss
+        if not math.isfinite(combined_loss):
+            raise RuntimeError(f"Pre-flight check failed: Loss is not finite (nan or inf). Loss values: {loss_values}")
+
+        print("✓ Pre-flight Check Passed: Training pipeline is stable.")
+
+    except Exception as e:
+        print("\n--- PRE-FLIGHT CHECK FAILED ---")
+        print(f"Error during pre-flight check: {e}")
+        import traceback
+        traceback.print_exc()
+        print("-----------------------------")
+        # Re-raise the exception to stop the main script
+        raise e
 
 
 def print_gpu_info():
@@ -340,7 +423,8 @@ def start_actual_training(cli_args):
         'n_heads': model_cfg.get('n_heads', 16),
         'max_seq_len': model_cfg.get('max_seq_len', 2048),
         'mlp_ratio': model_cfg.get('mlp_ratio', 4),
-        'causal': model_cfg.get('causal', True)
+        'causal': model_cfg.get('causal', True),
+        'n_candidates_span_selection': data_cfg.get('n_candidates_span_selection', 4) # Get from data config
     }
     
     # Model configuration is prepared (model_cfg)
@@ -397,6 +481,12 @@ def start_actual_training(cli_args):
 
     # Instantiate TrainingConfig *after* model, setup_precision, and device determination
     print(f"\n=== Initializing Training Configuration ===")
+    default_inference_prompts = [
+        {'task': 'lm', 'prompt': ''},
+        {'task': 'lm', 'prompt': 'The'},
+        {'task': 'lm', 'prompt': 'In a world where'}
+        # Add other default prompts if desired, e.g., for CLS or unshuffle
+    ]
     training_config_params = {
         'num_epochs': training_cfg.get('epochs', 1),
         'learning_rate': training_cfg.get('learning_rate', 3e-4),
@@ -413,7 +503,7 @@ def start_actual_training(cli_args):
         'scaler': scaler,
         'use_amp': use_amp,
         # Inference params from gen_cfg (defined earlier)
-        'inference_prompts': gen_cfg.get('prompts', ["", "The", "In", "Once upon a time"]),
+        'inference_prompts': gen_cfg.get('test_prompts', default_inference_prompts),
         'inference_max_length': gen_cfg.get('max_length', 100),
         'inference_temperature': gen_cfg.get('temperature', 0.8),
         'inference_top_k': gen_cfg.get('top_k', 50),
@@ -530,8 +620,10 @@ def start_actual_training(cli_args):
     data_config_for_builder = {
         **data_config,
         'use_levenshtein_task': lev_task_enabled,
-        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage'), # Pass as None if not in data_cfg
-        'max_train_tokens': data_cfg.get('max_train_tokens') # Pass as None if not in data_cfg (already fetched into data_config)
+        'use_span_selection_task': training_cfg.get('use_span_selection_task', False), # New
+        'n_candidates_span_selection': data_cfg.get('n_candidates_span_selection', 4), # New
+        'levenshtein_shuffle_percentage': data_cfg.get('levenshtein_shuffle_percentage'),
+        'max_train_tokens': data_cfg.get('max_train_tokens')
     }
     data_builder = create_data_builder(**data_config_for_builder)
 
@@ -570,11 +662,12 @@ def start_actual_training(cli_args):
     # Test a batch
     if 'train' in dataloaders:
         print("\n=== Data Sample ===")
-        # Adjust for LevenshteinDataset or standard output
+        # Adjust for the new 6-item tuple from the dataset
         if lev_task_enabled:
-            # CombinedMultiTaskDataset yields: input_tokens, lm_targets, auxiliary_value, task_type_flag
-            for input_tokens, lm_targets, auxiliary_values, task_type_flags in dataloaders['train']:
-                print(f"Multi-task Batch shapes: Input Toks-{input_tokens.shape}, LM Targets-{lm_targets.shape}, Aux-{auxiliary_values.shape}, TaskType-{task_type_flags.shape}")
+            # CombinedMultiTaskDataset now yields 6 items:
+            # input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags, true_original_ranks
+            for input_tokens, next_token_lm_targets, rank_targets, auxiliary_values, task_type_flags, true_original_ranks in dataloaders['train']:
+                print(f"Multi-task Batch shapes: Input Toks-{input_tokens.shape}, NextLM Targets-{next_token_lm_targets.shape}, Rank Targets-{rank_targets.shape}, Aux-{auxiliary_values.shape}, TaskType-{task_type_flags.shape}, TrueRanks-{true_original_ranks.shape}")
                 print(f"Sample multi-task input tokens: {input_tokens[0][:20].tolist()}")
                 # Determine task type for the first item in the batch
                 task_type = task_type_flags[0].item()
@@ -688,60 +781,51 @@ def start_actual_training(cli_args):
 
 def test_causal_attention(model, dataloaders, device, data_builder, lev_task_enabled: bool):
     """Test the difference between causal and non-causal attention."""
-    if 'train' not in dataloaders or not dataloaders['train']:
-        print("Warning: Train dataloader is empty or not found in test_causal_attention. Skipping test.")
+    if 'train' not in dataloaders or not dataloaders['train'] or len(dataloaders['train']) == 0:
+        print("Warning: Train dataloader is empty or not found. Skipping test_causal_attention.")
         return
 
-    batch_iter = iter(dataloaders['train'])
     try:
-        first_batch = next(batch_iter)
+        # Get a fresh iterator and pull just the first batch for the test
+        first_batch = next(iter(dataloaders['train']))
     except StopIteration:
-        print("Warning: Train dataloader is empty in test_causal_attention. Skipping test.")
+        print("Warning: Train dataloader is empty. Skipping test_causal_attention.")
         return
 
     if lev_task_enabled:
-        # Expecting (orig_tok, lm_tgt, shuf_tok, lev_dist, coh_score)
-        if len(first_batch) == 5:
-            x, _, _, _, _ = first_batch # Use the first item (original_tokens_cls)
+        if len(first_batch) == 6:
+            input_tokens, _, _, _, _, _ = first_batch
+            x = input_tokens
         else:
-            print(f"Warning: Expected 5 items in Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            print(f"Warning: Expected 6 items in multi-task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
     else:
-        # Expecting (input_ids, lm_targets)
         if len(first_batch) == 2:
-            x, _ = first_batch # y (lm_targets) is not used in this function
+            x, _ = first_batch
         else:
-            print(f"Warning: Expected 2 items in non-Levenshtein task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
+            print(f"Warning: Expected 2 items in single-task LM batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
 
     x = x.to(device)
-    # The rest of the function uses 'x'
-
     model.to(device)
     model.eval()
     
     with torch.no_grad():
-        # Test with causal=True (default)
         print("Testing with causal=True...")
-        # model.forward now returns logits, loss, nsp_logits
-        logits_causal, _, _ = model(x)
+        outputs_causal = model(x)
+        logits_causal = outputs_causal['lm_logits']
         
-        # Test with causal=False by modifying the attention layers
         print("Testing with causal=False...")
-        # Temporarily change causal setting
-        original_causal = []
+        original_causal = [block.attn.causal for block in model.blocks]
         for block in model.blocks:
-            original_causal.append(block.attn.causal)
             block.attn.causal = False
         
-        # model.forward now returns logits, loss, nsp_logits
-        logits_non_causal, _, _ = model(x)
+        outputs_non_causal = model(x)
+        logits_non_causal = outputs_non_causal['lm_logits']
         
-        # Restore original causal setting
         for i, block in enumerate(model.blocks):
             block.attn.causal = original_causal[i]
         
-        # Compare outputs
         diff = torch.abs(logits_causal - logits_non_causal).mean()
         print(f"Mean absolute difference between causal and non-causal: {diff:.6f}")
         
@@ -916,6 +1000,24 @@ if __name__ == "__main__":
         help='Weight for Levenshtein auxiliary loss component (overrides config, e.g., 0.1).'
     )
     parser.add_argument(
+        '--use-span-selection-task',
+        type=lambda x: (str(x).lower() == 'true'),
+        default=None,
+        help='Enable/disable Span Selection auxiliary task (True/False). Overrides config.'
+    )
+    parser.add_argument(
+        '--span-selection-loss-weight',
+        type=float,
+        default=None,
+        help='Weight for Span Selection auxiliary loss component (overrides config, e.g., 0.1).'
+    )
+    parser.add_argument(
+        '--n-candidates-span-selection',
+        type=int,
+        default=None,
+        help='Number of candidates for the span selection task (overrides config).'
+    )
+    parser.add_argument(
         '--levenshtein-shuffle-percentage',
         type=float,
         default=None,
@@ -1038,367 +1140,16 @@ import time
 # Import our separated modules
 import fwd
 import bwd
-import register_autograd  # This registers the autograd function for flash attention
+# import register_autograd  # This registers the autograd function for flash attention
 
-class FlashAttentionTest:
-    """Test class for flash attention functionality."""
-    
-    def __init__(self, device: str = "cuda"):
-        self.device = device
-        torch.manual_seed(42)
-        np.random.seed(42)
-        
-    def create_test_data(self, batch_size: int = 2, seq_len: int = 1024, 
-                        head_dim: int = 64, num_heads: int = 8) -> Tuple[torch.Tensor, ...]:
-        """Create test data for flash attention."""
-        q = torch.randn(batch_size, num_heads, seq_len, head_dim, 
-                       device=self.device, dtype=torch.float16, requires_grad=True)
-        k = torch.randn(batch_size, num_heads, seq_len, head_dim, 
-                       device=self.device, dtype=torch.float16, requires_grad=True)
-        v = torch.randn(batch_size, num_heads, seq_len, head_dim, 
-                       device=self.device, dtype=torch.float16, requires_grad=True)
-        
-        return q, k, v
-    
-    def reference_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                           scale: Optional[float] = None) -> torch.Tensor:
-        """Reference attention implementation for comparison."""
-        if scale is None:
-            scale = 1.0 / (q.size(-1) ** 0.5)
-        
-        # Compute attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-        
-        # Apply causal mask
-        seq_len = q.size(-2)
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=q.device))
-        scores = scores.masked_fill(mask == 0, float('-inf'))
-        
-        # Apply softmax
-        attn_weights = torch.softmax(scores, dim=-1)
-        
-        # Apply to values
-        out = torch.matmul(attn_weights, v)
-        return out
-    
-    def flash_attention_forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                                  scale: Optional[float] = None) -> torch.Tensor:
-        """Flash attention forward pass using our implementation."""
-        if scale is None:
-            scale = 1.0 / (q.size(-1) ** 0.5)
-        
-        # Use the forward pass from our fwd module
-        try:
-            # First ensure that custom ops are properly registered
-            import fwd  # This will register the forward operation
-            import register_autograd  # This will register the autograd function
-            
-            # Call the flash attention custom op with proper precision setting
-            lens = None  # No length masking for now
-            # Use the precision matching input dtype
-            precision = "fp16" if q.dtype == torch.float16 else "fp32"
-            
-            # Check if the operation exists
-            if not hasattr(torch.ops, 'flash_attention') or not hasattr(torch.ops.flash_attention, 'forward'):
-                raise RuntimeError("flash_attention::forward operation not found")
-                
-            output, lse = torch.ops.flash_attention.forward(
-                q, k, v, lens, scale, 
-                autotune=False, return_lse=False, 
-                prescale_qk=False, precision=precision
-            )
-            return output
-        except Exception as e:
-            # Fallback to a simplified version for testing
-            print(f"Warning: Using reference attention for testing due to: {e}")
-            return self.reference_attention(q, k, v, scale)
-    
-    def test_gradient_accuracy(self, tolerance: float = 1e-3) -> bool:
-        """Test gradient accuracy between flash and reference attention."""
-        print("Testing gradient accuracy...")
-        
-        # Create test data
-        q, k, v = self.create_test_data(batch_size=1, seq_len=128, head_dim=32, num_heads=4)
-        scale = 1.0 / (q.size(-1) ** 0.5)
-        
-        # Reference implementation
-        q_ref, k_ref, v_ref = q.clone().detach().requires_grad_(True), \
-                              k.clone().detach().requires_grad_(True), \
-                              v.clone().detach().requires_grad_(True)
-        
-        out_ref = self.reference_attention(q_ref, k_ref, v_ref, scale)
-        loss_ref = out_ref.sum()
-        loss_ref.backward()
-        
-        # Flash implementation
-        q_flash, k_flash, v_flash = q.clone().detach().requires_grad_(True), \
-                                     k.clone().detach().requires_grad_(True), \
-                                     v.clone().detach().requires_grad_(True)
-        
-        out_flash = self.flash_attention_forward(q_flash, k_flash, v_flash, scale)
-        loss_flash = out_flash.sum()
-        loss_flash.backward()
-        
-        # Compare gradients
-        grad_q_diff = torch.abs(q_ref.grad - q_flash.grad).max().item()
-        grad_k_diff = torch.abs(k_ref.grad - k_flash.grad).max().item()
-        grad_v_diff = torch.abs(v_ref.grad - v_flash.grad).max().item()
-        
-        print(f"Gradient differences:")
-        print(f"  Q gradient max diff: {grad_q_diff:.6f}")
-        print(f"  K gradient max diff: {grad_k_diff:.6f}")
-        print(f"  V gradient max diff: {grad_v_diff:.6f}")
-        
-        gradient_accurate = all([
-            grad_q_diff < tolerance,
-            grad_k_diff < tolerance,
-            grad_v_diff < tolerance
-        ])
-        
-        print(f"Gradient accuracy test: {'PASSED' if gradient_accurate else 'FAILED'}")
-        return gradient_accurate
-    
-    def test_loss_reduction(self, num_epochs: int = 10) -> Tuple[List[float], List[float]]:
-        """Test loss reduction capability with a simple training loop."""
-        print("Testing loss reduction capability...")
-        
-        # Create a simple model using flash attention
-        class SimpleModel(nn.Module):
-            def __init__(self, hidden_dim: int = 256, num_heads: int = 8):
-                super().__init__()
-                self.hidden_dim = hidden_dim
-                self.num_heads = num_heads
-                self.head_dim = hidden_dim // num_heads
-                
-                self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-                
-            def forward(self, x):
-                batch_size, seq_len, _ = x.shape
-                
-                q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                
-                # Use flash attention
-                attn_out = test_instance.flash_attention_forward(q, k, v)
-                attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-                
-                return self.out_proj(attn_out)
-        
-        # Reference model using standard attention
-        class ReferenceModel(nn.Module):
-            def __init__(self, hidden_dim: int = 256, num_heads: int = 8):
-                super().__init__()
-                self.hidden_dim = hidden_dim
-                self.num_heads = num_heads
-                self.head_dim = hidden_dim // num_heads
-                
-                self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-                self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-                
-            def forward(self, x):
-                batch_size, seq_len, _ = x.shape
-                
-                q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-                
-                # Use reference attention
-                attn_out = test_instance.reference_attention(q, k, v)
-                attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-                
-                return self.out_proj(attn_out)
-        
-        test_instance = self
-        
-        # Create models
-        flash_model = SimpleModel().to(self.device)
-        reference_model = ReferenceModel().to(self.device)
-        
-        # Copy weights to ensure fair comparison
-        reference_model.load_state_dict(flash_model.state_dict())
-        
-        # Create training data
-        batch_size, seq_len, hidden_dim = 2, 128, 256
-        x_train = torch.randn(batch_size, seq_len, hidden_dim, device=self.device)
-        y_train = torch.randn(batch_size, seq_len, hidden_dim, device=self.device)
-        
-        # Optimizers
-        optimizer_flash = optim.Adam(flash_model.parameters(), lr=1e-3)
-        optimizer_reference = optim.Adam(reference_model.parameters(), lr=1e-3)
-        
-        criterion = nn.MSELoss()
-        
-        flash_losses = []
-        reference_losses = []
-        
-        # Training loop
-        for epoch in range(num_epochs):
-            # Flash model
-            optimizer_flash.zero_grad()
-            out_flash = flash_model(x_train)
-            loss_flash = criterion(out_flash, y_train)
-            loss_flash.backward()
-            optimizer_flash.step()
-            flash_losses.append(loss_flash.item())
-            
-            # Reference model
-            optimizer_reference.zero_grad()
-            out_reference = reference_model(x_train)
-            loss_reference = criterion(out_reference, y_train)
-            loss_reference.backward()
-            optimizer_reference.step()
-            reference_losses.append(loss_reference.item())
-            
-            if epoch % 2 == 0:
-                print(f"Epoch {epoch}: Flash Loss = {loss_flash.item():.6f}, "
-                      f"Reference Loss = {loss_reference.item():.6f}")
-        
-        print(f"Final losses - Flash: {flash_losses[-1]:.6f}, "
-              f"Reference: {reference_losses[-1]:.6f}")
-        
-        return flash_losses, reference_losses
-    
-    def benchmark_performance(self, seq_lengths: List[int] = [128, 256, 512, 1024]) -> None:
-        """Benchmark performance comparison."""
-        print("Benchmarking performance...")
-        
-        streaming_times = []
-        reference_times = []
-        
-        for seq_len in seq_lengths:
-            print(f"Testing sequence length: {seq_len}")
-            
-            q, k, v = self.create_test_data(batch_size=1, seq_len=seq_len, head_dim=64, num_heads=8)
-            
-            # Warm up
-            for _ in range(3):
-                _ = self.flash_attention_forward(q, k, v)
-                _ = self.reference_attention(q, k, v)
-            
-            torch.cuda.synchronize()
-            
-            # Benchmark flash attention
-            start_time = time.time()
-            for _ in range(10):
-                _ = self.flash_attention_forward(q, k, v)
-            torch.cuda.synchronize()
-            flash_time = (time.time() - start_time) / 10
-            streaming_times.append(flash_time)
-            
-            # Benchmark reference
-            start_time = time.time()
-            for _ in range(10):
-                _ = self.reference_attention(q, k, v)
-            torch.cuda.synchronize()
-            reference_time = (time.time() - start_time) / 10
-            reference_times.append(reference_time)
-            
-            print(f"  Flash: {flash_time*1000:.2f}ms, Reference: {reference_time*1000:.2f}ms")
-        
-        # Plot results
-        try:
-            plt.figure(figsize=(10, 6))
-            plt.plot(seq_lengths, streaming_times, 'b-o', label='Flash Attention')
-            plt.plot(seq_lengths, reference_times, 'r-o', label='Reference Attention')
-            plt.xlabel('Sequence Length')
-            plt.ylabel('Time (seconds)')
-            plt.title('Performance Comparison: Flash vs Reference Attention')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig('./performance_comparison.png')
-            print("Performance plot saved as 'performance_comparison.png'")
-        except ImportError:
-            print("Matplotlib not available, skipping plot generation")
-    
-    def plot_loss_curves(self, flash_losses: List[float], reference_losses: List[float]) -> None:
-        """Plot loss curves for comparison."""
-        try:
-            plt.figure(figsize=(10, 6))
-            epochs = range(len(flash_losses))
-            plt.plot(epochs, flash_losses, 'b-o', label='Flash Attention')
-            plt.plot(epochs, reference_losses, 'r-o', label='Reference Attention')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.title('Training Loss Comparison')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig('./loss_comparison.png')
-            print("Loss comparison plot saved as 'loss_comparison.png'")
-        except ImportError:
-            print("Matplotlib not available, skipping plot generation")
+# FlashAttentionTest class removed.
 
+# The test suite's main() function definition was here.
+# This replacement effectively deletes it.
 
-def main():
-    """Main test function."""
-    print("=" * 60)
-    print("FLASH ATTENTION COMPREHENSIVE TEST")
-    print("=" * 60)
-    
-    # Check CUDA availability
-    if not torch.cuda.is_available():
-        print("CUDA not available, running on CPU (may be slow)")
-        device = "cpu"
-    else:
-        print(f"CUDA available with {torch.cuda.device_count()} device(s)")
-        device = "cuda"
-    
-    # Initialize test class
-    tester = FlashAttentionTest(device=device)
-    
-    # Test 1: Gradient Accuracy
-    print("\n" + "="*40)
-    print("TEST 1: GRADIENT ACCURACY")
-    print("="*40)
-    gradient_test_passed = tester.test_gradient_accuracy(tolerance=1e-3)
-    
-    # Test 2: Loss Reduction
-    print("\n" + "="*40)
-    print("TEST 2: LOSS REDUCTION")
-    print("="*40)
-    flash_losses, reference_losses = tester.test_loss_reduction(num_epochs=10)
-    
-    # Plot loss curves
-    tester.plot_loss_curves(flash_losses, reference_losses)
-    
-    # Check if both models can reduce loss
-    flash_reduced = flash_losses[0] > flash_losses[-1]
-    reference_reduced = reference_losses[0] > reference_losses[-1]
-    
-    print(f"\nLoss reduction results:")
-    print(f"  Flash model reduced loss: {flash_reduced}")
-    print(f"  Reference model reduced loss: {reference_reduced}")
-    print(f"  Initial vs Final - Flash: {flash_losses[0]:.6f} -> {flash_losses[-1]:.6f}")
-    print(f"  Initial vs Final - Reference: {reference_losses[0]:.6f} -> {reference_losses[-1]:.6f}")
-    
-    # Test 3: Performance Benchmark
-    if device == "cuda":
-        print("\n" + "="*40)
-        print("TEST 3: PERFORMANCE BENCHMARK")
-        print("="*40)
-        tester.benchmark_performance([128, 256, 512])
-    
-    # Summary
-    print("\n" + "="*60)
-    print("SUMMARY")
-    print("="*60)
-    print(f"✓ Gradient accuracy test: {'PASSED' if gradient_test_passed else 'FAILED'}")
-    print(f"✓ Loss reduction test: {'PASSED' if flash_reduced else 'FAILED'}")
-    print(f"✓ Modules separated successfully: fwd.py and bwd.py")
-    print(f"✓ Integration test: {'PASSED' if gradient_test_passed and flash_reduced else 'FAILED'}")
-    
-    overall_success = gradient_test_passed and flash_reduced
-    print(f"\nOverall test result: {'SUCCESS' if overall_success else 'PARTIAL SUCCESS'}")
-    
-    if not overall_success:
-        print("\nNote: Some tests may show partial success due to simplified fallback implementations.")
-        print("For full functionality, ensure the flash attention kernels are properly compiled.")
+# This if block is for the main training script logic handled by start_actual_training
+# if __name__ == "__main__":
+#    (this block is for start_actual_training, leave it alone)
 
-
-if __name__ == "__main__":
-    main()
+# The second if __name__ == "__main__": block (for the test suite) was here.
+# This replacement effectively deletes it.

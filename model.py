@@ -95,16 +95,15 @@ class GPTModel(nn.Module):
         mlp_ratio=4,
         causal=True,
         cls_token_id: int | None = None,
-        # nsp_task: bool = False, # Removed nsp_task
         use_cls_prefix_attention: bool = True,
-        # use_levenshtein_task: bool = False # Model doesn't need this if it just provides heads
+        n_candidates_span_selection: int = 4 # New argument for the span selection task
     ):
         super().__init__()
         self.dim = dim
         self.cls_token_id = cls_token_id
-        # self.nsp_task = nsp_task # Removed
         self.use_cls_prefix_attention = use_cls_prefix_attention
-        print(f"GPTModel.__init__: cls_token_id={self.cls_token_id}, use_cls_prefix_attention={self.use_cls_prefix_attention}. Levenshtein head added.")
+        self.n_candidates_span_selection = n_candidates_span_selection # Store n_candidates
+        print(f"GPTModel.__init__: cls_token_id={self.cls_token_id}, use_cls_prefix_attention={self.use_cls_prefix_attention}. Heads for NSP, Rank, and Span Selection are present.")
         self.max_seq_len = max_seq_len
         
         # Token and position embeddings (no bias)
@@ -126,48 +125,51 @@ class GPTModel(nn.Module):
         self.norm_out = RMSNorm(dim)
         self.head = nn.Linear(dim, vocab_size, bias=False)
         
-        # Levenshtein head (replaces NSP head)
-        self.levenshtein_head = nn.Linear(self.dim, 1) # Output a single scalar value
-        
         # NSP head for 3-class classification
         self.nsp_head = nn.Linear(self.dim, 3)  # 3 classes: 0=order, 1=out of order, 2=garbled
 
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
+
+        # Head for Auxiliary Task 1: Rank Regression (1 scalar per token, sigmoid output)
+        self.rank_regression_head = nn.Linear(self.dim, 1)
         
+        # Head for Auxiliary Task 2: Span Selection (integer regression from CLS token)
+        self.span_selection_head = nn.Linear(self.dim, 1)
+
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
-                # Special initialization for Levenshtein head to avoid ReLU clipping
-                if hasattr(self, 'levenshtein_head') and module is self.levenshtein_head:
-                    torch.nn.init.constant_(module.bias, 0.05)  # Small positive bias
-                else:
-                    torch.nn.init.zeros_(module.bias)
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, x, targets=None, force_disable_prefix_attention: bool = False):
         batch_size, seq_len = x.shape # x is input token IDs (batch_size, seq_len)
         
-        # Initialize loss and auxiliary output
+        # Initialize loss and all head outputs
         loss = None
-        predicted_distance_score = None # For Levenshtein task
-        nsp_logits = None # For NSP task
+        nsp_logits = None
+        rank_regression_outputs = None
+        span_selection_logits = None
 
         # Create current_is_prefix_token_mask based on cls_token_id and use_cls_prefix_attention
         current_is_prefix_token_mask = None
-        # Only create prefix mask if CLS token is defined, specific prefix attention for CLS is enabled, AND not forcibly disabled
-        if self.cls_token_id is not None and \
-           self.use_cls_prefix_attention and \
-           not force_disable_prefix_attention:
-            # The mask is (seq_len,) indicating True for CLS token positions based on the first batch item.
-            # This is because original_kernel.flash_attention expects a (T,) mask.
-            prefix_mask_bool_first_item = (x[0] == self.cls_token_id)
-            if prefix_mask_bool_first_item.any():
-                current_is_prefix_token_mask = prefix_mask_bool_first_item.to(x.device)
+        # force_disable_prefix_attention is an argument to forward
+        if self.use_cls_prefix_attention and not force_disable_prefix_attention:
+            # Create a mask [True, True, False, ..., False] for the sequence length
+            # This assumes Task ID (index 0) and CLS (index 1) are prefix tokens.
+            # x is input_ids with shape (batch_size, seq_len)
+            # seq_len is already available from x.shape
+            mask_values = torch.zeros(seq_len, dtype=torch.bool, device=x.device)
+            if seq_len > 0: # Task ID token
+                mask_values[0] = True
+            if seq_len > 1: # CLS token
+                mask_values[1] = True
+            current_is_prefix_token_mask = mask_values
 
         # Create position indices
         pos = torch.arange(0, seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
@@ -186,19 +188,22 @@ class GPTModel(nn.Module):
         # processed_x is hidden states (batch_size, seq_len, dim)
         processed_x = self.norm_out(processed_x)
 
-        # Language model logits
+        # Language model logits (Primary Task)
         logits = self.head(processed_x) # (batch_size, seq_len, vocab_size)
 
-        # Auxiliary heads using CLS token representation
+        # Auxiliary Task 1: Rank Regression Head
+        # Takes all hidden states and predicts a rank (0-1) for each token position.
+        rank_regression_logits = self.rank_regression_head(processed_x) # (batch_size, seq_len, 1)
+        rank_regression_outputs = torch.sigmoid(rank_regression_logits) # (batch_size, seq_len, 1)
+
+        # Auxiliary Task (NSP-like, using CLS token representation)
         if self.cls_token_id is not None: # Indicates CLS token processing is relevant
-            cls_representation = processed_x[:, 0, :]
-            # Apply relu to ensure non-negative distance prediction
-            predicted_distance_score = torch.relu(self.levenshtein_head(cls_representation).squeeze(-1)) # Output shape: (batch_size,)
-            # NSP logits for 3-class classification
-            nsp_logits = self.nsp_head(cls_representation) # Output shape: (batch_size, 3)
+            cls_representation = processed_x[:, 1, :] # CLS is at index 1
+            nsp_logits = self.nsp_head(cls_representation)
+            span_selection_logits = self.span_selection_head(cls_representation)
 
         if targets is not None:
-            # Calculate raw per-token loss, without reduction
+            # Calculate raw per-token loss for the primary LM task, without reduction
             raw_lm_loss_per_token = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
@@ -219,9 +224,16 @@ class GPTModel(nn.Module):
             lm_loss_per_item = per_item_lm_loss_sum / per_item_valid_token_count
             loss = lm_loss_per_item
         else:
-            loss = None
+            loss = None # Loss is None if targets are not provided (e.g., during inference)
 
-        return logits, loss, predicted_distance_score, nsp_logits # Return both auxiliary outputs
+        # Return all head outputs in a dictionary for clarity and scalability
+        return {
+            'lm_logits': logits,
+            'lm_loss': loss,
+            'nsp_logits': nsp_logits,
+            'rank_outputs': rank_regression_outputs,
+            'span_selection_logits': span_selection_logits
+        }
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_prefix_attention_in_prompt: bool = False):
         """
@@ -248,10 +260,9 @@ class GPTModel(nn.Module):
                 # Crop sequence if it gets too long
                 idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
                 
-                # Forward pass - update to expect three return values
-                # Pass force_disable_prefix_attention based on not use_prefix_attention_in_prompt
-                logits, _, _ = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
-                logits = logits[:, -1, :] / temperature
+                # Forward pass now returns a dictionary. We only need 'lm_logits' for generation.
+                model_outputs = self(idx_cond, force_disable_prefix_attention=(not use_prefix_attention_in_prompt))
+                logits = model_outputs['lm_logits'][:, -1, :] / temperature
                 
                 # Apply top-k filtering if specified
                 if top_k is not None:

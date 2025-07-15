@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
+from custom_samplers import StrictRatioBatchSampler # Added
 # Do NOT import load_dataset at module level to avoid conflicts
 import numpy as np
 from typing import Optional, Dict, Any
@@ -31,8 +32,10 @@ class DataBuilder:
         vocab_size: int = 256,
         max_eval_tokens: Optional[Any] = 50000,
         use_levenshtein_task: bool = False,
+        use_span_selection_task: bool = False,
+        n_candidates_span_selection: int = 4,
         levenshtein_shuffle_percentage: float = 0.25,
-        max_train_tokens: Optional[Any] = None, # New parameter
+        max_train_tokens: Optional[Any] = None,
     ):
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
@@ -60,22 +63,32 @@ class DataBuilder:
         else:
             self.levenshtein_shuffle_percentage = levenshtein_shuffle_percentage
 
-        self.cls_token_id = None # Default to None
-        self.sep_token_id = None # Default to None
-        if self.use_levenshtein_task:
-            self.cls_token_id = 256 # Fixed ID for Levenshtein task's CLS
-            self.sep_token_id = 257 # Fixed ID for SEP token (for NSP task)
-            original_vocab_size_param = vocab_size
-            if original_vocab_size_param == 256: # Default byte vocab size
-                self.vocab_size = 258 # Accommodate CLS (256) and SEP (257)
-            elif self.sep_token_id >= original_vocab_size_param: # If SEP ID is outside original range
-                print(f"Warning: vocab_size {original_vocab_size_param} from config might be too small for sep_token_id {self.sep_token_id}. Adjusting vocab_size.")
-                self.vocab_size = self.sep_token_id + 1
-            else: # tokens are within original vocab, assume it's accounted for (user configured)
-                self.vocab_size = original_vocab_size_param
-            print(f"Levenshtein task active: cls_token_id={self.cls_token_id}, sep_token_id={self.sep_token_id}, effective vocab_size={self.vocab_size}")
-        else: # Not using Levenshtein task
-            self.vocab_size = vocab_size # Use vocab_size as passed
+        self.cls_token_id = None
+        self.sep_token_id = None
+        self.mask_token_id = None
+
+        # Define special tokens if any multi-tasking is enabled
+        if self.use_levenshtein_task or use_span_selection_task:
+            self.cls_token_id = 256
+            self.sep_token_id = 257
+            self.mask_token_id = 258
+
+            # Recalculate vocab_size to include all special tokens
+            # Assumes base vocab is 0-255 (standard bytes)
+            base_vocab_size = 256
+            all_special_tokens = [self.cls_token_id, self.sep_token_id, self.mask_token_id]
+            # Filter out None values in case some tasks are disabled
+            valid_special_tokens = [t for t in all_special_tokens if t is not None]
+
+            if valid_special_tokens:
+                highest_token_id = max(valid_special_tokens)
+                self.vocab_size = max(base_vocab_size, highest_token_id + 1)
+            else:
+                self.vocab_size = base_vocab_size
+
+            print(f"Multi-tasking active. CLS={self.cls_token_id}, SEP={self.sep_token_id}, MASK={self.mask_token_id}. Effective vocab_size={self.vocab_size}")
+        else: # Not using any special tasks
+            self.vocab_size = vocab_size
 
         self.max_eval_tokens = max_eval_tokens if max_eval_tokens is not None else float('inf')
 
@@ -115,6 +128,11 @@ class DataBuilder:
                         string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
                         current_byte_sequence = []
                     string_parts.append("[SEP]")
+                elif self.mask_token_id is not None and token == self.mask_token_id:
+                    if current_byte_sequence:
+                        string_parts.append(bytes(current_byte_sequence).decode('utf-8', errors='replace'))
+                        current_byte_sequence = []
+                    string_parts.append("[MASK]")
                 elif 0 <= token <= 255:
                     current_byte_sequence.append(token)
                 else: # Special tokens other than CLS (e.g., padding -1) or unknown tokens
@@ -605,9 +623,10 @@ class DataBuilder:
                     seq_len=self.seq_len,
                     cls_token_id=self.cls_token_id,
                     sep_token_id=self.sep_token_id,
+                    mask_token_id=self.mask_token_id, # Pass the new ID
                     lm_ignore_idx=-1,
-                    input_pad_id=0,    # Assuming 0 is a safe padding ID not overlapping with CLS/SEP
-                    task_distribution=(0.25, 0.25, 0.5)  # 25% Lev, 25% NSP, 50% LM
+                    input_pad_id=0,
+                    task_distribution=(0.20, 0.20, 0.40, 0.20)
                 )
                 print(f"{split_name} Combined multi-task dataset: {len(datasets[split_name])} examples")
             else: # Standard TokenizedDataset for LM
@@ -669,34 +688,58 @@ class DataBuilder:
             current_shuffle_status = shuffle_train if split_name == 'train' else False
             current_pin_memory = torch.cuda.is_available()
 
-            print(f"batch_size: {batch_size}")
-            print(f"shuffle: {current_shuffle_status}")
-            print(f"num_workers: {num_workers}")
-            print(f"collate_fn: None (using default)") # DataLoader uses default_collate if None
-            print(f"pin_memory: {current_pin_memory}")
-
             if dataset_obj is None: # Re-check after prints, before DataLoader call
                 print(f"Skipping DataLoader for {split_name} as dataset is None or invalid after attribute checks.")
                 print(f"--- {split_name}_dataloader preparation skipped ---")
                 continue
 
-            try:
-                dataloaders[split_name] = DataLoader(
-                    dataset_obj, batch_size=batch_size, shuffle=current_shuffle_status,
-                    num_workers=num_workers, pin_memory=current_pin_memory
+            if split_name == 'train' and self.use_levenshtein_task: # Use custom sampler only for train and if multi-task
+                print(f"--- Preparing train_dataloader (using StrictRatioBatchSampler) ---")
+                # Ratios must now be a 4-element tuple: (rank, nsp, span, lm)
+                task_ratios = (0.20, 0.20, 0.20, 0.40)
+
+                train_batch_sampler = StrictRatioBatchSampler(
+                    dataset=dataset_obj,
+                    batch_size=batch_size,
+                    ratios=task_ratios,
+                    drop_last=True
                 )
-            except (TypeError, ValueError) as e:
-                # Handle datasets that don't support shuffling (e.g., IterableDatasets)
-                if current_shuffle_status and ("shuffle" in str(e) or "len()" in str(e)):
-                    print(f"Warning: Dataset doesn't support shuffling. Creating DataLoader without shuffle.")
+
+                dataloaders[split_name] = DataLoader(
+                    dataset_obj,
+                    batch_sampler=train_batch_sampler,
+                    num_workers=num_workers,
+                    pin_memory=current_pin_memory
+                    # When batch_sampler is provided, batch_size, shuffle, sampler, and drop_last are ignored.
+                    # DataLoader's batch_size should be None or 1 in this case, but it's implicitly handled.
+                )
+                print(f"batch_sampler: StrictRatioBatchSampler instance")
+                print(f"num_workers: {num_workers}")
+                print(f"pin_memory: {current_pin_memory}")
+
+            else: # Standard DataLoader for validation, test, or non-multi-task training
+                print(f"batch_size: {batch_size}")
+                print(f"shuffle: {current_shuffle_status}")
+                print(f"num_workers: {num_workers}")
+                print(f"collate_fn: None (using default)")
+                print(f"pin_memory: {current_pin_memory}")
+                try:
                     dataloaders[split_name] = DataLoader(
-                        dataset_obj, batch_size=batch_size, shuffle=False,
+                        dataset_obj, batch_size=batch_size, shuffle=current_shuffle_status,
                         num_workers=num_workers, pin_memory=current_pin_memory
                     )
-                else:
-                    raise  # Re-raise if it's a different error
-                    
+                except (TypeError, ValueError) as e:
+                    if current_shuffle_status and ("shuffle" in str(e) or "len()" in str(e)):
+                        print(f"Warning: Dataset doesn't support shuffling. Creating DataLoader without shuffle.")
+                        dataloaders[split_name] = DataLoader(
+                            dataset_obj, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=current_pin_memory
+                        )
+                    else:
+                        raise
+
             try:
+                # For BatchSampler, len(dataloader) gives number of batches.
                 batch_count = len(dataloaders[split_name])
                 print(f"{split_name} dataloader created: {batch_count} batches")
             except (TypeError, AttributeError):
@@ -716,10 +759,12 @@ class DataBuilder:
 
 def create_data_builder(
     dataset_name: str = "allenai/c4", dataset_config: str = "en",
-    seq_len: Optional[Any] = 512, # Keep Optional[Any] as it's passed to DataBuilder constructor
+    seq_len: Optional[Any] = 512,
     max_samples: Optional[int] = 2000,
     max_eval_tokens: Optional[Any] = 50000,
     use_levenshtein_task: bool = False,
+    use_span_selection_task: bool = False, # New
+    n_candidates_span_selection: int = 4, # New
     levenshtein_shuffle_percentage: float = 0.25,
     max_train_tokens: Optional[Any] = None,
 ) -> DataBuilder:
@@ -728,6 +773,8 @@ def create_data_builder(
         seq_len=seq_len, max_samples=max_samples,
         max_eval_tokens=max_eval_tokens,
         use_levenshtein_task=use_levenshtein_task,
+        use_span_selection_task=use_span_selection_task, # New
+        n_candidates_span_selection=n_candidates_span_selection, # New
         levenshtein_shuffle_percentage=levenshtein_shuffle_percentage,
         max_train_tokens=max_train_tokens
     )
