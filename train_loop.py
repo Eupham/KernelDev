@@ -173,6 +173,10 @@ class TrainingMetrics:
         self.val_span_selection_losses = [] # New
         self.penalty_rewards = []
         self.rl_rewards = []
+        self.first_train_lm_loss = None
+        self.first_train_rank_aux_loss = None
+        self.first_train_nsp_loss = None
+        self.first_train_span_selection_loss = None
 
     def update(self, train_loss=None, val_loss=None, learning_rate=None, step_time=None,
                  lm_loss_component=None, rank_aux_loss=None, nsp_loss=None, span_selection_loss=None, # New
@@ -191,6 +195,12 @@ class TrainingMetrics:
         if nsp_loss is not None: self.nsp_losses.append(nsp_loss)
         if span_selection_loss is not None: self.span_selection_losses.append(span_selection_loss)
         if rl_reward is not None: self.rl_rewards.append(rl_reward)
+
+        if self.total_steps == 0:
+            if lm_loss_component is not None: self.first_train_lm_loss = lm_loss_component
+            if rank_aux_loss is not None: self.first_train_rank_aux_loss = rank_aux_loss
+            if nsp_loss is not None: self.first_train_nsp_loss = nsp_loss
+            if span_selection_loss is not None: self.first_train_span_selection_loss = span_selection_loss
 
         if val_lm_loss_component is not None: self.val_lm_losses.append(val_lm_loss_component)
         if val_rank_aux_loss is not None: self.val_rank_aux_losses.append(val_rank_aux_loss)
@@ -472,11 +482,23 @@ class Trainer:
                         span_predicted_index = span_outputs[span_task_mask].squeeze(-1)
                         span_target_index = auxiliary_values[span_task_mask]
                         if span_predicted_index.numel() > 0 and span_target_index.numel() > 0:
+                            print(f"span_predicted_index dtype: {span_predicted_index.dtype}")
+                            print(f"span_target_index dtype: {span_target_index.dtype}")
+                            print(f"span_predicted_index values: {span_predicted_index}")
+                            print(f"span_target_index values: {span_target_index}")
                             span_selection_loss_tensor = F.mse_loss(span_predicted_index, span_target_index)
+                            print(f"span_selection_loss_tensor value: {span_selection_loss_tensor}")
                             span_selection_loss_item = span_selection_loss_tensor.item()
                 
                 # Combine losses for multi-task items
                 # Start with LM loss component (which could be 0 if no LM items in batch or all ignored)
+                if not torch.isfinite(final_batch_lm_loss_component) or not torch.isfinite(pg_loss) or not torch.isfinite(rank_loss_tensor) or not torch.isfinite(mean_nsp_loss_tensor) or not torch.isfinite(span_selection_loss_tensor):
+                    print("!!! Non-finite loss detected before combining !!!")
+                    print(f"  LM Loss: {final_batch_lm_loss_component}")
+                    print(f"  PG Loss: {pg_loss}")
+                    print(f"  Rank Loss: {rank_loss_tensor}")
+                    print(f"  NSP Loss: {mean_nsp_loss_tensor}")
+                    print(f"  Span Selection Loss: {span_selection_loss_tensor}")
                 print(f"LM loss: {final_batch_lm_loss_component}")
                 print(f"PG loss: {pg_loss}")
                 print(f"Rank loss: {rank_loss_tensor}")
@@ -800,6 +822,12 @@ class Trainer:
             # Unpack the new 6-item tuple from train_step, which now includes rl_reward_item
             combined_loss_item, current_lm_loss_item, current_rank_loss_item, \
                 current_nsp_loss_item, current_penalty_reward, rl_reward_item = self.train_step(batch)
+            if combined_loss_item == float('inf') or np.isnan(combined_loss_item):
+                print(f"Batch {batch_idx} caused a non-finite loss.")
+                print(f"  LM Loss: {current_lm_loss_item}")
+                print(f"  Rank Loss: {current_rank_loss_item}")
+                print(f"  NSP Loss: {current_nsp_loss_item}")
+                print(f"  Span Selection Loss: {self.metrics.span_selection_losses[-1] if self.metrics.span_selection_losses else 'N/A'}")
             epoch_losses.append(combined_loss_item)
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
@@ -950,6 +978,15 @@ class Trainer:
                 if self.is_distributed and train_sampler is not None and dist.get_world_size() > 1: train_sampler.set_epoch(epoch)
                 self.train_epoch(train_loader, val_loader, epoch)
                 self.save_checkpoint(self.metrics.total_steps)
+            print("=== First and Last Training Loss Components ===")
+            print(f"  First Train LM Comp: {self.metrics.first_train_lm_loss:.4f}" if self.metrics.first_train_lm_loss is not None else "  First Train LM Comp: N/A")
+            print(f"  Last Train LM Comp: {self.metrics.lm_losses[-1]:.4f}" if self.metrics.lm_losses else "  Last Train LM Comp: N/A")
+            print(f"  First Train RankReg Aux: {self.metrics.first_train_rank_aux_loss:.4f}" if self.metrics.first_train_rank_aux_loss is not None else "  First Train RankReg Aux: N/A")
+            print(f"  Last Train RankReg Aux: {self.metrics.rank_aux_losses[-1]:.4f}" if self.metrics.rank_aux_losses else "  Last Train RankReg Aux: N/A")
+            print(f"  First Train NSP: {self.metrics.first_train_nsp_loss:.4f}" if self.metrics.first_train_nsp_loss is not None else "  First Train NSP: N/A")
+            print(f"  Last Train NSP: {self.metrics.nsp_losses[-1]:.4f}" if self.metrics.nsp_losses else "  Last Train NSP: N/A")
+            print(f"  First Train SpanSelect: {self.metrics.first_train_span_selection_loss:.4f}" if self.metrics.first_train_span_selection_loss is not None else "  First Train SpanSelect: N/A")
+            print(f"  Last Train SpanSelect: {self.metrics.span_selection_losses[-1]:.4f}" if self.metrics.span_selection_losses else "  Last Train SpanSelect: N/A")
         except KeyboardInterrupt: print("\nTraining interrupted by user.")
         except Exception as e: print(f"\nTraining failed with error: {e}"); raise
         finally:
