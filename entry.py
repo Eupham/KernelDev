@@ -244,6 +244,82 @@ def setup_precision(model, precision):
     return dtype, scaler, use_amp
 
 
+def run_pre_flight_check(config: Dict[str, Any]):
+    """
+    Runs a quick, minimal test of the entire training pipeline with mock data
+    to catch errors before starting the slow data loading and training process.
+    """
+    print("\n=== Running Pre-flight Check ===")
+    try:
+        # Use a tiny, in-memory dataset
+        mock_docs = [
+            "This is the first sentence for testing.",
+            "Another example sentence is here.",
+            "The quick brown fox jumps over the lazy dog.",
+            "A journey of a thousand miles begins with a single step.",
+            "To be or not to be, that is the question.",
+            "The only thing we have to fear is fear itself."
+        ]
+
+        # Create a mock DataBuilder that uses the in-memory docs
+        mock_data_builder = DataBuilder(
+            # Use settings from the main config
+            seq_len=config['data'].get('seq_len', 128),
+            use_levenshtein_task=True,
+            use_span_selection_task=True,
+            n_candidates_span_selection=config['data'].get('n_candidates_span_selection', 4)
+        )
+
+        # Create a mock model config
+        mock_model_config = {
+            'vocab_size': mock_data_builder.get_vocab_size(),
+            'dim': 32, # Small dimension
+            'n_layers': 2,
+            'n_heads': 4,
+            'max_seq_len': config['data'].get('seq_len', 128),
+            'n_candidates_span_selection': config['data'].get('n_candidates_span_selection', 4),
+            'cls_token_id': mock_data_builder.cls_token_id,
+            'use_cls_prefix_attention': True
+        }
+        mock_model = GPTModel(**mock_model_config).to(config['hardware'].get('device', 'cpu'))
+
+        # Create mock dataloaders
+        mock_dataloaders = mock_data_builder.create_dataloaders(batch_size=4, num_workers=0)
+
+        # Create a mock trainer
+        mock_training_config = TrainingConfig(
+            device=config['hardware'].get('device', 'cpu'),
+            use_levenshtein_task=True,
+        )
+        mock_trainer = Trainer(mock_model, mock_training_config, mock_data_builder)
+
+        # Fetch one batch and run one train step
+        if 'train' not in mock_dataloaders or len(mock_dataloaders['train']) == 0:
+            raise RuntimeError("Pre-flight check failed: Mock training dataloader is empty.")
+
+        test_batch = next(iter(mock_dataloaders['train']))
+        print("Pre-flight check: Successfully created a test batch.")
+
+        loss_values = mock_trainer.train_step(test_batch)
+        combined_loss = loss_values[0]
+        print(f"Pre-flight check: train_step executed. Combined loss: {combined_loss}")
+
+        # Check for nan or inf loss
+        if not math.isfinite(combined_loss):
+            raise RuntimeError(f"Pre-flight check failed: Loss is not finite (nan or inf). Loss values: {loss_values}")
+
+        print("✓ Pre-flight Check Passed: Training pipeline is stable.")
+
+    except Exception as e:
+        print("\n--- PRE-FLIGHT CHECK FAILED ---")
+        print(f"Error during pre-flight check: {e}")
+        import traceback
+        traceback.print_exc()
+        print("-----------------------------")
+        # Re-raise the exception to stop the main script
+        raise e
+
+
 def print_gpu_info():
     """Print comprehensive GPU information and optimization status."""
     if torch.cuda.is_available():
