@@ -116,7 +116,10 @@ class LevenshteinDataset(Dataset):
                     if char_cursor_in_shuffled_text >= actual_content_len: break
 
                     original_0_char_idx = original_char_start_for_this_word_block + k_char_in_block
-                    rank = (original_0_char_idx + 1.0) / N_original_chars # 1-based normalized rank
+                    if N_original_chars > 0:
+                        rank = (original_0_char_idx + 1.0) / N_original_chars # 1-based normalized rank
+                    else:
+                        rank = 0.0
                     target_ranks_for_shuffled_chars.append(rank)
                     char_cursor_in_shuffled_text += 1
 
@@ -125,7 +128,10 @@ class LevenshteinDataset(Dataset):
                 # Add rank for the space after this word (if not the last word in sequence)
                 if i_shuf_word < len(final_shuffled_word_list) - 1:
                     original_space_0_idx = char_starts_of_original_words[original_word_idx] + len(original_words_list[original_word_idx])
-                    rank_for_space = (original_space_0_idx + 1.0) / N_original_chars
+                    if N_original_chars > 0:
+                        rank_for_space = (original_space_0_idx + 1.0) / N_original_chars
+                    else:
+                        rank_for_space = 0.0
                     target_ranks_for_shuffled_chars.append(rank_for_space)
                     char_cursor_in_shuffled_text += 1
 
@@ -148,6 +154,7 @@ class LevenshteinDataset(Dataset):
         # 8. Add dummy placeholder for original text ranks (for 6-tuple consistency)
         original_text_ranks_placeholder = torch.full((self.seq_len,), self.rank_ignore_idx_float, dtype=torch.float32)
 
+        print(f"Rank regression targets for item {idx}: {rank_regression_targets}")
         return (
             torch.tensor(padded_input_tokens, dtype=torch.long),
             torch.tensor(next_token_lm_targets_list, dtype=torch.long),

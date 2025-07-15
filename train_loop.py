@@ -29,7 +29,7 @@ class TrainingConfig:
         learning_rate: float = 1e-3,
         weight_decay: float = 0.01,
         warmup_steps: int = 1000,
-        max_grad_norm: float = 1.0,
+        max_grad_norm: float = 0.5,
         save_every: int = 1000,
         eval_every: int = 500,
         log_every: int = 100,
@@ -420,11 +420,14 @@ class Trainer:
 
                     # PG loss for minimization is -E[R * log(pi)]. So -reward * action_log_probs
                     # Clip reward to prevent excessively large gradients
-                    clipped_reward = torch.clamp(reward, -10.0, 10.0)
-                    pg_loss_unmasked = -clipped_reward.detach() * action_log_probs
+                    clipped_reward = torch.clamp(reward, -1.0, 1.0)
+                    if torch.isfinite(clipped_reward):
+                        pg_loss_unmasked = -clipped_reward.detach() * action_log_probs
 
-                    # Sum loss only for valid tokens and average over batch, adding epsilon to prevent division by zero
-                    pg_loss = (pg_loss_unmasked * policy_loss_mask).sum() / (policy_loss_mask.sum() + 1e-9)
+                        # Sum loss only for valid tokens and average over batch, adding epsilon to prevent division by zero
+                        pg_loss = (pg_loss_unmasked * policy_loss_mask).sum() / (policy_loss_mask.sum() + 1e-9)
+                    else:
+                        pg_loss = torch.tensor(0.0, device=self.config.device, dtype=torch.float32)
 
                     # The reward is now positive, so we can log it directly.
                     # It will be passed to metrics.update later.
@@ -433,17 +436,25 @@ class Trainer:
                 if rank_task_mask.any() and rank_targets is not None:
                     rank_outputs = model_outputs['rank_outputs']
                     if rank_outputs is not None:
+                        print(f"Rank outputs: {rank_outputs}")
                         predictions_for_rank = rank_outputs[rank_task_mask].squeeze(-1)
                         targets_for_rank = rank_targets[rank_task_mask]
                         if predictions_for_rank.numel() > 0 and targets_for_rank.numel() > 0:
                             rank_ignore_val = float(getattr(self.config, 'lm_ignore_idx', -1.0))
                             valid_rank_mask = (targets_for_rank != rank_ignore_val)
                             if valid_rank_mask.any():
-                                rank_loss_tensor = F.mse_loss(
-                                    predictions_for_rank[valid_rank_mask],
-                                    targets_for_rank[valid_rank_mask]
-                                )
-                                rank_loss_item = rank_loss_tensor.item()
+                                if torch.isfinite(targets_for_rank[valid_rank_mask]).all():
+                                    print(f"Predictions for rank: {predictions_for_rank[valid_rank_mask]}")
+                                    print(f"Targets for rank: {targets_for_rank[valid_rank_mask]}")
+                                    rank_loss_tensor = F.l1_loss(
+                                        predictions_for_rank[valid_rank_mask],
+                                        targets_for_rank[valid_rank_mask]
+                                    )
+                                    print(f"Rank loss tensor: {rank_loss_tensor}")
+                                    print(f"Rank loss tensor: {rank_loss_tensor}")
+                                    rank_loss_item = rank_loss_tensor.item()
+                                else:
+                                    print("Warning: rank_targets contains non-finite values. Skipping batch.")
                 
                 # NSP Loss component (from items marked as NSP task)
                 if nsp_task_mask.any():
@@ -469,13 +480,12 @@ class Trainer:
                 
                 # Combine losses for multi-task items
                 # Start with LM loss component (which could be 0 if no LM items in batch or all ignored)
-                combined_loss = final_batch_lm_loss_component + (self.config.rl_loss_weight * pg_loss)
+                combined_loss = final_batch_lm_loss_component
                 # Add weighted Rank Regression loss
-                combined_loss = combined_loss + (self.config.levenshtein_loss_weight * rank_loss_tensor)
-                # Add weighted NSP loss
-                combined_loss = combined_loss + (self.config.nsp_loss_weight * mean_nsp_loss_tensor)
-                # Add weighted Span Selection loss
-                combined_loss = combined_loss + (self.config.span_selection_loss_weight * span_selection_loss_tensor)
+                if torch.isfinite(rank_loss_tensor):
+                    combined_loss = combined_loss + (self.config.levenshtein_loss_weight * rank_loss_tensor)
+                else:
+                    print("Warning: rank_loss_tensor is not finite. Skipping.")
                 
             else: # Single-task LM mode
                 if per_item_lm_loss_all is not None: # Should contain losses for all items
@@ -775,6 +785,7 @@ class Trainer:
             train_loader.sampler.set_epoch(epoch)
         
         for batch_idx, batch in enumerate(train_loader):
+            print(f"Processing batch {batch_idx}")
             step_start = time.time()
             # Unpack the new 6-item tuple from train_step, which now includes rl_reward_item
             combined_loss_item, current_lm_loss_item, current_rank_loss_item, \
@@ -1024,7 +1035,12 @@ class Trainer:
 
         cls_id = self.data_builder.cls_token_id
 
-        content_prompt_string = prompt.strip() # Remove leading/trailing whitespace
+        if isinstance(prompt, dict):
+            content_prompt_string = prompt.get("prompt", "").strip()
+        elif isinstance(prompt, str):
+            content_prompt_string = prompt.strip()
+        else:
+            content_prompt_string = ""
 
         # Check if the (stripped) prompt string starts with "[CLS]"
         # Case sensitive check for "[CLS]"
