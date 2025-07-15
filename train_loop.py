@@ -472,11 +472,23 @@ class Trainer:
                         span_predicted_index = span_outputs[span_task_mask].squeeze(-1)
                         span_target_index = auxiliary_values[span_task_mask]
                         if span_predicted_index.numel() > 0 and span_target_index.numel() > 0:
+                            print(f"span_predicted_index dtype: {span_predicted_index.dtype}")
+                            print(f"span_target_index dtype: {span_target_index.dtype}")
+                            print(f"span_predicted_index values: {span_predicted_index}")
+                            print(f"span_target_index values: {span_target_index}")
                             span_selection_loss_tensor = F.mse_loss(span_predicted_index, span_target_index)
+                            print(f"span_selection_loss_tensor value: {span_selection_loss_tensor}")
                             span_selection_loss_item = span_selection_loss_tensor.item()
                 
                 # Combine losses for multi-task items
                 # Start with LM loss component (which could be 0 if no LM items in batch or all ignored)
+                if not torch.isfinite(final_batch_lm_loss_component) or not torch.isfinite(pg_loss) or not torch.isfinite(rank_loss_tensor) or not torch.isfinite(mean_nsp_loss_tensor) or not torch.isfinite(span_selection_loss_tensor):
+                    print("!!! Non-finite loss detected before combining !!!")
+                    print(f"  LM Loss: {final_batch_lm_loss_component}")
+                    print(f"  PG Loss: {pg_loss}")
+                    print(f"  Rank Loss: {rank_loss_tensor}")
+                    print(f"  NSP Loss: {mean_nsp_loss_tensor}")
+                    print(f"  Span Selection Loss: {span_selection_loss_tensor}")
                 print(f"LM loss: {final_batch_lm_loss_component}")
                 print(f"PG loss: {pg_loss}")
                 print(f"Rank loss: {rank_loss_tensor}")
@@ -800,6 +812,12 @@ class Trainer:
             # Unpack the new 6-item tuple from train_step, which now includes rl_reward_item
             combined_loss_item, current_lm_loss_item, current_rank_loss_item, \
                 current_nsp_loss_item, current_penalty_reward, rl_reward_item = self.train_step(batch)
+            if combined_loss_item == float('inf') or np.isnan(combined_loss_item):
+                print(f"Batch {batch_idx} caused a non-finite loss.")
+                print(f"  LM Loss: {current_lm_loss_item}")
+                print(f"  Rank Loss: {current_rank_loss_item}")
+                print(f"  NSP Loss: {current_nsp_loss_item}")
+                print(f"  Span Selection Loss: {self.metrics.span_selection_losses[-1] if self.metrics.span_selection_losses else 'N/A'}")
             epoch_losses.append(combined_loss_item)
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
