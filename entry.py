@@ -618,7 +618,6 @@ def start_actual_training(cli_args):
     
     # Create data builder
     print("\n=== Loading and Processing Data ===")
-    # Pass use_levenshtein_task and shuffle percentage to create_data_builder
     data_config_for_builder = {
         **data_config,
         'use_levenshtein_task': lev_task_enabled,
@@ -628,25 +627,6 @@ def start_actual_training(cli_args):
         'max_train_tokens': data_cfg.get('max_train_tokens')
     }
     data_builder = create_data_builder(**data_config_for_builder)
-
-    # Create CombinedMultiTaskDataset
-    train_dataset = CombinedMultiTaskDataset(
-        raw_documents=data_builder.get_documents('train'),
-        tokenizer_fn=data_builder.tokenizer,
-        seq_len=data_builder.seq_len,
-        cls_token_id=data_builder.cls_token_id,
-        sep_token_id=data_builder.sep_token_id,
-        mask_token_id=data_builder.mask_token_id,
-        lm_ignore_idx=data_builder.lm_ignore_idx,
-        input_pad_id=data_builder.input_pad_id
-    )
-
-    # Create StrictRatioBatchSampler
-    batch_sampler = StrictRatioBatchSampler(
-        dataset=train_dataset,
-        batch_size=batch_size,
-        ratios=[0.2, 0.2, 0.2, 0.4] # lev, nsp, span, lm
-    )
 
     # Robust handling for num_workers
     raw_num_workers = data_cfg.get('num_workers', 0)
@@ -659,33 +639,12 @@ def start_actual_training(cli_args):
         print(f"Warning: Could not convert num_workers value '{raw_num_workers}' to int ({e}). Defaulting to 0.")
         num_workers_int = 0
 
-    # Create DataLoader
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_sampler=batch_sampler,
-        num_workers=num_workers_int,
-    )
-
-    # For validation and test, we can use standard dataloaders
-    val_dataset = CombinedMultiTaskDataset(
-        raw_documents=data_builder.get_documents('validation'),
-        tokenizer_fn=data_builder.tokenizer,
-        seq_len=data_builder.seq_len,
-        cls_token_id=data_builder.cls_token_id,
-        sep_token_id=data_builder.sep_token_id,
-        mask_token_id=data_builder.mask_token_id,
-        lm_ignore_idx=data_builder.lm_ignore_idx,
-        input_pad_id=data_builder.input_pad_id
-    )
-
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
+    # Create dataloaders
+    dataloaders = data_builder.create_dataloaders(
         batch_size=batch_size,
-        shuffle=False,
         num_workers=num_workers_int,
+        shuffle_train=data_cfg.get('shuffle_train', True)
     )
-
-    dataloaders = {'train': train_loader, 'validation': val_loader}
     
     # Show data info
     for split_name, dataloader in dataloaders.items():
