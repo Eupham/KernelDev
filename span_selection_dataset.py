@@ -101,7 +101,7 @@ class SpanSelectionDataset(Dataset):
         # 5. Create dummy tensors for the other 5 tuple items to match batch format
         dummy_lm_targets = torch.full((self.seq_len,), self.lm_ignore_idx, dtype=torch.long)
         dummy_rank_targets = torch.full((self.seq_len,), float(self.lm_ignore_idx), dtype=torch.float32)
-        auxiliary_scalar_value = torch.tensor(float(target_index), dtype=torch.float32)
+        auxiliary_scalar_value = torch.tensor(target_index, dtype=torch.long)
         task_type_flag = torch.tensor(3.0, dtype=torch.float32)
         dummy_true_ranks = torch.full((self.seq_len,), float(self.lm_ignore_idx), dtype=torch.float32)
 

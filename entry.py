@@ -104,6 +104,8 @@ from argparse import ArgumentParser, REMAINDER
 
 
 # Import our custom modules
+from combined_dataset import CombinedMultiTaskDataset
+from custom_samplers import StrictRatioBatchSampler
 from model import GPTModel
 from data_builder import DataBuilder, create_data_builder
 from train_loop import Trainer, TrainingConfig, create_trainer
@@ -616,7 +618,6 @@ def start_actual_training(cli_args):
     
     # Create data builder
     print("\n=== Loading and Processing Data ===")
-    # Pass use_levenshtein_task and shuffle percentage to create_data_builder
     data_config_for_builder = {
         **data_config,
         'use_levenshtein_task': lev_task_enabled,
@@ -627,7 +628,6 @@ def start_actual_training(cli_args):
     }
     data_builder = create_data_builder(**data_config_for_builder)
 
-    # Create dataloaders
     # Robust handling for num_workers
     raw_num_workers = data_cfg.get('num_workers', 0)
     try:
@@ -639,21 +639,12 @@ def start_actual_training(cli_args):
         print(f"Warning: Could not convert num_workers value '{raw_num_workers}' to int ({e}). Defaulting to 0.")
         num_workers_int = 0
 
-    print(f"DEBUG: In entry.py, about to call data_builder.create_dataloaders with batch_size={batch_size}, num_workers={num_workers_int}")
-    try:
-        dataloaders = data_builder.create_dataloaders(
-            batch_size=batch_size,
-            num_workers=num_workers_int,
-            shuffle_train=data_cfg.get('shuffle_train', True)
-        )
-        print("DEBUG: In entry.py, data_builder.create_dataloaders call completed.")
-        print(f"Vocab size from data_builder: {actual_vocab_size} (UTF-8 bytes potentially extended for Levenshtein CLS)")
-        
-    except Exception as e:
-        print(f"Error creating dataloaders: {e}")
-        print("This might be due to missing datasets library or network issues.")
-        print("Please install with: pip install datasets")
-        return
+    # Create dataloaders
+    dataloaders = data_builder.create_dataloaders(
+        batch_size=batch_size,
+        num_workers=num_workers_int,
+        shuffle_train=data_cfg.get('shuffle_train', True)
+    )
     
     # Show data info
     for split_name, dataloader in dataloaders.items():
