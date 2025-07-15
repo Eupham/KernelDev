@@ -446,7 +446,7 @@ class Trainer:
                                 if torch.isfinite(targets_for_rank[valid_rank_mask]).all():
                                     print(f"Predictions for rank: {predictions_for_rank[valid_rank_mask]}")
                                     print(f"Targets for rank: {targets_for_rank[valid_rank_mask]}")
-                                    rank_loss_tensor = F.l1_loss(
+                                    rank_loss_tensor = F.mse_loss(
                                         predictions_for_rank[valid_rank_mask],
                                         targets_for_rank[valid_rank_mask]
                                     )
