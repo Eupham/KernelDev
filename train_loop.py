@@ -444,13 +444,10 @@ class Trainer:
                             valid_rank_mask = (targets_for_rank != rank_ignore_val)
                             if valid_rank_mask.any():
                                 if torch.isfinite(targets_for_rank[valid_rank_mask]).all():
-                                    print(f"Predictions for rank: {predictions_for_rank[valid_rank_mask]}")
-                                    print(f"Targets for rank: {targets_for_rank[valid_rank_mask]}")
-                                    rank_loss_tensor = F.mse_loss(
+                                    rank_loss_tensor = F.l1_loss(
                                         predictions_for_rank[valid_rank_mask],
                                         targets_for_rank[valid_rank_mask]
                                     )
-                                    print(f"Rank loss tensor: {rank_loss_tensor}")
                                     print(f"Rank loss tensor: {rank_loss_tensor}")
                                     rank_loss_item = rank_loss_tensor.item()
                                 else:
@@ -480,6 +477,11 @@ class Trainer:
                 
                 # Combine losses for multi-task items
                 # Start with LM loss component (which could be 0 if no LM items in batch or all ignored)
+                print(f"LM loss: {final_batch_lm_loss_component}")
+                print(f"PG loss: {pg_loss}")
+                print(f"Rank loss: {rank_loss_tensor}")
+                print(f"NSP loss: {mean_nsp_loss_tensor}")
+                print(f"Span selection loss: {span_selection_loss_tensor}")
                 combined_loss = final_batch_lm_loss_component + (self.config.rl_loss_weight * pg_loss)
                 # Add weighted Rank Regression loss
                 combined_loss = combined_loss + (self.config.levenshtein_loss_weight * rank_loss_tensor)
