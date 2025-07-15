@@ -678,19 +678,22 @@ class Trainer:
                 # Combine component losses for the batch (as float values)
                 batch_combined_loss_val = current_batch_lm_component_loss_val
                 if self.config.use_levenshtein_task: # If multi-tasking
-                    batch_combined_loss_val += (self.config.levenshtein_loss_weight * current_batch_rank_component_loss_val)
-                    batch_combined_loss_val += (self.config.nsp_loss_weight * current_batch_nsp_component_loss_val)
-                    batch_combined_loss_val += (self.config.span_selection_loss_weight * current_batch_span_selection_loss_val)
+                    if num_rank_batches > 0:
+                        batch_combined_loss_val += (self.config.levenshtein_loss_weight * current_batch_rank_component_loss_val)
+                    if num_nsp_batches > 0:
+                        batch_combined_loss_val += (self.config.nsp_loss_weight * current_batch_nsp_component_loss_val)
+                    if num_span_selection_batches > 0:
+                        batch_combined_loss_val += (self.config.span_selection_loss_weight * current_batch_span_selection_loss_val)
 
                 total_combined_loss_epoch += batch_combined_loss_val
                 num_batches_processed +=1
 
         self.model.train()
         avg_combined_loss = total_combined_loss_epoch / num_batches_processed if num_batches_processed > 0 else float('inf')
-        avg_lm_loss_component = accum_lm_loss_component / num_lm_batches if num_lm_batches > 0 else 0.0
-        avg_rank_loss_component = accum_rank_loss / num_rank_batches if num_rank_batches > 0 else 0.0
-        avg_nsp_loss_component = accum_nsp_loss / num_nsp_batches if num_nsp_batches > 0 else 0.0
-        avg_span_selection_loss_component = accum_span_selection_loss / num_span_selection_batches if num_span_selection_batches > 0 else 0.0 # New
+        avg_lm_loss_component = accum_lm_loss_component / num_batches_processed if num_batches_processed > 0 else 0.0
+        avg_rank_loss_component = accum_rank_loss / num_batches_processed if num_batches_processed > 0 else 0.0
+        avg_nsp_loss_component = accum_nsp_loss / num_batches_processed if num_batches_processed > 0 else 0.0
+        avg_span_selection_loss_component = accum_span_selection_loss / num_batches_processed if num_batches_processed > 0 else 0.0
 
         self.metrics.update(
             val_loss=avg_combined_loss,
@@ -699,10 +702,6 @@ class Trainer:
             val_nsp_loss=avg_nsp_loss_component,
             val_span_selection_loss=avg_span_selection_loss_component # New
         )
-        print(f"  Val LM Comp: {avg_lm_loss_component:.4f}")
-        print(f"  Val RankReg Aux: {avg_rank_loss_component:.4f}")
-        print(f"  Val NSP: {avg_nsp_loss_component:.4f}")
-        print(f"  Val SpanSelect: {avg_span_selection_loss_component:.4f}")
         return avg_combined_loss
     
     def save_checkpoint(self, step: int, is_best: bool = False):
