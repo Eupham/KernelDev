@@ -706,14 +706,14 @@ def start_actual_training(cli_args):
 def test_causal_attention(model, dataloaders, device, data_builder, lev_task_enabled: bool):
     """Test the difference between causal and non-causal attention."""
     if 'train' not in dataloaders or not dataloaders['train']:
-        print("Warning: Train dataloader is empty or not found in test_causal_attention. Skipping test.")
+        print("Warning: Train dataloader is not available. Skipping test_causal_attention.")
         return
 
-    batch_iter = iter(dataloaders['train'])
     try:
-        first_batch = next(batch_iter)
+        # Get a fresh iterator and pull just the first batch for the test
+        first_batch = next(iter(dataloaders['train']))
     except StopIteration:
-        print("Warning: Train dataloader is empty in test_causal_attention. Skipping test.")
+        print("Warning: Train dataloader is empty. Skipping test_causal_attention.")
         return
 
     if lev_task_enabled: # This means multi-task is enabled, datasets return 6 items

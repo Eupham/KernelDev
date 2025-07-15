@@ -419,10 +419,12 @@ class Trainer:
                     reward = -reward # Now reward is positive (or zero)
 
                     # PG loss for minimization is -E[R * log(pi)]. So -reward * action_log_probs
-                    pg_loss_unmasked = -reward.detach() * action_log_probs
+                    # Clip reward to prevent excessively large gradients
+                    clipped_reward = torch.clamp(reward, -10.0, 10.0)
+                    pg_loss_unmasked = -clipped_reward.detach() * action_log_probs
 
-                    # Sum loss only for valid tokens and average over batch
-                    pg_loss = (pg_loss_unmasked * policy_loss_mask).sum() / policy_loss_mask.sum()
+                    # Sum loss only for valid tokens and average over batch, adding epsilon to prevent division by zero
+                    pg_loss = (pg_loss_unmasked * policy_loss_mask).sum() / (policy_loss_mask.sum() + 1e-9)
 
                     # The reward is now positive, so we can log it directly.
                     # It will be passed to metrics.update later.
@@ -1154,9 +1156,10 @@ class Trainer:
                 continue
 
             try:
+                # The generate_sample function expects a string prompt, not a dict.
                 generated_text = self.generate_sample(
-                    prompt=prompt_text,
-                    task_id_byte=task_id_byte, # Pass the determined task_id_byte
+                    prompt=prompt_entry.get("prompt", ""), # Pass the string from the dict
+                    task_id_byte=task_id_byte,
                     max_length=max_len,
                     temperature=temp,
                     top_k=tk,
@@ -1164,7 +1167,7 @@ class Trainer:
                 )
                 all_generated_outputs.append({
                     'type': prompt_type,
-                    'prompt': prompt_text,
+                    'prompt': prompt_entry.get("prompt", ""),
                     'text': generated_text
                 })
             except Exception as e:
