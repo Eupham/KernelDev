@@ -702,6 +702,10 @@ class Trainer:
             val_nsp_loss=avg_nsp_loss_component,
             val_span_selection_loss=avg_span_selection_loss_component # New
         )
+        print(f"  Val LM Comp: {avg_lm_loss_component:.4f}")
+        print(f"  Val RankReg Aux: {avg_rank_loss_component:.4f}")
+        print(f"  Val NSP: {avg_nsp_loss_component:.4f}")
+        print(f"  Val SpanSelect: {avg_span_selection_loss_component:.4f}")
         return avg_combined_loss
     
     def save_checkpoint(self, step: int, is_best: bool = False):
