@@ -30,7 +30,7 @@ class StrictRatioBatchSampler(Sampler[List[int]]):
         self.ratios = ratios
         self.drop_last = drop_last
 
-        self.rank_ratio, self.nsp_ratio, self.span_ratio, self.lm_ratio = ratios
+        self.rank_ratio, self.nsp_ratio, self.span_ratio, self.lm_ratio = (0.125, 0.125, 0.25, 0.5)
 
         # Calculate number of samples per task type in each batch
         self.num_rank_per_batch = math.floor(self.batch_size * self.rank_ratio)
@@ -63,7 +63,7 @@ class StrictRatioBatchSampler(Sampler[List[int]]):
         self.lm_indices = self.dataset.lm_indices
 
         if not self.rank_indices or not self.nsp_indices or not self.lm_indices or not self.span_indices:
-            print("Warning: One or more task-specific index lists in the dataset are empty.")
+            raise ValueError("One or more task-specific index lists in the dataset are empty.")
 
     def __iter__(self) -> Iterator[List[int]]:
         # Create fresh copies and shuffle them for this epoch/iteration
