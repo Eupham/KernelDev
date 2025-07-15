@@ -469,19 +469,16 @@ class Trainer:
                     span_outputs = model_outputs['span_selection_logits']
                     if span_outputs is not None:
                         # Output is now a single scalar (regression), target is the index
-                        span_predicted_index = span_outputs[span_task_mask].squeeze(-1)
-                        span_target_index = auxiliary_values[span_task_mask]
+                        span_predicted_index = span_outputs[span_task_mask]
+                        span_target_index = auxiliary_values[span_task_mask].long()
                         if span_predicted_index.numel() > 0 and span_target_index.numel() > 0:
-                            span_selection_loss_tensor = F.mse_loss(span_predicted_index, span_target_index)
+                            loss_fn_span = torch.nn.CrossEntropyLoss()
+                            span_selection_loss_tensor = loss_fn_span(span_predicted_index, span_target_index)
                             span_selection_loss_item = span_selection_loss_tensor.item()
                 
                 # Combine losses for multi-task items
                 # Start with LM loss component (which could be 0 if no LM items in batch or all ignored)
-                print(f"LM loss: {final_batch_lm_loss_component}")
-                print(f"PG loss: {pg_loss}")
-                print(f"Rank loss: {rank_loss_tensor}")
-                print(f"NSP loss: {mean_nsp_loss_tensor}")
-                print(f"Span selection loss: {span_selection_loss_tensor}")
+                print(f"lm_loss: {final_batch_lm_loss_component.item()}, pg_loss: {pg_loss.item()}, rank_loss: {rank_loss_tensor.item()}, nsp_loss: {mean_nsp_loss_tensor.item()}, span_loss: {span_selection_loss_tensor.item()}")
                 combined_loss = final_batch_lm_loss_component + (self.config.rl_loss_weight * pg_loss)
                 # Add weighted Rank Regression loss
                 combined_loss = combined_loss + (self.config.levenshtein_loss_weight * rank_loss_tensor)
@@ -668,10 +665,10 @@ class Trainer:
 
                 # Span Selection Loss
                 if self.config.use_levenshtein_task and span_task_mask_eval.any() and span_selection_logits_all is not None:
-                    span_predicted_eval = span_selection_logits_all[span_task_mask_eval].squeeze(-1)
-                    span_targets_eval = auxiliary_values[span_task_mask_eval]
+                    span_predicted_eval = span_selection_logits_all[span_task_mask_eval]
+                    span_targets_eval = auxiliary_values[span_task_mask_eval].long()
                     if span_predicted_eval.numel() > 0 and span_targets_eval.numel() > 0:
-                        span_loss_val = F.mse_loss(span_predicted_eval, span_targets_eval).item()
+                        span_loss_val = F.cross_entropy(span_predicted_eval, span_targets_eval).item()
                         if not math.isnan(span_loss_val) and not math.isinf(span_loss_val):
                             current_batch_span_selection_loss_val = span_loss_val
                             accum_span_selection_loss += span_loss_val
