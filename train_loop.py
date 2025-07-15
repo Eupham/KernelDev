@@ -800,6 +800,12 @@ class Trainer:
             # Unpack the new 6-item tuple from train_step, which now includes rl_reward_item
             combined_loss_item, current_lm_loss_item, current_rank_loss_item, \
                 current_nsp_loss_item, current_penalty_reward, rl_reward_item = self.train_step(batch)
+            if combined_loss_item == float('inf') or np.isnan(combined_loss_item):
+                print(f"Batch {batch_idx} caused a non-finite loss.")
+                print(f"  LM Loss: {current_lm_loss_item}")
+                print(f"  Rank Loss: {current_rank_loss_item}")
+                print(f"  NSP Loss: {current_nsp_loss_item}")
+                print(f"  Span Selection Loss: {self.metrics.span_selection_losses[-1] if self.metrics.span_selection_losses else 'N/A'}")
             epoch_losses.append(combined_loss_item)
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
