@@ -705,8 +705,8 @@ def start_actual_training(cli_args):
 
 def test_causal_attention(model, dataloaders, device, data_builder, lev_task_enabled: bool):
     """Test the difference between causal and non-causal attention."""
-    if 'train' not in dataloaders or not dataloaders['train']:
-        print("Warning: Train dataloader is not available. Skipping test_causal_attention.")
+    if 'train' not in dataloaders or not dataloaders['train'] or len(dataloaders['train']) == 0:
+        print("Warning: Train dataloader is empty or not found. Skipping test_causal_attention.")
         return
 
     try:
@@ -716,17 +716,14 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
         print("Warning: Train dataloader is empty. Skipping test_causal_attention.")
         return
 
-    if lev_task_enabled: # This means multi-task is enabled, datasets return 6 items
-        # New 6-item tuple: (input_tokens, next_token_lm_targets, rank_targets, aux_scalar, task_flags, true_original_ranks)
+    if lev_task_enabled:
         if len(first_batch) == 6:
-            # We only need input_tokens for this test.
             input_tokens, _, _, _, _, _ = first_batch
             x = input_tokens
         else:
             print(f"Warning: Expected 6 items in multi-task batch, got {len(first_batch)}. Check dataloader. Skipping test_causal_attention.")
             return
-    else: # Standard LM task
-        # Expecting (input_ids, lm_targets)
+    else:
         if len(first_batch) == 2:
             x, _ = first_batch
         else:
@@ -738,27 +735,21 @@ def test_causal_attention(model, dataloaders, device, data_builder, lev_task_ena
     model.eval()
     
     with torch.no_grad():
-        # Test with causal=True (default)
         print("Testing with causal=True...")
         outputs_causal = model(x)
         logits_causal = outputs_causal['lm_logits']
         
-        # Test with causal=False by modifying the attention layers
         print("Testing with causal=False...")
-        # Temporarily change causal setting
-        original_causal = []
+        original_causal = [block.attn.causal for block in model.blocks]
         for block in model.blocks:
-            original_causal.append(block.attn.causal)
             block.attn.causal = False
         
         outputs_non_causal = model(x)
         logits_non_causal = outputs_non_causal['lm_logits']
         
-        # Restore original causal setting
         for i, block in enumerate(model.blocks):
             block.attn.causal = original_causal[i]
         
-        # Compare outputs
         diff = torch.abs(logits_causal - logits_non_causal).mean()
         print(f"Mean absolute difference between causal and non-causal: {diff:.6f}")
         

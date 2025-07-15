@@ -458,12 +458,13 @@ class Trainer:
 
                 # Span Selection Loss component (from items marked as Span task)
                 if span_task_mask.any():
-                    span_logits = model_outputs['span_selection_logits']
-                    if span_logits is not None:
-                        span_predicted = span_logits[span_task_mask]
-                        span_targets = auxiliary_values[span_task_mask].long()
-                        if span_predicted.numel() > 0 and span_targets.numel() > 0:
-                            span_selection_loss_tensor = F.cross_entropy(span_predicted, span_targets)
+                    span_outputs = model_outputs['span_selection_logits']
+                    if span_outputs is not None:
+                        # Output is now a single scalar (regression), target is the index
+                        span_predicted_index = span_outputs[span_task_mask].squeeze(-1)
+                        span_target_index = auxiliary_values[span_task_mask]
+                        if span_predicted_index.numel() > 0 and span_target_index.numel() > 0:
+                            span_selection_loss_tensor = F.mse_loss(span_predicted_index, span_target_index)
                             span_selection_loss_item = span_selection_loss_tensor.item()
                 
                 # Combine losses for multi-task items
@@ -654,10 +655,10 @@ class Trainer:
 
                 # Span Selection Loss
                 if self.config.use_levenshtein_task and span_task_mask_eval.any() and span_selection_logits_all is not None:
-                    span_predicted_eval = span_selection_logits_all[span_task_mask_eval]
-                    span_targets_eval = auxiliary_values[span_task_mask_eval].long()
+                    span_predicted_eval = span_selection_logits_all[span_task_mask_eval].squeeze(-1)
+                    span_targets_eval = auxiliary_values[span_task_mask_eval]
                     if span_predicted_eval.numel() > 0 and span_targets_eval.numel() > 0:
-                        span_loss_val = F.cross_entropy(span_predicted_eval, span_targets_eval).item()
+                        span_loss_val = F.mse_loss(span_predicted_eval, span_targets_eval).item()
                         if not math.isnan(span_loss_val) and not math.isinf(span_loss_val):
                             current_batch_span_selection_loss_val = span_loss_val
                             accum_span_selection_loss += span_loss_val
@@ -1156,9 +1157,8 @@ class Trainer:
                 continue
 
             try:
-                # The generate_sample function expects a string prompt, not a dict.
                 generated_text = self.generate_sample(
-                    prompt=prompt_entry.get("prompt", ""), # Pass the string from the dict
+                    prompt=prompt_entry.get("prompt", ""),
                     task_id_byte=task_id_byte,
                     max_length=max_len,
                     temperature=temp,

@@ -134,8 +134,8 @@ class GPTModel(nn.Module):
         # Head for Auxiliary Task 1: Rank Regression (1 scalar per token, sigmoid output)
         self.rank_regression_head = nn.Linear(self.dim, 1)
         
-        # Head for Auxiliary Task 2: Span Selection (n_candidates logits from CLS token)
-        self.span_selection_head = nn.Linear(self.dim, self.n_candidates_span_selection)
+        # Head for Auxiliary Task 2: Span Selection (integer regression from CLS token)
+        self.span_selection_head = nn.Linear(self.dim, 1)
 
         self.apply(self._init_weights)
     
