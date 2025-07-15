@@ -479,17 +479,11 @@ class Trainer:
                     span_outputs = model_outputs['span_selection_logits']
                     if span_outputs is not None:
                         # Output is now a single scalar (regression), target is the index
-                        span_predicted_index = span_outputs[span_task_mask].squeeze(-1)
+                        # Output is now a single scalar (regression), target is the index
+                        span_predicted_index = span_outputs[span_task_mask]
                         span_target_index = auxiliary_values[span_task_mask]
                         if span_predicted_index.numel() > 0 and span_target_index.numel() > 0:
-                            span_target_index = span_target_index.view(-1, 1)
-                            span_predicted_index = torch.clamp(span_predicted_index, -100.0, 100.0)
-                            span_target_index = torch.clamp(span_target_index, -100.0, 100.0)
-                            print(f"span_predicted_index dtype: {span_predicted_index.dtype}")
-                            print(f"span_target_index dtype: {span_target_index.dtype}")
-                            print(f"span_predicted_index values: {span_predicted_index}")
-                            print(f"span_target_index values: {span_target_index}")
-                            span_selection_loss_tensor = F.cross_entropy(span_predicted_index, span_target_index.squeeze(-1).long())
+                            span_selection_loss_tensor = F.cross_entropy(span_predicted_index, span_target_index.long())
                             if not torch.isfinite(span_selection_loss_tensor):
                                 print("!!! Non-finite span selection loss detected !!!")
                                 print(f"  span_predicted_index: {span_predicted_index}")
@@ -1264,5 +1258,8 @@ class Trainer:
         for item in generated_outputs: print(f"Type: {item.get('type', 'N/A')}, Prompt: '{item.get('prompt', 'N/A')}' → '{item.get('text', 'Error')}'")
         print("=" * 50)
 
-def create_trainer(model, config, data_builder=None): return Trainer(model, config, data_builder)
+def create_trainer(model, config, data_builder=None):
+    if hasattr(config, 'n_candidates_span_selection'):
+        model.n_candidates_span_selection = config.n_candidates_span_selection
+    return Trainer(model, config, data_builder)
 if __name__ == "__main__": print("Trainer module loaded successfully!")
