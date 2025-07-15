@@ -147,7 +147,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, force_disable_prefix_attention: bool = False):
+    def forward(self, x, targets=None, task_type_flags=None, force_disable_prefix_attention: bool = False):
         batch_size, seq_len = x.shape # x is input token IDs (batch_size, seq_len)
         
         # Initialize loss and all head outputs
@@ -191,40 +191,67 @@ class GPTModel(nn.Module):
         # Language model logits (Primary Task)
         logits = self.head(processed_x) # (batch_size, seq_len, vocab_size)
 
-        # Auxiliary Task 1: Rank Regression Head
-        # Takes all hidden states and predicts a rank (0-1) for each token position.
-        rank_regression_logits = self.rank_regression_head(processed_x) # (batch_size, seq_len, 1)
-        rank_regression_outputs = torch.sigmoid(rank_regression_logits) # (batch_size, seq_len, 1)
+        if task_type_flags is not None:
+            # LM task
+            lm_mask = (task_type_flags == 0)
+            if lm_mask.any():
+                if targets is not None:
+                    lm_loss_per_token_unmasked = F.cross_entropy(
+                        logits[lm_mask].view(-1, logits.size(-1)),
+                        targets[lm_mask].view(-1),
+                        ignore_index=-1,
+                        reduction='none'
+                    )
+                    lm_loss_per_token_unmasked = lm_loss_per_token_unmasked.view(lm_mask.sum(), seq_len)
+                    valid_targets_mask = (targets[lm_mask] != -1).float()
+                    per_item_lm_loss_sum = (lm_loss_per_token_unmasked * valid_targets_mask).sum(dim=1)
+                    per_item_valid_token_count = valid_targets_mask.sum(dim=1)
+                    per_item_valid_token_count = torch.where(
+                        per_item_valid_token_count == 0,
+                        torch.ones_like(per_item_valid_token_count),
+                        per_item_valid_token_count
+                    )
+                    lm_loss_per_item = per_item_lm_loss_sum / per_item_valid_token_count
+                    if loss is None:
+                        loss = torch.zeros_like(task_type_flags, dtype=torch.float32)
+                    loss[lm_mask] = lm_loss_per_item
 
-        # Auxiliary Task (NSP-like, using CLS token representation)
-        if self.cls_token_id is not None: # Indicates CLS token processing is relevant
-            cls_representation = processed_x[:, 1, :] # CLS is at index 1
-            nsp_logits = self.nsp_head(cls_representation)
-            span_selection_logits = self.span_selection_head(cls_representation)
+            # Rank Regression task
+            rank_mask = (task_type_flags == 1)
+            if rank_mask.any():
+                rank_regression_logits = self.rank_regression_head(processed_x[rank_mask])
+                rank_regression_outputs = torch.sigmoid(rank_regression_logits)
 
-        if targets is not None:
-            # Calculate raw per-token loss for the primary LM task, without reduction
-            raw_lm_loss_per_token = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-                reduction='none'
-            )
-            # Reshape per-token loss to (batch_size, seq_len)
-            lm_loss_per_token_unmasked = raw_lm_loss_per_token.view(batch_size, seq_len)
+            # NSP task
+            nsp_mask = (task_type_flags == 2)
+            if nsp_mask.any():
+                cls_representation = processed_x[nsp_mask, 1, :]
+                nsp_logits = self.nsp_head(cls_representation)
 
-            valid_targets_mask = (targets != -1).float()
-            per_item_lm_loss_sum = (lm_loss_per_token_unmasked * valid_targets_mask).sum(dim=1)
-            per_item_valid_token_count = valid_targets_mask.sum(dim=1)
-            per_item_valid_token_count = torch.where(
-                per_item_valid_token_count == 0,
-                torch.ones_like(per_item_valid_token_count),
-                per_item_valid_token_count
-            )
-            lm_loss_per_item = per_item_lm_loss_sum / per_item_valid_token_count
-            loss = lm_loss_per_item
+            # Span Selection task
+            span_mask = (task_type_flags == 3)
+            if span_mask.any():
+                cls_representation = processed_x[span_mask, 1, :]
+                span_selection_logits = self.span_selection_head(cls_representation)
         else:
-            loss = None # Loss is None if targets are not provided (e.g., during inference)
+            # Default to LM task if no task_type_flags are provided
+            if targets is not None:
+                raw_lm_loss_per_token = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1,
+                    reduction='none'
+                )
+                lm_loss_per_token_unmasked = raw_lm_loss_per_token.view(batch_size, seq_len)
+                valid_targets_mask = (targets != -1).float()
+                per_item_lm_loss_sum = (lm_loss_per_token_unmasked * valid_targets_mask).sum(dim=1)
+                per_item_valid_token_count = valid_targets_mask.sum(dim=1)
+                per_item_valid_token_count = torch.where(
+                    per_item_valid_token_count == 0,
+                    torch.ones_like(per_item_valid_token_count),
+                    per_item_valid_token_count
+                )
+                loss = per_item_lm_loss_sum / per_item_valid_token_count
 
         # Return all head outputs in a dictionary for clarity and scalability
         return {
