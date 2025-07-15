@@ -631,7 +631,7 @@ def start_actual_training(cli_args):
 
     # Create CombinedMultiTaskDataset
     train_dataset = CombinedMultiTaskDataset(
-        raw_documents=data_builder.train_documents,
+        raw_documents=data_builder.get_documents('train'),
         tokenizer_fn=data_builder.tokenizer,
         seq_len=data_builder.seq_len,
         cls_token_id=data_builder.cls_token_id,
@@ -668,7 +668,7 @@ def start_actual_training(cli_args):
 
     # For validation and test, we can use standard dataloaders
     val_dataset = CombinedMultiTaskDataset(
-        raw_documents=data_builder.val_documents,
+        raw_documents=data_builder.get_documents('validation'),
         tokenizer_fn=data_builder.tokenizer,
         seq_len=data_builder.seq_len,
         cls_token_id=data_builder.cls_token_id,
