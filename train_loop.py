@@ -29,7 +29,7 @@ class TrainingConfig:
         learning_rate: float = 1e-3,
         weight_decay: float = 0.01,
         warmup_steps: int = 1000,
-        max_grad_norm: float = 0.5,
+        max_grad_norm: float = 1.0,
         save_every: int = 1000,
         eval_every: int = 500,
         log_every: int = 100,
@@ -480,12 +480,13 @@ class Trainer:
                 
                 # Combine losses for multi-task items
                 # Start with LM loss component (which could be 0 if no LM items in batch or all ignored)
-                combined_loss = final_batch_lm_loss_component
+                combined_loss = final_batch_lm_loss_component + (self.config.rl_loss_weight * pg_loss)
                 # Add weighted Rank Regression loss
-                if torch.isfinite(rank_loss_tensor):
-                    combined_loss = combined_loss + (self.config.levenshtein_loss_weight * rank_loss_tensor)
-                else:
-                    print("Warning: rank_loss_tensor is not finite. Skipping.")
+                combined_loss = combined_loss + (self.config.levenshtein_loss_weight * rank_loss_tensor)
+                # Add weighted NSP loss
+                combined_loss = combined_loss + (self.config.nsp_loss_weight * mean_nsp_loss_tensor)
+                # Add weighted Span Selection loss
+                combined_loss = combined_loss + (self.config.span_selection_loss_weight * span_selection_loss_tensor)
                 
             else: # Single-task LM mode
                 if per_item_lm_loss_all is not None: # Should contain losses for all items
@@ -698,6 +699,10 @@ class Trainer:
             val_nsp_loss=avg_nsp_loss_component,
             val_span_selection_loss=avg_span_selection_loss_component # New
         )
+        print(f"  Val LM Comp: {avg_lm_loss_component:.4f}")
+        print(f"  Val RankReg Aux: {avg_rank_loss_component:.4f}")
+        print(f"  Val NSP: {avg_nsp_loss_component:.4f}")
+        print(f"  Val SpanSelect: {avg_span_selection_loss_component:.4f}")
         return avg_combined_loss
     
     def save_checkpoint(self, step: int, is_best: bool = False):

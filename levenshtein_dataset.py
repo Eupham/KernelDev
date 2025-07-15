@@ -94,46 +94,49 @@ class LevenshteinDataset(Dataset):
         # 5. Prepare rank_regression_targets
         # These are float values representing normalized original ranks, aligned with tokens_shuffled_content.
         target_ranks_for_shuffled_chars = []
-        if N_original_chars > 0: # Proceed only if there's a basis for ranks (non-empty canonical sentence)
-            # Calculate 0-based start char index of each word in canonical_original_sentence
-            char_starts_of_original_words = []
-            current_char_pos_in_original = 0
-            for word_text in original_words_list:
-                char_starts_of_original_words.append(current_char_pos_in_original)
-                current_char_pos_in_original += len(word_text)
-                current_char_pos_in_original += 1 # Account for the space after (even for the last word, for length consistency)
+        if N_original_chars == 0:
+            print(f"Warning: N_original_chars is 0 for item {idx}. Returning dummy sample.")
+            return (
+                torch.full((self.seq_len,), self.input_pad_id, dtype=torch.long),
+                torch.full((self.seq_len,), self.lm_ignore_idx, dtype=torch.long),
+                torch.full((self.seq_len,), self.rank_ignore_idx_float, dtype=torch.float32),
+                torch.tensor(0.0, dtype=torch.float32),
+                torch.tensor(1.0, dtype=torch.float32),
+                torch.full((self.seq_len,), self.rank_ignore_idx_float, dtype=torch.float32)
+            )
+        # Calculate 0-based start char index of each word in canonical_original_sentence
+        char_starts_of_original_words = []
+        current_char_pos_in_original = 0
+        for word_text in original_words_list:
+            char_starts_of_original_words.append(current_char_pos_in_original)
+            current_char_pos_in_original += len(word_text)
+            current_char_pos_in_original += 1 # Account for the space after (even for the last word, for length consistency)
 
-            # Iterate over the words in their shuffled order to reconstruct ranks
-            char_cursor_in_shuffled_text = 0
-            for i_shuf_word, current_shuffled_word_text in enumerate(final_shuffled_word_list):
-                if char_cursor_in_shuffled_text >= actual_content_len: break # Stop if we've filled ranks for all input tokens
+        # Iterate over the words in their shuffled order to reconstruct ranks
+        char_cursor_in_shuffled_text = 0
+        for i_shuf_word, current_shuffled_word_text in enumerate(final_shuffled_word_list):
+            if char_cursor_in_shuffled_text >= actual_content_len: break # Stop if we've filled ranks for all input tokens
 
-                original_word_idx = permuted_word_source_indices[i_shuf_word]
-                original_char_start_for_this_word_block = char_starts_of_original_words[original_word_idx]
+            original_word_idx = permuted_word_source_indices[i_shuf_word]
+            original_char_start_for_this_word_block = char_starts_of_original_words[original_word_idx]
 
-                # Add ranks for characters in the current word
-                for k_char_in_block in range(len(current_shuffled_word_text)):
-                    if char_cursor_in_shuffled_text >= actual_content_len: break
-
-                    original_0_char_idx = original_char_start_for_this_word_block + k_char_in_block
-                    if N_original_chars > 0:
-                        rank = (original_0_char_idx + 1.0) / N_original_chars # 1-based normalized rank
-                    else:
-                        rank = 0.0
-                    target_ranks_for_shuffled_chars.append(rank)
-                    char_cursor_in_shuffled_text += 1
-
+            # Add ranks for characters in the current word
+            for k_char_in_block in range(len(current_shuffled_word_text)):
                 if char_cursor_in_shuffled_text >= actual_content_len: break
 
-                # Add rank for the space after this word (if not the last word in sequence)
-                if i_shuf_word < len(final_shuffled_word_list) - 1:
-                    original_space_0_idx = char_starts_of_original_words[original_word_idx] + len(original_words_list[original_word_idx])
-                    if N_original_chars > 0:
-                        rank_for_space = (original_space_0_idx + 1.0) / N_original_chars
-                    else:
-                        rank_for_space = 0.0
-                    target_ranks_for_shuffled_chars.append(rank_for_space)
-                    char_cursor_in_shuffled_text += 1
+                original_0_char_idx = original_char_start_for_this_word_block + k_char_in_block
+                rank = (original_0_char_idx + 1.0) / N_original_chars # 1-based normalized rank
+                target_ranks_for_shuffled_chars.append(rank)
+                char_cursor_in_shuffled_text += 1
+
+            if char_cursor_in_shuffled_text >= actual_content_len: break
+
+            # Add rank for the space after this word (if not the last word in sequence)
+            if i_shuf_word < len(final_shuffled_word_list) - 1:
+                original_space_0_idx = char_starts_of_original_words[original_word_idx] + len(original_words_list[original_word_idx])
+                rank_for_space = (original_space_0_idx + 1.0) / N_original_chars
+                target_ranks_for_shuffled_chars.append(rank_for_space)
+                char_cursor_in_shuffled_text += 1
 
         # Create the final rank target sequence for the model (length self.seq_len)
         # Padded with rank_ignore_idx_float.
@@ -154,7 +157,6 @@ class LevenshteinDataset(Dataset):
         # 8. Add dummy placeholder for original text ranks (for 6-tuple consistency)
         original_text_ranks_placeholder = torch.full((self.seq_len,), self.rank_ignore_idx_float, dtype=torch.float32)
 
-        print(f"Rank regression targets for item {idx}: {rank_regression_targets}")
         return (
             torch.tensor(padded_input_tokens, dtype=torch.long),
             torch.tensor(next_token_lm_targets_list, dtype=torch.long),
