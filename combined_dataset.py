@@ -47,9 +47,13 @@ class CombinedMultiTaskDataset(Dataset):
         self.input_pad_id = input_pad_id
         
         # Task distribution
-        self.rank_ratio, self.nsp_ratio, self.span_ratio, self.lm_ratio = task_distribution
-        if abs(sum(task_distribution) - 1.0) > 1e-6:
-            raise ValueError("Task distribution must sum to 1.0")
+        self.task_ratios = {
+            'lm': 0.5,
+            'span_selection': 0.25,
+            'nsp': 0.125,
+            'levenshtein': 0.125
+        }
+        self.rank_ratio, self.nsp_ratio, self.span_ratio, self.lm_ratio = self.task_ratios['levenshtein'], self.task_ratios['nsp'], self.task_ratios['span_selection'], self.task_ratios['lm']
         
         # Create individual datasets
         self.levenshtein_dataset = LevenshteinDataset(
@@ -94,23 +98,23 @@ class CombinedMultiTaskDataset(Dataset):
         self.span_indices = []
         self.lm_indices = []
 
-        cycle_length = 10 # (0.2, 0.2, 0.2, 0.4) sums nicely
+        cycle_length = 8
 
         # Calculate boundaries for assigning indices to task types
-        rank_boundary = int(cycle_length * self.rank_ratio)
-        nsp_boundary = rank_boundary + int(cycle_length * self.nsp_ratio)
-        span_boundary = nsp_boundary + int(cycle_length * self.span_ratio)
+        lm_boundary = int(cycle_length * self.lm_ratio)
+        span_boundary = lm_boundary + int(cycle_length * self.span_ratio)
+        nsp_boundary = span_boundary + int(cycle_length * self.nsp_ratio)
 
         for i in range(self.length):
             position_in_cycle = i % cycle_length
-            if position_in_cycle < rank_boundary:
-                self.rank_indices.append(i)
-            elif position_in_cycle < nsp_boundary:
-                self.nsp_indices.append(i)
+            if position_in_cycle < lm_boundary:
+                self.lm_indices.append(i)
             elif position_in_cycle < span_boundary:
                 self.span_indices.append(i)
+            elif position_in_cycle < nsp_boundary:
+                self.nsp_indices.append(i)
             else:
-                self.lm_indices.append(i)
+                self.rank_indices.append(i)
         
         # Shuffle indices to ensure randomness within each task type
         random.shuffle(self.rank_indices)
