@@ -1001,6 +1001,7 @@ def _flash_attn_bwd_dq_inner(
         RCP_LN2=RCP_LN2,
         SM_SCALE=SM_SCALE,
         PRESCALE_QK=PRESCALE_QK,
+        BIDIRECTIONAL_PREFIX_LEN=BIDIRECTIONAL_PREFIX_LEN,
     )
 
     dqbatch_head_offset = batch * stride_dqb + head * stride_dqh
@@ -1150,6 +1151,7 @@ def _flash_attn_bwd_dkdv_inner(
         RCP_LN2=RCP_LN2,
         SM_SCALE=SM_SCALE,
         PRESCALE_QK=PRESCALE_QK,
+        BIDIRECTIONAL_PREFIX_LEN=BIDIRECTIONAL_PREFIX_LEN,
     )
 
     dkbatch_head_offset = batch * stride_dkb + head * stride_dkh
