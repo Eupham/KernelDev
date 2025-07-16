@@ -204,7 +204,8 @@ def start_actual_training(cli_args):
         'dataset_config': data_cfg.get('dataset_config', 'en'),
         'seq_len': data_cfg.get('seq_len', 1024),
         'max_samples': data_cfg.get('max_samples', 5000),
-        'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000)
+        'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000),
+        'on_the_fly_tokenization': data_cfg.get('on_the_fly_tokenization', True) # Default to True for faster iteration
     }
     
     # Model configuration

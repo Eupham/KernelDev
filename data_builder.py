@@ -5,18 +5,31 @@ import numpy as np
 from typing import Optional, Dict, Any
 
 
-class TokenizedDataset(Dataset):
-    # ... (class content as in original file)
-    def __init__(self, tokenized_data, seq_len=512):
-        self.data = tokenized_data
+class OnTheFlyTokenizedDataset(Dataset):
+    def __init__(self, raw_data, seq_len=512, tokenizer_fn=None):
+        self.raw_data = raw_data
         self.seq_len = seq_len
-        
+        self.tokenizer_fn = tokenizer_fn
+
     def __len__(self):
-        return max(1, len(self.data) - self.seq_len)
-    
+        return len(self.raw_data)
+
     def __getitem__(self, idx):
-        x = torch.tensor(self.data[idx:idx + self.seq_len], dtype=torch.long)
-        y = torch.tensor(self.data[idx + 1:idx + self.seq_len + 1], dtype=torch.long)
+        text = self.raw_data[idx]['text']
+        tokens = self.tokenizer_fn(text)
+
+        # This is a simplified approach. For long documents, you'd want to handle them as a continuous stream.
+        # Here, we'll just take the first `seq_len` tokens of each document.
+        # This might not be ideal for all use cases but is good for quick iteration.
+        tokens = tokens[:self.seq_len + 1]
+
+        if len(tokens) < self.seq_len + 1:
+            # Pad if the text is too short
+            padding = [0] * (self.seq_len + 1 - len(tokens))
+            tokens.extend(padding)
+
+        x = torch.tensor(tokens[:-1], dtype=torch.long)
+        y = torch.tensor(tokens[1:], dtype=torch.long)
         return x, y
 
 class DataBuilder:
@@ -28,8 +41,10 @@ class DataBuilder:
         seq_len: int = 512,
         max_samples: Optional[int] = 2000,
         vocab_size: int = 256,
-        max_eval_tokens: int = 50000
+        max_eval_tokens: int = 50000,
+        on_the_fly_tokenization: bool = False
     ):
+        self.on_the_fly_tokenization = on_the_fly_tokenization
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
         self.seq_len = seq_len
@@ -273,33 +288,56 @@ class DataBuilder:
         return tokenized_data
     
     def create_datasets(self):
-        # ... (method content as in original file, ensure robust to empty tokenized_data)
         raw_dataset = self.load_raw_dataset()
-        tokenized_data = self.tokenize_dataset(raw_dataset)
-        
-        datasets = {}
-        for split_name, tokens in tokenized_data.items():
-            if not tokens:
-                print(f"Warning: {split_name} split has no tokens. Skipping dataset creation.")
-                continue
+        if self.on_the_fly_tokenization:
+            datasets = {}
+            for split_name, data in raw_dataset.items():
+                if data:
+                    datasets[split_name] = OnTheFlyTokenizedDataset(data, self.seq_len, self._tokenize_text)
+                    print(f"{split_name} dataset (on-the-fly): {len(datasets[split_name])} samples")
+                else:
+                    print(f"Warning: {split_name} split has no data. Skipping dataset creation.")
+            return datasets
+        else:
+            # ... (original pre-tokenization logic)
+            tokenized_data = self.tokenize_dataset(raw_dataset)
 
-            current_max_eval_tokens = self.max_eval_tokens
-            if self.max_samples != float('inf') and split_name in ['validation', 'test']:
-                scaled_max_tokens = int(self.max_samples * 0.2 * self.seq_len) # Estimate based on 20% of max_samples
-                current_max_eval_tokens = min(self.max_eval_tokens, scaled_max_tokens)
-                current_max_eval_tokens = max(current_max_eval_tokens, self.seq_len * 2 + 1) # Ensure at least two full sequences + 1 for target
+            datasets = {}
+            for split_name, tokens in tokenized_data.items():
+                if not tokens:
+                    print(f"Warning: {split_name} split has no tokens. Skipping dataset creation.")
+                    continue
 
-            if len(tokens) > self.seq_len:
-                if split_name in ['validation', 'test']:
-                    if len(tokens) > current_max_eval_tokens:
-                        tokens = tokens[:current_max_eval_tokens]
-                        print(f"Limited {split_name} to {len(tokens)} tokens for faster evaluation (target: {current_max_eval_tokens})")
-                
-                datasets[split_name] = TokenizedDataset(tokens, self.seq_len)
-                print(f"{split_name} dataset: {len(datasets[split_name])} samples")
-            else:
-                print(f"Warning: {split_name} split has insufficient tokens ({len(tokens)}) for seq_len {self.seq_len}. Skipping dataset.")
-        return datasets
+                current_max_eval_tokens = self.max_eval_tokens
+                if self.max_samples != float('inf') and split_name in ['validation', 'test']:
+                    scaled_max_tokens = int(self.max_samples * 0.2 * self.seq_len)
+                    current_max_eval_tokens = min(self.max_eval_tokens, scaled_max_tokens)
+                    current_max_eval_tokens = max(current_max_eval_tokens, self.seq_len * 2 + 1)
+
+                if len(tokens) > self.seq_len:
+                    if split_name in ['validation', 'test']:
+                        if len(tokens) > current_max_eval_tokens:
+                            tokens = tokens[:current_max_eval_tokens]
+                            print(f"Limited {split_name} to {len(tokens)} tokens for faster evaluation (target: {current_max_eval_tokens})")
+
+                    # This part needs to be adapted. Let's assume the original TokenizedDataset is still defined for this path.
+                    from torch.utils.data import Dataset
+                    class TokenizedDataset(Dataset):
+                        def __init__(self, tokenized_data, seq_len=512):
+                            self.data = tokenized_data
+                            self.seq_len = seq_len
+                        def __len__(self):
+                            return max(1, len(self.data) - self.seq_len)
+                        def __getitem__(self, idx):
+                            x = torch.tensor(self.data[idx:idx + self.seq_len], dtype=torch.long)
+                            y = torch.tensor(self.data[idx + 1:idx + self.seq_len + 1], dtype=torch.long)
+                            return x, y
+
+                    datasets[split_name] = TokenizedDataset(tokens, self.seq_len)
+                    print(f"{split_name} dataset: {len(datasets[split_name])} samples")
+                else:
+                    print(f"Warning: {split_name} split has insufficient tokens ({len(tokens)}) for seq_len {self.seq_len}. Skipping dataset.")
+            return datasets
 
     def create_dataloaders(
         self, batch_size: int = 8, num_workers: int = 0, shuffle_train: bool = True
@@ -335,12 +373,14 @@ class DataBuilder:
 def create_data_builder(
     dataset_name: str = "allenai/c4", dataset_config: str = "en",
     seq_len: int = 512, max_samples: Optional[int] = 2000,
-    max_eval_tokens: int = 50000
+    max_eval_tokens: int = 50000,
+    on_the_fly_tokenization: bool = False
 ) -> DataBuilder:
     return DataBuilder(
         dataset_name=dataset_name, dataset_config=dataset_config,
         seq_len=seq_len, max_samples=max_samples,
-        max_eval_tokens=max_eval_tokens
+        max_eval_tokens=max_eval_tokens,
+        on_the_fly_tokenization=on_the_fly_tokenization
     )
 
 if __name__ == "__main__":
