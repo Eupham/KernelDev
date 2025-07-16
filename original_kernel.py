@@ -1893,6 +1893,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
         ctx.prescale_qk = prescale_qk
         ctx.precision = precision
         ctx.return_lse = return_lse
+        ctx.bidirectional_prefix_len = bidirectional_prefix_len
         
         # Apply Hadamard transform for incoherent processing
         q_transformed, k_transformed = q, k
