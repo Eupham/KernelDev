@@ -843,6 +843,7 @@ def _flash_attn_bwd(
             TILE_DK_K_SIZE=TILE_DK_K_SIZE,
             PIPELINING=PIPELINING,
             CAUSAL=CAUSAL,
+            BIDIRECTIONAL_PREFIX_LEN=BIDIRECTIONAL_PREFIX_LEN,
         )
     else:
         _flash_attn_bwd_dq_inner(
@@ -874,6 +875,7 @@ def _flash_attn_bwd(
             TILE_DQ_K_SIZE=TILE_DQ_K_SIZE,
             PIPELINING=PIPELINING,
             CAUSAL=CAUSAL,
+            BIDIRECTIONAL_PREFIX_LEN=BIDIRECTIONAL_PREFIX_LEN,
         )
 
 
