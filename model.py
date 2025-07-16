@@ -43,20 +43,25 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x):
+    def forward(self, x, bidirectional_prefix_len=0):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
+        # Determine causality based on the prefix length
+        # If prefix length is 0, it's fully causal. If it's >= seq_len, it's fully bidirectional.
+        is_causal = self.causal and bidirectional_prefix_len < seq_len
+
         # Use flash attention kernel
         out = flash_attention(
             q=q,
             k=k,
             v=v,
             lens=None,
-            causal=self.causal
+            causal=is_causal,
+            bidirectional_prefix_len=bidirectional_prefix_len
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -73,9 +78,10 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x):
+    def forward(self, x, bidirectional_prefix_len=0):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x))
+        # Pass bidirectional_prefix_len to the attention layer
+        x = x + self.attn(self.norm1(x), bidirectional_prefix_len=bidirectional_prefix_len)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -92,11 +98,13 @@ class GPTModel(nn.Module):
         n_heads=12,
         max_seq_len=2048,
         mlp_ratio=4,
-        causal=True
+        causal=True,
+        bidirectional_prefix_len=0
     ):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
+        self.bidirectional_prefix_len = bidirectional_prefix_len
         
         # Token and position embeddings (no bias)
         self.token_emb = nn.Embedding(vocab_size, dim)
@@ -139,7 +147,9 @@ class GPTModel(nn.Module):
         
         # Apply transformer blocks
         for block in self.blocks:
-            x = block(x)
+            # The causal parameter is now dynamically determined by bidirectional_prefix_len
+            # We pass bidirectional_prefix_len to the attention mechanism within the block
+            x = block(x, bidirectional_prefix_len=self.bidirectional_prefix_len)
         
         # Final normalization and output projection
         x = self.norm_out(x)

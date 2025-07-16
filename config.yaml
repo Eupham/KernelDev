@@ -54,7 +54,7 @@ data:
   seq_len: 1024
   
   # Maximum number of samples to use from dataset
-  max_samples: 1000000
+  max_samples: 5000
   
   # Maximum tokens for evaluation
   max_eval_tokens: 50000
@@ -85,6 +85,9 @@ model:
   
   # Use causal attention masking
   causal: true
+
+  # Length of the bidirectional prefix
+  bidirectional_prefix_len: 1
 
 # GPU/Memory Configuration
 hardware:

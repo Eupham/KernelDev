@@ -215,7 +215,8 @@ def start_actual_training(cli_args):
         'n_heads': model_cfg.get('n_heads', 16),
         'max_seq_len': model_cfg.get('max_seq_len', 2048),
         'mlp_ratio': model_cfg.get('mlp_ratio', 4),
-        'causal': model_cfg.get('causal', True)
+        'causal': model_cfg.get('causal', True),
+        'bidirectional_prefix_len': model_cfg.get('bidirectional_prefix_len', 0)
     }
     
     # Initialize model

@@ -447,6 +447,7 @@ def _flash_attn_fwd(
     TIME_BUCKET:  int,  #
     HEAD_DIM: tl.constexpr,  #
     CAUSAL: tl.constexpr,  #
+    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr, #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
     DTYPE:  tl.constexpr,  #
@@ -520,6 +521,12 @@ def _flash_attn_fwd(
         # For non-causal attention, attend to all tokens
         kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
 
+    # Adjust for bidirectional prefix
+    if BIDIRECTIONAL_PREFIX_LEN > 0:
+        # If the current query tile is within the prefix, it can attend to the full sequence
+        if q_token_idx < BIDIRECTIONAL_PREFIX_LEN:
+            kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
+
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
     q_lens_mask = (
         q_tile_indices[:, None] < seq_len
@@ -573,7 +580,10 @@ def _flash_attn_fwd(
         kv_indices = kv_token_idx + tile_k_arange
         # Conditional causal mask based on CAUSAL parameter
         if CAUSAL:
-            causal_mask = q_tile_indices[:, None] >= kv_indices[None, :]
+            # If the query token is in the prefix, it can attend to all key tokens
+            # Otherwise, it's causal
+            is_in_prefix = q_tile_indices[:, None] < BIDIRECTIONAL_PREFIX_LEN
+            causal_mask = (q_tile_indices[:, None] >= kv_indices[None, :]) | is_in_prefix
         else:
             causal_mask = True  # No causal masking - attend to all tokens
         mask = q_lens_mask & (
@@ -792,6 +802,7 @@ def _flash_attn_bwd(
     TILE_DK_Q_SIZE: tl.constexpr, TILE_DK_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
     CAUSAL: tl.constexpr,  #
+    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr, #
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
@@ -896,6 +907,7 @@ def _flash_attn_bwd_dq_inner(
     TILE_DQ_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
     CAUSAL: tl.constexpr,  #
+    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr, #
 ):
     q_tile_idx = tile_id
     q_token_idx = q_tile_idx * TILE_DQ_Q_SIZE
@@ -1035,6 +1047,7 @@ def _flash_attn_bwd_dkdv_inner(
     TILE_DK_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
     CAUSAL: tl.constexpr,  #
+    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr, #
 ):
     kv_tile_idx = tile_id
     kv_token_idx = kv_tile_idx * TILE_DK_K_SIZE
@@ -1183,6 +1196,7 @@ def _flash_attn_bwd_dq(
     RCP_LN2: tl.constexpr,
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
+    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr,
 ):
     # Conditional attention range based on CAUSAL parameter
     kv_start_tile_idx = 0
@@ -1232,7 +1246,8 @@ def _flash_attn_bwd_dq(
         kv_indices = kv_token_idx + tile_k_arange
         # Conditional causal mask based on CAUSAL parameter
         if CAUSAL:
-            causal_mask = q_tile_indices[:, None] >= kv_indices[None, :]
+            is_in_prefix = q_tile_indices[:, None] < BIDIRECTIONAL_PREFIX_LEN
+            causal_mask = (q_tile_indices[:, None] >= kv_indices[None, :]) | is_in_prefix
         else:
             causal_mask = True  # No causal masking - attend to all tokens
         mask = q_len_mask & (
@@ -1269,6 +1284,7 @@ def _flash_attn_bwd_dkdv(
     RCP_LN2: tl.constexpr,
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
+    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr,
 ):
     # Conditional logic for backward pass based on CAUSAL parameter
     kv_tile_max_token = min(kv_token_idx + TILE_K_SIZE, seq_len)
@@ -1337,7 +1353,8 @@ def _flash_attn_bwd_dkdv(
         q_tile_indices = q_token_idx + tile_q_arange
         # Conditional causal mask based on CAUSAL parameter
         if CAUSAL:
-            causal_mask = q_tile_indices[None, :] >= kv_indices[:, None]
+            is_in_prefix = q_tile_indices[None, :] < BIDIRECTIONAL_PREFIX_LEN
+            causal_mask = (q_tile_indices[None, :] >= kv_indices[:, None]) | is_in_prefix
         else:
             causal_mask = True  # No causal masking - attend to all tokens
         mask = kv_lens_mask & (
@@ -1542,6 +1559,7 @@ def attention_forward_adapter(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
+    bidirectional_prefix_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1588,6 +1606,7 @@ def attention_forward_adapter(
         TIME_BUCKET=triton.next_power_of_2(T),
         OUTPUT_LOGSUMEXP=return_lse,
         SM_SCALE=sm_scale,
+        BIDIRECTIONAL_PREFIX_LEN=bidirectional_prefix_len,
     )
 
     if LSE is None:
@@ -1607,6 +1626,7 @@ def attention_forward_adapter_abstract(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
+    bidirectional_prefix_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
@@ -1630,6 +1650,7 @@ def attention_backward_adapter(
     autotune: bool,
     prescale_qk: bool,
     precision: str,
+    bidirectional_prefix_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1692,6 +1713,7 @@ def attention_backward_adapter(
         DTYPE=q.dtype,
         SM_SCALE=sm_scale,
         PRESCALE_QK=prescale_qk,
+        BIDIRECTIONAL_PREFIX_LEN=bidirectional_prefix_len,
     )
 
     return DQ, DK, DV
@@ -1711,6 +1733,7 @@ def attention_backward_adapter_abstract(
     autotune: bool,
     prescale_qk: bool,
     precision: str,
+    bidirectional_prefix_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
     DK = torch.empty_like(k, memory_format=torch.contiguous_format)
@@ -1731,6 +1754,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         return_lse,
         prescale_qk,
         precision,
+        bidirectional_prefix_len,
     ) = inputs
     ctx.save_for_backward(
         q,
@@ -1745,6 +1769,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
     ctx.sm_scale = sm_scale
     ctx.prescale_qk = prescale_qk
     ctx.precision = precision
+    ctx.bidirectional_prefix_len = bidirectional_prefix_len
 
 
 def attention_backward_adapter_op(ctx, do, dlse):
@@ -1754,6 +1779,7 @@ def attention_backward_adapter_op(ctx, do, dlse):
     sm_scale = ctx.sm_scale
     prescale_qk = ctx.prescale_qk
     precision = ctx.precision
+    bidirectional_prefix_len = ctx.bidirectional_prefix_len
 
     DQ, DK, DV = torch.ops.flash_attention.backward(
         q=q,
@@ -1768,6 +1794,7 @@ def attention_backward_adapter_op(ctx, do, dlse):
         autotune=autotune,
         prescale_qk=prescale_qk,
         precision=precision,
+        bidirectional_prefix_len=bidirectional_prefix_len,
     )
 
     return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None
@@ -1826,6 +1853,7 @@ def _flash_attention(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
+    bidirectional_prefix_len: int,
 ):
     requires_grad = any(i.requires_grad for i in (q, k, v))
     O, LSE = torch.ops.flash_attention.forward(
@@ -1839,6 +1867,7 @@ def _flash_attention(
         prescale_qk=prescale_qk,
         return_lse=return_lse or requires_grad,
         precision=precision,
+        bidirectional_prefix_len=bidirectional_prefix_len,
     )
     if return_lse:
         return O, LSE
@@ -1854,7 +1883,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
-        incoherent_processing, hadamard_signs_q, hadamard_signs_k
+        incoherent_processing, hadamard_signs_q, hadamard_signs_k, bidirectional_prefix_len
     ):
         # Store context for backward pass
         ctx.incoherent_processing = incoherent_processing
@@ -1907,6 +1936,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
             prescale_qk=prescale_qk,
             return_lse=return_lse or requires_grad,
             precision=precision,
+            bidirectional_prefix_len=bidirectional_prefix_len,
         )
         
         # Save tensors for backward pass
@@ -1941,6 +1971,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 autotune=ctx.autotune,
                 prescale_qk=ctx.prescale_qk,
                 precision=ctx.precision,
+                bidirectional_prefix_len=ctx.bidirectional_prefix_len,
             )
             
             # Apply inverse Hadamard transform to gradients to get gradients w.r.t. original Q and K
@@ -1962,6 +1993,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 autotune=ctx.autotune,
                 prescale_qk=ctx.prescale_qk,
                 precision=ctx.precision,
+                bidirectional_prefix_len=ctx.bidirectional_prefix_len,
             )
         
         return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None
@@ -1981,6 +2013,7 @@ def flash_attention(
     incoherent_processing: bool | None = None,
     hadamard_signs_q: torch.Tensor | None = None,
     hadamard_signs_k: torch.Tensor | None = None,
+    bidirectional_prefix_len: int = 0,
 ):
     """
     Computes self-attention with optional causal masking and flash attention optimization.
@@ -2031,7 +2064,7 @@ def flash_attention(
     if use_incoherent:
         return IncoherentFlashAttention.apply(
             q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
-            use_incoherent, hadamard_signs_q, hadamard_signs_k
+            use_incoherent, hadamard_signs_q, hadamard_signs_k, bidirectional_prefix_len
         )
     else:
         # Use standard flash attention for normal case
@@ -2046,6 +2079,7 @@ def flash_attention(
             return_lse=return_lse,
             prescale_qk=prescale_qk,
             precision=precision,
+            bidirectional_prefix_len=bidirectional_prefix_len,
         )
 
 
