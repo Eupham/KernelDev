@@ -262,9 +262,6 @@ class Trainer:
         x, y = batch
         x, y = x.to(self.config.device), y.to(self.config.device)
         
-        # Zero gradients
-        self.optimizer.zero_grad()
-        
         if self.config.use_amp and self.config.scaler is not None:
             # Mixed precision forward pass
             with torch.amp.autocast('cuda'):
@@ -272,73 +269,46 @@ class Trainer:
             
             if loss is None:
                 return 0.0
-            
-            # Mixed precision backward pass
-            self.config.scaler.scale(loss).backward()
-            
-            # Gradient clipping with mixed precision
-            if self.config.max_grad_norm > 0:
-                self.config.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.max_grad_norm
-                )
-            
-            # Optimizer step with mixed precision
-            self.config.scaler.step(self.optimizer)
-            self.config.scaler.update()
-            
         else:
             # Standard precision forward pass
             logits, loss = self.model(x, y)
             
             if loss is None:
                 return 0.0
-            
-            # Standard precision backward pass
-            loss.backward()
-            
-            # Gradient clipping
-            if self.config.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.max_grad_norm
-                )
-            
-            # Optimizer step
-            self.optimizer.step()
         
-        return loss.item()
+        return loss
     
-    def evaluate(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
+    def evaluate(self, dataloaders: Dict[str, DataLoader], max_batches: Optional[int] = 50) -> float:
         """Evaluate the model on a dataset."""
         self.model.eval()
         total_loss = 0
         num_batches = 0
         
         with torch.no_grad():
-            for batch_idx, batch in enumerate(dataloader):
-                if max_batches is not None and batch_idx >= max_batches:
-                    print(f"Evaluation limited to {max_batches} batches for speed")
-                    break
+            for task_name, dataloader in dataloaders.items():
+                for batch_idx, batch in enumerate(dataloader):
+                    if max_batches is not None and batch_idx >= max_batches:
+                        print(f"Evaluation for task {task_name} limited to {max_batches} batches for speed")
+                        break
+
+                    x, y = batch
+                    x, y = x.to(self.config.device), y.to(self.config.device)
                     
-                x, y = batch
-                x, y = x.to(self.config.device), y.to(self.config.device)
-                
-                if self.config.use_amp:
-                    # Use mixed precision for evaluation
-                    with torch.amp.autocast('cuda'):
+                    if self.config.use_amp:
+                        # Use mixed precision for evaluation
+                        with torch.amp.autocast('cuda'):
+                            logits, loss = self.model(x, y)
+                    else:
+                        # Standard precision evaluation
                         logits, loss = self.model(x, y)
-                else:
-                    # Standard precision evaluation
-                    logits, loss = self.model(x, y)
-                
-                if loss is not None:
-                    total_loss += loss.item()
-                    num_batches += 1
+
+                    if loss is not None:
+                        total_loss += loss.item()
+                        num_batches += 1
         
         self.model.train()
         return total_loss / num_batches if num_batches > 0 else float('inf')
+
     
     def save_checkpoint(self, step: int, is_best: bool = False):
         """Save model checkpoint."""
@@ -439,24 +409,52 @@ class Trainer:
     
     def train_epoch(
         self,
-        train_loader: DataLoader,
-        val_loader: Optional[DataLoader] = None,
-        epoch: int = 0
+        train_loaders: Dict[str, DataLoader],
+        val_loaders: Optional[Dict[str, DataLoader]] = None,
+        epoch: int = 0,
+        task_configs: Dict[str, Any] = None
     ):
         """Train for one epoch."""
         self.model.train()
         epoch_losses = []
         start_time = time.time()
 
-        if self.is_distributed and hasattr(train_loader.sampler, 'set_epoch') and dist.get_world_size() > 1:
-            train_loader.sampler.set_epoch(epoch)
+        # Create iterators for all training dataloaders
+        train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
         
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx in range(self.steps_per_epoch):
             step_start = time.time()
             
-            # Training step
-            loss = self.train_step(batch)
-            epoch_losses.append(loss)
+            total_loss = 0
+
+            for task_name, task_iter in train_iters.items():
+                try:
+                    batch = next(task_iter)
+                except StopIteration:
+                    # Reset iterator if one task is shorter than others
+                    train_iters[task_name] = iter(train_loaders[task_name])
+                    batch = next(train_iters[task_name])
+
+                loss = self.train_step(batch)
+                task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
+                total_loss += loss * task_weight
+
+            epoch_losses.append(total_loss)
+
+            # Backpropagate combined loss
+            self.optimizer.zero_grad()
+            if self.config.use_amp and self.config.scaler is not None:
+                self.config.scaler.scale(total_loss).backward()
+                if self.config.max_grad_norm > 0:
+                    self.config.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.config.scaler.step(self.optimizer)
+                self.config.scaler.update()
+            else:
+                total_loss.backward()
+                if self.config.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.optimizer.step()
             
             # Update learning rate scheduler
             self.scheduler.step()
@@ -465,7 +463,7 @@ class Trainer:
             # Update metrics
             step_time = time.time() - step_start
             self.metrics.update(
-                train_loss=loss,
+                train_loss=total_loss,
                 learning_rate=current_lr,
                 step_time=step_time
             )
@@ -477,15 +475,15 @@ class Trainer:
                 avg_step_time = self.metrics.get_avg_step_time()
                 print(
                     f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
-                    f"Loss: {loss:.4f}, LR: {current_lr:.6f}, "
+                    f"Loss: {total_loss:.4f}, LR: {current_lr:.6f}, "
                     f"Step Time: {avg_step_time:.3f}s"
                 )
             
             # Evaluation (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
-               val_loader is not None and \
+               val_loaders is not None and \
                self.metrics.total_steps % self.config.eval_every == 0:
-                val_loss = self.evaluate(val_loader)
+                val_loss = self.evaluate(val_loaders)
                 self.metrics.update(val_loss=val_loss) # rank-local metric
                 
                 is_best = val_loss < self.metrics.best_val_loss # rank-local best
@@ -540,9 +538,9 @@ class Trainer:
                self.metrics.total_steps % self.config.save_every == 0:
                 self.save_checkpoint(self.metrics.total_steps) # rank 0 guarded
                 
-                if val_loader is not None:
+                if val_loaders is not None:
                     print(f"\n=== Generating Inference Sample at Step {self.metrics.total_steps} (Rank 0) ===")
-                    perplexity = self.calculate_perplexity(val_loader, max_batches=20)
+                    perplexity = self.calculate_perplexity(val_loaders, max_batches=20)
                     # Use last val_loss from metrics if available, else current val_loss if eval was just run
                     current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (val_loss if 'val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
 
@@ -578,72 +576,60 @@ class Trainer:
     
     def train(
         self,
-        train_loader: DataLoader,
-        val_loader: Optional[DataLoader] = None
+        train_loaders: Dict[str, DataLoader],
+        val_loaders: Optional[Dict[str, DataLoader]] = None,
+        task_configs: Dict[str, Any] = None
     ):
         """Main training loop."""
         print(f"Starting training for {self.config.num_epochs} epochs...")
 
-        train_sampler = None
-        val_sampler = None
         if self.is_distributed and dist.get_world_size() > 1:
-            train_sampler = DistributedSampler(train_loader.dataset, shuffle=True, num_replicas=dist.get_world_size(), rank=dist.get_rank())
-            # Keep existing train_loader settings like num_workers, pin_memory
-            train_loader = DataLoader(
-                train_loader.dataset,
-                batch_size=train_loader.batch_size, # Use existing batch_size
-                sampler=train_sampler,
-                num_workers=getattr(train_loader, 'num_workers', 0),
-                pin_memory=getattr(train_loader, 'pin_memory', False)
-            )
-            if val_loader:
-                val_sampler = DistributedSampler(val_loader.dataset, shuffle=False, num_replicas=dist.get_world_size(), rank=dist.get_rank())
-                val_loader = DataLoader(
-                    val_loader.dataset,
-                    batch_size=getattr(val_loader, 'batch_size', 1), # Use existing or default
-                    sampler=val_sampler,
-                    num_workers=getattr(val_loader, 'num_workers', 0),
-                    pin_memory=getattr(val_loader, 'pin_memory', False)
+            # Re-wrap dataloaders with DistributedSampler if in DDP mode
+            for task, loader in train_loaders.items():
+                sampler = DistributedSampler(loader.dataset, shuffle=True, num_replicas=dist.get_world_size(), rank=dist.get_rank())
+                train_loaders[task] = DataLoader(
+                    loader.dataset, batch_size=loader.batch_size, sampler=sampler,
+                    num_workers=getattr(loader, 'num_workers', 0), pin_memory=getattr(loader, 'pin_memory', False),
+                    collate_fn=loader.collate_fn
                 )
+            if val_loaders:
+                for task, loader in val_loaders.items():
+                    sampler = DistributedSampler(loader.dataset, shuffle=False, num_replicas=dist.get_world_size(), rank=dist.get_rank())
+                    val_loaders[task] = DataLoader(
+                        loader.dataset, batch_size=loader.batch_size, sampler=sampler,
+                        num_workers=getattr(loader, 'num_workers', 0), pin_memory=getattr(loader, 'pin_memory', False),
+                        collate_fn=loader.collate_fn
+                    )
 
-        if not self.is_distributed or dist.get_rank() == 0:
-            print(f"Training batches per epoch (Rank 0 view): {len(train_loader)}")
-            if val_loader:
-                print(f"Validation batches (Rank 0 view): {len(val_loader)}")
-
-        # Calculate steps_per_epoch and re-initialize scheduler
-        self.steps_per_epoch = len(train_loader)
+        # Calculate steps_per_epoch based on the largest dataloader
+        self.steps_per_epoch = max(len(loader) for loader in train_loaders.values())
         if not self.is_distributed or dist.get_rank() == 0:
             print(f"Calculated steps_per_epoch: {self.steps_per_epoch}")
 
         new_T0 = math.ceil(self.steps_per_epoch * self.config.scheduler_T0_epoch_fraction)
-        if new_T0 < 1: # Ensure T_0 is at least 1
-            print(f"Warning: Calculated T_0 ({new_T0}) is less than 1. Setting to 1.")
-            new_T0 = 1
+        if new_T0 < 1: new_T0 = 1
 
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=new_T0,
-            T_mult=self.config.scheduler_T_mult,
-            eta_min=self.config.learning_rate * 0.1 # Assuming 0.1 factor for eta_min
+            self.optimizer, T_0=new_T0, T_mult=self.config.scheduler_T_mult,
+            eta_min=self.config.learning_rate * 0.1
         )
         if not self.is_distributed or dist.get_rank() == 0:
             print(f"Scheduler re-initialized with T_0 = {new_T0} based on steps_per_epoch.")
-        
-        # Initial evaluation (only on rank 0)
-        if val_loader and (not self.is_distributed or dist.get_rank() == 0):
-            initial_val_loss = self.evaluate(val_loader)
-            self.metrics.update(val_loss=initial_val_loss) # rank-local metric
-            print(f"Initial validation loss (Rank 0): {initial_val_loss:.4f}")
-        
+
+        # Initial evaluation
+        if val_loaders and (not self.is_distributed or dist.get_rank() == 0):
+            initial_val_loss = self.evaluate(val_loaders)
+            self.metrics.update(val_loss=initial_val_loss)
+            print(f"Initial validation loss: {initial_val_loss:.4f}")
+
         try:
             for epoch in range(self.config.num_epochs):
-                if self.is_distributed and train_sampler is not None and dist.get_world_size() > 1:
-                    train_sampler.set_epoch(epoch)
+                if self.is_distributed and dist.get_world_size() > 1:
+                    for loader in train_loaders.values():
+                        loader.sampler.set_epoch(epoch)
 
-                avg_loss = self.train_epoch(train_loader, val_loader, epoch) # avg_loss is rank-local
+                self.train_epoch(train_loaders, val_loaders, epoch, task_configs)
                 
-                # Save final checkpoint for epoch (rank 0 guarded in save_checkpoint)
                 self.save_checkpoint(self.metrics.total_steps)
         
         except KeyboardInterrupt:
@@ -761,29 +747,30 @@ class Trainer:
         self.model.train()
         return generated_text
     
-    def calculate_perplexity(self, dataloader: DataLoader, max_batches: Optional[int] = 50) -> float:
+    def calculate_perplexity(self, dataloaders: Dict[str, DataLoader], max_batches: Optional[int] = 50) -> float:
         """Calculate perplexity on a dataset."""
         self.model.eval()
         total_loss = 0
         num_batches = 0
         
         with torch.no_grad():
-            for batch_idx, batch in enumerate(dataloader):
-                if max_batches is not None and batch_idx >= max_batches:
-                    break
+            for task_name, dataloader in dataloaders.items():
+                for batch_idx, batch in enumerate(dataloader):
+                    if max_batches is not None and batch_idx >= max_batches:
+                        break
+
+                    x, y = batch
+                    x, y = x.to(self.config.device), y.to(self.config.device)
                     
-                x, y = batch
-                x, y = x.to(self.config.device), y.to(self.config.device)
-                
-                if self.config.use_amp and self.config.scaler is not None:
-                    with torch.amp.autocast('cuda'):
+                    if self.config.use_amp and self.config.scaler is not None:
+                        with torch.amp.autocast('cuda'):
+                            logits, loss = self.model(x, y)
+                    else:
                         logits, loss = self.model(x, y)
-                else:
-                    logits, loss = self.model(x, y)
-                
-                if loss is not None:
-                    total_loss += loss.item()
-                    num_batches += 1
+
+                    if loss is not None:
+                        total_loss += loss.item()
+                        num_batches += 1
         
         self.model.train()
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')

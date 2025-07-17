@@ -216,8 +216,7 @@ def start_actual_training(cli_args):
         'n_heads': model_cfg.get('n_heads', 16),
         'max_seq_len': model_cfg.get('max_seq_len', 2048),
         'mlp_ratio': model_cfg.get('mlp_ratio', 4),
-        'causal': model_cfg.get('causal', True),
-        'bidirectional_prefix_len': model_cfg.get('bidirectional_prefix_len', 0)
+        'causal': model_cfg.get('causal', True)
     }
     
     # Initialize model
@@ -355,11 +354,6 @@ def start_actual_training(cli_args):
         print(f"Initial training loss: {initial_train_loss:.4f}")
         print(f"Initial validation loss: {initial_val_loss:.4f}")
     
-    # Test causal vs non-causal attention
-    if logging_cfg.get('test_attention_modes', True):
-        print(f"\n=== Testing Causal vs Non-Causal Attention ===")
-        test_causal_attention(model, dataloaders, training_config.device, data_builder)
-    
     # Start training
     print(f"\n=== Starting Training ===")
     try:
@@ -371,20 +365,6 @@ def start_actual_training(cli_args):
         
         print(f"\n=== Training Completed ===")
         
-        # Final evaluation
-        if 'train' in dataloaders and 'validation' in dataloaders:
-            max_eval_batches = eval_cfg.get('max_eval_batches', 10)
-            final_train_loss = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
-            final_val_loss = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
-            print(f"Final training loss: {final_train_loss:.4f}")
-            print(f"Final validation loss: {final_val_loss:.4f}")
-            
-            # Show improvement
-            if 'initial_train_loss' in locals():
-                train_improvement = initial_train_loss - final_train_loss
-                val_improvement = initial_val_loss - final_val_loss
-                print(f"Training loss improvement: {train_improvement:.4f}")
-                print(f"Validation loss improvement: {val_improvement:.4f}")
         
         # Plot training curves
         if logging_cfg.get('save_training_plots', True):
@@ -410,50 +390,6 @@ def start_actual_training(cli_args):
     print(f"\n=== Training Session Complete ===")
 
 # --- End of original main logic, now in start_actual_training ---
-
-def test_causal_attention(model, dataloaders, device, data_builder):
-    """Test the difference between causal and non-causal attention."""
-    if 'train' not in dataloaders:
-        return
-    
-    # Get a sample batch
-    for x, y in dataloaders['train']:
-        x = x.to(device)
-        break
-    
-    model.to(device)
-    model.eval()
-    
-    with torch.no_grad():
-        # Test with causal=True (default)
-        print("Testing with causal=True...")
-        logits_causal, _ = model(x)
-        
-        # Test with causal=False by modifying the attention layers
-        print("Testing with causal=False...")
-        # Temporarily change causal setting
-        original_causal = []
-        for block in model.blocks:
-            original_causal.append(block.attn.causal)
-            block.attn.causal = False
-        
-        logits_non_causal, _ = model(x)
-        
-        # Restore original causal setting
-        for i, block in enumerate(model.blocks):
-            block.attn.causal = original_causal[i]
-        
-        # Compare outputs
-        diff = torch.abs(logits_causal - logits_non_causal).mean()
-        print(f"Mean absolute difference between causal and non-causal: {diff:.6f}")
-        
-        if diff > 1e-6:
-            print("✓ Causal masking is working correctly (outputs differ)")
-        else:
-            print("⚠ Causal masking might not be working (outputs are identical)")
-    
-    model.train()
-
 
 def test_generation(trainer, data_builder, gen_cfg=None):
     """Test text generation with the trained model."""
