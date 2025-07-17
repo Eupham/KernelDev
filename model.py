@@ -43,14 +43,14 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, attention_mask=None):
+    def forward(self, x):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        is_causal = self.causal if attention_mask is None else False
+        is_causal = self.causal
 
         # Use flash attention kernel
         out = flash_attention(
@@ -58,8 +58,7 @@ class MultiHeadAttention(nn.Module):
             k=k,
             v=v,
             lens=None,
-            causal=is_causal,
-            attention_mask=attention_mask
+            causal=is_causal
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -76,9 +75,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, attention_mask=None):
+    def forward(self, x):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask)
+        x = x + self.attn(self.norm1(x))
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -144,7 +143,7 @@ class GPTModel(nn.Module):
         
         # Apply transformer blocks
         for block in self.blocks:
-            x = block(x, attention_mask=attention_mask)
+            x = block(x)
         
         # Final normalization and output projection
         x = self.norm_out(x)

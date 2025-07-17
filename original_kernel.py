@@ -812,6 +812,7 @@ def _flash_attn_bwd(
     if dkv_worker:
         _flash_attn_bwd_dkdv_inner(
             Q, K, V, DELTA, LSE, DO, DK, DV,
+            ATTN_MASK,
             stride_qb, stride_qh, stride_qt, stride_qk,
             stride_kb, stride_kh, stride_kt, stride_kk,
             stride_vb, stride_vh, stride_vt, stride_vk,
@@ -820,6 +821,7 @@ def _flash_attn_bwd(
             stride_dob, stride_doh, stride_dot, stride_dok,
             stride_dkb, stride_dkh, stride_dkt, stride_dkk,
             stride_dvb, stride_dvh, stride_dvt, stride_dvk,
+            mask_stride_b, mask_stride_h, mask_stride_t,
             batch=batch,
             head=head,
             tile_id=tile_id,
@@ -1561,7 +1563,7 @@ def attention_forward_adapter(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    attention_mask: torch.Tensor,
+    attention_mask: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1629,7 +1631,7 @@ def attention_forward_adapter_abstract(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    bidirectional_prefix_len: int,
+    attention_mask: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
@@ -1737,7 +1739,7 @@ def attention_backward_adapter_abstract(
     autotune: bool,
     prescale_qk: bool,
     precision: str,
-    bidirectional_prefix_len: int,
+    attention_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
     DK = torch.empty_like(k, memory_format=torch.contiguous_format)
@@ -1856,7 +1858,7 @@ def _flash_attention(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    bidirectional_prefix_len: int,
+    attention_mask: torch.Tensor | None,
 ):
     requires_grad = any(i.requires_grad for i in (q, k, v))
     O, LSE = torch.ops.flash_attention.forward(
@@ -1870,7 +1872,7 @@ def _flash_attention(
         prescale_qk=prescale_qk,
         return_lse=return_lse or requires_grad,
         precision=precision,
-        bidirectional_prefix_len=bidirectional_prefix_len,
+        attention_mask=attention_mask,
     )
     if return_lse:
         return O, LSE
@@ -1886,7 +1888,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
-        incoherent_processing, hadamard_signs_q, hadamard_signs_k, bidirectional_prefix_len
+        incoherent_processing, hadamard_signs_q, hadamard_signs_k, attention_mask
     ):
         # Store context for backward pass
         ctx.incoherent_processing = incoherent_processing
@@ -1896,7 +1898,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
         ctx.prescale_qk = prescale_qk
         ctx.precision = precision
         ctx.return_lse = return_lse
-        ctx.bidirectional_prefix_len = bidirectional_prefix_len
+        ctx.attention_mask = attention_mask
         
         # Apply Hadamard transform for incoherent processing
         q_transformed, k_transformed = q, k
@@ -1940,7 +1942,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
             prescale_qk=prescale_qk,
             return_lse=return_lse or requires_grad,
             precision=precision,
-            bidirectional_prefix_len=bidirectional_prefix_len,
+            attention_mask=attention_mask,
         )
         
         # Save tensors for backward pass
@@ -1975,7 +1977,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 autotune=ctx.autotune,
                 prescale_qk=ctx.prescale_qk,
                 precision=ctx.precision,
-                bidirectional_prefix_len=ctx.bidirectional_prefix_len,
+                attention_mask=ctx.attention_mask,
             )
             
             # Apply inverse Hadamard transform to gradients to get gradients w.r.t. original Q and K
@@ -1997,7 +1999,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 autotune=ctx.autotune,
                 prescale_qk=ctx.prescale_qk,
                 precision=ctx.precision,
-                bidirectional_prefix_len=ctx.bidirectional_prefix_len,
+                attention_mask=ctx.attention_mask,
             )
         
         return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None
@@ -2017,7 +2019,7 @@ def flash_attention(
     incoherent_processing: bool | None = None,
     hadamard_signs_q: torch.Tensor | None = None,
     hadamard_signs_k: torch.Tensor | None = None,
-    bidirectional_prefix_len: int = 0,
+    attention_mask: torch.Tensor | None = None,
 ):
     """
     Computes self-attention with optional causal masking and flash attention optimization.
@@ -2068,7 +2070,7 @@ def flash_attention(
     if use_incoherent:
         return IncoherentFlashAttention.apply(
             q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
-            use_incoherent, hadamard_signs_q, hadamard_signs_k, bidirectional_prefix_len
+            use_incoherent, hadamard_signs_q, hadamard_signs_k, attention_mask
         )
     else:
         # Use standard flash attention for normal case
@@ -2083,7 +2085,7 @@ def flash_attention(
             return_lse=return_lse,
             prescale_qk=prescale_qk,
             precision=precision,
-            bidirectional_prefix_len=bidirectional_prefix_len,
+            attention_mask=attention_mask,
         )
 
 
