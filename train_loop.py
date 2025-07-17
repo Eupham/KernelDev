@@ -262,19 +262,23 @@ class Trainer:
         x, y = batch
         x, y = x.to(self.config.device), y.to(self.config.device)
         
-        if self.config.use_amp and self.config.scaler is not None:
-            # Mixed precision forward pass
-            with torch.amp.autocast('cuda'):
+        if y.dim() == 1:
+            # This is a cocktail party batch
+            if self.config.use_amp and self.config.scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    logits, loss = self.model(x, y)
+            else:
                 logits, loss = self.model(x, y)
-            
-            if loss is None:
-                return 0.0
         else:
-            # Standard precision forward pass
-            logits, loss = self.model(x, y)
-            
-            if loss is None:
-                return 0.0
+            # This is a teacher forcing batch
+            if self.config.use_amp and self.config.scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    logits, loss = self.model(x, y)
+            else:
+                logits, loss = self.model(x, y)
+
+        if loss is None:
+            return 0.0
         
         return loss
     
