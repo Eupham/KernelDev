@@ -370,7 +370,6 @@ def start_actual_training(cli_args):
         
         print(f"\n=== Training Completed ===")
         
-        
         # Plot training curves
         if logging_cfg.get('save_training_plots', True):
             print(f"\n=== Plotting Results ===")
