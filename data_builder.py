@@ -1,9 +1,19 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset # Keep this import
+from datasets import load_dataset
 import numpy as np
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+import random
 
+# Define special tokens
+SPECIAL_TOKENS = {
+    '[PAD]': 0,
+    '[CLS]': 1,
+    '[MASK]': 2,
+    '[SPAN]': 3,
+    '[ES]': 4
+}
+NUM_SPECIAL_TOKENS = len(SPECIAL_TOKENS)
 
 class OnTheFlyTokenizedDataset(Dataset):
     def __init__(self, raw_data, seq_len=512, tokenizer_fn=None):
@@ -17,15 +27,12 @@ class OnTheFlyTokenizedDataset(Dataset):
     def __getitem__(self, idx):
         text = self.raw_data[idx]['text']
         tokens = self.tokenizer_fn(text)
+        tokens = [t + NUM_SPECIAL_TOKENS for t in tokens] # Shift regular tokens
 
-        # This is a simplified approach. For long documents, you'd want to handle them as a continuous stream.
-        # Here, we'll just take the first `seq_len` tokens of each document.
-        # This might not be ideal for all use cases but is good for quick iteration.
         tokens = tokens[:self.seq_len + 1]
 
         if len(tokens) < self.seq_len + 1:
-            # Pad if the text is too short
-            padding = [0] * (self.seq_len + 1 - len(tokens))
+            padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len + 1 - len(tokens))
             tokens.extend(padding)
 
         x = torch.tensor(tokens[:-1], dtype=torch.long)
@@ -33,7 +40,6 @@ class OnTheFlyTokenizedDataset(Dataset):
         return x, y
 
 class DataBuilder:
-    # ... (constructor and other methods like _tokenize_text, _detokenize_bytes as in original file)
     def __init__(
         self,
         dataset_name: str = "allenai/c4",
@@ -42,16 +48,18 @@ class DataBuilder:
         max_samples: Optional[int] = 2000,
         vocab_size: int = 256,
         max_eval_tokens: int = 50000,
-        on_the_fly_tokenization: bool = False
+        on_the_fly_tokenization: bool = False,
+        task_configs: dict = None
     ):
         self.on_the_fly_tokenization = on_the_fly_tokenization
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
         self.seq_len = seq_len
         self.max_samples = max_samples if max_samples is not None else float('inf')
-        self.vocab_size = vocab_size
+        self.vocab_size = vocab_size + NUM_SPECIAL_TOKENS
         self.max_eval_tokens = max_eval_tokens
-        
+        self.task_configs = task_configs or {}
+
         print(f"Using UTF-8 byte tokenization with vocabulary size: {self.vocab_size}")
         print(f"Max evaluation tokens per split: {self.max_eval_tokens}")
         if self.max_samples != float('inf'):
@@ -61,8 +69,10 @@ class DataBuilder:
 
     def _tokenize_text(self, text: str) -> list:
         return list(text.encode('utf-8'))
-    
+
     def _detokenize_bytes(self, tokens: list) -> str:
+        # Filter out special tokens before decoding
+        tokens = [t - NUM_SPECIAL_TOKENS for t in tokens if t >= NUM_SPECIAL_TOKENS]
         try:
             byte_data = bytes(tokens)
             return byte_data.decode('utf-8', errors='replace')
@@ -339,10 +349,73 @@ class DataBuilder:
                     print(f"Warning: {split_name} split has insufficient tokens ({len(tokens)}) for seq_len {self.seq_len}. Skipping dataset.")
             return datasets
 
+    def _collate_fn_teacher_forcing(self, batch):
+        inputs = torch.stack([item[0] for item in batch])
+        targets = torch.stack([item[1] for item in batch])
+        return inputs, targets
+
+    def _collate_fn_cocktail_party(self, batch):
+        # Implementation of the cocktail party task collate function
+        # This is a simplified example. A more robust implementation would be needed.
+        task_config = self.task_configs.get('cocktail_party', {})
+        num_distractors = task_config.get('num_distractors', 3)
+        min_span_size = task_config.get('min_span_size', 10)
+        max_span_size = task_config.get('max_span_size', 50)
+
+        new_batch = []
+        for i in range(len(batch)):
+            # 1. Get original sample
+            original_tokens, _ = batch[i]
+            original_tokens = original_tokens.tolist()
+
+            # 2. Select a span to mask
+            span_size = random.randint(min_span_size, max_span_size)
+            span_start = random.randint(0, len(original_tokens) - span_size)
+            span = original_tokens[span_start : span_start + span_size]
+
+            # 3. Create distractors
+            distractors = []
+            for _ in range(num_distractors):
+                distractor_idx = random.randint(0, len(batch) - 1)
+                if distractor_idx == i:
+                    distractor_idx = (i + 1) % len(batch)
+                distractor_tokens, _ = batch[distractor_idx]
+                distractor_tokens = distractor_tokens.tolist()
+                distractor_start = random.randint(0, len(distractor_tokens) - span_size)
+                distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
+                distractors.append(distractor_span)
+
+            # 4. Construct the new sequence
+            # [CLS] ... [MASK] ... [SPAN] ... [ES] [SPAN] ... [ES] ...
+            masked_sequence = original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
+
+            all_spans = [span] + distractors
+            random.shuffle(all_spans)
+
+            final_sequence = [SPECIAL_TOKENS['[CLS]']] + masked_sequence
+            for s in all_spans:
+                final_sequence += [SPECIAL_TOKENS['[SPAN]']] + s + [SPECIAL_TOKENS['[ES]']]
+
+            # Truncate or pad to seq_len
+            final_sequence = final_sequence[:self.seq_len]
+            padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_sequence))
+            final_sequence += padding
+
+            # Create targets
+            # For simplicity, we'll just use the original targets for the masked part
+            # A more sophisticated approach would be needed for the classification task
+            targets = torch.tensor(final_sequence[1:] + [SPECIAL_TOKENS['[PAD]']], dtype=torch.long)
+
+            new_batch.append((torch.tensor(final_sequence, dtype=torch.long), targets))
+
+        inputs = torch.stack([item[0] for item in new_batch])
+        targets = torch.stack([item[1] for item in new_batch])
+        return inputs, targets
+
+
     def create_dataloaders(
         self, batch_size: int = 8, num_workers: int = 0, shuffle_train: bool = True
-    ) -> Dict[str, DataLoader]:
-        # ... (method content as in original file, ensure robust to empty datasets dict)
+    ) -> Dict[str, Dict[str, DataLoader]]:
         datasets = self.create_datasets()
         dataloaders = {}
         if not datasets:
@@ -353,12 +426,25 @@ class DataBuilder:
             if not dataset_obj:
                 print(f"Skipping DataLoader for {split_name} as dataset is empty or invalid.")
                 continue
+
+            dataloaders[split_name] = {}
             shuffle = shuffle_train if split_name == 'train' else False
-            dataloaders[split_name] = DataLoader(
+
+            # Teacher forcing dataloader
+            dataloaders[split_name]['teacher_forcing'] = DataLoader(
                 dataset_obj, batch_size=batch_size, shuffle=shuffle,
-                num_workers=num_workers, pin_memory=torch.cuda.is_available()
+                num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                collate_fn=self._collate_fn_teacher_forcing
             )
-            print(f"{split_name} dataloader: {len(dataloaders[split_name])} batches")
+
+            # Cocktail party dataloader
+            if 'cocktail_party' in self.task_configs:
+                dataloaders[split_name]['cocktail_party'] = DataLoader(
+                    dataset_obj, batch_size=batch_size, shuffle=shuffle,
+                    num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                    collate_fn=self._collate_fn_cocktail_party
+                )
+
         return dataloaders
 
     def get_vocab_size(self) -> int:
@@ -374,13 +460,15 @@ def create_data_builder(
     dataset_name: str = "allenai/c4", dataset_config: str = "en",
     seq_len: int = 512, max_samples: Optional[int] = 2000,
     max_eval_tokens: int = 50000,
-    on_the_fly_tokenization: bool = False
+    on_the_fly_tokenization: bool = False,
+    task_configs: dict = None
 ) -> DataBuilder:
     return DataBuilder(
         dataset_name=dataset_name, dataset_config=dataset_config,
         seq_len=seq_len, max_samples=max_samples,
         max_eval_tokens=max_eval_tokens,
-        on_the_fly_tokenization=on_the_fly_tokenization
+        on_the_fly_tokenization=on_the_fly_tokenization,
+        task_configs=task_configs
     )
 
 if __name__ == "__main__":

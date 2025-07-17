@@ -144,3 +144,13 @@ logging:
 
 # Random Seed (for reproducibility)
 random_seed: 42
+
+# Task Configuration
+tasks:
+  teacher_forcing:
+    weight: 0.5
+  cocktail_party:
+    weight: 0.5
+    num_distractors: 3
+    min_span_size: 10
+    max_span_size: 50

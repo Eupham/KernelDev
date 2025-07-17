@@ -43,16 +43,14 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, bidirectional_prefix_len=0):
+    def forward(self, x, attention_mask=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        # Determine causality based on the prefix length
-        # If prefix length is 0, it's fully causal. If it's >= seq_len, it's fully bidirectional.
-        is_causal = self.causal and bidirectional_prefix_len < seq_len
+        is_causal = self.causal if attention_mask is None else False
 
         # Use flash attention kernel
         out = flash_attention(
@@ -61,7 +59,7 @@ class MultiHeadAttention(nn.Module):
             v=v,
             lens=None,
             causal=is_causal,
-            bidirectional_prefix_len=bidirectional_prefix_len
+            attention_mask=attention_mask
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -78,10 +76,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, bidirectional_prefix_len=0):
+    def forward(self, x, attention_mask=None):
         # Pre-norm for attention
-        # Pass bidirectional_prefix_len to the attention layer
-        x = x + self.attn(self.norm1(x), bidirectional_prefix_len=bidirectional_prefix_len)
+        x = x + self.attn(self.norm1(x), attention_mask=attention_mask)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -136,7 +133,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None):
+    def forward(self, x, targets=None, attention_mask=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -147,9 +144,7 @@ class GPTModel(nn.Module):
         
         # Apply transformer blocks
         for block in self.blocks:
-            # The causal parameter is now dynamically determined by bidirectional_prefix_len
-            # We pass bidirectional_prefix_len to the attention mechanism within the block
-            x = block(x, bidirectional_prefix_len=self.bidirectional_prefix_len)
+            x = block(x, attention_mask=attention_mask)
         
         # Final normalization and output projection
         x = self.norm_out(x)

@@ -437,17 +437,18 @@ def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
 def _flash_attn_fwd(
     Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, #
     LSE: tl.tensor, O: tl.tensor,  #
+    ATTN_MASK: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,  #
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
     stride_mb: int, stride_mh: int, stride_mt: int,  #
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
     lens_stride: int,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
     T: int,  #
     TIME_BUCKET:  int,  #
     HEAD_DIM: tl.constexpr,  #
     CAUSAL: tl.constexpr,  #
-    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr, #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
     DTYPE:  tl.constexpr,  #
@@ -521,12 +522,6 @@ def _flash_attn_fwd(
         # For non-causal attention, attend to all tokens
         kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
 
-    # Adjust for bidirectional prefix
-    if BIDIRECTIONAL_PREFIX_LEN > 0:
-        # If the current query tile is within the prefix, it can attend to the full sequence
-        if q_token_idx < BIDIRECTIONAL_PREFIX_LEN:
-            kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
-
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
     q_lens_mask = (
         q_tile_indices[:, None] < seq_len
@@ -578,17 +573,15 @@ def _flash_attn_fwd(
         )
 
         kv_indices = kv_token_idx + tile_k_arange
-        # Conditional causal mask based on CAUSAL parameter
-        if CAUSAL:
-            # If the query token is in the prefix, it can attend to all key tokens
-            # Otherwise, it's causal
-            is_in_prefix = q_tile_indices[:, None] < BIDIRECTIONAL_PREFIX_LEN
-            causal_mask = (q_tile_indices[:, None] >= kv_indices[None, :]) | is_in_prefix
+        if ATTN_MASK is not None:
+            mask_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h
+            mask = tl.load(mask_ptr + q_tile_indices[:, None] * T + kv_indices[None, :])
+        elif CAUSAL:
+            mask = q_tile_indices[:, None] >= kv_indices[None, :]
         else:
-            causal_mask = True  # No causal masking - attend to all tokens
-        mask = q_lens_mask & (
-            kv_indices[None, :] < seq_len
-        ) & causal_mask
+            mask = True
+
+        mask = mask & (q_lens_mask & (kv_indices[None, :] < seq_len))
         
         if not PERFECT_MATCHING:
             q_attended |= tl.max(mask, 1) > 0
@@ -773,6 +766,7 @@ def _flash_attn_bwd(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, L: tl.tensor, #
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor, DK: tl.tensor, DV: tl.tensor,
+    ATTN_MASK: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,  #
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
@@ -783,6 +777,7 @@ def _flash_attn_bwd(
     stride_dkb: int, stride_dkh: int, stride_dkt: int, stride_dkk: int,  #
     stride_dvb: int, stride_dvh: int, stride_dvt: int, stride_dvk: int,  #
     lens_stride: int,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
     T: int,  #
     TIME_BUCKET: int,  #
     DQ_TILES_NUM: int,  #
@@ -802,7 +797,6 @@ def _flash_attn_bwd(
     TILE_DK_Q_SIZE: tl.constexpr, TILE_DK_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
     CAUSAL: tl.constexpr,  #
-    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr, #
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
@@ -843,12 +837,12 @@ def _flash_attn_bwd(
             TILE_DK_K_SIZE=TILE_DK_K_SIZE,
             PIPELINING=PIPELINING,
             CAUSAL=CAUSAL,
-            BIDIRECTIONAL_PREFIX_LEN=BIDIRECTIONAL_PREFIX_LEN,
         )
     else:
         _flash_attn_bwd_dq_inner(
             Q, K, V, DELTA, LSE,
             DO, DQ,
+            ATTN_MASK,
             stride_qb, stride_qh, stride_qt, stride_qk,
             stride_kb, stride_kh, stride_kt, stride_kk,
             stride_vb, stride_vh, stride_vt, stride_vk,
@@ -856,6 +850,7 @@ def _flash_attn_bwd(
             stride_mb, stride_mh, stride_mt,
             stride_dob, stride_doh, stride_dot, stride_dok,
             stride_dqb, stride_dqh, stride_dqt, stride_dqk,
+            mask_stride_b, mask_stride_h, mask_stride_t,
             batch=batch,
             head=head,
             tile_id=tile_id,
@@ -875,7 +870,6 @@ def _flash_attn_bwd(
             TILE_DQ_K_SIZE=TILE_DQ_K_SIZE,
             PIPELINING=PIPELINING,
             CAUSAL=CAUSAL,
-            BIDIRECTIONAL_PREFIX_LEN=BIDIRECTIONAL_PREFIX_LEN,
         )
 
 
@@ -883,6 +877,7 @@ def _flash_attn_bwd(
 def _flash_attn_bwd_dq_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor,
+    ATTN_MASK: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,
@@ -890,6 +885,7 @@ def _flash_attn_bwd_dq_inner(
     stride_mb: int, stride_mh: int, stride_mt: int,
     stride_dob: int, stride_doh: int, stride_dot: int, stride_dok: int,
     stride_dqb: int, stride_dqh: int, stride_dqt: int, stride_dqk: int,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
     batch: int,
     head: int,
     tile_id: int,
@@ -909,7 +905,6 @@ def _flash_attn_bwd_dq_inner(
     TILE_DQ_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
     CAUSAL: tl.constexpr,  #
-    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr, #
 ):
     q_tile_idx = tile_id
     q_token_idx = q_tile_idx * TILE_DQ_Q_SIZE
@@ -989,6 +984,9 @@ def _flash_attn_bwd_dq_inner(
     dq = _flash_attn_bwd_dq(
         dq, q, m, di, do,
         kt_tile_ptr, vt_tile_ptr,
+        ATTN_MASK,
+        mask_stride_b, mask_stride_h, mask_stride_t,
+        batch, head,
         seq_len=seq_len,
         q_token_idx=q_token_idx,
         TILE_Q_SIZE=TILE_DQ_Q_SIZE,
@@ -1001,7 +999,6 @@ def _flash_attn_bwd_dq_inner(
         RCP_LN2=RCP_LN2,
         SM_SCALE=SM_SCALE,
         PRESCALE_QK=PRESCALE_QK,
-        BIDIRECTIONAL_PREFIX_LEN=BIDIRECTIONAL_PREFIX_LEN,
     )
 
     dqbatch_head_offset = batch * stride_dqb + head * stride_dqh
@@ -1024,6 +1021,7 @@ def _flash_attn_bwd_dkdv_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor,
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DK: tl.tensor, DV: tl.tensor,
+    ATTN_MASK: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,
@@ -1033,6 +1031,7 @@ def _flash_attn_bwd_dkdv_inner(
     stride_dok: int, stride_dkb: int, stride_dkh: int,
     stride_dkt: int, stride_dkk: int, stride_dvb: int,
     stride_dvh: int, stride_dvt: int, stride_dvk: int,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
     batch: int,
     head: int,
     tile_id: int,
@@ -1050,7 +1049,6 @@ def _flash_attn_bwd_dkdv_inner(
     TILE_DK_K_SIZE: tl.constexpr,  #
     PIPELINING: tl.constexpr,  #
     CAUSAL: tl.constexpr,  #
-    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr, #
 ):
     kv_tile_idx = tile_id
     kv_token_idx = kv_tile_idx * TILE_DK_K_SIZE
@@ -1139,6 +1137,9 @@ def _flash_attn_bwd_dkdv_inner(
         dk, dv,
         qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
         k, v,
+        ATTN_MASK,
+        mask_stride_b, mask_stride_h, mask_stride_t,
+        batch, head,
         seq_len=seq_len,
         kv_token_idx=kv_token_idx,
         TILE_Q_SIZE=TILE_DK_Q_SIZE,
@@ -1151,7 +1152,6 @@ def _flash_attn_bwd_dkdv_inner(
         RCP_LN2=RCP_LN2,
         SM_SCALE=SM_SCALE,
         PRESCALE_QK=PRESCALE_QK,
-        BIDIRECTIONAL_PREFIX_LEN=BIDIRECTIONAL_PREFIX_LEN,
     )
 
     dkbatch_head_offset = batch * stride_dkb + head * stride_dkh
@@ -1188,6 +1188,9 @@ def _flash_attn_bwd_dq(
     dq: tl.tensor, q: tl.tensor, m: tl.tensor,
     di: tl.tensor, do: tl.tensor,
     kt_tile_ptr: tl.tensor, vt_tile_ptr: tl.tensor,
+    ATTN_MASK: tl.tensor,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
+    batch: int, head: int,
     seq_len: tl.tensor,
     q_token_idx: int,
     TILE_Q_SIZE: tl.constexpr,
@@ -1200,7 +1203,6 @@ def _flash_attn_bwd_dq(
     RCP_LN2: tl.constexpr,
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
-    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr,
 ):
     # Conditional attention range based on CAUSAL parameter
     kv_start_tile_idx = 0
@@ -1248,18 +1250,15 @@ def _flash_attn_bwd_dq(
         p = tl.math.exp2(qk - m)
 
         kv_indices = kv_token_idx + tile_k_arange
-        # Conditional causal mask based on CAUSAL parameter
-        if CAUSAL:
-            is_in_prefix = q_tile_indices[:, None] < BIDIRECTIONAL_PREFIX_LEN
-            causal_mask = (q_tile_indices[:, None] >= kv_indices[None, :]) | is_in_prefix
+        if ATTN_MASK is not None:
+            mask_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h
+            mask = tl.load(mask_ptr + q_tile_indices[:, None] * T + kv_indices[None, :])
+        elif CAUSAL:
+            mask = q_tile_indices[:, None] >= kv_indices[None, :]
         else:
-            causal_mask = True  # No causal masking - attend to all tokens
-        mask = q_len_mask & (
-            kv_indices[None, :] < seq_len
-        ) & causal_mask
-        if not PERFECT_MATCHING:
-            # Simple causal masking - no need for context-based logic
-            pass
+            mask = True
+
+        mask = mask & (q_len_mask & (kv_indices[None, :] < seq_len))
 
         p = tl.where(mask, p, 0.0)
         dp = tl.dot(do, vT.to(do.dtype), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
@@ -1276,6 +1275,9 @@ def _flash_attn_bwd_dkdv(
     qt_tile_ptr: tl.tensor, do_tile_ptr: tl.tensor,
     lse_tile_ptr: tl.tensor, delta_tile_ptr: tl.tensor,
     k: tl.tensor, v: tl.tensor,
+    ATTN_MASK: tl.tensor,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
+    batch: int, head: int,
     seq_len: tl.tensor,
     kv_token_idx: int,
     TILE_Q_SIZE: tl.constexpr,
@@ -1288,7 +1290,6 @@ def _flash_attn_bwd_dkdv(
     RCP_LN2: tl.constexpr,
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
-    BIDIRECTIONAL_PREFIX_LEN: tl.constexpr,
 ):
     # Conditional logic for backward pass based on CAUSAL parameter
     kv_tile_max_token = min(kv_token_idx + TILE_K_SIZE, seq_len)
@@ -1355,18 +1356,15 @@ def _flash_attn_bwd_dkdv(
         pT = tl.math.exp2(qkT - m[None, :])
 
         q_tile_indices = q_token_idx + tile_q_arange
-        # Conditional causal mask based on CAUSAL parameter
-        if CAUSAL:
-            is_in_prefix = q_tile_indices[None, :] < BIDIRECTIONAL_PREFIX_LEN
-            causal_mask = (q_tile_indices[None, :] >= kv_indices[:, None]) | is_in_prefix
+        if ATTN_MASK is not None:
+            mask_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h
+            mask = tl.load(mask_ptr + q_tile_indices[None, :] * T + kv_indices[:, None])
+        elif CAUSAL:
+            mask = q_tile_indices[None, :] >= kv_indices[:, None]
         else:
-            causal_mask = True  # No causal masking - attend to all tokens
-        mask = kv_lens_mask & (
-            q_tile_indices[None, :] < seq_len
-        ) & causal_mask
-        if not PERFECT_MATCHING:
-            # Simple causal masking - no need for context-based logic
-            pass
+            mask = True
+
+        mask = mask & (kv_lens_mask & (q_tile_indices[None, :] < seq_len))
         pT = tl.where(mask, pT, 0.0)
 
         dv = tl.dot(pT, do.to(pT.dtype), dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
@@ -1563,7 +1561,7 @@ def attention_forward_adapter(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    bidirectional_prefix_len: int,
+    attention_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1595,12 +1593,14 @@ def attention_forward_adapter(
         lens,
         LSE,
         O,
+        attention_mask,
         *strides(q, 4),
         *strides(kt, 4),
         *strides(v, 4),
         *(strides(LSE, 3) if LSE is not None else [0] * 3),
         *strides(O, 4),
         *(strides(lens, 1) if lens is not None else [0]),
+        *(strides(attention_mask, 3) if attention_mask is not None else [0]*3),
         T=T,
         HEAD_DIM=HEAD_DIM,
         CAUSAL=causal,
@@ -1610,7 +1610,6 @@ def attention_forward_adapter(
         TIME_BUCKET=triton.next_power_of_2(T),
         OUTPUT_LOGSUMEXP=return_lse,
         SM_SCALE=sm_scale,
-        BIDIRECTIONAL_PREFIX_LEN=bidirectional_prefix_len,
     )
 
     if LSE is None:
@@ -1654,7 +1653,7 @@ def attention_backward_adapter(
     autotune: bool,
     prescale_qk: bool,
     precision: str,
-    bidirectional_prefix_len: int,
+    attention_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1699,6 +1698,7 @@ def attention_backward_adapter(
         DQ,
         DK,
         DV,
+        attention_mask,
         *strides(q, 4),
         *strides(k, 4),
         *strides(v, 4),
@@ -1709,6 +1709,7 @@ def attention_backward_adapter(
         *strides(DK, 4),
         *strides(DV, 4),
         *(strides(lens, 1) if lens is not None else [0]),
+        *(strides(attention_mask, 3) if attention_mask is not None else [0]*3),
         T=T,
         HEAD_DIM=HEAD_DIM,
         CAUSAL=causal,
@@ -1717,7 +1718,6 @@ def attention_backward_adapter(
         DTYPE=q.dtype,
         SM_SCALE=sm_scale,
         PRESCALE_QK=prescale_qk,
-        BIDIRECTIONAL_PREFIX_LEN=bidirectional_prefix_len,
     )
 
     return DQ, DK, DV
@@ -1758,7 +1758,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         return_lse,
         prescale_qk,
         precision,
-        bidirectional_prefix_len,
+        attention_mask,
     ) = inputs
     ctx.save_for_backward(
         q,
@@ -1767,23 +1767,22 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         O,
         LSE,
         lens,
+        attention_mask,
     )
     ctx.causal = causal
     ctx.autotune = autotune
     ctx.sm_scale = sm_scale
     ctx.prescale_qk = prescale_qk
     ctx.precision = precision
-    ctx.bidirectional_prefix_len = bidirectional_prefix_len
 
 
 def attention_backward_adapter_op(ctx, do, dlse):
-    q, k, v, o, lse, lens = ctx.saved_tensors
+    q, k, v, o, lse, lens, attention_mask = ctx.saved_tensors
     causal = ctx.causal
     autotune = ctx.autotune
     sm_scale = ctx.sm_scale
     prescale_qk = ctx.prescale_qk
     precision = ctx.precision
-    bidirectional_prefix_len = ctx.bidirectional_prefix_len
 
     DQ, DK, DV = torch.ops.flash_attention.backward(
         q=q,
@@ -1798,10 +1797,10 @@ def attention_backward_adapter_op(ctx, do, dlse):
         autotune=autotune,
         prescale_qk=prescale_qk,
         precision=precision,
-        bidirectional_prefix_len=bidirectional_prefix_len,
+        attention_mask=attention_mask,
     )
 
-    return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None
+    return DQ, DK, DV, None, None, None, None, None, None, None, None, None
 
 
 torch.library.register_autograd(

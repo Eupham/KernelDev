@@ -287,7 +287,8 @@ def start_actual_training(cli_args):
     
     # Create data builder
     print("\n=== Loading and Processing Data ===")
-    data_builder = create_data_builder(**data_config)
+    task_configs = config.get('tasks', {})
+    data_builder = create_data_builder(**data_config, task_configs=task_configs)
     
     # Create dataloaders
     try:
@@ -309,13 +310,26 @@ def start_actual_training(cli_args):
         return
     
     # Show data info
-    for split_name, dataloader in dataloaders.items():
-        print(f"{split_name}: {len(dataloader)} batches of size {batch_size}")
-    
+    for split_name, task_dataloaders in dataloaders.items():
+        print(f"--- {split_name} ---")
+        for task_name, dataloader in task_dataloaders.items():
+            print(f"  {task_name}: {len(dataloader)} batches of size {batch_size}")
+
     # Test a batch
-    if 'train' in dataloaders:
-        print("\n=== Data Sample ===")
-        for x, y in dataloaders['train']:
+    if 'train' in dataloaders and 'teacher_forcing' in dataloaders['train']:
+        print("\n=== Data Sample (Teacher Forcing) ===")
+        for x, y in dataloaders['train']['teacher_forcing']:
+            print(f"Batch shape: {x.shape}")
+            print(f"Sample tokens: {x[0][:20].tolist()}")
+
+            # Decode sample text
+            sample_text = data_builder.decode_tokens(x[0][:50])
+            print(f"Sample text: '{sample_text[:100]}...'")
+            break
+
+    if 'train' in dataloaders and 'cocktail_party' in dataloaders['train']:
+        print("\n=== Data Sample (Cocktail Party) ===")
+        for x, y in dataloaders['train']['cocktail_party']:
             print(f"Batch shape: {x.shape}")
             print(f"Sample tokens: {x[0][:20].tolist()}")
             
@@ -350,8 +364,9 @@ def start_actual_training(cli_args):
     print(f"\n=== Starting Training ===")
     try:
         trainer.train(
-            train_loader=dataloaders.get('train'),
-            val_loader=dataloaders.get('validation')
+            train_loaders=dataloaders.get('train'),
+            val_loaders=dataloaders.get('validation'),
+            task_configs=task_configs
         )
         
         print(f"\n=== Training Completed ===")
