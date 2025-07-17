@@ -71,14 +71,14 @@ class DataBuilder:
         return list(text.encode('utf-8'))
 
     def _detokenize_bytes(self, tokens: list) -> str:
-        # Filter out special tokens before decoding
-        tokens = [t - NUM_SPECIAL_TOKENS for t in tokens if t >= NUM_SPECIAL_TOKENS]
-        try:
-            byte_data = bytes(tokens)
-            return byte_data.decode('utf-8', errors='replace')
-        except Exception as e:
-            print(f"Warning: Error decoding tokens: {e}")
-            return f"[DECODE_ERROR: {tokens[:10]}...]"
+        special_token_map = {v: k for k, v in SPECIAL_TOKENS.items()}
+        decoded_tokens = []
+        for t in tokens:
+            if t in special_token_map:
+                decoded_tokens.append(special_token_map[t])
+            else:
+                decoded_tokens.append(chr(t - NUM_SPECIAL_TOKENS))
+        return "".join(decoded_tokens)
 
     def _process_iterable_dataset(self, dataset_iterable, dataset_name_logging: str) -> list:
         samples = []
@@ -355,61 +355,60 @@ class DataBuilder:
         return inputs, targets
 
     def _collate_fn_cocktail_party(self, batch):
-        # Implementation of the cocktail party task collate function
-        # This is a simplified example. A more robust implementation would be needed.
         task_config = self.task_configs.get('cocktail_party', {})
         num_distractors = task_config.get('num_distractors', 3)
         min_span_size = task_config.get('min_span_size', 10)
         max_span_size = task_config.get('max_span_size', 50)
 
-        new_batch = []
+        new_batch_inputs = []
+        new_batch_targets = []
         for i in range(len(batch)):
-            # 1. Get original sample
             original_tokens, _ = batch[i]
             original_tokens = original_tokens.tolist()
 
-            # 2. Select a span to mask
             span_size = random.randint(min_span_size, max_span_size)
+            if len(original_tokens) <= span_size:
+                continue
             span_start = random.randint(0, len(original_tokens) - span_size)
             span = original_tokens[span_start : span_start + span_size]
 
-            # 3. Create distractors
             distractors = []
             for _ in range(num_distractors):
-                distractor_idx = random.randint(0, len(batch) - 1)
-                if distractor_idx == i:
-                    distractor_idx = (i + 1) % len(batch)
+                distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
                 distractor_tokens, _ = batch[distractor_idx]
                 distractor_tokens = distractor_tokens.tolist()
+                if len(distractor_tokens) <= span_size:
+                    continue
                 distractor_start = random.randint(0, len(distractor_tokens) - span_size)
                 distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
                 distractors.append(distractor_span)
 
-            # 4. Construct the new sequence
-            # [CLS] ... [MASK] ... [SPAN] ... [ES] [SPAN] ... [ES] ...
             masked_sequence = original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
 
-            all_spans = [span] + distractors
+            all_spans = [(span, 1)] + [(d, 0) for d in distractors]
             random.shuffle(all_spans)
 
-            final_sequence = [SPECIAL_TOKENS['[CLS]']] + masked_sequence
-            for s in all_spans:
-                final_sequence += [SPECIAL_TOKENS['[SPAN]']] + s + [SPECIAL_TOKENS['[ES]']]
+            correct_span_index = -1
 
-            # Truncate or pad to seq_len
+            final_sequence = [SPECIAL_TOKENS['[CLS]']] + masked_sequence
+            for i, (s, is_correct) in enumerate(all_spans):
+                final_sequence += [SPECIAL_TOKENS['[SPAN]']] + s + [SPECIAL_TOKENS['[ES]']]
+                if is_correct:
+                    correct_span_index = i
+
             final_sequence = final_sequence[:self.seq_len]
             padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_sequence))
             final_sequence += padding
 
-            # Create targets
-            # For simplicity, we'll just use the original targets for the masked part
-            # A more sophisticated approach would be needed for the classification task
-            targets = torch.tensor(final_sequence[1:] + [SPECIAL_TOKENS['[PAD]']], dtype=torch.long)
+            targets = torch.zeros(len(all_spans))
+            if correct_span_index != -1:
+                targets[correct_span_index] = 1
 
-            new_batch.append((torch.tensor(final_sequence, dtype=torch.long), targets))
+            new_batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
+            new_batch_targets.append(targets)
 
-        inputs = torch.stack([item[0] for item in new_batch])
-        targets = torch.stack([item[1] for item in new_batch])
+        inputs = torch.stack(new_batch_inputs)
+        targets = torch.stack(new_batch_targets)
         return inputs, targets
 
 

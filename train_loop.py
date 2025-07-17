@@ -426,6 +426,7 @@ class Trainer:
             step_start = time.time()
             
             total_loss = 0
+            individual_losses = {}
 
             for task_name, task_iter in train_iters.items():
                 try:
@@ -436,6 +437,7 @@ class Trainer:
                     batch = next(train_iters[task_name])
 
                 loss = self.train_step(batch)
+                individual_losses[task_name] = loss
                 task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
                 total_loss += loss * task_weight
 
@@ -455,16 +457,6 @@ class Trainer:
                 if self.config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
-
-            # Logging
-            if (not self.is_distributed or dist.get_rank() == 0) and \
-               self.metrics.total_steps % self.config.log_every == 0:
-                log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
-                log_str += f"Total Loss: {total_loss.item():.4f}, "
-                for task_name, loss in individual_losses.items():
-                    log_str += f"{task_name} Loss: {loss.item():.4f}, "
-                log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
-                print(log_str)
             
             # Update learning rate scheduler
             self.scheduler.step()
@@ -473,7 +465,7 @@ class Trainer:
             # Update metrics
             step_time = time.time() - step_start
             self.metrics.update(
-                train_loss=total_loss,
+                train_loss=total_loss.item(),
                 learning_rate=current_lr,
                 step_time=step_time
             )
@@ -483,11 +475,12 @@ class Trainer:
             if (not self.is_distributed or dist.get_rank() == 0) and \
                self.metrics.total_steps % self.config.log_every == 0:
                 avg_step_time = self.metrics.get_avg_step_time()
-                print(
-                    f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
-                    f"Loss: {total_loss:.4f}, LR: {current_lr:.6f}, "
-                    f"Step Time: {avg_step_time:.3f}s"
-                )
+                log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
+                log_str += f"Total Loss: {total_loss.item():.4f}, "
+                for task_name, loss in individual_losses.items():
+                    log_str += f"{task_name} Loss: {loss.item():.4f}, "
+                log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
+                print(log_str)
             
             # Evaluation (only on rank 0 if distributed)
             if (not self.is_distributed or dist.get_rank() == 0) and \
