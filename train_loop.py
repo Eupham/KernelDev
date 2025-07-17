@@ -439,7 +439,7 @@ class Trainer:
                 task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
                 total_loss += loss * task_weight
 
-            epoch_losses.append(total_loss)
+            epoch_losses.append(total_loss.item())
 
             # Backpropagate combined loss
             self.optimizer.zero_grad()
@@ -455,6 +455,16 @@ class Trainer:
                 if self.config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
+
+            # Logging
+            if (not self.is_distributed or dist.get_rank() == 0) and \
+               self.metrics.total_steps % self.config.log_every == 0:
+                log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
+                log_str += f"Total Loss: {total_loss.item():.4f}, "
+                for task_name, loss in individual_losses.items():
+                    log_str += f"{task_name} Loss: {loss.item():.4f}, "
+                log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
+                print(log_str)
             
             # Update learning rate scheduler
             self.scheduler.step()

@@ -320,6 +320,7 @@ def start_actual_training(cli_args):
         for x, y in dataloaders['train']['teacher_forcing']:
             print(f"Batch shape: {x.shape}")
             print(f"Sample tokens: {x[0][:20].tolist()}")
+            print(f"Sample targets: {y[0][:20].tolist()}")
 
             # Decode sample text
             sample_text = data_builder.decode_tokens(x[0][:50])
@@ -331,6 +332,7 @@ def start_actual_training(cli_args):
         for x, y in dataloaders['train']['cocktail_party']:
             print(f"Batch shape: {x.shape}")
             print(f"Sample tokens: {x[0][:20].tolist()}")
+            print(f"Sample targets: {y[0][:20].tolist()}")
             
             # Decode sample text
             sample_text = data_builder.decode_tokens(x[0][:50])
