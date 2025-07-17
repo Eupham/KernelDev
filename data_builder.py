@@ -29,6 +29,9 @@ class OnTheFlyTokenizedDataset(Dataset):
         tokens = self.tokenizer_fn(text)
         tokens = [t + NUM_SPECIAL_TOKENS for t in tokens] # Shift regular tokens
 
+        # Add CLS token to the beginning of the sequence
+        tokens = [SPECIAL_TOKENS['[CLS]']] + tokens
+
         tokens = tokens[:self.seq_len + 1]
 
         if len(tokens) < self.seq_len + 1:
@@ -390,7 +393,7 @@ class DataBuilder:
 
             correct_span_index = -1
 
-            final_sequence = [SPECIAL_TOKENS['[CLS]']] + masked_sequence
+            final_sequence = masked_sequence
             for i, (s, is_correct) in enumerate(all_spans):
                 final_sequence += [SPECIAL_TOKENS['[SPAN]']] + s + [SPECIAL_TOKENS['[ES]']]
                 if is_correct:
@@ -400,9 +403,7 @@ class DataBuilder:
             padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_sequence))
             final_sequence += padding
 
-            targets = torch.zeros(len(all_spans))
-            if correct_span_index != -1:
-                targets[correct_span_index] = 1
+            targets = torch.tensor(correct_span_index, dtype=torch.long)
 
             new_batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
             new_batch_targets.append(targets)
