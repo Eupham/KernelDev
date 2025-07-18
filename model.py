@@ -83,6 +83,8 @@ class TransformerBlock(nn.Module):
         return x
 
 
+from data_builder import NUM_BIO_TAGS
+
 class GPTModel(nn.Module):
     """GPT-styled model using flash attention kernel."""
     
@@ -95,8 +97,7 @@ class GPTModel(nn.Module):
         max_seq_len=2048,
         mlp_ratio=4,
         causal=True,
-        bidirectional_prefix_len=0,
-        num_distractors=3, # Add this for cocktail party task
+        bidirectional_prefix_len=0
     ):
         super().__init__()
         self.dim = dim
@@ -125,8 +126,8 @@ class GPTModel(nn.Module):
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
         
-        # Classification head for the cocktail party task
-        self.classification_head = nn.Linear(dim, num_distractors + 1)
+        # Head for cocktail party BIO tagging
+        self.cocktail_party_head = nn.Linear(dim, NUM_BIO_TAGS, bias=False)
 
         self.apply(self._init_weights)
     
@@ -136,7 +137,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None):
+    def forward(self, x, targets=None, attention_mask=None, task_name=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -152,21 +153,17 @@ class GPTModel(nn.Module):
         # Final normalization
         x = self.norm_out(x)
         
-        if targets is not None and targets.dim() == 1:
-            # Cocktail party task (classification)
-            # Use the representation of the [MASK] token for classification
-            # Assuming the [MASK] token is at a fixed position or can be found.
-            # Let's assume the cocktail party collate function places the [MASK] token.
-            # For simplicity, we'll take the mean representation of the sequence.
-            cls_representation = x.mean(dim=1)
-            logits = self.classification_head(cls_representation)
-            loss = F.cross_entropy(logits, targets)
-
-            # Calculate accuracy
-            preds = torch.argmax(logits, dim=-1)
-            accuracy = (preds == targets).float().mean()
-
-            return logits, {"loss": loss, "accuracy": accuracy}
+        if task_name == 'cocktail_party':
+            # Cocktail party task (BIO tagging)
+            logits = self.cocktail_party_head(x)
+            loss = None
+            if targets is not None:
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1
+                )
+            return logits, loss
         else:
             # Teacher forcing task (generative)
             logits = self.head(x)

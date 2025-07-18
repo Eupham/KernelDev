@@ -257,24 +257,21 @@ class Trainer:
             return self.config.learning_rate * step / self.config.warmup_steps
         return self.config.learning_rate
     
-    def train_step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> float:
+    def train_step(self, batch: Tuple[torch.Tensor, torch.Tensor], task_name: str) -> float:
         """Perform a single training step."""
         x, y = batch
         x, y = x.to(self.config.device), y.to(self.config.device)
         
         if self.config.use_amp and self.config.scaler is not None:
             with torch.amp.autocast('cuda'):
-                logits, loss_val = self.model(x, y)
+                logits, loss = self.model(x, y, task_name=task_name)
         else:
-            logits, loss_val = self.model(x, y)
+            logits, loss = self.model(x, y, task_name=task_name)
 
-        if loss_val is None:
-            return 0.0, {}
-
-        if isinstance(loss_val, dict):
-            return loss_val['loss'], {k: v for k, v in loss_val.items() if k != 'loss'}
+        if loss is None:
+            return 0.0
         
-        return loss_val, {}
+        return loss
     
     def evaluate(self, dataloaders: Dict[str, DataLoader], max_batches: Optional[int] = 50) -> float:
         """Evaluate the model on a dataset."""
@@ -295,13 +292,16 @@ class Trainer:
                     if self.config.use_amp:
                         # Use mixed precision for evaluation
                         with torch.amp.autocast('cuda'):
-                            logits, loss = self.model(x, y)
+                            logits, loss = self.model(x, y, task_name=task_name)
                     else:
                         # Standard precision evaluation
-                        logits, loss = self.model(x, y)
+                        logits, loss = self.model(x, y, task_name=task_name)
 
                     if loss is not None:
-                        total_loss += loss.item()
+                        if isinstance(loss, dict):
+                            total_loss += loss['loss'].item()
+                        else:
+                            total_loss += loss.item()
                         num_batches += 1
         
         self.model.train()
@@ -434,8 +434,8 @@ class Trainer:
                     train_iters[task_name] = iter(train_loaders[task_name])
                     batch = next(train_iters[task_name])
 
-                loss, metrics = self.train_step(batch)
-                individual_losses[task_name] = (loss, metrics)
+                loss = self.train_step(batch, task_name)
+                individual_losses[task_name] = loss
                 task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
                 total_loss += loss * task_weight
 
@@ -475,10 +475,8 @@ class Trainer:
                 avg_step_time = self.metrics.get_avg_step_time()
                 log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
                 log_str += f"Total Loss: {total_loss.item():.4f}, "
-                for task_name, (loss, metrics) in individual_losses.items():
+                for task_name, loss in individual_losses.items():
                     log_str += f"{task_name} Loss: {loss.item():.4f}, "
-                    if 'accuracy' in metrics:
-                        log_str += f"{task_name} Accuracy: {metrics['accuracy'].item():.4f}, "
                 log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
             

@@ -6,12 +6,19 @@ from typing import Optional, Dict, Any, List
 import random
 
 # Define special tokens
+BIO_TAGS = {
+    'O': 0,
+    'B-ORIG': 1,
+    'I-ORIG': 2,
+}
+NUM_BIO_TAGS = len(BIO_TAGS)
+
 SPECIAL_TOKENS = {
     '[PAD]': 0,
     '[CLS]': 1,
     '[MASK]': 2,
     '[SPAN]': 3,
-    '[ES]': 4
+    '[ES]': 4,
 }
 NUM_SPECIAL_TOKENS = len(SPECIAL_TOKENS)
 
@@ -388,25 +395,40 @@ class DataBuilder:
 
             masked_sequence = original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
 
+            # Create target BIO sequence for the masked sequence
+            target_bio = [BIO_TAGS['O']] * len(masked_sequence)
+
             all_spans = [(span, 1)] + [(d, 0) for d in distractors]
             random.shuffle(all_spans)
 
-            correct_span_index = -1
-
             final_sequence = masked_sequence
-            for i, (s, is_correct) in enumerate(all_spans):
+            final_target_bio = target_bio
+
+            for s, is_correct in all_spans:
+                span_len = len(s)
                 final_sequence += [SPECIAL_TOKENS['[SPAN]']] + s + [SPECIAL_TOKENS['[ES]']]
+
+                # Update BIO tags
                 if is_correct:
-                    correct_span_index = i
+                    bio_tags = [BIO_TAGS['B-ORIG']] + [BIO_TAGS['I-ORIG']] * (span_len - 1)
+                else:
+                    bio_tags = [BIO_TAGS['O']] * span_len
 
+                final_target_bio += [BIO_TAGS['O']] + bio_tags + [BIO_TAGS['O']]
+
+
+            # Truncate and pad
             final_sequence = final_sequence[:self.seq_len]
-            padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_sequence))
-            final_sequence += padding
+            final_target_bio = final_target_bio[:self.seq_len]
 
-            targets = torch.tensor(correct_span_index, dtype=torch.long)
+            seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_sequence))
+            final_sequence += seq_padding
+
+            target_padding = [BIO_TAGS['O']] * (self.seq_len - len(final_target_bio))
+            final_target_bio += target_padding
 
             new_batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
-            new_batch_targets.append(targets)
+            new_batch_targets.append(torch.tensor(final_target_bio, dtype=torch.long))
 
         inputs = torch.stack(new_batch_inputs)
         targets = torch.stack(new_batch_targets)
