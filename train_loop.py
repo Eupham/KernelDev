@@ -312,8 +312,19 @@ class Trainer:
         soft_iou = ((soft_inter + eps) / (soft_union + eps)).mean().item()
 
         # Entropy
-        s = torch.clamp(s, eps, 1.0 - eps)
-        entropy = -torch.mean(s * torch.log2(s) + (1.0 - s) * torch.log2(1.0 - s)).item()
+        s_clamped = torch.clamp(s, eps, 1.0 - eps)
+        entropy_term_1 = s_clamped * torch.log2(s_clamped)
+        entropy_term_2 = (1.0 - s_clamped) * torch.log2(1.0 - s_clamped)
+        entropy = -torch.mean(entropy_term_1 + entropy_term_2).item()
+
+        if self.metrics.total_steps == 50:
+            print("\n--- Last Entropy Calculation ---")
+            print("s:", s)
+            print("s_clamped:", s_clamped)
+            print("entropy_term_1:", entropy_term_1)
+            print("entropy_term_2:", entropy_term_2)
+            print("entropy:", entropy)
+            print("-----------------------------\n")
 
         return {
             'iou': iou,
@@ -713,6 +724,10 @@ class Trainer:
 
                 self.train_epoch(train_loaders, val_loaders, epoch, task_configs)
                 
+                if self.metrics.total_steps >= 50:
+                    print("Stopping training after 50 steps for debugging.")
+                    break
+
                 self.save_checkpoint(self.metrics.total_steps)
         
         except KeyboardInterrupt:
