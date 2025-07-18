@@ -925,5 +925,3 @@ if __name__ == "__main__":
     # Test the trainer (requires a model to be passed)
     print("Trainer module loaded successfully!")
     print("Use create_trainer() to create a trainer instance.")
-
-[end of train_loop.py]
