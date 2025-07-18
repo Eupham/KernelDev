@@ -147,7 +147,7 @@ class TrainingMetrics:
     def __init__(self):
         self.train_losses = []
         self.val_losses = []
-        self.cocktail_party_accuracies = []
+        self.cocktail_party_metrics = []
         self.learning_rates = []
         self.step_times = []
         self.total_steps = 0
@@ -158,7 +158,7 @@ class TrainingMetrics:
         self,
         train_loss: Optional[float] = None,
         val_loss: Optional[float] = None,
-        cocktail_party_accuracy: Optional[float] = None,
+        cocktail_party_metrics: Optional[Dict[str, float]] = None,
         learning_rate: Optional[float] = None,
         step_time: Optional[float] = None
     ):
@@ -172,8 +172,8 @@ class TrainingMetrics:
                 self.best_val_loss = val_loss
                 self.best_step = self.total_steps
         
-        if cocktail_party_accuracy is not None:
-            self.cocktail_party_accuracies.append(cocktail_party_accuracy)
+        if cocktail_party_metrics is not None:
+            self.cocktail_party_metrics.append(cocktail_party_metrics)
 
         if learning_rate is not None:
             self.learning_rates.append(learning_rate)
@@ -195,7 +195,7 @@ class TrainingMetrics:
         metrics_dict = {
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
-            'cocktail_party_accuracies': self.cocktail_party_accuracies,
+            'cocktail_party_metrics': self.cocktail_party_metrics,
             'learning_rates': self.learning_rates,
             'step_times': self.step_times,
             'total_steps': self.total_steps,
@@ -280,65 +280,54 @@ class Trainer:
         
         return loss
     
-    def _calculate_span_accuracy(self, preds: torch.Tensor, y: torch.Tensor, threshold: float = 0.75) -> float:
-        """Calculate span-based accuracy for the cocktail party task using Jaccard index."""
-        correct_predictions = 0
-        total_samples = y.size(0)
+    def _calculate_mask_metrics(self, logits: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
+        """
+        Calculates IoU, Precision, Recall, Soft-IoU, and Entropy for the cocktail party task.
+        """
+        # Get the probabilities for the positive class (B-ORIG or I-ORIG)
+        # We'll treat B-ORIG and I-ORIG as a single "selected" class for the mask.
+        probs = torch.softmax(logits, dim=-1)
+        # Let's consider the probability of being either B-ORIG or I-ORIG
+        s = probs[..., BIO_TAGS['B-ORIG']] + probs[..., BIO_TAGS['I-ORIG']]
 
-        for i in range(total_samples):
-            pred_tags = preds[i]
-            true_tags = y[i]
+        # Create the ground truth mask G
+        g = ((y == BIO_TAGS['B-ORIG']) | (y == BIO_TAGS['I-ORIG'])).float()
 
-            # Find true span
-            true_span_indices = torch.where((true_tags == BIO_TAGS['B-ORIG']) | (true_tags == BIO_TAGS['I-ORIG']))[0]
+        # Hard mask m
+        m = (s > 0.5).float()
 
-            if len(true_span_indices) == 0:
-                if len(torch.where((pred_tags == BIO_TAGS['B-ORIG']) | (pred_tags == BIO_TAGS['I-ORIG']))[0]) == 0:
-                    correct_predictions +=1
-                continue
+        eps = 1e-8
 
-            # Find predicted spans
-            predicted_spans = []
-            in_span = False
-            current_span = []
-            for j, tag in enumerate(pred_tags):
-                if tag == BIO_TAGS['B-ORIG']:
-                    if in_span:
-                        predicted_spans.append(torch.tensor(current_span, device=preds.device))
-                    current_span = [j]
-                    in_span = True
-                elif tag == BIO_TAGS['I-ORIG'] and in_span:
-                    current_span.append(j)
-                elif in_span:
-                    predicted_spans.append(torch.tensor(current_span, device=preds.device))
-                    in_span = False
-                    current_span = []
-            if in_span:
-                predicted_spans.append(torch.tensor(current_span, device=preds.device))
+        # IoU, Precision, Recall
+        inter = (m * g).sum(dim=1)
+        union = (m + g).clamp(min=0, max=1).sum(dim=1)
 
-            # Check for best matching predicted span using Jaccard index
-            best_jaccard = 0.0
-            true_span_set = set(true_span_indices.cpu().numpy())
-            for pred_span in predicted_spans:
-                pred_span_set = set(pred_span.cpu().numpy())
-                intersection = len(true_span_set.intersection(pred_span_set))
-                union = len(true_span_set.union(pred_span_set))
-                jaccard = intersection / union if union > 0 else 0
-                if jaccard > best_jaccard:
-                    best_jaccard = jaccard
+        iou = ((inter + eps) / (union + eps)).mean().item()
+        precision = ((inter + eps) / (m.sum(dim=1) + eps)).mean().item()
+        recall = ((inter + eps) / (g.sum(dim=1) + eps)).mean().item()
 
-            if best_jaccard >= threshold:
-                correct_predictions += 1
+        # Soft-IoU
+        soft_inter = torch.min(s, g).sum(dim=1)
+        soft_union = torch.max(s, g).sum(dim=1)
+        soft_iou = ((soft_inter + eps) / (soft_union + eps)).mean().item()
 
-        return correct_predictions / total_samples if total_samples > 0 else 0.0
+        # Entropy
+        entropy = -(s * torch.log2(s + eps) + (1 - s) * torch.log2(1 - s + eps)).mean().item()
 
-    def evaluate(self, dataloaders: Dict[str, DataLoader], max_batches: Optional[int] = 50, task_to_evaluate: Optional[str] = None) -> float:
+        return {
+            'iou': iou,
+            'precision': precision,
+            'recall': recall,
+            'soft_iou': soft_iou,
+            'entropy': entropy,
+        }
+
+    def evaluate(self, dataloaders: Dict[str, DataLoader], max_batches: Optional[int] = 50, task_to_evaluate: Optional[str] = None) -> Tuple[float, Dict[str, float]]:
         """Evaluate the model on a dataset."""
         self.model.eval()
         total_loss = 0
         num_batches = 0
-        cocktail_party_accuracy = 0
-        cocktail_party_batches = 0
+        cocktail_party_metrics = {}
         
         with torch.no_grad():
             for task_name, dataloader in dataloaders.items():
@@ -354,11 +343,9 @@ class Trainer:
                     x, y = x.to(self.config.device), y.to(self.config.device)
                     
                     if self.config.use_amp:
-                        # Use mixed precision for evaluation
                         with torch.amp.autocast('cuda'):
                             logits, loss = self.model(x, y, task_name=task_name)
                     else:
-                        # Standard precision evaluation
                         logits, loss = self.model(x, y, task_name=task_name)
 
                     if loss is not None:
@@ -369,17 +356,19 @@ class Trainer:
                         num_batches += 1
 
                         if task_name == 'cocktail_party':
-                            preds = torch.argmax(logits, dim=-1)
-                            cocktail_party_accuracy += self._calculate_span_accuracy(preds, y)
-                            cocktail_party_batches += 1
-
+                            metrics = self._calculate_mask_metrics(logits, y)
+                            for k, v in metrics.items():
+                                if k not in cocktail_party_metrics:
+                                    cocktail_party_metrics[k] = []
+                                cocktail_party_metrics[k].append(v)
 
         self.model.train()
 
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
-        avg_accuracy = cocktail_party_accuracy / cocktail_party_batches if cocktail_party_batches > 0 else 0
 
-        return avg_loss, avg_accuracy
+        avg_cocktail_party_metrics = {k: np.mean(v) for k, v in cocktail_party_metrics.items()}
+
+        return avg_loss, avg_cocktail_party_metrics
 
     
     def save_checkpoint(self, step: int, is_best: bool = False):
@@ -552,11 +541,12 @@ class Trainer:
                 for task_name, loss in individual_losses.items():
                     log_str += f"{task_name} Loss: {loss.item():.4f}, "
 
-                # Evaluate and log cocktail party accuracy every 50 steps
+                # Evaluate and log cocktail party metrics every 50 steps
                 if val_loaders and 'cocktail_party' in val_loaders:
-                    _, val_accuracy = self.evaluate(val_loaders, max_batches=10, task_to_evaluate='cocktail_party')
-                    self.metrics.update(cocktail_party_accuracy=val_accuracy)
-                    log_str += f"Cocktail Party Accuracy: {val_accuracy:.4f}, "
+                    _, cocktail_party_metrics = self.evaluate(val_loaders, max_batches=10, task_to_evaluate='cocktail_party')
+                    self.metrics.update(cocktail_party_metrics=cocktail_party_metrics)
+                    for k, v in cocktail_party_metrics.items():
+                        log_str += f"{k}: {v:.4f}, "
 
                 log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
@@ -565,14 +555,16 @@ class Trainer:
             if (not self.is_distributed or dist.get_rank() == 0) and \
                val_loaders is not None and \
                self.metrics.total_steps % self.config.eval_every == 0:
-                val_loss, val_accuracy = self.evaluate(val_loaders)
+                val_loss, cocktail_party_metrics = self.evaluate(val_loaders)
                 self.metrics.update(val_loss=val_loss) # rank-local metric
                 
                 is_best = val_loss < self.metrics.best_val_loss # rank-local best
                 print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
-                if val_accuracy > 0:
-                    # This is redundant if we log it every 50 steps, but let's keep it for the main eval
-                    print(f"Overall Cocktail Party Accuracy: {val_accuracy:.4f}")
+                if cocktail_party_metrics:
+                    log_str = "Overall Cocktail Party Metrics: "
+                    for k, v in cocktail_party_metrics.items():
+                        log_str += f"{k}: {v:.4f}, "
+                    print(log_str)
                 
                 if is_best: # save_checkpoint itself is rank 0 guarded
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
