@@ -695,13 +695,14 @@ class Trainer:
 
         # Initial evaluation
         if val_loaders and (not self.is_distributed or dist.get_rank() == 0):
-            initial_val_loss, initial_val_accuracy = self.evaluate(val_loaders)
+            initial_val_loss, initial_val_metrics = self.evaluate(val_loaders)
             self.metrics.update(val_loss=initial_val_loss)
             print(f"Initial validation loss: {initial_val_loss:.4f}")
-            if initial_val_accuracy > 0:
-                print(f"Initial cocktail party accuracy: {initial_val_accuracy:.4f}")
-            if initial_val_accuracy > 0:
-                print(f"Initial cocktail party accuracy: {initial_val_accuracy:.4f}")
+            if initial_val_metrics:
+                log_str = "Initial cocktail party metrics: "
+                for k, v in initial_val_metrics.items():
+                    log_str += f"{k}: {v:.4f}, "
+                print(log_str)
 
         try:
             for epoch in range(self.config.num_epochs):

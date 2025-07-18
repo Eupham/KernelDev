@@ -355,11 +355,14 @@ def start_actual_training(cli_args):
     if 'train' in dataloaders and 'validation' in dataloaders:
         max_eval_batches = eval_cfg.get('max_eval_batches', 10)
         initial_train_loss, _ = trainer.evaluate(dataloaders['train'], max_batches=max_eval_batches)
-        initial_val_loss, initial_val_accuracy = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
+        initial_val_loss, initial_val_metrics = trainer.evaluate(dataloaders['validation'], max_batches=max_eval_batches)
         print(f"Initial training loss: {initial_train_loss:.4f}")
         print(f"Initial validation loss: {initial_val_loss:.4f}")
-        if initial_val_accuracy > 0:
-            print(f"Initial cocktail party accuracy: {initial_val_accuracy:.4f}")
+        if initial_val_metrics:
+            log_str = "Initial cocktail party metrics: "
+            for k, v in initial_val_metrics.items():
+                log_str += f"{k}: {v:.4f}, "
+            print(log_str)
     
     # Start training
     print(f"\n=== Starting Training ===")
