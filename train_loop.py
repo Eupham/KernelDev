@@ -262,25 +262,19 @@ class Trainer:
         x, y = batch
         x, y = x.to(self.config.device), y.to(self.config.device)
         
-        if y.dim() == 1:
-            # This is a cocktail party batch
-            if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    logits, loss = self.model(x, y)
-            else:
-                logits, loss = self.model(x, y)
+        if self.config.use_amp and self.config.scaler is not None:
+            with torch.amp.autocast('cuda'):
+                logits, loss_val = self.model(x, y)
         else:
-            # This is a teacher forcing batch
-            if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    logits, loss = self.model(x, y)
-            else:
-                logits, loss = self.model(x, y)
+            logits, loss_val = self.model(x, y)
 
-        if loss is None:
-            return 0.0
+        if loss_val is None:
+            return 0.0, {}
+
+        if isinstance(loss_val, dict):
+            return loss_val['loss'], {k: v for k, v in loss_val.items() if k != 'loss'}
         
-        return loss
+        return loss_val, {}
     
     def evaluate(self, dataloaders: Dict[str, DataLoader], max_batches: Optional[int] = 50) -> float:
         """Evaluate the model on a dataset."""
@@ -440,8 +434,8 @@ class Trainer:
                     train_iters[task_name] = iter(train_loaders[task_name])
                     batch = next(train_iters[task_name])
 
-                loss = self.train_step(batch)
-                individual_losses[task_name] = loss
+                loss, metrics = self.train_step(batch)
+                individual_losses[task_name] = (loss, metrics)
                 task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
                 total_loss += loss * task_weight
 
@@ -481,8 +475,10 @@ class Trainer:
                 avg_step_time = self.metrics.get_avg_step_time()
                 log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
                 log_str += f"Total Loss: {total_loss.item():.4f}, "
-                for task_name, loss in individual_losses.items():
+                for task_name, (loss, metrics) in individual_losses.items():
                     log_str += f"{task_name} Loss: {loss.item():.4f}, "
+                    if 'accuracy' in metrics:
+                        log_str += f"{task_name} Accuracy: {metrics['accuracy'].item():.4f}, "
                 log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
             
