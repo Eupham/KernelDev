@@ -309,14 +309,16 @@ class Trainer:
 
                         if task_name == 'cocktail_party':
                             preds = torch.argmax(logits, dim=-1)
-                            # Create a mask for the original span tokens
-                            mask = (y == BIO_TAGS['B-ORIG']) | (y == BIO_TAGS['I-ORIG'])
-                            # Calculate accuracy only on the original span tokens
-                            correct_predictions = (preds[mask] == y[mask]).sum().item()
-                            total_predictions = mask.sum().item()
-                            if total_predictions > 0:
-                                cocktail_party_accuracy += correct_predictions / total_predictions
-                            cocktail_party_batches += 1
+
+                            # Span-based accuracy
+                            for i in range(y.size(0)):
+                                true_span_mask = (y[i] == BIO_TAGS['B-ORIG']) | (y[i] == BIO_TAGS['I-ORIG'])
+                                pred_span_mask = (preds[i] == BIO_TAGS['B-ORIG']) | (preds[i] == BIO_TAGS['I-ORIG'])
+
+                                if torch.equal(true_span_mask, pred_span_mask):
+                                    cocktail_party_accuracy += 1
+
+                            cocktail_party_batches += y.size(0)
 
         self.model.train()
 
