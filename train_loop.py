@@ -312,8 +312,8 @@ class Trainer:
         soft_iou = ((soft_inter + eps) / (soft_union + eps)).mean().item()
 
         # Entropy
-        s_clamped = torch.clamp(s, eps, 1.0 - eps)
-        entropy = -torch.mean(s_clamped * torch.log2(s_clamped) + (1.0 - s_clamped) * torch.log2(1.0 - s_clamped)).item()
+        s = torch.clamp(s, eps, 1.0 - eps)
+        entropy = -torch.mean(s * torch.log2(s) + (1.0 - s) * torch.log2(1.0 - s)).item()
 
         return {
             'iou': iou,
