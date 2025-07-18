@@ -147,6 +147,7 @@ class TrainingMetrics:
     def __init__(self):
         self.train_losses = []
         self.val_losses = []
+        self.cocktail_party_accuracies = []
         self.learning_rates = []
         self.step_times = []
         self.total_steps = 0
@@ -157,6 +158,7 @@ class TrainingMetrics:
         self,
         train_loss: Optional[float] = None,
         val_loss: Optional[float] = None,
+        cocktail_party_accuracy: Optional[float] = None,
         learning_rate: Optional[float] = None,
         step_time: Optional[float] = None
     ):
@@ -170,6 +172,9 @@ class TrainingMetrics:
                 self.best_val_loss = val_loss
                 self.best_step = self.total_steps
         
+        if cocktail_party_accuracy is not None:
+            self.cocktail_party_accuracies.append(cocktail_party_accuracy)
+
         if learning_rate is not None:
             self.learning_rates.append(learning_rate)
         
@@ -190,6 +195,7 @@ class TrainingMetrics:
         metrics_dict = {
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
+            'cocktail_party_accuracies': self.cocktail_party_accuracies,
             'learning_rates': self.learning_rates,
             'step_times': self.step_times,
             'total_steps': self.total_steps,
@@ -274,7 +280,59 @@ class Trainer:
         
         return loss
     
-    def evaluate(self, dataloaders: Dict[str, DataLoader], max_batches: Optional[int] = 50) -> float:
+    def _calculate_span_accuracy(self, preds: torch.Tensor, y: torch.Tensor, threshold: float = 0.75) -> float:
+        """Calculate span-based accuracy for the cocktail party task using Jaccard index."""
+        correct_predictions = 0
+        total_samples = y.size(0)
+
+        for i in range(total_samples):
+            pred_tags = preds[i]
+            true_tags = y[i]
+
+            # Find true span
+            true_span_indices = torch.where((true_tags == BIO_TAGS['B-ORIG']) | (true_tags == BIO_TAGS['I-ORIG']))[0]
+
+            if len(true_span_indices) == 0:
+                if len(torch.where((pred_tags == BIO_TAGS['B-ORIG']) | (pred_tags == BIO_TAGS['I-ORIG']))[0]) == 0:
+                    correct_predictions +=1
+                continue
+
+            # Find predicted spans
+            predicted_spans = []
+            in_span = False
+            current_span = []
+            for j, tag in enumerate(pred_tags):
+                if tag == BIO_TAGS['B-ORIG']:
+                    if in_span:
+                        predicted_spans.append(torch.tensor(current_span, device=preds.device))
+                    current_span = [j]
+                    in_span = True
+                elif tag == BIO_TAGS['I-ORIG'] and in_span:
+                    current_span.append(j)
+                elif in_span:
+                    predicted_spans.append(torch.tensor(current_span, device=preds.device))
+                    in_span = False
+                    current_span = []
+            if in_span:
+                predicted_spans.append(torch.tensor(current_span, device=preds.device))
+
+            # Check for best matching predicted span using Jaccard index
+            best_jaccard = 0.0
+            true_span_set = set(true_span_indices.cpu().numpy())
+            for pred_span in predicted_spans:
+                pred_span_set = set(pred_span.cpu().numpy())
+                intersection = len(true_span_set.intersection(pred_span_set))
+                union = len(true_span_set.union(pred_span_set))
+                jaccard = intersection / union if union > 0 else 0
+                if jaccard > best_jaccard:
+                    best_jaccard = jaccard
+
+            if best_jaccard >= threshold:
+                correct_predictions += 1
+
+        return correct_predictions / total_samples if total_samples > 0 else 0.0
+
+    def evaluate(self, dataloaders: Dict[str, DataLoader], max_batches: Optional[int] = 50, task_to_evaluate: Optional[str] = None) -> float:
         """Evaluate the model on a dataset."""
         self.model.eval()
         total_loss = 0
@@ -284,9 +342,12 @@ class Trainer:
         
         with torch.no_grad():
             for task_name, dataloader in dataloaders.items():
+                if task_to_evaluate and task_name != task_to_evaluate:
+                    continue
                 for batch_idx, batch in enumerate(dataloader):
                     if max_batches is not None and batch_idx >= max_batches:
-                        print(f"Evaluation for task {task_name} limited to {max_batches} batches for speed")
+                        if not task_to_evaluate:
+                            print(f"Evaluation for task {task_name} limited to {max_batches} batches for speed")
                         break
 
                     x, y = batch
@@ -309,19 +370,9 @@ class Trainer:
 
                         if task_name == 'cocktail_party':
                             preds = torch.argmax(logits, dim=-1)
+                            cocktail_party_accuracy += self._calculate_span_accuracy(preds, y)
+                            cocktail_party_batches += 1
 
-                            # Span-based accuracy
-                            for i in range(y.size(0)):
-                                true_span_indices = torch.where((y[i] == BIO_TAGS['B-ORIG']) | (y[i] == BIO_TAGS['I-ORIG']))[0]
-                                pred_span_indices = torch.where((preds[i] == BIO_TAGS['B-ORIG']) | (preds[i] == BIO_TAGS['I-ORIG']))[0]
-
-                                if len(true_span_indices) > 0 and torch.equal(true_span_indices, pred_span_indices):
-                                    true_span_tokens = x[i][true_span_indices]
-                                    pred_span_tokens = x[i][pred_span_indices]
-                                    if torch.equal(true_span_tokens, pred_span_tokens):
-                                        cocktail_party_accuracy += 1
-
-                            cocktail_party_batches += y.size(0)
 
         self.model.train()
 
@@ -500,6 +551,13 @@ class Trainer:
                 log_str += f"Total Loss: {total_loss.item():.4f}, "
                 for task_name, loss in individual_losses.items():
                     log_str += f"{task_name} Loss: {loss.item():.4f}, "
+
+                # Evaluate and log cocktail party accuracy every 50 steps
+                if val_loaders and 'cocktail_party' in val_loaders:
+                    _, val_accuracy = self.evaluate(val_loaders, max_batches=10, task_to_evaluate='cocktail_party')
+                    self.metrics.update(cocktail_party_accuracy=val_accuracy)
+                    log_str += f"Cocktail Party Accuracy: {val_accuracy:.4f}, "
+
                 log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
             
@@ -513,7 +571,8 @@ class Trainer:
                 is_best = val_loss < self.metrics.best_val_loss # rank-local best
                 print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
                 if val_accuracy > 0:
-                    print(f"Cocktail Party Accuracy: {val_accuracy:.4f}")
+                    # This is redundant if we log it every 50 steps, but let's keep it for the main eval
+                    print(f"Overall Cocktail Party Accuracy: {val_accuracy:.4f}")
                 
                 if is_best: # save_checkpoint itself is rank 0 guarded
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
