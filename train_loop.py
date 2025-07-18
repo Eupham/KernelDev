@@ -515,10 +515,6 @@ class Trainer:
                 if val_accuracy > 0:
                     print(f"Cocktail Party Accuracy: {val_accuracy:.4f}")
                 
-                if not self.is_distributed or dist.get_rank() == 0:
-                    if val_accuracy > 0:
-                        print(f"Cocktail Party Accuracy: {val_accuracy:.4f}")
-
                 if is_best: # save_checkpoint itself is rank 0 guarded
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
 
@@ -651,6 +647,8 @@ class Trainer:
             initial_val_loss, initial_val_accuracy = self.evaluate(val_loaders)
             self.metrics.update(val_loss=initial_val_loss)
             print(f"Initial validation loss: {initial_val_loss:.4f}")
+            if initial_val_accuracy > 0:
+                print(f"Initial cocktail party accuracy: {initial_val_accuracy:.4f}")
             if initial_val_accuracy > 0:
                 print(f"Initial cocktail party accuracy: {initial_val_accuracy:.4f}")
 
