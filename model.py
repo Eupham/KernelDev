@@ -158,11 +158,14 @@ class GPTModel(nn.Module):
             logits = self.cocktail_party_head(x)
             loss = None
             if targets is not None:
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
-                    ignore_index=BIO_TAGS['O']
-                )
+                if (targets == BIO_TAGS['O']).all():
+                    loss = torch.tensor(0.0, device=x.device, requires_grad=True)
+                else:
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        targets.view(-1),
+                        ignore_index=BIO_TAGS['O']
+                    )
             return logits, loss
         else:
             # Teacher forcing task (generative)

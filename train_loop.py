@@ -309,9 +309,9 @@ class Trainer:
 
                         if task_name == 'cocktail_party':
                             preds = torch.argmax(logits, dim=-1)
-                            # Create a mask for non-padding tokens
-                            mask = (y != BIO_TAGS['O'])
-                            # Calculate accuracy only on non-padded tokens
+                            # Create a mask for the original span tokens
+                            mask = (y == BIO_TAGS['B-ORIG']) | (y == BIO_TAGS['I-ORIG'])
+                            # Calculate accuracy only on the original span tokens
                             correct_predictions = (preds[mask] == y[mask]).sum().item()
                             total_predictions = mask.sum().item()
                             if total_predictions > 0:
