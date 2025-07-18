@@ -83,7 +83,7 @@ class TransformerBlock(nn.Module):
         return x
 
 
-from data_builder import NUM_BIO_TAGS
+from data_builder import NUM_BIO_TAGS, SPECIAL_TOKENS, BIO_TAGS
 
 class GPTModel(nn.Module):
     """GPT-styled model using flash attention kernel."""
