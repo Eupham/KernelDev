@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from data_builder import BIO_TAGS
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
