@@ -278,6 +278,8 @@ class Trainer:
         self.model.eval()
         total_loss = 0
         num_batches = 0
+        cocktail_party_accuracy = 0
+        cocktail_party_batches = 0
         
         with torch.no_grad():
             for task_name, dataloader in dataloaders.items():
@@ -303,9 +305,24 @@ class Trainer:
                         else:
                             total_loss += loss.item()
                         num_batches += 1
-        
+
+                        if task_name == 'cocktail_party':
+                            preds = torch.argmax(logits, dim=-1)
+                            # Create a mask for non-padding tokens
+                            mask = (y != BIO_TAGS['O'])
+                            # Calculate accuracy only on non-padded tokens
+                            correct_predictions = (preds[mask] == y[mask]).sum().item()
+                            total_predictions = mask.sum().item()
+                            if total_predictions > 0:
+                                cocktail_party_accuracy += correct_predictions / total_predictions
+                            cocktail_party_batches += 1
+
         self.model.train()
-        return total_loss / num_batches if num_batches > 0 else float('inf')
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+        avg_accuracy = cocktail_party_accuracy / cocktail_party_batches if cocktail_party_batches > 0 else 0
+
+        return avg_loss, avg_accuracy
 
     
     def save_checkpoint(self, step: int, is_best: bool = False):
@@ -484,11 +501,13 @@ class Trainer:
             if (not self.is_distributed or dist.get_rank() == 0) and \
                val_loaders is not None and \
                self.metrics.total_steps % self.config.eval_every == 0:
-                val_loss = self.evaluate(val_loaders)
+                val_loss, val_accuracy = self.evaluate(val_loaders)
                 self.metrics.update(val_loss=val_loss) # rank-local metric
                 
                 is_best = val_loss < self.metrics.best_val_loss # rank-local best
                 print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
+                if val_accuracy > 0:
+                    print(f"Cocktail Party Accuracy: {val_accuracy:.4f}")
                 
                 if is_best: # save_checkpoint itself is rank 0 guarded
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
@@ -619,9 +638,11 @@ class Trainer:
 
         # Initial evaluation
         if val_loaders and (not self.is_distributed or dist.get_rank() == 0):
-            initial_val_loss = self.evaluate(val_loaders)
+            initial_val_loss, initial_val_accuracy = self.evaluate(val_loaders)
             self.metrics.update(val_loss=initial_val_loss)
             print(f"Initial validation loss: {initial_val_loss:.4f}")
+            if initial_val_accuracy > 0:
+                print(f"Initial cocktail party accuracy: {initial_val_accuracy:.4f}")
 
         try:
             for epoch in range(self.config.num_epochs):

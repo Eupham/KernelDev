@@ -161,7 +161,7 @@ class GPTModel(nn.Module):
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     targets.view(-1),
-                    ignore_index=-1
+                    ignore_index=BIO_TAGS['O']
                 )
             return logits, loss
         else:
@@ -173,7 +173,7 @@ class GPTModel(nn.Module):
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     targets.view(-1),
-                    ignore_index=-1
+                    ignore_index=SPECIAL_TOKENS['[PAD]']
                 )
             return logits, loss
     
