@@ -515,6 +515,10 @@ class Trainer:
                 if val_accuracy > 0:
                     print(f"Cocktail Party Accuracy: {val_accuracy:.4f}")
                 
+                if not self.is_distributed or dist.get_rank() == 0:
+                    if val_accuracy > 0:
+                        print(f"Cocktail Party Accuracy: {val_accuracy:.4f}")
+
                 if is_best: # save_checkpoint itself is rank 0 guarded
                     self.save_checkpoint(self.metrics.total_steps, is_best=True)
 
