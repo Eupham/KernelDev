@@ -312,11 +312,14 @@ class Trainer:
 
                             # Span-based accuracy
                             for i in range(y.size(0)):
-                                true_span_mask = (y[i] == BIO_TAGS['B-ORIG']) | (y[i] == BIO_TAGS['I-ORIG'])
-                                pred_span_mask = (preds[i] == BIO_TAGS['B-ORIG']) | (preds[i] == BIO_TAGS['I-ORIG'])
+                                true_span_indices = torch.where((y[i] == BIO_TAGS['B-ORIG']) | (y[i] == BIO_TAGS['I-ORIG']))[0]
+                                pred_span_indices = torch.where((preds[i] == BIO_TAGS['B-ORIG']) | (preds[i] == BIO_TAGS['I-ORIG']))[0]
 
-                                if torch.equal(true_span_mask, pred_span_mask):
-                                    cocktail_party_accuracy += 1
+                                if len(true_span_indices) > 0 and torch.equal(true_span_indices, pred_span_indices):
+                                    true_span_tokens = x[i][true_span_indices]
+                                    pred_span_tokens = x[i][pred_span_indices]
+                                    if torch.equal(true_span_tokens, pred_span_tokens):
+                                        cocktail_party_accuracy += 1
 
                             cocktail_party_batches += y.size(0)
 
