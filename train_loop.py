@@ -319,8 +319,9 @@ class Trainer:
         soft_iou = ((soft_inter + eps) / (soft_union + eps)).mean().item()
 
         # Entropy of the probabilities
-        p = torch.clamp(s.float(), min=eps, max=1.0 - eps)
-        entropy = Bernoulli(probs=p).entropy().mean().item()
+        mask = g.bool()
+        p = torch.clamp(s[mask].float(), min=eps, max=1.0 - eps)
+        entropy = Bernoulli(probs=p).entropy().mean().item() if p.numel() > 0 else 0.0
 
         return {
             'iou': iou,

@@ -184,8 +184,9 @@ class GPTModel(nn.Module):
                 iou_loss = 1.0 - soft_iou.mean()
 
                 # Entropy Loss
-                p = torch.clamp(s.float(), min=eps, max=1.0 - eps)
-                ent_loss = Bernoulli(probs=p).entropy().mean()
+                mask = g.bool()
+                p = torch.clamp(s[mask].float(), min=eps, max=1.0 - eps)
+                ent_loss = Bernoulli(probs=p).entropy().mean() if p.numel() > 0 else torch.tensor(0.0, device=x.device)
 
                 loss = {
                     'cross_entropy': ce_loss,
