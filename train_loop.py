@@ -306,12 +306,14 @@ class Trainer:
 
         eps = 1e-8
 
-        # IoU, Precision, Recall (using hard mask)
+        # IoU, Precision, F1 Score (using hard mask)
         inter = (m * g).sum(dim=1)
         union = (m + g).clamp(min=0, max=1).sum(dim=1)
         iou = ((inter + eps) / (union + eps)).mean().item()
-        precision = ((inter + eps) / (m.sum(dim=1) + eps)).mean().item()
-        recall = ((inter + eps) / (g.sum(dim=1) + eps)).mean().item()
+        precision = ((inter + eps) / (m.sum(dim=1) + eps)).mean()
+        recall = ((inter + eps) / (g.sum(dim=1) + eps)).mean()
+        f1_score = (2 * precision * recall / (precision + recall + eps)).item()
+        precision = precision.item()
 
         # Soft-IoU (using probabilities)
         soft_inter = (s * g).sum(dim=1)
@@ -326,7 +328,7 @@ class Trainer:
         return {
             'iou': iou,
             'precision': precision,
-            'recall': recall,
+            'f1_score': f1_score,
             'soft_iou': soft_iou,
             'entropy': entropy,
         }
