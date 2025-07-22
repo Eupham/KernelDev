@@ -86,6 +86,8 @@ class TransformerBlock(nn.Module):
 from data_builder import NUM_BIO_TAGS, SPECIAL_TOKENS, BIO_TAGS
 from torch.distributions import Bernoulli
 
+global_pos_weight = None
+
 class GPTModel(nn.Module):
     """GPT-styled model using flash attention kernel."""
     
@@ -159,38 +161,35 @@ class GPTModel(nn.Module):
             logits = self.cocktail_party_head(x)
             loss = None
             if targets is not None:
-                # Calculate probabilities for the positive class (B-ORIG or I-ORIG)
+                global global_pos_weight
                 probs = torch.softmax(logits, dim=-1)
                 s = probs[..., BIO_TAGS['B-ORIG']] + probs[..., BIO_TAGS['I-ORIG']]
                 g = ((targets == BIO_TAGS['B-ORIG']) | (targets == BIO_TAGS['I-ORIG'])).float()
-
-                # Weighted Cross-Entropy Loss
-                pos_count = g.sum()
-                neg_count = (1 - g).sum()
-                pos_weight = neg_count / (pos_count + 1e-8)
-
-                ce_loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
-                    ignore_index=BIO_TAGS['O'],
-                    weight=torch.tensor([1.0, pos_weight, pos_weight], device=x.device) # O, B-ORIG, I-ORIG
-                )
-
-                # Soft-IoU Loss
                 eps = 1e-8
-                soft_inter = torch.min(s, g).sum(dim=1)
-                soft_union = torch.max(s, g).sum(dim=1)
-                soft_iou = (soft_inter + eps) / (soft_union + eps)
-                iou_loss = 1.0 - soft_iou.mean()
 
-                # Entropy Loss
-                p = torch.clamp(s.float(), min=eps, max=1.0 - eps)
-                ent_loss = Bernoulli(probs=p).entropy().mean()
+                if global_pos_weight is None:
+                    pos_count = g.sum()
+                    neg_count = (1 - g).sum()
+                    global_pos_weight = (neg_count / (pos_count + 1e-8)).clamp(max=10.0)
+
+                # --- 1) Cross-entropy as binary BCEWithLogits ---
+                logit_mask = torch.log(s / (1 - s + eps) + eps)
+                bce = F.binary_cross_entropy_with_logits(logit_mask, g, pos_weight=global_pos_weight)
+
+                # --- 2) Soft-IoU ---
+                soft_inter = (s * g).sum(dim=1)
+                soft_union = (s + g - s * g).sum(dim=1)
+                iou_loss = 1 - ((soft_inter + eps) / (soft_union + eps)).mean()
+
+                # --- 3) Entropy over all tokens ---
+                p_all = torch.clamp(s, min=eps, max=1 - eps)
+                ent = - (p_all * torch.log2(p_all) + (1 - p_all) * torch.log2(1 - p_all))
+                entropy = ent.mean()
 
                 loss = {
-                    'cross_entropy': ce_loss,
+                    'bce': bce,
                     'soft_iou': iou_loss,
-                    'entropy': ent_loss
+                    'entropy': entropy
                 }
             return logits, loss
         else:
