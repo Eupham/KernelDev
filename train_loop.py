@@ -317,7 +317,9 @@ class Trainer:
             entropy = -1.0 # Or some other indicator
         else:
             s_clamped = torch.clamp(s, min=eps, max=1.0 - eps)
-            entropy = -torch.mean(s_clamped * torch.log2(s_clamped) + (1.0 - s_clamped) * torch.log2(1.0 - s_clamped)).item()
+            one_minus_s_clamped = torch.clamp(1.0 - s_clamped, min=eps, max=1.0 - eps)
+            entropy_tensor = -torch.mean(s_clamped * torch.log2(s_clamped) + one_minus_s_clamped * torch.log2(one_minus_s_clamped))
+            entropy = entropy_tensor.detach().item()
 
         return {
             'iou': iou,
