@@ -712,7 +712,7 @@ class Trainer:
 
         # Initial evaluation
         if val_loaders and (not self.is_distributed or dist.get_rank() == 0):
-            initial_val_loss, initial_val_metrics = self.evaluate(val_loaders)
+            initial_val_loss, initial_val_metrics = self.evaluate(val_loaders, task_configs)
             self.metrics.update(val_loss=initial_val_loss)
             print(f"Initial validation loss: {initial_val_loss:.4f}")
             if initial_val_metrics:
