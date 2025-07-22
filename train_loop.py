@@ -264,7 +264,7 @@ class Trainer:
             return self.config.learning_rate * step / self.config.warmup_steps
         return self.config.learning_rate
     
-    def train_step(self, batch: Tuple[torch.Tensor, torch.Tensor], task_name: str) -> float:
+    def train_step(self, batch: Tuple[torch.Tensor, torch.Tensor], task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step."""
         x, y = batch
         x, y = x.to(self.config.device), y.to(self.config.device)
@@ -283,7 +283,7 @@ class Trainer:
             total_loss = 0
             for loss_name, loss_value in loss.items():
                 # Default weight to 1.0 if not specified in config
-                weight = self.config.task_configs.get(task_name, {}).get(f"{loss_name}_weight", 1.0)
+                weight = task_configs.get(task_name, {}).get(f"{loss_name}_weight", 1.0)
                 total_loss += weight * loss_value
             return total_loss
         else:
@@ -508,7 +508,7 @@ class Trainer:
                     train_iters[task_name] = iter(train_loaders[task_name])
                     batch = next(train_iters[task_name])
 
-                loss = self.train_step(batch, task_name)
+                loss = self.train_step(batch, task_name, task_configs)
                 if isinstance(loss, dict):
                     task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
                     total_loss += task_weight * sum(loss.values())
