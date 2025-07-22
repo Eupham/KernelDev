@@ -25,7 +25,7 @@ training:
   max_grad_norm: 1.0
   
   # Checkpoint and logging intervals
-  save_every: 500      # Save checkpoint every N steps
+  save_every: 1000      # Save checkpoint every N steps
   eval_every: 200      # Evaluate on validation set every N steps
   log_every: 50        # Log training metrics every N steps
   
@@ -54,7 +54,7 @@ data:
   seq_len: 1024
   
   # Maximum number of samples to use from dataset
-  max_samples: 5000
+  max_samples: 500000
   
   # Maximum tokens for evaluation
   max_eval_tokens: 50000
