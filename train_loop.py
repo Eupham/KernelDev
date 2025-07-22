@@ -277,59 +277,49 @@ class Trainer:
 
         if loss is None:
             return 0.0
-        
-        return loss
+
+        if isinstance(loss, dict):
+            # Handle weighted combination of losses for cocktail_party task
+            total_loss = 0
+            for loss_name, loss_value in loss.items():
+                # Default weight to 1.0 if not specified in config
+                weight = self.config.task_configs.get(task_name, {}).get(f"{loss_name}_weight", 1.0)
+                total_loss += weight * loss_value
+            return total_loss
+        else:
+            return loss
     
     def _calculate_mask_metrics(self, logits: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
         """
-        Calculates IoU, Precision, Recall, Soft-IoU, and Entropy for the cocktail party task.
+        Calculates IoU, Precision, Recall, Soft-IoU, and Entropy for the cocktail party task for logging.
         """
         # Get the probabilities for the positive class (B-ORIG or I-ORIG)
-        # We'll treat B-ORIG and I-ORIG as a single "selected" class for the mask.
         probs = torch.softmax(logits, dim=-1)
-        # Let's consider the probability of being either B-ORIG or I-ORIG
         s = probs[..., BIO_TAGS['B-ORIG']] + probs[..., BIO_TAGS['I-ORIG']]
 
         # Create the ground truth mask G
         g = ((y == BIO_TAGS['B-ORIG']) | (y == BIO_TAGS['I-ORIG'])).float()
 
-        # Hard mask m
+        # Hard mask m for IoU, precision, and recall
         m = (s > 0.5).float()
 
         eps = 1e-8
 
-        # IoU, Precision, Recall
+        # IoU, Precision, Recall (using hard mask)
         inter = (m * g).sum(dim=1)
         union = (m + g).clamp(min=0, max=1).sum(dim=1)
-
         iou = ((inter + eps) / (union + eps)).mean().item()
         precision = ((inter + eps) / (m.sum(dim=1) + eps)).mean().item()
         recall = ((inter + eps) / (g.sum(dim=1) + eps)).mean().item()
 
-        # Soft-IoU
-        soft_inter = torch.min(s, g).sum(dim=1)
-        soft_union = torch.max(s, g).sum(dim=1)
+        # Soft-IoU (using probabilities)
+        soft_inter = (s * g).sum(dim=1)
+        soft_union = (s + g - s * g).sum(dim=1)
         soft_iou = ((soft_inter + eps) / (soft_union + eps)).mean().item()
 
-        # Entropy
-        s = s.float()
-        if torch.isnan(s).any():
-            print("NaN in s before entropy")
-            entropy = -1.0
-        else:
-            eps = 1e-12
-            s_clamped = torch.clamp(s, min=eps, max=1.0 - eps)
-            one_minus_s = torch.clamp(1.0 - s_clamped, min=eps, max=1.0 - eps)
-
-            term1 = s_clamped * torch.log2(s_clamped)
-            term2 = one_minus_s * torch.log2(one_minus_s)
-
-            if torch.isnan(term1).any(): print("NaN in term1")
-            if torch.isnan(term2).any(): print("NaN in term2")
-
-            entropy_tensor = term1 + term2
-            entropy_tensor = torch.nan_to_num(entropy_tensor, nan=0.0, posinf=0.0, neginf=0.0)
-            entropy = -torch.mean(entropy_tensor).item()
+        # Entropy of the probabilities
+        s_clamped = torch.clamp(s, min=eps, max=1.0 - eps)
+        entropy = -torch.mean(s_clamped * torch.log2(s_clamped) + (1 - s_clamped) * torch.log2(1 - s_clamped)).item()
 
         return {
             'iou': iou,
@@ -515,9 +505,15 @@ class Trainer:
                     batch = next(train_iters[task_name])
 
                 loss = self.train_step(batch, task_name)
-                individual_losses[task_name] = loss
-                task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
-                total_loss += loss * task_weight
+                if isinstance(loss, dict):
+                    task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
+                    total_loss += task_weight * sum(loss.values())
+                    for k, v in loss.items():
+                        individual_losses[f"{task_name}_{k}"] = v
+                else:
+                    individual_losses[task_name] = loss
+                    task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
+                    total_loss += loss * task_weight
 
             epoch_losses.append(total_loss.item())
 
@@ -555,8 +551,8 @@ class Trainer:
                 avg_step_time = self.metrics.get_avg_step_time()
                 log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
                 log_str += f"Total Loss: {total_loss.item():.4f}, "
-                for task_name, loss in individual_losses.items():
-                    log_str += f"{task_name} Loss: {loss.item():.4f}, "
+                for loss_name, loss_value in individual_losses.items():
+                    log_str += f"{loss_name} Loss: {loss_value.item():.4f}, "
 
                 # Evaluate and log cocktail party metrics every 50 steps
                 if val_loaders and 'cocktail_party' in val_loaders:

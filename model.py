@@ -158,14 +158,40 @@ class GPTModel(nn.Module):
             logits = self.cocktail_party_head(x)
             loss = None
             if targets is not None:
-                if (targets == BIO_TAGS['O']).all():
-                    loss = torch.tensor(0.0, device=x.device, requires_grad=True)
-                else:
-                    loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        targets.view(-1),
-                        ignore_index=BIO_TAGS['O']
-                    )
+                # Calculate probabilities for the positive class (B-ORIG or I-ORIG)
+                probs = torch.softmax(logits, dim=-1)
+                s = probs[..., BIO_TAGS['B-ORIG']] + probs[..., BIO_TAGS['I-ORIG']]
+                g = ((targets == BIO_TAGS['B-ORIG']) | (targets == BIO_TAGS['I-ORIG'])).float()
+
+                # Weighted Cross-Entropy Loss
+                pos_count = g.sum()
+                neg_count = (1 - g).sum()
+                pos_weight = neg_count / (pos_count + 1e-8)
+
+                ce_loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=BIO_TAGS['O'],
+                    weight=torch.tensor([1.0, pos_weight, pos_weight], device=x.device) # O, B-ORIG, I-ORIG
+                )
+
+                # Soft-IoU Loss
+                eps = 1e-8
+                soft_inter = torch.min(s, g).sum(dim=1)
+                soft_union = torch.max(s, g).sum(dim=1)
+                soft_iou = (soft_inter + eps) / (soft_union + eps)
+                iou_loss = 1.0 - soft_iou.mean()
+
+                # Entropy Loss
+                s_clamped = torch.clamp(s, eps, 1 - eps)
+                ent_terms = s_clamped * torch.log(s_clamped) + (1 - s_clamped) * torch.log(1 - s_clamped)
+                ent_loss = -ent_terms.mean()
+
+                loss = {
+                    'cross_entropy': ce_loss,
+                    'soft_iou': iou_loss,
+                    'entropy': ent_loss
+                }
             return logits, loss
         else:
             # Teacher forcing task (generative)
