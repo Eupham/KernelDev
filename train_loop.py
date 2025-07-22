@@ -312,9 +312,12 @@ class Trainer:
         soft_iou = ((soft_inter + eps) / (soft_union + eps)).mean().item()
 
         # Entropy
-        s_float32 = s.float()
-        s_clamped = torch.clamp(s_float32, eps, 1.0 - eps)
-        entropy = -torch.mean(s_clamped * torch.log2(s_clamped) + (1.0 - s_clamped) * torch.log2(1.0 - s_clamped)).item()
+        if torch.isnan(s).any():
+            print("NaN detected in probabilities (s) before entropy calculation!")
+            entropy = -1.0 # Or some other indicator
+        else:
+            s_clamped = torch.clamp(s, min=eps, max=1.0 - eps)
+            entropy = -torch.mean(s_clamped * torch.log2(s_clamped) + (1.0 - s_clamped) * torch.log2(1.0 - s_clamped)).item()
 
         return {
             'iou': iou,
