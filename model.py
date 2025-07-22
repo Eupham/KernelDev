@@ -84,6 +84,7 @@ class TransformerBlock(nn.Module):
 
 
 from data_builder import NUM_BIO_TAGS, SPECIAL_TOKENS, BIO_TAGS
+from torch.distributions import Bernoulli
 
 class GPTModel(nn.Module):
     """GPT-styled model using flash attention kernel."""
@@ -183,9 +184,8 @@ class GPTModel(nn.Module):
                 iou_loss = 1.0 - soft_iou.mean()
 
                 # Entropy Loss
-                s_clamped = torch.clamp(s, eps, 1 - eps)
-                ent_terms = s_clamped * torch.log(s_clamped) + (1 - s_clamped) * torch.log(1 - s_clamped)
-                ent_loss = -ent_terms.mean()
+                p = torch.clamp(s.float(), min=eps, max=1.0 - eps)
+                ent_loss = Bernoulli(probs=p).entropy().mean()
 
                 loss = {
                     'cross_entropy': ce_loss,

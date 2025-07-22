@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from data_builder import BIO_TAGS
+from torch.distributions import Bernoulli
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -318,8 +319,8 @@ class Trainer:
         soft_iou = ((soft_inter + eps) / (soft_union + eps)).mean().item()
 
         # Entropy of the probabilities
-        s_clamped = torch.clamp(s, min=eps, max=1.0 - eps)
-        entropy = -torch.mean(s_clamped * torch.log2(s_clamped) + (1 - s_clamped) * torch.log2(1 - s_clamped)).item()
+        p = torch.clamp(s.float(), min=eps, max=1.0 - eps)
+        entropy = Bernoulli(probs=p).entropy().mean().item()
 
         return {
             'iou': iou,
