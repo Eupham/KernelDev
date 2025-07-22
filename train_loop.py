@@ -329,7 +329,7 @@ class Trainer:
             'entropy': entropy,
         }
 
-    def evaluate(self, dataloaders: Dict[str, DataLoader], max_batches: Optional[int] = 50, task_to_evaluate: Optional[str] = None) -> Tuple[float, Dict[str, float]]:
+    def evaluate(self, dataloaders: Dict[str, DataLoader], task_configs: Dict[str, Any], max_batches: Optional[int] = 50, task_to_evaluate: Optional[str] = None) -> Tuple[float, Dict[str, float]]:
         """Evaluate the model on a dataset."""
         self.model.eval()
         total_loss = 0
@@ -357,7 +357,11 @@ class Trainer:
 
                     if loss is not None:
                         if isinstance(loss, dict):
-                            total_loss += loss['loss'].item()
+                            batch_loss = 0
+                            for loss_name, loss_value in loss.items():
+                                weight = task_configs.get(task_name, {}).get(f"{loss_name}_weight", 1.0)
+                                batch_loss += weight * loss_value
+                            total_loss += batch_loss.item()
                         else:
                             total_loss += loss.item()
                         num_batches += 1
@@ -556,7 +560,7 @@ class Trainer:
 
                 # Evaluate and log cocktail party metrics every 50 steps
                 if val_loaders and 'cocktail_party' in val_loaders:
-                    _, cocktail_party_metrics = self.evaluate(val_loaders, max_batches=10, task_to_evaluate='cocktail_party')
+                    _, cocktail_party_metrics = self.evaluate(val_loaders, task_configs, max_batches=10, task_to_evaluate='cocktail_party')
                     self.metrics.update(cocktail_party_metrics=cocktail_party_metrics)
                     for k, v in cocktail_party_metrics.items():
                         log_str += f"{k}: {v:.4f}, "
@@ -568,7 +572,7 @@ class Trainer:
             if (not self.is_distributed or dist.get_rank() == 0) and \
                val_loaders is not None and \
                self.metrics.total_steps % self.config.eval_every == 0:
-                val_loss, cocktail_party_metrics = self.evaluate(val_loaders)
+                val_loss, cocktail_party_metrics = self.evaluate(val_loaders, task_configs)
                 self.metrics.update(val_loss=val_loss) # rank-local metric
                 
                 is_best = val_loss < self.metrics.best_val_loss # rank-local best
