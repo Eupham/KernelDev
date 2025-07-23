@@ -80,12 +80,13 @@ class DataBuilder:
     def _tokenize_text(self, text: str) -> list:
         return list(text.encode('utf-8'))
 
-    def _detokenize_bytes(self, tokens: list) -> str:
+    def _detokenize_bytes(self, tokens: list, skip_special_tokens=False) -> str:
         special_token_map = {v: k for k, v in SPECIAL_TOKENS.items()}
         decoded_tokens = []
         for t in tokens:
             if t in special_token_map:
-                decoded_tokens.append(special_token_map[t])
+                if not skip_special_tokens:
+                    decoded_tokens.append(special_token_map[t])
             else:
                 decoded_tokens.append(chr(t - NUM_SPECIAL_TOKENS))
         return "".join(decoded_tokens)
@@ -472,10 +473,10 @@ class DataBuilder:
     def get_vocab_size(self) -> int:
         return self.vocab_size
     
-    def decode_tokens(self, tokens):
+    def decode_tokens(self, tokens, skip_special_tokens=False):
         if isinstance(tokens, torch.Tensor):
             tokens = tokens.cpu().tolist()
-        return self._detokenize_bytes(tokens)
+        return self._detokenize_bytes(tokens, skip_special_tokens=skip_special_tokens)
 
 
 def create_data_builder(
