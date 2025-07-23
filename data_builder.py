@@ -418,7 +418,7 @@ class DataBuilder:
 
             for s, is_correct in all_spans:
                 span_len = len(s)
-                final_sequence += [SPECIAL_TOKENS['[SPAN]']] + s + [SPECIAL_TOKENS['[ES]']]
+                final_sequence.extend(self._tokenize_text(f"[SPAN]{self.decode_tokens(s, skip_special_tokens=True)}[ES]"))
 
                 # Update BIO tags
                 if is_correct:
