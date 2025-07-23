@@ -29,6 +29,7 @@ class TrainingConfig:
         save_every: int = 1000,
         eval_every: int = 500,
         log_every: int = 100,
+        inference_every: int = 500,
         checkpoint_dir: str = "checkpoints",
         device: str = "auto",
         use_amp: bool = False,
@@ -56,6 +57,7 @@ class TrainingConfig:
         self.save_every = save_every
         self.eval_every = eval_every
         self.log_every = log_every
+        self.inference_every = inference_every
         self.checkpoint_dir = checkpoint_dir
         self.use_amp = use_amp
         self.scaler = scaler
@@ -631,7 +633,7 @@ class Trainer:
             # Periodic inference
             if (not self.is_distributed or dist.get_rank() == 0) and \
                self.metrics.total_steps > 0 and \
-               self.metrics.total_steps % self.config.eval_every == 0:
+               self.metrics.total_steps % self.config.inference_every == 0:
                 if val_loaders is not None:
                     print(f"\n=== Generating Inference Sample at Step {self.metrics.total_steps} (Rank 0) ===")
                     perplexity = self.calculate_perplexity(val_loaders, max_batches=20)
