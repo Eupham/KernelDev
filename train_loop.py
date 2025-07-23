@@ -622,12 +622,16 @@ class Trainer:
                         )
                         print(f"Scheduler re-initialized due to plateau. New T_0 = {new_T0}. LR reset to {self.initial_lr:.6f}")
 
-            # Regular checkpoint saving & inference (only on rank 0 if distributed)
+            # Regular checkpoint saving
             if (not self.is_distributed or dist.get_rank() == 0) and \
                self.metrics.total_steps > 0 and \
                self.metrics.total_steps % self.config.save_every == 0:
                 self.save_checkpoint(self.metrics.total_steps) # rank 0 guarded
 
+            # Periodic inference
+            if (not self.is_distributed or dist.get_rank() == 0) and \
+               self.metrics.total_steps > 0 and \
+               self.metrics.total_steps % self.config.eval_every == 0:
                 if val_loaders is not None:
                     print(f"\n=== Generating Inference Sample at Step {self.metrics.total_steps} (Rank 0) ===")
                     perplexity = self.calculate_perplexity(val_loaders, max_batches=20)
