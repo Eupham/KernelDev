@@ -902,11 +902,12 @@ class Trainer:
         with torch.no_grad():
             if prompt:
                 # Tokenize prompt using DataBuilder's method
-                tokens = self.data_builder._tokenize_text(prompt)
+                tokens = self.data_builder._tokenize_text(f"[CLS] {prompt}")
                 x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device)
             else:
-                # Start with a random token
-                x = torch.randint(0, self.data_builder.vocab_size, (1, 1)).to(self.config.device)
+                # Start with a CLS token
+                tokens = self.data_builder._tokenize_text("[CLS]")
+                x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device)
             
             if self.config.use_amp:
                 # Use mixed precision for generation
@@ -988,11 +989,12 @@ class Trainer:
                 try:
                     if prompt:
                         # Tokenize prompt using DataBuilder's method
-                        tokens = self.data_builder._tokenize_text(prompt)
+                        tokens = self.data_builder._tokenize_text(f"[CLS] {prompt}")
                         x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device)
                     else:
-                        # Start with a random token
-                        x = torch.randint(0, self.data_builder.vocab_size, (1, 1)).to(self.config.device)
+                        # Start with a CLS token
+                        tokens = self.data_builder._tokenize_text("[CLS]")
+                        x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.config.device)
                     
                     # Generate tokens with top-k, top-p sampling
                     generated = model_to_generate_from.generate(
