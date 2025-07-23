@@ -33,11 +33,8 @@ class OnTheFlyTokenizedDataset(Dataset):
 
     def __getitem__(self, idx):
         text = self.raw_data[idx]['text']
+        text = f"[CLS] {text}"
         tokens = self.tokenizer_fn(text)
-        tokens = [t + NUM_SPECIAL_TOKENS for t in tokens] # Shift regular tokens
-
-        # Add CLS token to the beginning of the sequence
-        tokens = [SPECIAL_TOKENS['[CLS]']] + tokens
 
         tokens = tokens[:self.seq_len + 1]
 
@@ -78,7 +75,21 @@ class DataBuilder:
             print("Will attempt to load all available samples from the dataset.")
 
     def _tokenize_text(self, text: str) -> list:
-        return list(text.encode('utf-8'))
+        # This is a simplified tokenizer. A real implementation would use a pre-trained tokenizer.
+        tokens = []
+        i = 0
+        while i < len(text):
+            found = False
+            for token_str, token_id in SPECIAL_TOKENS.items():
+                if text[i:].startswith(token_str):
+                    tokens.append(token_id)
+                    i += len(token_str)
+                    found = True
+                    break
+            if not found:
+                tokens.append(text[i].encode('utf-8')[0] + NUM_SPECIAL_TOKENS)
+                i += 1
+        return tokens
 
     def _detokenize_bytes(self, tokens: list, skip_special_tokens=False) -> str:
         special_token_map = {v: k for k, v in SPECIAL_TOKENS.items()}
