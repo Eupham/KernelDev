@@ -470,31 +470,6 @@ class Trainer:
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
         # Restore metrics (rank-local)
-        checkpoint_path = os.path.join(
-            self.config.checkpoint_dir,
-            f'checkpoint_step_{step}.pt'
-        )
-        torch.save(checkpoint, checkpoint_path)
-        
-        # Save best checkpoint
-        if is_best:
-            best_path = os.path.join(
-                self.config.checkpoint_dir,
-                'best_checkpoint.pt'
-            )
-            torch.save(checkpoint, best_path)
-        
-        print(f"Checkpoint saved: {checkpoint_path}")
-    
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.config.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        # Restore metrics
         for key, value in checkpoint['metrics'].items():
             setattr(self.metrics, key, value)
         
@@ -807,15 +782,15 @@ class Trainer:
         if not self.is_distributed or dist.get_rank() == 0:
             print(f"Calculated steps_per_epoch: {self.steps_per_epoch}")
 
-        new_T0 = math.ceil(self.steps_per_epoch * self.config.scheduler_T0_epoch_fraction)
-        if new_T0 < 1: new_T0 = 1
+        total_steps = self.steps_per_epoch * self.config.num_epochs
+        new_T0 = total_steps
 
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=new_T0, T_mult=self.config.scheduler_T_mult,
+            self.optimizer, T_0=new_T0, T_mult=1,
             eta_min=self.config.learning_rate * 0.1
         )
         if not self.is_distributed or dist.get_rank() == 0:
-            print(f"Scheduler re-initialized with T_0 = {new_T0} based on steps_per_epoch.")
+            print(f"Scheduler re-initialized with T_0 = {new_T0} based on total training steps.")
 
         # Initial evaluation
         if val_loaders and (not self.is_distributed or dist.get_rank() == 0):
