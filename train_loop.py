@@ -29,6 +29,7 @@ class TrainingConfig:
         save_every: int = 1000,
         eval_every: int = 500,
         log_every: int = 100,
+        moving_avg_window: int = 100,
         inference_every: int = 500,
         checkpoint_dir: str = "checkpoints",
         device: str = "auto",
@@ -57,6 +58,7 @@ class TrainingConfig:
         self.save_every = save_every
         self.eval_every = eval_every
         self.log_every = log_every
+        self.moving_avg_window = moving_avg_window
         self.inference_every = inference_every
         self.checkpoint_dir = checkpoint_dir
         self.use_amp = use_amp
@@ -147,7 +149,7 @@ def init_distributed(trainer_instance: 'Trainer'):
 class TrainingMetrics:
     """Class to track and manage training metrics."""
     
-    def __init__(self):
+    def __init__(self, moving_avg_window: int = 100):
         self.train_losses = []
         self.val_losses = []
         self.cocktail_party_metrics = []
@@ -156,6 +158,8 @@ class TrainingMetrics:
         self.total_steps = 0
         self.best_val_loss = float('inf')
         self.best_step = 0
+        self.moving_avg_window = moving_avg_window
+        self.recent_train_losses = []
     
     def update(
         self,
@@ -168,6 +172,9 @@ class TrainingMetrics:
         """Update metrics with new values."""
         if train_loss is not None:
             self.train_losses.append(train_loss)
+            self.recent_train_losses.append(train_loss)
+            if len(self.recent_train_losses) > self.moving_avg_window:
+                self.recent_train_losses.pop(0)
         
         if val_loss is not None:
             self.val_losses.append(val_loss)
@@ -185,6 +192,16 @@ class TrainingMetrics:
             self.step_times.append(step_time)
         
         self.total_steps += 1
+
+    def get_loss_moving_average(self) -> float:
+        if not self.recent_train_losses:
+            return 0.0
+        return np.mean(self.recent_train_losses)
+
+    def get_loss_variance(self) -> float:
+        if len(self.recent_train_losses) < 2:
+            return 0.0
+        return np.var(self.recent_train_losses)
     
     def get_avg_step_time(self, last_n: int = 100) -> float:
         """Get average step time for the last N steps."""
@@ -220,7 +237,7 @@ class Trainer:
         self.model = model
         self.config = config
         self.data_builder = data_builder
-        self.metrics = TrainingMetrics()
+        self.metrics = TrainingMetrics(moving_avg_window=self.config.log_every)
         self.is_distributed = False # Will be set by init_distributed
 
         # Initialize plateau tracking attributes
@@ -558,8 +575,10 @@ class Trainer:
             if (not self.is_distributed or dist.get_rank() == 0) and \
                self.metrics.total_steps % self.config.log_every == 0:
                 avg_step_time = self.metrics.get_avg_step_time()
+                loss_ma = self.metrics.get_loss_moving_average()
+                loss_var = self.metrics.get_loss_variance()
                 log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
-                log_str += f"Total Loss: {total_loss.item():.4f}, "
+                log_str += f"Total Loss: {total_loss.item():.4f} (MA: {loss_ma:.4f}, Var: {loss_var:.4f}), "
                 for loss_name, loss_value in individual_losses.items():
                     log_str += f"{loss_name} Loss: {loss_value.item():.4f}, "
 
