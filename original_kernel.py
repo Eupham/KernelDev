@@ -592,7 +592,10 @@ def _flash_attn_fwd(
             diag_block = tl.load(diag_block_ptr, boundary_check=(0, 1))
 
             # Extract the diagonal to see which keys are in spans
-            is_key_in_span_diag = tl.diag(diag_block)
+            row_indices = tl.arange(0, TILE_K_SIZE)[:, None]
+            col_indices = tl.arange(0, TILE_K_SIZE)[None, :]
+            diag_mask = row_indices == col_indices
+            is_key_in_span_diag = tl.reduce(diag_block * diag_mask, 1, tl.sum)
 
             # A key is not in a span if its diagonal element is 0
             is_key_not_in_span = (is_key_in_span_diag == 0)[None, :]
@@ -1291,7 +1294,10 @@ def _flash_attn_bwd_dq(
             diag_block = tl.load(diag_block_ptr, boundary_check=(0, 1))
 
             # A key is not in a span if its diagonal element is 0
-            is_key_in_span_diag = tl.diag(diag_block)
+            row_indices = tl.arange(0, TILE_K_SIZE)[:, None]
+            col_indices = tl.arange(0, TILE_K_SIZE)[None, :]
+            diag_mask = row_indices == col_indices
+            is_key_in_span_diag = tl.reduce(diag_block * diag_mask, 1, tl.sum)
             is_key_not_in_span = (is_key_in_span_diag == 0)[None, :]
 
             # The final mask allows attention to same-span tokens OR non-span tokens
@@ -1415,7 +1421,10 @@ def _flash_attn_bwd_dkdv(
             diag_block = tl.load(diag_block_ptr, boundary_check=(0, 1))
 
             # A key is not in a span if its diagonal element is 0
-            is_key_in_span_diag = tl.diag(diag_block)
+            row_indices = tl.arange(0, TILE_K_SIZE)[:, None]
+            col_indices = tl.arange(0, TILE_K_SIZE)[None, :]
+            diag_mask = row_indices == col_indices
+            is_key_in_span_diag = tl.reduce(diag_block * diag_mask, 1, tl.sum)
             is_key_not_in_span = (is_key_in_span_diag == 0)[:, None]
 
             # The final mask allows attention to same-span tokens OR non-span tokens
