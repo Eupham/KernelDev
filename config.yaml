@@ -152,5 +152,5 @@ tasks:
   cocktail_party:
     weight: 0.5
     num_distractors: 3
-    min_span_size: 10
-    max_span_size: 50
+    min_span_size: 100
+    max_span_size: 200
