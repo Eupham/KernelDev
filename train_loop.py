@@ -268,12 +268,7 @@ class Trainer:
         
         # Initialize learning rate scheduler
         self.initial_lr = self.config.learning_rate
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=self.config.warmup_steps, # Placeholder T_0, will be updated
-            T_mult=self.config.scheduler_T_mult,
-            eta_min=self.initial_lr * 0.1 # eta_min based on initial_lr
-        )
+        self.scheduler = None # Will be initialized in train()
         
         print(f"Trainer initialized on device: {self.config.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -560,79 +555,54 @@ class Trainer:
                 log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
 
-            # Evaluation (only on rank 0 if distributed)
-            if (not self.is_distributed or dist.get_rank() == 0) and \
-               val_loaders is not None and \
-               self.metrics.total_steps % self.config.eval_every == 0:
-                val_loss, cocktail_party_metrics = self.evaluate(val_loaders, task_configs)
-                self.metrics.update(val_loss=val_loss) # rank-local metric
+            # Evaluation, saving, and inference block (runs on rank 0)
+            if (not self.is_distributed or dist.get_rank() == 0):
+                # Evaluation
+                if val_loaders is not None and self.metrics.total_steps % self.config.eval_every == 0:
+                    val_loss, cocktail_party_metrics = self.evaluate(val_loaders, task_configs)
+                    self.metrics.update(val_loss=val_loss)
 
-                is_best = val_loss < self.metrics.best_val_loss # rank-local best
-                print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
-                if cocktail_party_metrics:
-                    log_str = "Overall Cocktail Party Metrics: "
-                    for k, v in cocktail_party_metrics.items():
-                        log_str += f"{k}: {v:.4f}, "
-                    print(log_str)
+                    is_best = val_loss < self.metrics.best_val_loss
+                    print(f"Validation Loss: {val_loss:.4f} {'(Best!)' if is_best else ''}")
+                    if cocktail_party_metrics:
+                        log_str = "Overall Cocktail Party Metrics: "
+                        for k, v in cocktail_party_metrics.items():
+                            log_str += f"{k}: {v:.4f}, "
+                        print(log_str)
 
-                if is_best: # save_checkpoint itself is rank 0 guarded
-                    self.save_checkpoint(self.metrics.total_steps, is_best=True)
+                    if is_best:
+                        self.save_checkpoint(self.metrics.total_steps, is_best=True)
 
-                # Plateau detection logic
-                current_metric_val = val_loss # Assuming val_loss is the metric for now
+                    # Plateau detection logic
+                    improved = False
+                    if self.config.plateau_mode == 'min':
+                        if val_loss < self.plateau_best_metric_val - self.config.plateau_threshold:
+                            improved = True
+                    else: # max mode
+                        if val_loss > self.plateau_best_metric_val + self.config.plateau_threshold:
+                            improved = True
 
-                improved = False
-                if self.config.plateau_mode == 'min':
-                    if current_metric_val < self.plateau_best_metric_val - self.config.plateau_threshold:
-                        improved = True
-                elif self.config.plateau_mode == 'max':
-                    if current_metric_val > self.plateau_best_metric_val + self.config.plateau_threshold:
-                        improved = True
-
-                if improved:
-                    self.plateau_best_metric_val = current_metric_val
-                    self.plateau_patience_counter = 0
-                    print(f"Metric improved to {current_metric_val:.4f}. Resetting plateau patience.")
-                else:
-                    self.plateau_patience_counter += 1
-                    print(f"Metric did not improve significantly. Plateau patience: {self.plateau_patience_counter}/{self.config.plateau_patience}")
-
-                if self.plateau_patience_counter >= self.config.plateau_patience:
-                    print(f"Plateau detected! Metric did not improve for {self.config.plateau_patience} evaluations.")
-                    self.plateau_patience_counter = 0 # Reset counter
-
-                    if self.steps_per_epoch is None:
-                        print("Error: self.steps_per_epoch is not set. Cannot re-initialize scheduler correctly.")
+                    if improved:
+                        self.plateau_best_metric_val = val_loss
+                        self.plateau_patience_counter = 0
+                        print(f"Metric improved to {val_loss:.4f}. Resetting plateau patience.")
                     else:
-                        new_T0 = math.ceil(self.steps_per_epoch * self.config.scheduler_T0_epoch_fraction)
-                        if new_T0 < 1: new_T0 = 1
+                        self.plateau_patience_counter += 1
+                        print(f"Metric did not improve. Plateau patience: {self.plateau_patience_counter}/{self.config.plateau_patience}")
 
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = self.initial_lr
+                    if self.plateau_patience_counter >= self.config.plateau_patience:
+                        print("Plateau detected! Consider stopping training or adjusting learning rate manually.")
+                        self.plateau_patience_counter = 0
 
-                        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                            self.optimizer,
-                            T_0=new_T0,
-                            T_mult=self.config.scheduler_T_mult,
-                            eta_min=self.config.learning_rate * 0.1 # Or a configured value
-                        )
-                        print(f"Scheduler re-initialized due to plateau. New T_0 = {new_T0}. LR reset to {self.initial_lr:.6f}")
+                # Regular checkpoint saving
+                if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_every == 0:
+                    self.save_checkpoint(self.metrics.total_steps)
 
-            # Regular checkpoint saving
-            if (not self.is_distributed or dist.get_rank() == 0) and \
-               self.metrics.total_steps > 0 and \
-               self.metrics.total_steps % self.config.save_every == 0:
-                self.save_checkpoint(self.metrics.total_steps) # rank 0 guarded
-
-            # Periodic inference
-            if (not self.is_distributed or dist.get_rank() == 0) and \
-               self.metrics.total_steps > 0 and \
-               self.metrics.total_steps % self.config.inference_every == 0:
-                if val_loaders is not None:
-                    print(f"\n=== Generating Inference Sample at Step {self.metrics.total_steps} (Rank 0) ===")
+                # Periodic inference
+                if val_loaders is not None and self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.inference_every == 0:
+                    print(f"\n=== Generating Inference Sample at Step {self.metrics.total_steps} ===")
                     perplexity = self.calculate_perplexity(val_loaders, max_batches=20)
-                    # Use last val_loss from metrics if available, else current val_loss if eval was just run
-                    current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (val_loss if 'val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
+                    current_val_loss = self.metrics.val_losses[-1] if self.metrics.val_losses else float('inf')
 
                     prompts = self.config.inference_prompts
                     generated_texts = self.generate_inference_sample(
@@ -644,93 +614,7 @@ class Trainer:
                     )
                     self.save_inference_sample(
                         step=self.metrics.total_steps,
-                        val_loss=current_val_loss_for_sample,
-                        perplexity=perplexity,
-                        generated_texts=generated_texts,
-                        prompts=prompts
-                    )
-            
-            # Evaluation (only on rank 0 if distributed)
-            if (not self.is_distributed or dist.get_rank() == 0) and \
-               val_loaders is not None and \
-               self.metrics.total_steps % self.config.eval_every == 0:
-                val_loss, cocktail_party_metrics = self.evaluate(val_loaders, task_configs)
-                self.metrics.update(val_loss=val_loss) # rank-local metric
-                
-                is_best = val_loss < self.metrics.best_val_loss # rank-local best
-                print(f"Validation Loss (Rank {dist.get_rank() if self.is_distributed else 0}): {val_loss:.4f} {'(Best!)' if is_best else ''}")
-                if cocktail_party_metrics:
-                    log_str = "Overall Cocktail Party Metrics: "
-                    for k, v in cocktail_party_metrics.items():
-                        log_str += f"{k}: {v:.4f}, "
-                    print(log_str)
-                
-                if is_best: # save_checkpoint itself is rank 0 guarded
-                    self.save_checkpoint(self.metrics.total_steps, is_best=True)
-
-                # Plateau detection logic
-                current_metric_val = val_loss # Assuming val_loss is the metric for now
-
-                improved = False
-                if self.config.plateau_mode == 'min':
-                    if current_metric_val < self.plateau_best_metric_val - self.config.plateau_threshold:
-                        improved = True
-                elif self.config.plateau_mode == 'max':
-                    if current_metric_val > self.plateau_best_metric_val + self.config.plateau_threshold:
-                        improved = True
-
-                if improved:
-                    self.plateau_best_metric_val = current_metric_val
-                    self.plateau_patience_counter = 0
-                    print(f"Metric improved to {current_metric_val:.4f}. Resetting plateau patience.")
-                else:
-                    self.plateau_patience_counter += 1
-                    print(f"Metric did not improve significantly. Plateau patience: {self.plateau_patience_counter}/{self.config.plateau_patience}")
-
-                if self.plateau_patience_counter >= self.config.plateau_patience:
-                    print(f"Plateau detected! Metric did not improve for {self.config.plateau_patience} evaluations.")
-                    self.plateau_patience_counter = 0 # Reset counter
-
-                    if self.steps_per_epoch is None:
-                        print("Error: self.steps_per_epoch is not set. Cannot re-initialize scheduler correctly.")
-                    else:
-                        new_T0 = math.ceil(self.steps_per_epoch * self.config.scheduler_T0_epoch_fraction)
-                        if new_T0 < 1: new_T0 = 1
-
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = self.initial_lr
-
-                        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                            self.optimizer,
-                            T_0=new_T0,
-                            T_mult=self.config.scheduler_T_mult,
-                            eta_min=self.config.learning_rate * 0.1 # Or a configured value
-                        )
-                        print(f"Scheduler re-initialized due to plateau. New T_0 = {new_T0}. LR reset to {self.initial_lr:.6f}")
-            
-            # Regular checkpoint saving & inference (only on rank 0 if distributed)
-            if (not self.is_distributed or dist.get_rank() == 0) and \
-               self.metrics.total_steps > 0 and \
-               self.metrics.total_steps % self.config.save_every == 0:
-                self.save_checkpoint(self.metrics.total_steps) # rank 0 guarded
-                
-                if val_loaders is not None:
-                    print(f"\n=== Generating Inference Sample at Step {self.metrics.total_steps} (Rank 0) ===")
-                    perplexity = self.calculate_perplexity(val_loaders, max_batches=20)
-                    # Use last val_loss from metrics if available, else current val_loss if eval was just run
-                    current_val_loss_for_sample = self.metrics.val_losses[-1] if self.metrics.val_losses else (val_loss if 'val_loss' in locals() and self.metrics.total_steps % self.config.eval_every == 0 else float('inf'))
-
-                    prompts = self.config.inference_prompts
-                    generated_texts = self.generate_inference_sample(
-                        prompts=prompts,
-                        max_length=self.config.inference_max_length,
-                        temperature=self.config.inference_temperature,
-                        top_k=self.config.inference_top_k,
-                        top_p=self.config.inference_top_p
-                    )
-                    self.save_inference_sample(
-                        step=self.metrics.total_steps,
-                        val_loss=current_val_loss_for_sample,
+                        val_loss=current_val_loss,
                         perplexity=perplexity,
                         generated_texts=generated_texts,
                         prompts=prompts
@@ -783,14 +667,11 @@ class Trainer:
             print(f"Calculated steps_per_epoch: {self.steps_per_epoch}")
 
         total_steps = self.steps_per_epoch * self.config.num_epochs
-        new_T0 = total_steps
-
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=new_T0, T_mult=1,
-            eta_min=self.config.learning_rate * 0.1
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=total_steps, eta_min=0
         )
         if not self.is_distributed or dist.get_rank() == 0:
-            print(f"Scheduler re-initialized with T_0 = {new_T0} based on total training steps.")
+            print(f"Scheduler initialized with T_max = {total_steps} for a single decay.")
 
         # Initial evaluation
         if val_loaders and (not self.is_distributed or dist.get_rank() == 0):
