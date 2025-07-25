@@ -196,7 +196,7 @@ class GPTModel(nn.Module):
                 loss = {
                     'ce': ce_loss,
                     'soft_iou': iou_loss,
-                    'entropy': entropy_loss
+                    'entropy': ent_loss
                 }
             return logits, loss
         else:
