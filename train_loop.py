@@ -293,16 +293,7 @@ class Trainer:
         if loss is None:
             return 0.0
 
-        if isinstance(loss, dict):
-            # Handle weighted combination of losses for cocktail_party task
-            total_loss = 0
-            for loss_name, loss_value in loss.items():
-                # Default weight to 1.0 if not specified in config
-                weight = task_configs.get(task_name, {}).get(f"{loss_name}_weight", 1.0)
-                total_loss += weight * loss_value
-            return total_loss
-        else:
-            return loss
+        return loss
     
     def _calculate_mask_metrics(self, logits: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
         """
@@ -501,15 +492,18 @@ class Trainer:
                     batch = next(train_iters[task_name])
 
                 loss = self.train_step(batch, task_name, task_configs)
+
+                task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
                 if isinstance(loss, dict):
-                    task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
-                    total_loss += task_weight * sum(loss.values())
-                    for k, v in loss.items():
-                        individual_losses[f"{task_name}_{k}"] = v
+                    weighted_loss = 0
+                    for loss_name, loss_value in loss.items():
+                        loss_weight = task_configs.get(task_name, {}).get(f"{loss_name}_weight", 1.0)
+                        weighted_loss += loss_weight * loss_value
+                        individual_losses[f"{task_name}_{loss_name}"] = loss_value.item()
+                    total_loss += task_weight * weighted_loss
                 else:
-                    individual_losses[task_name] = loss
-                    task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
-                    total_loss += loss * task_weight
+                    individual_losses[task_name] = loss.item()
+                    total_loss += task_weight * loss
 
             epoch_losses.append(total_loss.item())
 
@@ -550,7 +544,7 @@ class Trainer:
                 log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
                 log_str += f"Total Loss: {total_loss.item():.4f} (MA: {loss_ma:.4f}, Var: {loss_var:.4f}), "
                 for loss_name, loss_value in individual_losses.items():
-                    log_str += f"{loss_name} Loss: {loss_value.item():.4f}, "
+                    log_str += f"{loss_name}: {loss_value:.4f}, "
 
                 log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
