@@ -159,44 +159,50 @@ class GPTModel(nn.Module):
             logits = self.cocktail_party_head(x)
             loss = None
             if targets is not None:
-                probs = torch.softmax(logits, dim=-1)
-                s = probs[..., BIO_TAGS['B-ORIG']] + probs[..., BIO_TAGS['I-ORIG']]
-                g = ((targets == BIO_TAGS['B-ORIG']) | (targets == BIO_TAGS['I-ORIG'])).float()
+                pad_idx = SPECIAL_TOKENS['[PAD]']
                 eps = 1e-8
 
-                pad_idx = SPECIAL_TOKENS['[PAD]']
+                # 1) flatten everything
+                logits_flat = logits.view(-1, NUM_BIO_TAGS)    # [B·L, 3]
+                targets_flat = targets.view(-1)                # [B·L]
 
-                # 1) mask out padding
-                mask    = (targets != pad_idx)
-                logits_ = logits.view(-1, NUM_BIO_TAGS)
-                targs_  = targets.view(-1)[mask.view(-1)]
+                # 2) build a mask over the non-pad positions
+                keep_mask = (targets_flat != pad_idx)         # [B·L]
 
-                # 2) CE over all three classes, ignoring only pad
-                pos       = (targs_ != BIO_TAGS['O']).float().sum()
-                neg       = (targs_ == BIO_TAGS['O']).float().sum()
-                pos_w     = (neg/(pos+1e-8)).clamp(max=10.0).to(logits.device)
-                weight    = torch.tensor([1.0, pos_w, pos_w], device=logits.device)
-                ce_loss   = F.cross_entropy(logits_, targets.view(-1),
-                                            ignore_index=pad_idx,
-                                            weight=weight)
+                # 3) select only the valid entries
+                logits_sel = logits_flat[keep_mask]           # [N, 3]
+                targets_sel = targets_flat[keep_mask]         # [N]
 
-                # 3) Soft-IoU & entropy only on the “is-orig” prob
-                probs     = torch.softmax(logits, dim=-1)
-                s         = probs[..., BIO_TAGS['B-ORIG']] + probs[..., BIO_TAGS['I-ORIG']]
-                g_full    = ((targets==BIO_TAGS['B-ORIG'])|(targets==BIO_TAGS['I-ORIG'])).float()
-                s_valid   = s[mask]
-                g_valid   = g_full[mask]
+                # 4) recompute per-batch pos_weight
+                is_pos = (targets_sel != BIO_TAGS['O']).float()
+                pos =   is_pos.sum()
+                neg =   (1 - is_pos).sum()
+                pos_w = (neg/(pos+1e-8)).clamp(max=10.0).to(logits.device)
+                weight = torch.tensor([1.0, pos_w, pos_w], device=logits.device)
 
-                soft_inter= (s_valid * g_valid).sum()
-                soft_union= (s_valid + g_valid - s_valid*g_valid).sum()
-                iou_loss  = 1 - (soft_inter+1e-8)/(soft_union+1e-8)
+                # 5) run CE on the masked slice
+                ce_loss = F.cross_entropy(
+                    logits_sel,
+                    targets_sel,
+                    weight=weight
+                )
 
-                ent_loss  = Bernoulli(probs=s_valid).entropy().mean()
+                # 6) Soft-IoU & entropy only on the “is-orig” prob
+                probs = torch.softmax(logits, dim=-1)[..., BIO_TAGS['B-ORIG']] \
+                      + torch.softmax(logits, dim=-1)[..., BIO_TAGS['I-ORIG']]
+                probs_flat = probs.view(-1)[keep_mask]      # [N]
+                gold_flat  = is_pos                        # [N]
+
+                soft_inter= (probs_flat * gold_flat).sum()
+                soft_union= (probs_flat + gold_flat - probs_flat*gold_flat).sum()
+                iou_loss  = 1 - (soft_inter+eps)/(soft_union+eps)
+
+                entropy_loss = Bernoulli(probs=probs_flat).entropy().mean()
 
                 loss = {
                     'ce': ce_loss,
                     'soft_iou': iou_loss,
-                    'entropy': ent_loss
+                    'entropy': entropy_loss
                 }
             return logits, loss
         else:
