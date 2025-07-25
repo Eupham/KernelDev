@@ -181,10 +181,10 @@ class GPTModel(nn.Module):
                 soft_union = (s + g - s * g).sum(dim=1)
                 iou_loss = 1 - ((soft_inter + eps) / (soft_union + eps)).mean()
 
-                # --- 3) Entropy over all tokens ---
+                # --- 3) Entropy over all tokens (to be MINIMIZED) ---
                 p_all = torch.clamp(s, min=eps, max=1 - eps)
                 ent = - (p_all * torch.log2(p_all) + (1 - p_all) * torch.log2(1 - p_all))
-                entropy = -ent.mean()
+                entropy = ent.mean()
 
                 loss = {
                     'bce': bce,
