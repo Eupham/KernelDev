@@ -172,9 +172,14 @@ class GPTModel(nn.Module):
                     neg_count = (1 - g).sum()
                     global_pos_weight = (neg_count / (pos_count + 1e-8)).clamp(max=10.0)
 
-                # --- 1) Cross-entropy as binary BCEWithLogits ---
-                logit_mask = torch.log(s / (1 - s + eps) + eps)
-                bce = F.binary_cross_entropy_with_logits(logit_mask, g, pos_weight=global_pos_weight)
+                # --- 1) 3-class Cross-Entropy Loss ---
+                pos_weight = global_pos_weight if global_pos_weight is not None else torch.tensor(1.0, device=logits.device)
+                ce_loss = F.cross_entropy(
+                    logits.view(-1, NUM_BIO_TAGS),
+                    targets.view(-1),
+                    ignore_index=BIO_TAGS['O'],
+                    weight=torch.tensor([1.0, pos_weight, pos_weight], device=logits.device)
+                )
 
                 # --- 2) Soft-IoU ---
                 soft_inter = (s * g).sum(dim=1)
@@ -184,12 +189,12 @@ class GPTModel(nn.Module):
                 # --- 3) Entropy over all tokens (to be MINIMIZED) ---
                 p_all = torch.clamp(s, min=eps, max=1 - eps)
                 ent = - (p_all * torch.log2(p_all) + (1 - p_all) * torch.log2(1 - p_all))
-                entropy = ent.mean()
+                entropy_loss = ent.mean()
 
                 loss = {
-                    'bce': bce,
+                    'ce': ce_loss,
                     'soft_iou': iou_loss,
-                    'entropy': entropy
+                    'entropy': entropy_loss
                 }
             return logits, loss
         else:
