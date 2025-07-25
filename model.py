@@ -184,7 +184,7 @@ class GPTModel(nn.Module):
                 # --- 3) Entropy over all tokens ---
                 p_all = torch.clamp(s, min=eps, max=1 - eps)
                 ent = - (p_all * torch.log2(p_all) + (1 - p_all) * torch.log2(1 - p_all))
-                entropy = ent.mean()
+                entropy = -ent.mean()
 
                 loss = {
                     'bce': bce,
