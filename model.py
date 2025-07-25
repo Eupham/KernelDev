@@ -194,9 +194,9 @@ class GPTModel(nn.Module):
                 ent_loss  = Bernoulli(probs=s_valid).entropy().mean()
 
                 loss = {
-                  'ce':       ce_loss,
-                  'soft_iou': iou_loss,
-                  'entropy':  entropy_loss
+                    'ce': ce_loss,
+                    'soft_iou': iou_loss,
+                    'entropy': entropy_loss
                 }
             return logits, loss
         else:
