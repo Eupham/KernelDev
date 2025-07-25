@@ -522,7 +522,8 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
             
-            # Update learning rate scheduler
+            # Update optimizer and learning rate scheduler
+            self.optimizer.step()
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
             

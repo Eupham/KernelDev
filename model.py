@@ -86,8 +86,6 @@ class TransformerBlock(nn.Module):
 from data_builder import NUM_BIO_TAGS, SPECIAL_TOKENS, BIO_TAGS
 from torch.distributions import Bernoulli
 
-global_pos_weight = None
-
 class GPTModel(nn.Module):
     """GPT-styled model using flash attention kernel."""
     
@@ -161,41 +159,39 @@ class GPTModel(nn.Module):
             logits = self.cocktail_party_head(x)
             loss = None
             if targets is not None:
-                global global_pos_weight
                 probs = torch.softmax(logits, dim=-1)
                 s = probs[..., BIO_TAGS['B-ORIG']] + probs[..., BIO_TAGS['I-ORIG']]
                 g = ((targets == BIO_TAGS['B-ORIG']) | (targets == BIO_TAGS['I-ORIG'])).float()
                 eps = 1e-8
 
-                if global_pos_weight is None:
-                    pos_count = g.sum()
-                    neg_count = (1 - g).sum()
-                    global_pos_weight = (neg_count / (pos_count + 1e-8)).clamp(max=10.0)
+                pad_idx = SPECIAL_TOKENS['[PAD]']
 
-                # 1) compute probabilities and mask
-                pad_m   = (targets != SPECIAL_TOKENS['[PAD]'])
-                valid   = pad_m
-                p_valid = s[valid]
-                g_valid = g[valid]
+                # 1) mask out padding
+                mask    = (targets != pad_idx)
+                logits_ = logits.view(-1, NUM_BIO_TAGS)
+                targs_  = targets.view(-1)[mask.view(-1)]
 
-                # 2) cross-entropy on the full 3-way logits
-                pos_w = (1 - g_valid).sum() / (g_valid.sum() + 1e-8)
-                pos_w = pos_w.clamp(max=10.0).item()
-                weight = torch.tensor([1.0, pos_w, pos_w], dtype=logits.dtype, device=logits.device)
-                ce_loss = F.cross_entropy(
-                    logits.view(-1, NUM_BIO_TAGS),
-                    targets.view(-1),
-                    ignore_index=BIO_TAGS['O'],
-                    weight=weight
-                )
+                # 2) CE over all three classes, ignoring only pad
+                pos       = (targs_ != BIO_TAGS['O']).float().sum()
+                neg       = (targs_ == BIO_TAGS['O']).float().sum()
+                pos_w     = (neg/(pos+1e-8)).clamp(max=10.0).to(logits.device)
+                weight    = torch.tensor([1.0, pos_w, pos_w], device=logits.device)
+                ce_loss   = F.cross_entropy(logits_, targets.view(-1),
+                                            ignore_index=pad_idx,
+                                            weight=weight)
 
-                # 3) soft-IoU
-                soft_inter = (p_valid * g_valid).sum()
-                soft_union = (p_valid + g_valid - p_valid*g_valid).sum()
-                iou_loss   = 1 - (soft_inter + eps)/(soft_union + eps)
+                # 3) Soft-IoU & entropy only on the “is-orig” prob
+                probs     = torch.softmax(logits, dim=-1)
+                s         = probs[..., BIO_TAGS['B-ORIG']] + probs[..., BIO_TAGS['I-ORIG']]
+                g_full    = ((targets==BIO_TAGS['B-ORIG'])|(targets==BIO_TAGS['I-ORIG'])).float()
+                s_valid   = s[mask]
+                g_valid   = g_full[mask]
 
-                # 4) entropy regularizer (numerically stable)
-                entropy_loss = Bernoulli(probs=p_valid).entropy().mean()
+                soft_inter= (s_valid * g_valid).sum()
+                soft_union= (s_valid + g_valid - s_valid*g_valid).sum()
+                iou_loss  = 1 - (soft_inter+1e-8)/(soft_union+1e-8)
+
+                ent_loss  = Bernoulli(probs=s_valid).entropy().mean()
 
                 loss = {
                   'ce':       ce_loss,
