@@ -172,29 +172,35 @@ class GPTModel(nn.Module):
                     neg_count = (1 - g).sum()
                     global_pos_weight = (neg_count / (pos_count + 1e-8)).clamp(max=10.0)
 
-                # --- 1) 3-class Cross-Entropy Loss ---
-                pos_weight = global_pos_weight if global_pos_weight is not None else torch.tensor(1.0, device=logits.device)
+                # 1) compute probabilities and mask
+                pad_m   = (targets != SPECIAL_TOKENS['[PAD]'])
+                valid   = pad_m
+                p_valid = s[valid]
+                g_valid = g[valid]
+
+                # 2) cross-entropy on the full 3-way logits
+                pos_w = (1 - g_valid).sum() / (g_valid.sum() + 1e-8)
+                pos_w = pos_w.clamp(max=10.0).item()
+                weight = torch.tensor([1.0, pos_w, pos_w], dtype=logits.dtype, device=logits.device)
                 ce_loss = F.cross_entropy(
                     logits.view(-1, NUM_BIO_TAGS),
                     targets.view(-1),
                     ignore_index=BIO_TAGS['O'],
-                    weight=torch.tensor([1.0, pos_weight, pos_weight], device=logits.device)
+                    weight=weight
                 )
 
-                # --- 2) Soft-IoU ---
-                soft_inter = (s * g).sum(dim=1)
-                soft_union = (s + g - s * g).sum(dim=1)
-                iou_loss = 1 - ((soft_inter + eps) / (soft_union + eps)).mean()
+                # 3) soft-IoU
+                soft_inter = (p_valid * g_valid).sum()
+                soft_union = (p_valid + g_valid - p_valid*g_valid).sum()
+                iou_loss   = 1 - (soft_inter + eps)/(soft_union + eps)
 
-                # --- 3) Entropy over all tokens (to be MINIMIZED) ---
-                p_all = torch.clamp(s, min=eps, max=1 - eps)
-                ent = - (p_all * torch.log2(p_all) + (1 - p_all) * torch.log2(1 - p_all))
-                entropy_loss = ent.mean()
+                # 4) entropy regularizer (numerically stable)
+                entropy_loss = Bernoulli(probs=p_valid).entropy().mean()
 
                 loss = {
-                    'ce': ce_loss,
-                    'soft_iou': iou_loss,
-                    'entropy': entropy_loss
+                  'ce':       ce_loss,
+                  'soft_iou': iou_loss,
+                  'entropy':  entropy_loss
                 }
             return logits, loss
         else:
