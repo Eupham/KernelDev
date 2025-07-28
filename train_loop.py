@@ -325,13 +325,16 @@ class Trainer:
         soft_union = (s + g - s * g).sum(dim=1)
         soft_iou = ((soft_inter + eps) / (soft_union + eps)).mean().item()
 
-        # ----- BEGIN 3‑WAY CATEGORICAL ENTROPY -----
-        # logits: [B, T, 3]  →  probs3: [B, T, 3]
-        probs3 = torch.softmax(logits, dim=-1)
-        # per‑token entropy H = -sum_c p_c log p_c
-        ent3 = -(probs3 * torch.log(probs3 + eps)).sum(dim=-1)  # [B, T]
-        entropy = ent3.mean().item()
-        # -----  END 3‑WAY CATEGORICAL ENTROPY -----
+        # ----- BEGIN 3‑WAY CATEGORICAL ENTROPY (stable) -----
+        # Flatten to [B*T, 3]
+        flat_logits = logits.view(-1, logits.size(-1))
+        # log_probs via log_softmax is more stable than softmax→log
+        log_probs = F.log_softmax(flat_logits, dim=-1)      # [B*T, 3]
+        probs     = log_probs.exp()                         # [B*T, 3]
+        # per‑token entropy:  -∑ p_c * log p_c
+        ent = -(probs * log_probs).sum(dim=-1)              # [B*T]
+        entropy = ent.mean().item()
+        # -----  END 3‑WAY CATEGORICAL ENTROPY  -----
 
         return {
             'iou': iou,
