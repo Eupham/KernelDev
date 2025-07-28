@@ -159,7 +159,7 @@ class GPTModel(nn.Module):
             logits = self.cocktail_party_head(x)
             loss = None
             if targets is not None:
-                pad_label = SPECIAL_TOKENS['[PAD]']
+                pad_label = BIO_TAGS['PAD']
                 eps = 1e-8
 
                 # Flatten logits and targets
@@ -168,6 +168,8 @@ class GPTModel(nn.Module):
 
                 # Select only real labels
                 keep = (targets_flat != pad_label)
+                num_real = keep.sum().item()
+                assert num_real > 0, "No non-pad tokens in this batch!"
                 if keep.any():
                     # Compute frequency of each class: O, B-ORIG, I-ORIG
                     freq = torch.bincount(targets_flat[keep].long(), minlength=NUM_BIO_TAGS).float()
