@@ -159,7 +159,7 @@ class GPTModel(nn.Module):
             logits = self.cocktail_party_head(x)
             loss = None
             if targets is not None:
-                pad_label = BIO_TAGS['PAD']
+                pad_label = SPECIAL_TOKENS['[PAD]']
                 eps = 1e-8
 
                 # Flatten logits and targets
