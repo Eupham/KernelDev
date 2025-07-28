@@ -797,6 +797,8 @@ class Trainer:
         
         with torch.no_grad():
             for task_name, dataloader in dataloaders.items():
+                if task_name == 'cocktail_party':
+                    continue
                 for batch_idx, batch in enumerate(dataloader):
                     if max_batches is not None and batch_idx >= max_batches:
                         break
@@ -806,9 +808,9 @@ class Trainer:
                     
                     if self.config.use_amp and self.config.scaler is not None:
                         with torch.amp.autocast('cuda'):
-                            logits, loss = self.model(x, y)
+                            logits, loss = self.model(x, targets=y, task_name=task_name)
                     else:
-                        logits, loss = self.model(x, y)
+                        logits, loss = self.model(x, targets=y, task_name=task_name)
 
                     if loss is not None:
                         total_loss += loss.item()
