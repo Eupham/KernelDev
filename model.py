@@ -162,43 +162,47 @@ class GPTModel(nn.Module):
                 pad_idx = SPECIAL_TOKENS['[PAD]']
                 eps = 1e-8
 
-                # 1) flatten everything
-                logits_flat = logits.view(-1, NUM_BIO_TAGS)
+                # flatten everything
+                logits_flat  = logits.view(-1, NUM_BIO_TAGS)
                 targets_flat = targets.view(-1)
+                keep_mask    = (targets_flat != pad_idx)
 
-                # 2) recompute per-batch pos_weight
-                keep_mask = (targets_flat != pad_idx)
-                targets_sel = targets_flat[keep_mask]
-                is_pos = (targets_sel != BIO_TAGS['O']).float()
-                pos = is_pos.sum()
-                neg = (1 - is_pos).sum()
-                pos_w = (neg/(pos+1e-8)).clamp(max=10.0).to(logits.device)
-                weight = torch.tensor([1.0, pos_w, pos_w], device=logits.device)
+                # --- 1) CE with ignore_index is okay, but still guard zero‐nonpad
+                if keep_mask.any():
+                    targets_sel = targets_flat[keep_mask]
+                    is_pos = (targets_sel != BIO_TAGS['O']).float()
+                    pos = is_pos.sum()
+                    neg = (1 - is_pos).sum()
+                    pos_w = (neg/(pos+1e-8)).clamp(max=10.0).to(logits.device)
+                    weight = torch.tensor([1.0, pos_w, pos_w], device=logits.device)
+                    ce_loss = F.cross_entropy(
+                        logits_flat,
+                        targets_flat,
+                        ignore_index=pad_idx,
+                        weight=weight
+                    )
+                else:
+                    ce_loss = torch.tensor(0.0, device=logits.device)
 
-                # 3) run CE on the full flattened tensors, ignoring pad_idx
-                ce_loss = F.cross_entropy(
-                    logits_flat,
-                    targets_flat,
-                    ignore_index=pad_idx,
-                    weight=weight
-                )
+                # --- 2) Soft‑IoU & entropy only when there’s at least one non‑pad
+                if keep_mask.any():
+                    probs     = torch.softmax(logits, dim=-1)[..., BIO_TAGS['B-ORIG']] \
+                              + torch.softmax(logits, dim=-1)[..., BIO_TAGS['I-ORIG']]
+                    probs_flat = probs.view(-1)[keep_mask]
+                    gold_flat  = (targets_flat[keep_mask] != BIO_TAGS['O']).float()
 
-                # 6) Soft-IoU & entropy only on the “is-orig” prob
-                probs = torch.softmax(logits, dim=-1)[..., BIO_TAGS['B-ORIG']] \
-                      + torch.softmax(logits, dim=-1)[..., BIO_TAGS['I-ORIG']]
-                probs_flat = probs.view(-1)[keep_mask]      # [N]
-                gold_flat  = is_pos                        # [N]
-
-                soft_inter= (probs_flat * gold_flat).sum()
-                soft_union= (probs_flat + gold_flat - probs_flat*gold_flat).sum()
-                iou_loss  = 1 - (soft_inter+eps)/(soft_union+eps)
-
-                entropy_loss = Bernoulli(probs=probs_flat).entropy().mean()
+                    soft_inter  = (probs_flat * gold_flat).sum()
+                    soft_union  = (probs_flat + gold_flat - probs_flat * gold_flat).sum()
+                    iou_loss    = 1 - (soft_inter + eps) / (soft_union + eps)
+                    entropy_loss= Bernoulli(probs=probs_flat).entropy().mean()
+                else:
+                    iou_loss     = torch.tensor(0.0, device=logits.device)
+                    entropy_loss = torch.tensor(0.0, device=logits.device)
 
                 loss = {
-                    'ce': ce_loss,
+                    'ce':       ce_loss,
                     'soft_iou': iou_loss,
-                    'entropy': entropy_loss
+                    'entropy':  entropy_loss
                 }
             return logits, loss
         else:

@@ -516,15 +516,14 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.config.scaler.step(self.optimizer)
                 self.config.scaler.update()
-                if self.scheduler is not None:
-                    self.scheduler.step()
             else:
                 total_loss.backward()
                 if self.config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
-                if self.scheduler is not None:
-                    self.scheduler.step()
+
+            if self.scheduler is not None:
+                self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
             
             # Update metrics
