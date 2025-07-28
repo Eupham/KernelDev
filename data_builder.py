@@ -10,8 +10,9 @@ BIO_TAGS = {
     'O': 0,
     'B-ORIG': 1,
     'I-ORIG': 2,
+    'PAD': -100,
 }
-NUM_BIO_TAGS = len(BIO_TAGS)
+NUM_BIO_TAGS = 3
 
 SPECIAL_TOKENS = {
     '[PAD]': 0,
@@ -436,7 +437,7 @@ class DataBuilder:
             seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_sequence))
             final_sequence += seq_padding
 
-            target_padding = [BIO_TAGS['O']] * (self.seq_len - len(final_target_bio))
+            target_padding = [BIO_TAGS['PAD']] * (self.seq_len - len(final_target_bio))
             final_target_bio += target_padding
 
             new_batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
