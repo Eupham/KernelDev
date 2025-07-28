@@ -325,9 +325,13 @@ class Trainer:
         soft_union = (s + g - s * g).sum(dim=1)
         soft_iou = ((soft_inter + eps) / (soft_union + eps)).mean().item()
 
-        # Entropy of the probabilities
-        p = torch.clamp(s.float(), min=eps, max=1.0 - eps)
-        entropy = Bernoulli(probs=p).entropy().mean().item()
+        # ----- BEGIN 3‑WAY CATEGORICAL ENTROPY -----
+        # logits: [B, T, 3]  →  probs3: [B, T, 3]
+        probs3 = torch.softmax(logits, dim=-1)
+        # per‑token entropy H = -sum_c p_c log p_c
+        ent3 = -(probs3 * torch.log(probs3 + eps)).sum(dim=-1)  # [B, T]
+        entropy = ent3.mean().item()
+        # -----  END 3‑WAY CATEGORICAL ENTROPY -----
 
         return {
             'iou': iou,
