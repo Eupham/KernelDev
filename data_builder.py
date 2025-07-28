@@ -426,9 +426,13 @@ class DataBuilder:
 
             # Pad spans
             padded_spans = []
-            max_span_len = max(len(s) for s in spans)
+            #This is the source of the bug, this should be batch-wide
+            max_len_for_a_given_span_in_batch = 0
+            if spans:
+                max_len_for_a_given_span_in_batch = max(len(s) for s in spans)
+
             for s in spans:
-                padded_s = s + [SPECIAL_TOKENS['[PAD]']] * (max_span_len - len(s))
+                padded_s = s + [SPECIAL_TOKENS['[PAD]']] * (max_len_for_a_given_span_in_batch - len(s))
                 padded_spans.append(padded_s)
 
             batch_inputs.append(torch.tensor(masked_sequence, dtype=torch.long))
@@ -439,8 +443,23 @@ class DataBuilder:
             # If no valid samples were created, return empty tensors
             return torch.empty(0), torch.empty(0), torch.empty(0)
 
+        # Pad all span tensors in the batch to the same size
+        max_batch_span_len = 0
+        if batch_spans:
+            max_batch_span_len = max(s.size(1) for s in batch_spans)
+
+        padded_batch_spans = []
+        for s in batch_spans:
+            padding_size = max_batch_span_len - s.size(1)
+            if padding_size > 0:
+                # Pad on the right (dim 1)
+                padded_s = torch.nn.functional.pad(s, (0, padding_size), 'constant', SPECIAL_TOKENS['[PAD]'])
+                padded_batch_spans.append(padded_s)
+            else:
+                padded_batch_spans.append(s)
+
         inputs = torch.stack(batch_inputs)
-        spans = torch.stack(batch_spans)
+        spans = torch.stack(padded_batch_spans)
         correct_indices = torch.stack(batch_correct_indices)
 
         return inputs, spans, correct_indices
