@@ -127,9 +127,6 @@ class GPTModel(nn.Module):
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
         
-        # Head for cocktail party BIO tagging
-        self.cocktail_party_head = nn.Linear(dim, NUM_BIO_TAGS, bias=False)
-
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
@@ -138,60 +135,42 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None):
+    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
         pos = torch.arange(0, seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
         
         # Token and position embeddings
-        x = self.token_emb(x) + self.pos_emb(pos)
+        x_embed = self.token_emb(x) + self.pos_emb(pos)
         
         # Apply transformer blocks
         for block in self.blocks:
-            x = block(x)
+            x_embed = block(x_embed)
         
         # Final normalization
-        x = self.norm_out(x)
+        x_embed = self.norm_out(x_embed)
         
         if task_name == 'cocktail_party':
-            # Cocktail party task (BIO tagging)
-            logits = self.cocktail_party_head(x)
+            # Find [MASK] token positions
+            mask_pos = (x == SPECIAL_TOKENS['[MASK]']).nonzero(as_tuple=True)[1]
+            h_context = x_embed[torch.arange(batch_size), mask_pos]
+
+            # Embed spans
+            spans_embed = self.token_emb(spans)
+            h_spans = spans_embed.mean(dim=2)
+
+            # Compute scores
+            scores = (h_context.unsqueeze(1) * h_spans).sum(-1)
+
             loss = None
-            if targets is not None:
-                pad_label = BIO_TAGS['PAD']
-                eps = 1e-8
+            if correct_idx is not None:
+                loss = F.cross_entropy(scores, correct_idx)
 
-                # Flatten logits and targets
-                logits_flat  = logits.view(-1, NUM_BIO_TAGS)
-                targets_flat = targets.view(-1)
-
-                # Select only real labels
-                keep = (targets_flat != pad_label)
-                num_real = keep.sum().item()
-                assert num_real > 0, "No non-pad tokens in this batch!"
-                if keep.any():
-                    # Compute frequency of each class: O, B-ORIG, I-ORIG
-                    freq = torch.bincount(targets_flat[keep].long(), minlength=NUM_BIO_TAGS).float()
-                    total = freq.sum()
-                    # Inverse-frequency weight, clamped to [0.1, 10]
-                    class_weight = ((total - freq) / (freq + 1e-8)).clamp(min=0.1, max=10.0).to(logits.device)
-
-                    # Cross‑entropy with true pad ignore and balanced weights
-                    ce_loss = F.cross_entropy(
-                        logits_flat,
-                        targets_flat,
-                        ignore_index=pad_label,
-                        weight=class_weight
-                    )
-                else:
-                    ce_loss = torch.tensor(0.0, device=logits.device)
-
-                loss = {'ce': ce_loss}
-            return logits, loss
+            return scores, loss
         else:
             # Teacher forcing task (generative)
-            logits = self.head(x)
+            logits = self.head(x_embed)
             loss = None
             if targets is not None:
                 # Compute cross-entropy loss

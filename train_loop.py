@@ -279,95 +279,37 @@ class Trainer:
             return self.config.learning_rate * step / self.config.warmup_steps
         return self.config.learning_rate
     
-    def train_step(self, batch: Tuple[torch.Tensor, torch.Tensor], task_name: str, task_configs: Dict[str, Any]) -> float:
+    def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step."""
-        x, y = batch
-        x, y = x.to(self.config.device), y.to(self.config.device)
-        
-        if self.config.use_amp and self.config.scaler is not None:
-            with torch.amp.autocast('cuda'):
-                logits, loss = self.model(x, y, task_name=task_name)
+        if task_name == 'cocktail_party':
+            inputs, spans, correct_idx = batch
+            inputs, spans, correct_idx = inputs.to(self.config.device), spans.to(self.config.device), correct_idx.to(self.config.device)
+
+            if self.config.use_amp and self.config.scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
+            else:
+                scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
         else:
-            logits, loss = self.model(x, y, task_name=task_name)
+            x, y = batch
+            x, y = x.to(self.config.device), y.to(self.config.device)
+
+            if self.config.use_amp and self.config.scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    logits, loss = self.model(x, targets=y, task_name=task_name)
+            else:
+                logits, loss = self.model(x, targets=y, task_name=task_name)
 
         if loss is None:
             return 0.0
 
         return loss
-    
-    def _calculate_mask_metrics(self, logits: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
-        """
-        Calculates IoU, Precision, Recall, Soft-IoU, and Entropy for the cocktail party task for logging.
-        """
-        # Get the probabilities for the positive class (B-ORIG or I-ORIG)
-        probs = torch.softmax(logits, dim=-1)
-        s = probs[..., BIO_TAGS['B-ORIG']] + probs[..., BIO_TAGS['I-ORIG']]
 
-        # Create the ground truth mask G
-        g = ((y == BIO_TAGS['B-ORIG']) | (y == BIO_TAGS['I-ORIG'])).float()
-
-        # Hard mask m for IoU, precision, and recall
-        m = (s > 0.5).float()
-
-        eps = 1e-8
-
-        # IoU, Precision, F1 Score (using hard mask)
-        inter = (m * g).sum(dim=1)
-        union = (m + g).clamp(min=0, max=1).sum(dim=1)
-        iou = ((inter + eps) / (union + eps)).mean().item()
-        precision = ((inter + eps) / (m.sum(dim=1) + eps)).mean()
-        recall = ((inter + eps) / (g.sum(dim=1) + eps)).mean()
-        f1_score = (2 * precision * recall / (precision + recall + eps)).item()
-        precision = precision.item()
-
-        # Soft-IoU (using probabilities)
-        soft_inter = (s * g).sum(dim=1)
-        soft_union = (s + g - s * g).sum(dim=1)
-        soft_iou = ((soft_inter + eps) / (soft_union + eps)).mean().item()
-
-        # ----- BEGIN 3‑WAY CATEGORICAL ENTROPY (stable) -----
-        # Flatten to [B*T, 3]
-        flat_logits = logits.view(-1, logits.size(-1))
-        # log_probs via log_softmax is more stable than softmax→log
-        log_probs = F.log_softmax(flat_logits, dim=-1)      # [B*T, 3]
-        probs3     = log_probs.exp()                         # [B*T, 3]
-        # per‑token entropy:  -∑ p_c * log p_c
-        ent = -(probs3 * log_probs).sum(dim=-1)              # [B*T]
-
-        # Identify spans
-        predicted_tags = torch.argmax(logits, dim=-1)
-        span_entropies = []
-        for i in range(predicted_tags.shape[0]): # Iterate over batch
-            is_in_span = False
-            current_span_entropy = []
-            for j in range(predicted_tags.shape[1]): # Iterate over sequence
-                if predicted_tags[i,j] == BIO_TAGS['B-ORIG']:
-                    if is_in_span: # End of previous span
-                        if current_span_entropy:
-                            span_entropies.append(np.mean(current_span_entropy))
-                    is_in_span = True
-                    current_span_entropy = [ent.view(logits.shape[0], logits.shape[1])[i,j].item()]
-                elif predicted_tags[i,j] == BIO_TAGS['I-ORIG'] and is_in_span:
-                    current_span_entropy.append(ent.view(logits.shape[0], logits.shape[1])[i,j].item())
-                else:
-                    if is_in_span: # End of span
-                        if current_span_entropy:
-                            span_entropies.append(np.mean(current_span_entropy))
-                    is_in_span = False
-                    current_span_entropy = []
-            if is_in_span and current_span_entropy: # End of sequence
-                span_entropies.append(np.mean(current_span_entropy))
-
-        entropy = np.mean(span_entropies) if span_entropies else 0.0
-        # -----  END 3‑WAY CATEGORICAL ENTROPY  -----
-
-        return {
-            'iou': iou,
-            'precision': precision,
-            'f1_score': f1_score,
-            'soft_iou': soft_iou,
-            'entropy': entropy,
-        }
+    def _calculate_accuracy(self, scores: torch.Tensor, correct_idx: torch.Tensor) -> Dict[str, float]:
+        """Calculates accuracy for the contrastive task."""
+        predicted_idx = torch.argmax(scores, dim=1)
+        accuracy = (predicted_idx == correct_idx).float().mean().item()
+        return {'accuracy': accuracy}
 
     def evaluate(self, dataloaders: Dict[str, DataLoader], task_configs: Dict[str, Any], max_batches: Optional[int] = 50, task_to_evaluate: Optional[str] = None) -> Tuple[float, Dict[str, float]]:
         """Evaluate the model on a dataset."""
@@ -386,14 +328,31 @@ class Trainer:
                             print(f"Evaluation for task {task_name} limited to {max_batches} batches for speed")
                         break
 
-                    x, y = batch
-                    x, y = x.to(self.config.device), y.to(self.config.device)
-                    
-                    if self.config.use_amp:
-                        with torch.amp.autocast('cuda'):
-                            logits, loss = self.model(x, y, task_name=task_name)
+                    loss = None
+                    if task_name == 'cocktail_party':
+                        inputs, spans, correct_idx = batch
+                        inputs, spans, correct_idx = inputs.to(self.config.device), spans.to(self.config.device), correct_idx.to(self.config.device)
+                        if self.config.use_amp:
+                            with torch.amp.autocast('cuda'):
+                                scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
+                        else:
+                            scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
+
+                        if loss is not None:
+                            metrics = self._calculate_accuracy(scores, correct_idx)
+                            for k, v in metrics.items():
+                                if k not in cocktail_party_metrics:
+                                    cocktail_party_metrics[k] = []
+                                cocktail_party_metrics[k].append(v)
                     else:
-                        logits, loss = self.model(x, y, task_name=task_name)
+                        x, y = batch
+                        x, y = x.to(self.config.device), y.to(self.config.device)
+
+                        if self.config.use_amp:
+                            with torch.amp.autocast('cuda'):
+                                logits, loss = self.model(x, targets=y, task_name=task_name)
+                        else:
+                            logits, loss = self.model(x, targets=y, task_name=task_name)
 
                     if loss is not None:
                         if isinstance(loss, dict):
@@ -405,13 +364,6 @@ class Trainer:
                         else:
                             total_loss += loss.item()
                         num_batches += 1
-
-                        if task_name == 'cocktail_party':
-                            metrics = self._calculate_mask_metrics(logits, y)
-                            for k, v in metrics.items():
-                                if k not in cocktail_party_metrics:
-                                    cocktail_party_metrics[k] = []
-                                cocktail_party_metrics[k].append(v)
 
         self.model.train()
 

@@ -383,8 +383,10 @@ class DataBuilder:
         min_span_size = task_config.get('min_span_size', 10)
         max_span_size = task_config.get('max_span_size', 50)
 
-        new_batch_inputs = []
-        new_batch_targets = []
+        batch_inputs = []
+        batch_spans = []
+        batch_correct_indices = []
+
         for i in range(len(batch)):
             original_tokens, _ = batch[i]
             original_tokens = original_tokens.tolist()
@@ -393,7 +395,7 @@ class DataBuilder:
             if len(original_tokens) <= span_size:
                 continue
             span_start = random.randint(0, len(original_tokens) - span_size)
-            span = original_tokens[span_start : span_start + span_size]
+            true_span = original_tokens[span_start : span_start + span_size]
 
             distractors = []
             for _ in range(num_distractors):
@@ -406,46 +408,42 @@ class DataBuilder:
                 distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
                 distractors.append(distractor_span)
 
+            if not distractors:
+                continue
+
             masked_sequence = original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
 
-            # Create target BIO sequence for the masked sequence
-            target_bio = [BIO_TAGS['O']] * len(masked_sequence)
+            all_spans_with_labels = [(true_span, 1)] + [(d, 0) for d in distractors]
+            random.shuffle(all_spans_with_labels)
 
-            all_spans = [(span, 1)] + [(d, 0) for d in distractors]
-            random.shuffle(all_spans)
+            spans, is_positive = zip(*all_spans_with_labels)
+            correct_idx = is_positive.index(1)
 
-            final_sequence = masked_sequence
-            final_target_bio = target_bio
+            # Pad masked_sequence
+            masked_sequence = masked_sequence[:self.seq_len]
+            seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(masked_sequence))
+            masked_sequence += seq_padding
 
-            for s, is_correct in all_spans:
-                span_len = len(s)
-                final_sequence.extend(self._tokenize_text(f"[SPAN]{self.decode_tokens(s, skip_special_tokens=True)}[ES]"))
+            # Pad spans
+            padded_spans = []
+            max_span_len = max(len(s) for s in spans)
+            for s in spans:
+                padded_s = s + [SPECIAL_TOKENS['[PAD]']] * (max_span_len - len(s))
+                padded_spans.append(padded_s)
 
-                # Update BIO tags
-                if is_correct:
-                    bio_tags = [BIO_TAGS['B-ORIG']] + [BIO_TAGS['I-ORIG']] * (span_len - 1)
-                else:
-                    bio_tags = [BIO_TAGS['O']] * span_len
+            batch_inputs.append(torch.tensor(masked_sequence, dtype=torch.long))
+            batch_spans.append(torch.tensor(padded_spans, dtype=torch.long))
+            batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
 
-                final_target_bio += [BIO_TAGS['O']] + bio_tags + [BIO_TAGS['O']]
+        if not batch_inputs:
+            # If no valid samples were created, return empty tensors
+            return torch.empty(0), torch.empty(0), torch.empty(0)
 
+        inputs = torch.stack(batch_inputs)
+        spans = torch.stack(batch_spans)
+        correct_indices = torch.stack(batch_correct_indices)
 
-            # Truncate and pad
-            final_sequence = final_sequence[:self.seq_len]
-            final_target_bio = final_target_bio[:self.seq_len]
-
-            seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_sequence))
-            final_sequence += seq_padding
-
-            target_padding = [BIO_TAGS['PAD']] * (self.seq_len - len(final_target_bio))
-            final_target_bio += target_padding
-
-            new_batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
-            new_batch_targets.append(torch.tensor(final_target_bio, dtype=torch.long))
-
-        inputs = torch.stack(new_batch_inputs)
-        targets = torch.stack(new_batch_targets)
-        return inputs, targets
+        return inputs, spans, correct_indices
 
 
     def create_dataloaders(
