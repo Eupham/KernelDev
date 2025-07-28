@@ -330,10 +330,35 @@ class Trainer:
         flat_logits = logits.view(-1, logits.size(-1))
         # log_probs via log_softmax is more stable than softmax→log
         log_probs = F.log_softmax(flat_logits, dim=-1)      # [B*T, 3]
-        probs     = log_probs.exp()                         # [B*T, 3]
+        probs3     = log_probs.exp()                         # [B*T, 3]
         # per‑token entropy:  -∑ p_c * log p_c
-        ent = -(probs * log_probs).sum(dim=-1)              # [B*T]
-        entropy = ent.mean().item()
+        ent = -(probs3 * log_probs).sum(dim=-1)              # [B*T]
+
+        # Identify spans
+        predicted_tags = torch.argmax(logits, dim=-1)
+        span_entropies = []
+        for i in range(predicted_tags.shape[0]): # Iterate over batch
+            is_in_span = False
+            current_span_entropy = []
+            for j in range(predicted_tags.shape[1]): # Iterate over sequence
+                if predicted_tags[i,j] == BIO_TAGS['B-ORIG']:
+                    if is_in_span: # End of previous span
+                        if current_span_entropy:
+                            span_entropies.append(np.mean(current_span_entropy))
+                    is_in_span = True
+                    current_span_entropy = [ent.view(logits.shape[0], logits.shape[1])[i,j].item()]
+                elif predicted_tags[i,j] == BIO_TAGS['I-ORIG'] and is_in_span:
+                    current_span_entropy.append(ent.view(logits.shape[0], logits.shape[1])[i,j].item())
+                else:
+                    if is_in_span: # End of span
+                        if current_span_entropy:
+                            span_entropies.append(np.mean(current_span_entropy))
+                    is_in_span = False
+                    current_span_entropy = []
+            if is_in_span and current_span_entropy: # End of sequence
+                span_entropies.append(np.mean(current_span_entropy))
+
+        entropy = np.mean(span_entropies) if span_entropies else 0.0
         # -----  END 3‑WAY CATEGORICAL ENTROPY  -----
 
         return {
