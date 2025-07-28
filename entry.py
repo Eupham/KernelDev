@@ -330,16 +330,15 @@ def start_actual_training(cli_args):
 
     if 'train' in dataloaders and 'cocktail_party' in dataloaders['train']:
         print("\n=== Data Sample (Cocktail Party) ===")
-        for x, y in dataloaders['train']['cocktail_party']:
-            print(f"Batch shape: {x.shape}")
-            print(f"Sample tokens: {x[0][:20].tolist()}")
-            if y.dim() == 0:
-                print(f"Sample targets: {y.tolist()}")
-            else:
-                print(f"Sample targets: {y[0][:20].tolist()}")
+        for batch in dataloaders['train']['cocktail_party']:
+            inputs, spans, correct_idx = batch
+            print(f"Batch shape: {inputs.shape}")
+            print(f"Spans shape: {spans.shape}")
+            print(f"Sample tokens: {inputs[0][:20].tolist()}")
+            print(f"Sample correct_idx: {correct_idx[0].tolist()}")
             
             # Decode sample text
-            sample_text = data_builder.decode_tokens(x[0][:50])
+            sample_text = data_builder.decode_tokens(inputs[0][:50])
             print(f"Sample text: '{sample_text[:100]}...'")
             break
     
