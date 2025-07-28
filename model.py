@@ -159,51 +159,33 @@ class GPTModel(nn.Module):
             logits = self.cocktail_party_head(x)
             loss = None
             if targets is not None:
-                pad_idx = SPECIAL_TOKENS['[PAD]']
+                pad_label = BIO_TAGS['PAD']
                 eps = 1e-8
 
-                # flatten everything
+                # Flatten logits and targets
                 logits_flat  = logits.view(-1, NUM_BIO_TAGS)
                 targets_flat = targets.view(-1)
-                keep_mask    = (targets_flat != pad_idx)
 
-                # --- 1) CE with ignore_index is okay, but still guard zero‐nonpad
-                if keep_mask.any():
-                    targets_sel = targets_flat[keep_mask]
-                    is_pos = (targets_sel != BIO_TAGS['O']).float()
-                    pos = is_pos.sum()
-                    neg = (1 - is_pos).sum()
-                    pos_w = (neg/(pos+1e-8)).clamp(max=10.0).to(logits.device)
-                    weight = torch.tensor([1.0, pos_w, pos_w], device=logits.device)
+                # Select only real labels
+                keep = (targets_flat != pad_label)
+                if keep.any():
+                    # Compute frequency of each class: O, B-ORIG, I-ORIG
+                    freq = torch.bincount(targets_flat[keep].long(), minlength=NUM_BIO_TAGS).float()
+                    total = freq.sum()
+                    # Inverse-frequency weight, clamped to [0.1, 10]
+                    class_weight = ((total - freq) / (freq + 1e-8)).clamp(min=0.1, max=10.0).to(logits.device)
+
+                    # Cross‑entropy with true pad ignore and balanced weights
                     ce_loss = F.cross_entropy(
                         logits_flat,
                         targets_flat,
-                        ignore_index=pad_idx,
-                        weight=weight
+                        ignore_index=pad_label,
+                        weight=class_weight
                     )
                 else:
                     ce_loss = torch.tensor(0.0, device=logits.device)
 
-                # --- 2) Soft‑IoU & entropy only when there’s at least one non‑pad
-                if keep_mask.any():
-                    probs     = torch.softmax(logits, dim=-1)[..., BIO_TAGS['B-ORIG']] \
-                              + torch.softmax(logits, dim=-1)[..., BIO_TAGS['I-ORIG']]
-                    probs_flat = probs.view(-1)[keep_mask]
-                    gold_flat  = (targets_flat[keep_mask] != BIO_TAGS['O']).float()
-
-                    soft_inter  = (probs_flat * gold_flat).sum()
-                    soft_union  = (probs_flat + gold_flat - probs_flat * gold_flat).sum()
-                    iou_loss    = 1 - (soft_inter + eps) / (soft_union + eps)
-                    entropy_loss= Bernoulli(probs=probs_flat).entropy().mean()
-                else:
-                    iou_loss     = torch.tensor(0.0, device=logits.device)
-                    entropy_loss = torch.tensor(0.0, device=logits.device)
-
-                loss = {
-                    'ce':       ce_loss,
-                    'soft_iou': iou_loss,
-                    'entropy':  entropy_loss
-                }
+                loss = {'ce': ce_loss}
             return logits, loss
         else:
             # Teacher forcing task (generative)
