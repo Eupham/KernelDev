@@ -290,6 +290,18 @@ class Trainer:
                     scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
             else:
                 scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
+        elif task_name == 'soft_jigsaw':
+            inputs, p_star = batch
+            inputs, p_star = inputs.to(self.config.device), p_star.to(self.config.device)
+
+            task_cfg = task_configs.get('soft_jigsaw', {})
+            tau = task_cfg.get('tau', 0.1)
+
+            if self.config.use_amp and self.config.scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
+            else:
+                P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
         else:
             x, y = batch
             x, y = x.to(self.config.device), y.to(self.config.device)
@@ -344,6 +356,18 @@ class Trainer:
                                 if k not in cocktail_party_metrics:
                                     cocktail_party_metrics[k] = []
                                 cocktail_party_metrics[k].append(v)
+                    elif task_name == 'soft_jigsaw':
+                        inputs, p_star = batch
+                        inputs, p_star = inputs.to(self.config.device), p_star.to(self.config.device)
+
+                        task_cfg = task_configs.get('soft_jigsaw', {})
+                        tau = task_cfg.get('tau', 0.1)
+
+                        if self.config.use_amp:
+                            with torch.amp.autocast('cuda'):
+                                P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
+                        else:
+                            P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
                     else:
                         x, y = batch
                         x, y = x.to(self.config.device), y.to(self.config.device)

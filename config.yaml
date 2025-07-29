@@ -148,9 +148,13 @@ random_seed: 42
 # Task Configuration
 tasks:
   teacher_forcing:
-    weight: 0.5
+    weight: 1.0
   cocktail_party:
-    weight: 0.5
+    weight: 1.0
     num_distractors: 3
     min_span_size: 100
     max_span_size: 200
+  soft_jigsaw:
+    weight: 1.0
+    M: 5
+    tau: 0.1

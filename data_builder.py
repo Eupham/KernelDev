@@ -465,6 +465,54 @@ class DataBuilder:
         return inputs, spans, correct_indices
 
 
+    def _collate_fn_soft_jigsaw(self, batch):
+        task_config = self.task_configs.get('soft_jigsaw', {})
+        M = task_config.get('M', 5)
+
+        batch_inputs = []
+        batch_p_star = []
+
+        for item in batch:
+            text, _ = item
+            text = self.decode_tokens(text.tolist())
+            sentences = [s.strip() for s in text.split('.') if s.strip()]
+
+            if len(sentences) < M:
+                continue
+
+            start_index = random.randint(0, len(sentences) - M)
+            original_sentences = sentences[start_index : start_index + M]
+
+            indexed_sentences = list(enumerate(original_sentences))
+            random.shuffle(indexed_sentences)
+
+            shuffled_sentences = [s for _, s in indexed_sentences]
+            original_indices = [i for i, _ in indexed_sentences]
+
+            p_star = torch.zeros(M, M)
+            for i in range(M):
+                p_star[i, original_indices[i]] = 1
+
+            # Create input sequence
+            input_text = f"[CLS] " + f" [SPAN] ".join(shuffled_sentences)
+            tokens = self._tokenize_text(input_text)
+
+            if len(tokens) > self.seq_len:
+                tokens = tokens[:self.seq_len]
+            else:
+                tokens += [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
+
+            batch_inputs.append(torch.tensor(tokens, dtype=torch.long))
+            batch_p_star.append(p_star)
+
+        if not batch_inputs:
+            return torch.empty(0), torch.empty(0)
+
+        inputs = torch.stack(batch_inputs)
+        p_star = torch.stack(batch_p_star)
+
+        return inputs, p_star
+
     def create_dataloaders(
         self, batch_size: int = 8, num_workers: int = 0, shuffle_train: bool = True
     ) -> Dict[str, Dict[str, DataLoader]]:
@@ -484,7 +532,7 @@ class DataBuilder:
 
             # Teacher forcing dataloader
             dataloaders[split_name]['teacher_forcing'] = DataLoader(
-                dataset_obj, batch_size=batch_size, shuffle=shuffle,
+                dataset_obj, batch_size=16, shuffle=shuffle,
                 num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                 collate_fn=self._collate_fn_teacher_forcing
             )
@@ -492,9 +540,17 @@ class DataBuilder:
             # Cocktail party dataloader
             if 'cocktail_party' in self.task_configs:
                 dataloaders[split_name]['cocktail_party'] = DataLoader(
-                    dataset_obj, batch_size=batch_size, shuffle=shuffle,
+                    dataset_obj, batch_size=8, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_cocktail_party
+                )
+
+            # Soft jigsaw dataloader
+            if 'soft_jigsaw' in self.task_configs:
+                dataloaders[split_name]['soft_jigsaw'] = DataLoader(
+                    dataset_obj, batch_size=8, shuffle=shuffle,
+                    num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                    collate_fn=self._collate_fn_soft_jigsaw
                 )
 
         return dataloaders

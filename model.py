@@ -86,6 +86,11 @@ class TransformerBlock(nn.Module):
 from data_builder import NUM_BIO_TAGS, SPECIAL_TOKENS, BIO_TAGS
 from torch.distributions import Bernoulli
 
+def soft_sort(S, tau=1.0):
+    S_tilde = S / tau
+    P_hat = torch.softmax(S_tilde, dim=-1)
+    return P_hat
+
 class GPTModel(nn.Module):
     """GPT-styled model using flash attention kernel."""
     
@@ -126,6 +131,9 @@ class GPTModel(nn.Module):
         
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
+
+        # Head for soft jigsaw task
+        self.permute_head = nn.Linear(dim, 5) # M=5
         
         self.apply(self._init_weights)
     
@@ -135,7 +143,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None):
+    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -168,6 +176,36 @@ class GPTModel(nn.Module):
                 loss = F.cross_entropy(scores, correct_idx)
 
             return scores, loss
+        elif task_name == 'soft_jigsaw':
+            # Simplified sentence pooling
+            span_token_id = SPECIAL_TOKENS['[SPAN]']
+            span_indices = (x == span_token_id).nonzero(as_tuple=False)
+
+            sentence_embeddings = []
+            for i in range(batch_size):
+                sample_span_indices = span_indices[span_indices[:, 0] == i][:, 1]
+
+                # Add start and end of sequence for pooling
+                sentence_boundaries = [0] + sample_span_indices.tolist() + [seq_len]
+
+                pooled_embeddings = []
+                for j in range(len(sentence_boundaries) - 1):
+                    start, end = sentence_boundaries[j], sentence_boundaries[j+1]
+                    if start + 1 < end: # Ensure there are tokens to pool
+                         pooled_embeddings.append(x_embed[i, start+1:end].mean(dim=0))
+
+                if pooled_embeddings:
+                    sentence_embeddings.append(torch.stack(pooled_embeddings))
+
+            if not sentence_embeddings:
+                 return None, torch.tensor(0.0, device=x.device, requires_grad=True)
+
+            H = torch.stack(sentence_embeddings)
+
+            S = self.permute_head(H)
+            P_hat = soft_sort(S, tau)
+            loss = F.mse_loss(P_hat, p_star)
+            return P_hat, loss
         else:
             # Teacher forcing task (generative)
             logits = self.head(x_embed)
