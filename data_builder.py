@@ -478,7 +478,7 @@ class DataBuilder:
             sentences = [s.strip() for s in text.split('.') if s.strip()]
 
             if len(sentences) < M:
-                sentences += [''] * (M - len(sentences))
+                continue
 
 
             start_index = random.randint(0, len(sentences) - M)
