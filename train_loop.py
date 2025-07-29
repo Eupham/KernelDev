@@ -499,6 +499,9 @@ class Trainer:
                     train_iters[task_name] = iter(train_loaders[task_name])
                     batch = next(train_iters[task_name])
 
+                if batch is None:
+                    continue
+
                 loss = self.train_step(batch, task_name, task_configs)
 
                 task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
@@ -529,6 +532,7 @@ class Trainer:
                 if self.config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
+
             if self.scheduler is not None:
                 self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]

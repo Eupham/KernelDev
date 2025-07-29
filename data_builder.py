@@ -507,7 +507,7 @@ class DataBuilder:
             batch_p_star.append(p_star)
 
         if not batch_inputs:
-            return torch.empty(0), torch.empty(0)
+            return None
 
         inputs = torch.stack(batch_inputs)
         p_star = torch.stack(batch_p_star)
