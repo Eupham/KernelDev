@@ -197,6 +197,15 @@ class GPTModel(nn.Module):
                         # fallback: zero‑vector of same dimension
                         emb = x_embed.new_zeros(x_embed.size(-1))
                     pooled_embeddings.append(emb)
+
+                M = p_star.size(1)
+                L = len(pooled_embeddings)
+                if L < M:
+                    zero = x_embed.new_zeros(x_embed.size(-1))
+                    pooled_embeddings += [zero] * (M - L)
+                elif L > M:
+                    pooled_embeddings = pooled_embeddings[:M]
+
                 sentence_embeddings.append(torch.stack(pooled_embeddings))
 
             H = torch.stack(sentence_embeddings)
