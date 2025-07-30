@@ -24,10 +24,18 @@ SPECIAL_TOKENS = {
 NUM_SPECIAL_TOKENS = len(SPECIAL_TOKENS)
 
 class OnTheFlyTokenizedDataset(Dataset):
-    def __init__(self, raw_data, seq_len=512, tokenizer_fn=None):
+    def __init__(self, raw_data, seq_len=512, tokenizer_fn=None, task_configs=None):
         self.raw_data = raw_data
         self.seq_len = seq_len
         self.tokenizer_fn = tokenizer_fn
+        self.task_configs = task_configs or {}
+
+        if 'soft_jigsaw' in self.task_configs:
+            M = self.task_configs['soft_jigsaw'].get('M', 5)
+            self.raw_data = [
+                item for item in self.raw_data
+                if len(item['text'].split('.')) >= M
+            ]
 
     def __len__(self):
         return len(self.raw_data)
@@ -326,7 +334,9 @@ class DataBuilder:
             datasets = {}
             for split_name, data in raw_dataset.items():
                 if data:
-                    datasets[split_name] = OnTheFlyTokenizedDataset(data, self.seq_len, self._tokenize_text)
+                    datasets[split_name] = OnTheFlyTokenizedDataset(
+                        data, self.seq_len, self._tokenize_text, self.task_configs
+                    )
                     print(f"{split_name} dataset (on-the-fly): {len(datasets[split_name])} samples")
                 else:
                     print(f"Warning: {split_name} split has no data. Skipping dataset creation.")
@@ -476,10 +486,6 @@ class DataBuilder:
             text, _ = item
             text = self.decode_tokens(text.tolist())
             sentences = [s.strip() for s in text.split('.') if s.strip()]
-
-            if len(sentences) < M:
-                continue
-
 
             start_index = random.randint(0, len(sentences) - M)
             original_sentences = sentences[start_index : start_index + M]
