@@ -91,6 +91,15 @@ def soft_sort(S, tau=1.0):
     P_hat = torch.softmax(S_tilde, dim=-1)
     return P_hat
 
+def sinkhorn(log_logits, n_iters=20):
+    """Sinkhorn-Knopp normalization."""
+    for _ in range(n_iters):
+        # Normalize rows in log-space
+        log_logits = log_logits - torch.logsumexp(log_logits, dim=2, keepdim=True)
+        # Normalize columns in log-space
+        log_logits = log_logits - torch.logsumexp(log_logits, dim=1, keepdim=True)
+    return torch.exp(log_logits)
+
 class GPTModel(nn.Module):
     """GPT-styled model using flash attention kernel."""
     
@@ -133,7 +142,7 @@ class GPTModel(nn.Module):
         self.head.weight = self.token_emb.weight
 
         # Head for soft jigsaw task
-        self.permute_head = nn.Linear(dim, 5) # M=5
+        self.permute_head = nn.Linear(dim, 5, bias=True) # M=5
         
         self.apply(self._init_weights)
     
@@ -211,7 +220,8 @@ class GPTModel(nn.Module):
             H = torch.stack(sentence_embeddings)
 
             S = self.permute_head(H)
-            P_hat = soft_sort(S, tau)
+        log_S = S / tau
+        P_hat = sinkhorn(log_S, n_iters=10)
             loss = F.mse_loss(P_hat, p_star)
             return P_hat, loss
         else:

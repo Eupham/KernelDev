@@ -155,6 +155,6 @@ tasks:
     min_span_size: 100
     max_span_size: 200
   soft_jigsaw:
-    weight: 1.0
+    weight: 5.0
     M: 5
-    tau: 0.1
+    tau: 0.5
