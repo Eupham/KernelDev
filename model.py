@@ -220,8 +220,8 @@ class GPTModel(nn.Module):
             H = torch.stack(sentence_embeddings)
 
             S = self.permute_head(H)
-        log_S = S / tau
-        P_hat = sinkhorn(log_S, n_iters=10)
+            log_S = S / tau
+            P_hat = sinkhorn(log_S, n_iters=10)
             loss = F.mse_loss(P_hat, p_star)
             return P_hat, loss
         else:
