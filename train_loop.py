@@ -532,9 +532,11 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
 
+            # Get current LR *before* scheduler steps to log the correct value for the current step
+            current_lr = self.optimizer.param_groups[0]['lr']
+
             if self.scheduler is not None:
                 self.scheduler.step()
-            current_lr = self.scheduler.get_last_lr()[0]
             
             # Update metrics
             step_time = time.time() - step_start
@@ -822,7 +824,8 @@ class Trainer:
         
         with torch.no_grad():
             for task_name, dataloader in dataloaders.items():
-                if task_name == 'cocktail_party':
+                # Perplexity is only meaningful for the generative, teacher_forcing task
+                if task_name != 'teacher_forcing':
                     continue
                 for batch_idx, batch in enumerate(dataloader):
                     if max_batches is not None and batch_idx >= max_batches:
