@@ -179,26 +179,25 @@ class GPTModel(nn.Module):
         elif task_name == 'soft_jigsaw':
             # Simplified sentence pooling
             span_token_id = SPECIAL_TOKENS['[SPAN]']
-            span_indices = (x == span_token_id).nonzero(as_tuple=False)
 
             sentence_embeddings = []
             for i in range(batch_size):
-                sample_span_indices = span_indices[span_indices[:, 0] == i][:, 1]
+                span_indices = (x[i] == span_token_id).nonzero(as_tuple=False).squeeze(-1)
 
                 # Add start and end of sequence for pooling
-                sentence_boundaries = [0] + sample_span_indices.tolist() + [seq_len]
+                sentence_boundaries = [0] + span_indices.tolist() + [seq_len]
 
                 pooled_embeddings = []
                 for j in range(len(sentence_boundaries) - 1):
                     start, end = sentence_boundaries[j], sentence_boundaries[j+1]
-                    if start + 1 < end: # Ensure there are tokens to pool
-                         pooled_embeddings.append(x_embed[i, start+1:end].mean(dim=0))
-
-                if pooled_embeddings:
-                    sentence_embeddings.append(torch.stack(pooled_embeddings))
-
-            if not sentence_embeddings:
-                 return None, torch.tensor(0.0, device=x.device, requires_grad=True)
+                    span_tokens = x_embed[i, start+1:end]
+                    if span_tokens.numel() > 0:
+                        emb = span_tokens.mean(dim=0)
+                    else:
+                        # fallback: zero‑vector of same dimension
+                        emb = x_embed.new_zeros(x_embed.size(-1))
+                    pooled_embeddings.append(emb)
+                sentence_embeddings.append(torch.stack(pooled_embeddings))
 
             H = torch.stack(sentence_embeddings)
 

@@ -478,7 +478,8 @@ class DataBuilder:
             sentences = [s.strip() for s in text.split('.') if s.strip()]
 
             if len(sentences) < M:
-                continue
+                sentences += [''] * (M - len(sentences))
+
 
             start_index = random.randint(0, len(sentences) - M)
             original_sentences = sentences[start_index : start_index + M]
@@ -506,7 +507,7 @@ class DataBuilder:
             batch_p_star.append(p_star)
 
         if not batch_inputs:
-            return None
+            return torch.empty(0), torch.empty(0)
 
         inputs = torch.stack(batch_inputs)
         p_star = torch.stack(batch_p_star)
