@@ -86,11 +86,6 @@ class TransformerBlock(nn.Module):
 from data_builder import NUM_BIO_TAGS, SPECIAL_TOKENS, BIO_TAGS
 from torch.distributions import Bernoulli
 
-def soft_sort(S, tau=1.0):
-    S_tilde = S / tau
-    P_hat = torch.softmax(S_tilde, dim=-1)
-    return P_hat
-
 def sinkhorn(log_logits, n_iters=20):
     """Sinkhorn-Knopp normalization."""
     for _ in range(n_iters):
