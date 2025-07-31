@@ -1,9 +1,10 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from data_builder import BIO_TAGS
+from data_builder import BIO_TAGS, SPECIAL_TOKENS
 from torch.distributions import Bernoulli
 import torch.distributed as dist
+import random
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
@@ -311,6 +312,30 @@ class Trainer:
                     logits, loss = self.model(x, targets=y, task_name=task_name)
             else:
                 logits, loss = self.model(x, targets=y, task_name=task_name)
+
+            # Next-K Token Prediction Logic
+            if loss is not None:
+                nextk_prob = 0.25
+                if random.random() < nextk_prob:
+                    K = 4
+                    extra_loss = 0.0
+                    V = logits.size(-1) # Vocabulary size
+                    for k in range(2, K + 1):
+                        # Ensure sequence is long enough for the shift
+                        if logits.size(1) > k:
+                            logits_k = logits[:, :-k, :]
+                            targets_k = y[:, k:]
+
+                            # Add the cross-entropy loss for this offset
+                            extra_loss += F.cross_entropy(
+                                logits_k.reshape(-1, V),
+                                targets_k.reshape(-1),
+                                ignore_index=SPECIAL_TOKENS['[PAD]']
+                            )
+
+                    # Add the extra loss to the main teacher-forcing loss
+                    if isinstance(extra_loss, torch.Tensor):
+                        loss = loss + extra_loss
 
         if loss is None:
             return 0.0
