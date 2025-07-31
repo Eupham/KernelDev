@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from data_builder import BIO_TAGS
+from data_builder import BIO_TAGS, SPECIAL_TOKENS
 from torch.distributions import Bernoulli
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -284,42 +284,34 @@ class Trainer:
         loss = None
         device = self.config.device
         use_amp = self.config.use_amp and self.config.scaler is not None
-
         autocast_context = torch.amp.autocast('cuda') if use_amp else torch.no_grad()
 
-        if task_name == 'cocktail_party':
-            inputs, spans, correct_idx = batch
-            inputs, spans, correct_idx = inputs.to(device), spans.to(device), correct_idx.to(device)
-            with autocast_context:
+        with autocast_context:
+            if task_name == 'cocktail_party':
+                inputs, spans, correct_idx = batch
+                inputs, spans, correct_idx = inputs.to(device), spans.to(device), correct_idx.to(device)
                 _, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
 
-        elif task_name == 'soft_jigsaw':
-            inputs, p_star = batch
-            inputs, p_star = inputs.to(device), p_star.to(device)
-            tau = task_configs.get('soft_jigsaw', {}).get('tau', 0.1)
-            with autocast_context:
+            elif task_name == 'soft_jigsaw':
+                inputs, p_star = batch
+                inputs, p_star = inputs.to(device), p_star.to(device)
+                tau = task_configs.get('soft_jigsaw', {}).get('tau', 0.1)
                 _, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
 
-        elif task_name == 'next_k':
-            x_prefix, y_nextk = batch
-            if x_prefix.nelement() == 0: return torch.tensor(0.0)
-            x_prefix, y_nextk = x_prefix.to(device), y_nextk.to(device)
+            elif task_name == 'next_k':
+                x_prefix, y_nextk = batch
+                if x_prefix.nelement() == 0: return torch.tensor(0.0)
+                x_prefix, y_nextk = x_prefix.to(device), y_nextk.to(device)
 
-            with autocast_context:
-                logits, _ = self.model(x_prefix, task_name='teacher_forcing')
+                x_combined = torch.cat([x_prefix, y_nextk[:, :-1]], dim=1)
+                prefix_padding = torch.full_like(x_prefix, SPECIAL_TOKENS['[PAD]'])
+                y_combined = torch.cat([prefix_padding, y_nextk], dim=1)
 
-            # Predict the K tokens following the prefix
-            logits_for_next_k = logits[:, -y_nextk.size(1):, :]
-            loss = F.cross_entropy(
-                logits_for_next_k.reshape(-1, logits_for_next_k.size(-1)),
-                y_nextk.reshape(-1),
-                ignore_index=0  # PAD token ID
-            )
+                _, loss = self.model(x_combined, targets=y_combined, task_name='teacher_forcing')
 
-        else: # Default to teacher_forcing
-            x, y = batch
-            x, y = x.to(device), y.to(device)
-            with autocast_context:
+            else: # Default to teacher_forcing
+                x, y = batch
+                x, y = x.to(device), y.to(device)
                 _, loss = self.model(x, targets=y, task_name=task_name)
 
         return loss if loss is not None else torch.tensor(0.0)
@@ -377,15 +369,13 @@ class Trainer:
                         if x_prefix.nelement() == 0:
                             continue
                         x_prefix, y_nextk = x_prefix.to(self.config.device), y_nextk.to(self.config.device)
-                        with torch.amp.autocast('cuda'):
-                            logits, _ = self.model(x_prefix, task_name='teacher_forcing')
 
-                        logits_for_next_k = logits[:, -y_nextk.size(1):, :]
-                        loss = F.cross_entropy(
-                            logits_for_next_k.reshape(-1, logits_for_next_k.size(-1)),
-                            y_nextk.reshape(-1),
-                            ignore_index=0
-                        )
+                        x_combined = torch.cat([x_prefix, y_nextk[:, :-1]], dim=1)
+                        prefix_padding = torch.full_like(x_prefix, SPECIAL_TOKENS['[PAD]'])
+                        y_combined = torch.cat([prefix_padding, y_nextk], dim=1)
+
+                        with torch.amp.autocast('cuda'):
+                            _, loss = self.model(x_combined, targets=y_combined, task_name='teacher_forcing')
 
                     else:
                         x, y = batch

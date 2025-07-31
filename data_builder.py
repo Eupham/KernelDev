@@ -59,9 +59,6 @@ class NextKDataset(Dataset):
         text = f"[CLS] {text}"
         tokens = self.tokenizer_fn(text)
 
-        if len(tokens) < self.seq_len + self.k:
-            return None
-
         prefix = tokens[:self.seq_len]
         next_k = tokens[self.seq_len:self.seq_len + self.k]
 
@@ -105,7 +102,6 @@ class SoftJigsawDataset(Dataset):
         return len(self.raw_data)
 
     def __getitem__(self, idx):
-        # The collate function for jigsaw expects text, not tokens
         return self.raw_data[idx]['text'], self.raw_data[idx]['text']
 
 class DataBuilder:
@@ -137,7 +133,6 @@ class DataBuilder:
             print("Will attempt to load all available samples from the dataset.")
 
     def _tokenize_text(self, text: str) -> list:
-        # This is a simplified tokenizer. A real implementation would use a pre-trained tokenizer.
         tokens = []
         i = 0
         while i < len(text):
@@ -204,7 +199,6 @@ class DataBuilder:
         print(f"Loading dataset: {self.dataset_name}/{self.dataset_config}")
         loaded_samples = []
 
-        # Attempt 1: C4 'en' (streaming)
         try:
             print("Attempting Method 1: Load C4 'en' (streaming)...")
             dataset_stream = load_dataset(
@@ -212,46 +206,13 @@ class DataBuilder:
             )
             print("C4 'en' (streaming) load_dataset call succeeded. Processing samples...")
             loaded_samples = self._process_iterable_dataset(dataset_stream, "C4 'en' streaming")
-            
-            if len(loaded_samples) < self.max_samples and self.max_samples != float('inf'):
-                if len(loaded_samples) == 0 and self.max_samples > 0:
-                    raise ValueError(f"Streaming C4 'en' yielded 0 samples when {self.max_samples} were requested.")
-                print(f"Streaming C4 'en' loaded {len(loaded_samples)} samples, less than requested {self.max_samples}. Will try non-streaming.")
-                if len(loaded_samples) == 0 :
-                    raise ValueError("Triggering non-streaming C4 'en' due to 0 samples from stream.")
-            print(f"Successfully processed {len(loaded_samples)} samples from C4 'en' stream.")
         except Exception as e_c4_en_stream:
             print(f"Method 1 (C4 'en' streaming) failed: {e_c4_en_stream}")
-            loaded_samples = []
-
-            if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
-                try:
-                    print("Attempting Method 1.5: Load C4 'en' (non-streaming, sliced)...")
-                    fetch_n = int(self.max_samples * 1.5) if self.max_samples != float('inf') else 5000
-                    fetch_n = max(fetch_n, 100)
-                    print(f"Will try to fetch up to {fetch_n} records for non-streaming C4 'en'.")
-                    dataset_non_stream = load_dataset(
-                        self.dataset_name, name=self.dataset_config, split=f'train[:{fetch_n}]', trust_remote_code=True
-                    )
-                    print("C4 'en' (non-streaming) load_dataset call succeeded. Processing samples...")
-                    loaded_samples = self._process_iterable_dataset(dataset_non_stream, "C4 'en' non-streaming")
-                    if not loaded_samples and self.max_samples > 0:
-                        raise ValueError("Non-streaming C4 'en' also yielded no samples.")
-                    print(f"Successfully loaded {len(loaded_samples)} samples via C4 'en' non-streaming.")
-                except Exception as e_c4_en_non_stream:
-                    print(f"Method 1.5 (C4 'en' non-streaming) failed: {e_c4_en_non_stream}")
-                    loaded_samples = []
-
-        if not loaded_samples:
-            print("All C4 'en' attempts failed. Trying other datasets...")
-            # Fallback to other datasets if C4 'en' fails
-            # (Logic for trying other datasets as in the original function)
 
         if not loaded_samples:
             print("All dataset loading methods failed. Falling back to simple text dataset...")
             loaded_samples = self._create_fallback_dataset()
 
-        # Partition data for different tasks
         task_data = {task: [] for task in self.task_configs.keys()}
         if 'teacher_forcing' not in task_data:
             task_data['teacher_forcing'] = []
@@ -263,25 +224,14 @@ class DataBuilder:
             task_name = task_names[i % num_tasks]
             task_data[task_name].append(sample)
 
-        # Create train/val/test splits for each task's data partition
         final_data = {}
         for task_name, samples in task_data.items():
             if not samples:
-                print(f"Warning: No samples for task {task_name} after partitioning.")
                 final_data[task_name] = {'train': [], 'validation': [], 'test': []}
                 continue
 
             train_split = int(0.8 * len(samples))
             val_split = int(0.9 * len(samples))
-            # Adjust splits to prevent them from being empty
-            if len(samples) > 2 and train_split >= len(samples) -1:
-                train_split = len(samples) - 2
-            if len(samples) > 1 and val_split <= train_split:
-                val_split = train_split + 1
-            if val_split >= len(samples):
-                val_split = len(samples) -1
-
-
             final_data[task_name] = {
                 'train': samples[:train_split],
                 'validation': samples[train_split:val_split],
@@ -292,31 +242,15 @@ class DataBuilder:
         return final_data
 
     def _create_fallback_dataset(self):
-        # ... (method content as in original file, ensure it uses self.max_samples correctly)
         sample_texts = [
-            "The quick brown fox jumps over the lazy dog. This is a classic pangram used in typing practice.",
-            "Machine learning is a subset of artificial intelligence that focuses on algorithms that can learn from data.",
-            "Deep learning uses neural networks with multiple layers to model complex patterns in data.",
-            "Natural language processing enables computers to understand and generate human language.",
-            "Transformers have revolutionized the field of natural language processing with their attention mechanisms.",
-            "GPT models are based on the transformer architecture and are trained on large amounts of text data.",
-            "Flash attention is an efficient implementation of the attention mechanism that reduces memory usage.",
-            "PyTorch is a popular deep learning framework that provides dynamic computation graphs.",
-            "CUDA enables parallel computing on NVIDIA GPUs for accelerated machine learning workloads.",
-            "Tokenization is the process of converting text into numerical tokens that models can process.",
+            "The quick brown fox jumps over the lazy dog.",
+            "Machine learning is a subset of artificial intelligence.",
         ]
         num_repetitions = (self.max_samples // 10 if self.max_samples != float('inf') and self.max_samples > 10 else 100)
-        num_repetitions = max(num_repetitions, 1) # Ensure at least one repetition
         full_sample_texts = sample_texts * num_repetitions
-        
-        # Ensure fallback provides a reasonable number of texts for splitting
-        num_fallback_texts = max(20, len(full_sample_texts))
-
-        # Return as a list of dicts
-        return [{'text': text} for text in full_sample_texts[:num_fallback_texts]]
+        return [{'text': text} for text in full_sample_texts]
     
     def tokenize_dataset(self, dataset):
-        # This method is no longer used with on-the-fly tokenization, but kept for compatibility
         pass
     
     def create_datasets(self):
@@ -327,7 +261,6 @@ class DataBuilder:
             datasets[task_name] = {}
             for split_name, data in task_data_splits.items():
                 if not data:
-                    print(f"Warning: {split_name} split for task {task_name} has no data. Skipping dataset creation.")
                     continue
 
                 dataset_class = None
@@ -349,17 +282,12 @@ class DataBuilder:
         return datasets
 
     def _collate_fn_teacher_forcing(self, batch):
-        inputs = torch.stack([item[0] for item in batch])
-        targets = torch.stack([item[1] for item in batch])
-        return inputs, targets
+        inputs, targets = zip(*batch)
+        return torch.stack(inputs), torch.stack(targets)
 
     def _collate_fn_next_k(self, batch):
-        batch = [b for b in batch if b is not None]
-        if not batch:
-            return torch.empty(0), torch.empty(0)
-        x_prefix = torch.stack([x for x, _ in batch])
-        y_nextk = torch.stack([y for _, y in batch])
-        return x_prefix, y_nextk
+        x, y = zip(*batch)
+        return torch.stack(x), torch.stack(y)
 
     def _collate_fn_cocktail_party(self, batch):
         task_config = self.task_configs.get('cocktail_party', {})
@@ -367,17 +295,13 @@ class DataBuilder:
         min_span_size = task_config.get('min_span_size', 10)
         max_span_size = task_config.get('max_span_size', 50)
 
-        batch_inputs = []
-        batch_spans = []
-        batch_correct_indices = []
+        batch_inputs, batch_spans, batch_correct_indices = [], [], []
 
         for i in range(len(batch)):
             original_tokens, _ = batch[i]
             original_tokens = original_tokens.tolist()
-
             span_size = random.randint(min_span_size, max_span_size)
-            if len(original_tokens) <= span_size:
-                continue
+            if len(original_tokens) <= span_size: continue
             span_start = random.randint(0, len(original_tokens) - span_size)
             true_span = original_tokens[span_start : span_start + span_size]
 
@@ -386,31 +310,26 @@ class DataBuilder:
                 distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
                 distractor_tokens, _ = batch[distractor_idx]
                 distractor_tokens = distractor_tokens.tolist()
-                if len(distractor_tokens) <= span_size:
-                    continue
+                if len(distractor_tokens) <= span_size: continue
                 distractor_start = random.randint(0, len(distractor_tokens) - span_size)
                 distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
                 distractors.append(distractor_span)
 
-            if not distractors:
-                continue
+            if not distractors: continue
 
             masked_sequence = original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
-
             all_spans_with_labels = [(true_span, 1)] + [(d, 0) for d in distractors]
             random.shuffle(all_spans_with_labels)
-
             spans, is_positive = zip(*all_spans_with_labels)
             correct_idx = is_positive.index(1)
 
             masked_sequence = masked_sequence[:self.seq_len]
-            seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(masked_sequence))
-            masked_sequence += seq_padding
+            masked_sequence += [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(masked_sequence))
 
             padded_spans = []
-            max_len_for_a_given_span_in_batch = max(len(s) for s in spans) if spans else 0
+            max_len_span = max(len(s) for s in spans) if spans else 0
             for s in spans:
-                padded_s = s + [SPECIAL_TOKENS['[PAD]']] * (max_len_for_a_given_span_in_batch - len(s))
+                padded_s = s + [SPECIAL_TOKENS['[PAD]']] * (max_len_span - len(s))
                 padded_spans.append(padded_s)
 
             batch_inputs.append(torch.tensor(masked_sequence, dtype=torch.long))
@@ -423,18 +342,11 @@ class DataBuilder:
         max_batch_span_len = max(s.size(1) for s in batch_spans) if batch_spans else 0
         padded_batch_spans = []
         for s in batch_spans:
-            padding_size = max_batch_span_len - s.size(1)
-            if padding_size > 0:
-                padded_s = torch.nn.functional.pad(s, (0, padding_size), 'constant', SPECIAL_TOKENS['[PAD]'])
-                padded_batch_spans.append(padded_s)
-            else:
-                padded_batch_spans.append(s)
+            padding = max_batch_span_len - s.size(1)
+            padded_s = torch.nn.functional.pad(s, (0, padding), 'constant', SPECIAL_TOKENS['[PAD]']) if padding > 0 else s
+            padded_batch_spans.append(padded_s)
 
-        inputs = torch.stack(batch_inputs)
-        spans = torch.stack(padded_batch_spans)
-        correct_indices = torch.stack(batch_correct_indices)
-
-        return inputs, spans, correct_indices
+        return torch.stack(batch_inputs), torch.stack(padded_batch_spans), torch.stack(batch_correct_indices)
 
     def _collate_fn_soft_jigsaw(self, batch):
         task_config = self.task_configs.get('soft_jigsaw', {})
