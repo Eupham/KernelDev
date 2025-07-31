@@ -147,7 +147,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1):
+    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, ignore_index=-100):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -228,7 +228,7 @@ class GPTModel(nn.Module):
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     targets.view(-1),
-                    ignore_index=SPECIAL_TOKENS['[PAD]']
+                    ignore_index=ignore_index
                 )
             return logits, loss
     
