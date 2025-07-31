@@ -46,29 +46,25 @@ class TeacherForcingDataset(Dataset):
 
 class NextKDataset(Dataset):
     def __init__(self, raw_data, seq_len=512, k=5, tokenizer_fn=None):
-        self.raw_data = raw_data
         self.seq_len = seq_len
         self.k = k
         self.tokenizer_fn = tokenizer_fn
 
+        self.filtered = []
+        for sample in raw_data:
+            tokens = self.tokenizer_fn(f"[CLS] {sample['text']}")
+            if len(tokens) >= seq_len + k:
+                self.filtered.append(tokens)
+
     def __len__(self):
-        return len(self.raw_data)
+        return len(self.filtered)
 
-    def __getitem__(self, idx):
-        text = self.raw_data[idx]['text']
-        text = f"[CLS] {text}"
-        tokens = self.tokenizer_fn(text)
-
+    def __getitem__(self, i):
+        tokens = self.filtered[i]
         prefix = tokens[:self.seq_len]
         next_k = tokens[self.seq_len:self.seq_len + self.k]
-
-        if len(prefix) < self.seq_len:
-            prefix.extend([SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(prefix)))
-        if len(next_k) < self.k:
-            next_k.extend([SPECIAL_TOKENS['[PAD]']] * (self.k - len(next_k)))
-
         x_prefix = torch.tensor(prefix, dtype=torch.long)
-        y_nextk = torch.tensor(next_k, dtype=torch.long)
+        y_nextk  = torch.tensor(next_k, dtype=torch.long)
         return x_prefix, y_nextk
 
 class CocktailPartyDataset(Dataset):
