@@ -149,6 +149,9 @@ random_seed: 42
 tasks:
   teacher_forcing:
     weight: 1.0
+  next_k:
+    weight: 0.5
+    k: 5
   cocktail_party:
     weight: 1.0
     num_distractors: 3

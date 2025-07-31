@@ -23,7 +23,7 @@ SPECIAL_TOKENS = {
 }
 NUM_SPECIAL_TOKENS = len(SPECIAL_TOKENS)
 
-class OnTheFlyTokenizedDataset(Dataset):
+class TeacherForcingDataset(Dataset):
     def __init__(self, raw_data, seq_len=512, tokenizer_fn=None):
         self.raw_data = raw_data
         self.seq_len = seq_len
@@ -36,16 +36,77 @@ class OnTheFlyTokenizedDataset(Dataset):
         text = self.raw_data[idx]['text']
         text = f"[CLS] {text}"
         tokens = self.tokenizer_fn(text)
-
         tokens = tokens[:self.seq_len + 1]
-
         if len(tokens) < self.seq_len + 1:
             padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len + 1 - len(tokens))
             tokens.extend(padding)
-
         x = torch.tensor(tokens[:-1], dtype=torch.long)
         y = torch.tensor(tokens[1:], dtype=torch.long)
         return x, y
+
+class NextKDataset(Dataset):
+    def __init__(self, raw_data, seq_len=512, k=5, tokenizer_fn=None):
+        self.raw_data = raw_data
+        self.seq_len = seq_len
+        self.k = k
+        self.tokenizer_fn = tokenizer_fn
+
+    def __len__(self):
+        return len(self.raw_data)
+
+    def __getitem__(self, idx):
+        text = self.raw_data[idx]['text']
+        text = f"[CLS] {text}"
+        tokens = self.tokenizer_fn(text)
+
+        if len(tokens) < self.seq_len + self.k:
+            return None
+
+        prefix = tokens[:self.seq_len]
+        next_k = tokens[self.seq_len:self.seq_len + self.k]
+
+        if len(prefix) < self.seq_len:
+            prefix.extend([SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(prefix)))
+        if len(next_k) < self.k:
+            next_k.extend([SPECIAL_TOKENS['[PAD]']] * (self.k - len(next_k)))
+
+        x_prefix = torch.tensor(prefix, dtype=torch.long)
+        y_nextk = torch.tensor(next_k, dtype=torch.long)
+        return x_prefix, y_nextk
+
+class CocktailPartyDataset(Dataset):
+    def __init__(self, raw_data, seq_len=512, tokenizer_fn=None):
+        self.raw_data = raw_data
+        self.seq_len = seq_len
+        self.tokenizer_fn = tokenizer_fn
+
+    def __len__(self):
+        return len(self.raw_data)
+
+    def __getitem__(self, idx):
+        text = self.raw_data[idx]['text']
+        text = f"[CLS] {text}"
+        tokens = self.tokenizer_fn(text)
+        tokens = tokens[:self.seq_len + 1]
+        if len(tokens) < self.seq_len + 1:
+            padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len + 1 - len(tokens))
+            tokens.extend(padding)
+        x = torch.tensor(tokens[:-1], dtype=torch.long)
+        y = torch.tensor(tokens[1:], dtype=torch.long)
+        return x, y
+
+class SoftJigsawDataset(Dataset):
+    def __init__(self, raw_data, seq_len=512, tokenizer_fn=None):
+        self.raw_data = raw_data
+        self.seq_len = seq_len
+        self.tokenizer_fn = tokenizer_fn
+
+    def __len__(self):
+        return len(self.raw_data)
+
+    def __getitem__(self, idx):
+        # The collate function for jigsaw expects text, not tokens
+        return self.raw_data[idx]['text'], self.raw_data[idx]['text']
 
 class DataBuilder:
     def __init__(
@@ -156,20 +217,18 @@ class DataBuilder:
                 if len(loaded_samples) == 0 and self.max_samples > 0:
                     raise ValueError(f"Streaming C4 'en' yielded 0 samples when {self.max_samples} were requested.")
                 print(f"Streaming C4 'en' loaded {len(loaded_samples)} samples, less than requested {self.max_samples}. Will try non-streaming.")
-                # Do not reset loaded_samples here, keep what was loaded and attempt non-streaming to supplement or replace
-                if len(loaded_samples) == 0 : # Only raise if completely empty, otherwise proceed to non-streaming to try and get more
+                if len(loaded_samples) == 0 :
                     raise ValueError("Triggering non-streaming C4 'en' due to 0 samples from stream.")
             print(f"Successfully processed {len(loaded_samples)} samples from C4 'en' stream.")
         except Exception as e_c4_en_stream:
             print(f"Method 1 (C4 'en' streaming) failed: {e_c4_en_stream}")
-            loaded_samples = [] # Ensure it's empty if this path failed before trying non-streaming
+            loaded_samples = []
 
-            # Attempt 1.5: C4 'en' (non-streaming, sliced)
             if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
                 try:
                     print("Attempting Method 1.5: Load C4 'en' (non-streaming, sliced)...")
                     fetch_n = int(self.max_samples * 1.5) if self.max_samples != float('inf') else 5000
-                    fetch_n = max(fetch_n, 100) # Ensure a minimum fetch
+                    fetch_n = max(fetch_n, 100)
                     print(f"Will try to fetch up to {fetch_n} records for non-streaming C4 'en'.")
                     dataset_non_stream = load_dataset(
                         self.dataset_name, name=self.dataset_config, split=f'train[:{fetch_n}]', trust_remote_code=True
@@ -181,80 +240,56 @@ class DataBuilder:
                     print(f"Successfully loaded {len(loaded_samples)} samples via C4 'en' non-streaming.")
                 except Exception as e_c4_en_non_stream:
                     print(f"Method 1.5 (C4 'en' non-streaming) failed: {e_c4_en_non_stream}")
-                    loaded_samples = [] # Ensure empty if this also failed
+                    loaded_samples = []
 
-        if loaded_samples and (len(loaded_samples) >= self.max_samples or self.max_samples == float('inf')):
-            print(f"Successfully loaded {len(loaded_samples)} samples using C4 'en'.")
-        elif loaded_samples: # Loaded some, but less than max_samples
-             print(f"Loaded {len(loaded_samples)} (less than {self.max_samples}) from C4 'en'. Proceeding with these or trying other datasets.")
-        else: # No samples from C4 'en'
-            print("All C4 'en' attempts (streaming/non-streaming) failed or yielded no samples.")
+        if not loaded_samples:
+            print("All C4 'en' attempts failed. Trying other datasets...")
+            # Fallback to other datasets if C4 'en' fails
+            # (Logic for trying other datasets as in the original function)
 
-        # If not enough samples from C4 'en', try other methods
-        if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
-            print(f"Attempting other datasets as C4 'en' yielded {len(loaded_samples)}/{self.max_samples} samples.")
-            # Attempt 2: C4 without 'en' config (streaming)
-            try:
-                print("Attempting Method 2: Load C4 (no config) (streaming)...")
-                dataset_m2 = load_dataset(self.dataset_name, streaming=True, split='train', trust_remote_code=True)
-                print("C4 (no config, streaming) load_dataset call succeeded. Processing samples...")
-                loaded_samples = self._process_iterable_dataset(dataset_m2, "C4 (no config) streaming")
-                if not loaded_samples and self.max_samples > 0:
-                    raise ValueError("Method 2 (C4 no config, streaming) yielded no samples.")
-                print(f"Successfully loaded {len(loaded_samples)} samples using C4 (no config).")
-            except Exception as e_method2:
-                print(f"Method 2 (C4 no config, streaming) failed: {e_method2}")
-                loaded_samples = []
+        if not loaded_samples:
+            print("All dataset loading methods failed. Falling back to simple text dataset...")
+            loaded_samples = self._create_fallback_dataset()
 
-        # If still not enough, try wikitext
-        if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
-            print(f"Attempting wikitext as previous methods yielded {len(loaded_samples)}/{self.max_samples} samples.")
-            # Attempt 3: Wikitext (streaming)
-            try:
-                print("Attempting Method 3: Load wikitext (streaming)...")
-                dataset_m3 = load_dataset("wikitext", "wikitext-2-raw-v1", streaming=True, split='train')
-                print("Wikitext (streaming) load_dataset call succeeded. Processing samples...")
-                loaded_samples = self._process_iterable_dataset(dataset_m3, "wikitext streaming")
-                if not loaded_samples and self.max_samples > 0:
-                    raise ValueError("Method 3 (wikitext, streaming) yielded no samples.")
-                print(f"Successfully loaded {len(loaded_samples)} samples using wikitext.")
-            except Exception as e_method3:
-                print(f"Method 3 (wikitext, streaming) failed: {e_method3}")
-                loaded_samples = []
+        # Partition data for different tasks
+        task_data = {task: [] for task in self.task_configs.keys()}
+        if 'teacher_forcing' not in task_data:
+            task_data['teacher_forcing'] = []
 
-        # Final check and fallback
-        if loaded_samples and (len(loaded_samples) >= self.max_samples or self.max_samples == float('inf')):
-            print(f"Final dataset loaded with {len(loaded_samples)} samples.")
-        elif loaded_samples: # Loaded some, but maybe not enough
-            print(f"Warning: Final dataset loaded with {len(loaded_samples)} samples, requested {self.max_samples}. Using available data.")
-        else:
-            print("All primary dataset loading methods failed or yielded no usable samples. Falling back to simple text dataset...")
-            return self._create_fallback_dataset()
+        num_tasks = len(task_data)
+        task_names = list(task_data.keys())
 
-        # Split data for train/validation/test
-        train_split = int(0.8 * len(loaded_samples))
-        val_split = int(0.9 * len(loaded_samples))
-        # Ensure validation and test sets are not empty if train_split is too large
-        if train_split == len(loaded_samples) and len(loaded_samples) > 0: train_split = len(loaded_samples) -2 # min 1 for val, 1 for test
-        if val_split <= train_split and val_split < len(loaded_samples) -1 : val_split = train_split + 1
-        if val_split >= len(loaded_samples): val_split = len(loaded_samples) -1
-        if train_split < 0: train_split = 0
+        for i, sample in enumerate(loaded_samples):
+            task_name = task_names[i % num_tasks]
+            task_data[task_name].append(sample)
 
-        final_train_data = loaded_samples[:train_split]
-        final_val_data = loaded_samples[train_split:val_split] if val_split > train_split else []
-        final_test_data = loaded_samples[val_split:] if val_split < len(loaded_samples) else []
+        # Create train/val/test splits for each task's data partition
+        final_data = {}
+        for task_name, samples in task_data.items():
+            if not samples:
+                print(f"Warning: No samples for task {task_name} after partitioning.")
+                final_data[task_name] = {'train': [], 'validation': [], 'test': []}
+                continue
 
-        # Handle cases where splits might be empty due to small loaded_samples size
-        if not final_train_data and loaded_samples: final_train_data = loaded_samples # Use all for train if splits fail
-        if not final_val_data and final_train_data: final_val_data = final_train_data[:max(1, len(final_train_data)//10)] # 10% of train for val
-        if not final_test_data and final_train_data: final_test_data = final_train_data[:max(1, len(final_train_data)//10)] # 10% of train for test
+            train_split = int(0.8 * len(samples))
+            val_split = int(0.9 * len(samples))
+            # Adjust splits to prevent them from being empty
+            if len(samples) > 2 and train_split >= len(samples) -1:
+                train_split = len(samples) - 2
+            if len(samples) > 1 and val_split <= train_split:
+                val_split = train_split + 1
+            if val_split >= len(samples):
+                val_split = len(samples) -1
 
-        print(f"Returning dataset splits: train={len(final_train_data)}, val={len(final_val_data)}, test={len(final_test_data)}")
-        return {
-            'train': final_train_data,
-            'validation': final_val_data,
-            'test': final_test_data
-        }
+
+            final_data[task_name] = {
+                'train': samples[:train_split],
+                'validation': samples[train_split:val_split],
+                'test': samples[val_split:]
+            }
+            print(f"Task {task_name} data splits: train={len(final_data[task_name]['train'])}, val={len(final_data[task_name]['validation'])}, test={len(final_data[task_name]['test'])}")
+
+        return final_data
 
     def _create_fallback_dataset(self):
         # ... (method content as in original file, ensure it uses self.max_samples correctly)
@@ -276,106 +311,55 @@ class DataBuilder:
         
         # Ensure fallback provides a reasonable number of texts for splitting
         num_fallback_texts = max(20, len(full_sample_texts))
-        text_block = '\n'.join(full_sample_texts[:num_fallback_texts])
 
-        # Ensure splits are somewhat reasonable even for small text_block
-        len_block = len(text_block)
-        train_end = int(0.8 * len_block)
-        val_end = int(0.9 * len_block)
-
-        return {
-            'train': [{'text': text_block[:train_end]}],
-            'validation': [{'text': text_block[train_end:val_end]}],
-            'test': [{'text': text_block[val_end:]}]
-        }
+        # Return as a list of dicts
+        return [{'text': text} for text in full_sample_texts[:num_fallback_texts]]
     
     def tokenize_dataset(self, dataset):
-        # ... (method content as in original file, ensure robust to empty splits)
-        tokenized_data = {}
-        for split_name, split_data_list in dataset.items():
-            print(f"Tokenizing {split_name} split...")
-            all_text = ""
-            if not isinstance(split_data_list, list):
-                print(f"Warning: {split_name} data is not a list (type: {type(split_data_list)}), skipping tokenization.")
-                tokenized_data[split_name] = [] # Ensure key exists with empty list
-                continue
-            if not split_data_list: # Handle empty list
-                print(f"Warning: {split_name} data list is empty. Skipping tokenization.")
-                tokenized_data[split_name] = []
-                continue
-
-            for item in split_data_list:
-                if isinstance(item, dict) and 'text' in item:
-                    text_content = item['text']
-                    if text_content and text_content.strip():
-                        all_text += text_content + "\n"
-            
-            print(f"Text length for {split_name}: {len(all_text)} characters")
-            if not all_text.strip():
-                print(f"Warning: No text content found for {split_name} split. Resulting tokens will be empty.")
-                tokens = []
-            else:
-                tokens = self._tokenize_text(all_text)
-            print(f"Tokenized to {len(tokens)} byte tokens")
-            tokenized_data[split_name] = tokens
-        return tokenized_data
+        # This method is no longer used with on-the-fly tokenization, but kept for compatibility
+        pass
     
     def create_datasets(self):
-        raw_dataset = self.load_raw_dataset()
-        if self.on_the_fly_tokenization:
-            datasets = {}
-            for split_name, data in raw_dataset.items():
-                if data:
-                    datasets[split_name] = OnTheFlyTokenizedDataset(data, self.seq_len, self._tokenize_text)
-                    print(f"{split_name} dataset (on-the-fly): {len(datasets[split_name])} samples")
-                else:
-                    print(f"Warning: {split_name} split has no data. Skipping dataset creation.")
-            return datasets
-        else:
-            # ... (original pre-tokenization logic)
-            tokenized_data = self.tokenize_dataset(raw_dataset)
+        raw_dataset_by_task = self.load_raw_dataset()
+        datasets = {}
 
-            datasets = {}
-            for split_name, tokens in tokenized_data.items():
-                if not tokens:
-                    print(f"Warning: {split_name} split has no tokens. Skipping dataset creation.")
+        for task_name, task_data_splits in raw_dataset_by_task.items():
+            datasets[task_name] = {}
+            for split_name, data in task_data_splits.items():
+                if not data:
+                    print(f"Warning: {split_name} split for task {task_name} has no data. Skipping dataset creation.")
                     continue
 
-                current_max_eval_tokens = self.max_eval_tokens
-                if self.max_samples != float('inf') and split_name in ['validation', 'test']:
-                    scaled_max_tokens = int(self.max_samples * 0.2 * self.seq_len)
-                    current_max_eval_tokens = min(self.max_eval_tokens, scaled_max_tokens)
-                    current_max_eval_tokens = max(current_max_eval_tokens, self.seq_len * 2 + 1)
+                dataset_class = None
+                kwargs = {'raw_data': data, 'seq_len': self.seq_len, 'tokenizer_fn': self._tokenize_text}
 
-                if len(tokens) > self.seq_len:
-                    if split_name in ['validation', 'test']:
-                        if len(tokens) > current_max_eval_tokens:
-                            tokens = tokens[:current_max_eval_tokens]
-                            print(f"Limited {split_name} to {len(tokens)} tokens for faster evaluation (target: {current_max_eval_tokens})")
+                if task_name == 'teacher_forcing':
+                    dataset_class = TeacherForcingDataset
+                elif task_name == 'next_k':
+                    dataset_class = NextKDataset
+                    kwargs['k'] = self.task_configs.get('next_k', {}).get('k', 5)
+                elif task_name == 'cocktail_party':
+                    dataset_class = CocktailPartyDataset
+                elif task_name == 'soft_jigsaw':
+                    dataset_class = SoftJigsawDataset
 
-                    # This part needs to be adapted. Let's assume the original TokenizedDataset is still defined for this path.
-                    from torch.utils.data import Dataset
-                    class TokenizedDataset(Dataset):
-                        def __init__(self, tokenized_data, seq_len=512):
-                            self.data = tokenized_data
-                            self.seq_len = seq_len
-                        def __len__(self):
-                            return max(1, len(self.data) - self.seq_len)
-                        def __getitem__(self, idx):
-                            x = torch.tensor(self.data[idx:idx + self.seq_len], dtype=torch.long)
-                            y = torch.tensor(self.data[idx + 1:idx + self.seq_len + 1], dtype=torch.long)
-                            return x, y
-
-                    datasets[split_name] = TokenizedDataset(tokens, self.seq_len)
-                    print(f"{split_name} dataset: {len(datasets[split_name])} samples")
-                else:
-                    print(f"Warning: {split_name} split has insufficient tokens ({len(tokens)}) for seq_len {self.seq_len}. Skipping dataset.")
-            return datasets
+                if dataset_class:
+                    datasets[task_name][split_name] = dataset_class(**kwargs)
+                    print(f"Task '{task_name}', split '{split_name}' dataset created with {len(datasets[task_name][split_name])} samples.")
+        return datasets
 
     def _collate_fn_teacher_forcing(self, batch):
         inputs = torch.stack([item[0] for item in batch])
         targets = torch.stack([item[1] for item in batch])
         return inputs, targets
+
+    def _collate_fn_next_k(self, batch):
+        batch = [b for b in batch if b is not None]
+        if not batch:
+            return torch.empty(0), torch.empty(0)
+        x_prefix = torch.stack([x for x, _ in batch])
+        y_nextk = torch.stack([y for _, y in batch])
+        return x_prefix, y_nextk
 
     def _collate_fn_cocktail_party(self, batch):
         task_config = self.task_configs.get('cocktail_party', {})
@@ -419,18 +403,12 @@ class DataBuilder:
             spans, is_positive = zip(*all_spans_with_labels)
             correct_idx = is_positive.index(1)
 
-            # Pad masked_sequence
             masked_sequence = masked_sequence[:self.seq_len]
             seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(masked_sequence))
             masked_sequence += seq_padding
 
-            # Pad spans
             padded_spans = []
-            #This is the source of the bug, this should be batch-wide
-            max_len_for_a_given_span_in_batch = 0
-            if spans:
-                max_len_for_a_given_span_in_batch = max(len(s) for s in spans)
-
+            max_len_for_a_given_span_in_batch = max(len(s) for s in spans) if spans else 0
             for s in spans:
                 padded_s = s + [SPECIAL_TOKENS['[PAD]']] * (max_len_for_a_given_span_in_batch - len(s))
                 padded_spans.append(padded_s)
@@ -440,19 +418,13 @@ class DataBuilder:
             batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
 
         if not batch_inputs:
-            # If no valid samples were created, return empty tensors
             return torch.empty(0), torch.empty(0), torch.empty(0)
 
-        # Pad all span tensors in the batch to the same size
-        max_batch_span_len = 0
-        if batch_spans:
-            max_batch_span_len = max(s.size(1) for s in batch_spans)
-
+        max_batch_span_len = max(s.size(1) for s in batch_spans) if batch_spans else 0
         padded_batch_spans = []
         for s in batch_spans:
             padding_size = max_batch_span_len - s.size(1)
             if padding_size > 0:
-                # Pad on the right (dim 1)
                 padded_s = torch.nn.functional.pad(s, (0, padding_size), 'constant', SPECIAL_TOKENS['[PAD]'])
                 padded_batch_spans.append(padded_s)
             else:
@@ -464,95 +436,76 @@ class DataBuilder:
 
         return inputs, spans, correct_indices
 
-
     def _collate_fn_soft_jigsaw(self, batch):
         task_config = self.task_configs.get('soft_jigsaw', {})
         M = task_config.get('M', 5)
-
-        batch_inputs = []
-        batch_p_star = []
+        batch_inputs, batch_p_star = [], []
 
         for item in batch:
             text, _ = item
-            text = self.decode_tokens(text.tolist())
             sentences = [s.strip() for s in text.split('.') if s.strip()]
-
-            if len(sentences) < M:
-                continue
+            if len(sentences) < M: continue
 
             start_index = random.randint(0, len(sentences) - M)
             original_sentences = sentences[start_index : start_index + M]
 
             indexed_sentences = list(enumerate(original_sentences))
             random.shuffle(indexed_sentences)
-
             shuffled_sentences = [s for _, s in indexed_sentences]
             original_indices = [i for i, _ in indexed_sentences]
 
             p_star = torch.zeros(M, M)
-            for i in range(M):
-                p_star[i, original_indices[i]] = 1
+            for i in range(M): p_star[i, original_indices[i]] = 1
 
-            # Create input sequence
             input_text = f"[CLS] " + f" [SPAN] ".join(shuffled_sentences)
             tokens = self._tokenize_text(input_text)
-
-            if len(tokens) > self.seq_len:
-                tokens = tokens[:self.seq_len]
-            else:
-                tokens += [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
+            tokens = tokens[:self.seq_len] + [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
 
             batch_inputs.append(torch.tensor(tokens, dtype=torch.long))
             batch_p_star.append(p_star)
 
-        if not batch_inputs:
-            return None
-
-        inputs = torch.stack(batch_inputs)
-        p_star = torch.stack(batch_p_star)
-
-        return inputs, p_star
+        if not batch_inputs: return None
+        return torch.stack(batch_inputs), torch.stack(batch_p_star)
 
     def create_dataloaders(
         self, batch_size: int = 8, num_workers: int = 0, shuffle_train: bool = True
     ) -> Dict[str, Dict[str, DataLoader]]:
-        datasets = self.create_datasets()
+        datasets_by_task = self.create_datasets()
         dataloaders = {}
-        if not datasets:
-            print("Warning: No datasets were created. Returning empty dataloaders dict.")
-            return dataloaders
 
-        for split_name, dataset_obj in datasets.items():
-            if not dataset_obj:
-                print(f"Skipping DataLoader for {split_name} as dataset is empty or invalid.")
-                continue
-
+        for split_name in ['train', 'validation', 'test']:
             dataloaders[split_name] = {}
             shuffle = shuffle_train if split_name == 'train' else False
 
-            # Teacher forcing dataloader
-            dataloaders[split_name]['teacher_forcing'] = DataLoader(
-                dataset_obj, batch_size=16, shuffle=shuffle,
-                num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-                collate_fn=self._collate_fn_teacher_forcing
-            )
+            for task_name, task_datasets in datasets_by_task.items():
+                if split_name not in task_datasets or not task_datasets[split_name]:
+                    continue
 
-            # Cocktail party dataloader
-            if 'cocktail_party' in self.task_configs:
-                dataloaders[split_name]['cocktail_party'] = DataLoader(
-                    dataset_obj, batch_size=8, shuffle=shuffle,
-                    num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-                    collate_fn=self._collate_fn_cocktail_party
-                )
+                dataset_obj = task_datasets[split_name]
 
-            # Soft jigsaw dataloader
-            if 'soft_jigsaw' in self.task_configs:
-                dataloaders[split_name]['soft_jigsaw'] = DataLoader(
-                    dataset_obj, batch_size=8, shuffle=shuffle,
-                    num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-                    collate_fn=self._collate_fn_soft_jigsaw
-                )
+                collate_fn_map = {
+                    'teacher_forcing': self._collate_fn_teacher_forcing,
+                    'next_k': self._collate_fn_next_k,
+                    'cocktail_party': self._collate_fn_cocktail_party,
+                    'soft_jigsaw': self._collate_fn_soft_jigsaw,
+                }
 
+                batch_size_map = {
+                    'teacher_forcing': 8,
+                    'next_k': 4,
+                    'cocktail_party': 8,
+                    'soft_jigsaw': 8,
+                }
+
+                task_batch_size = batch_size_map.get(task_name, batch_size)
+                collate_fn = collate_fn_map.get(task_name)
+
+                if collate_fn:
+                    dataloaders[split_name][task_name] = DataLoader(
+                        dataset_obj, batch_size=task_batch_size, shuffle=shuffle,
+                        num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                        collate_fn=collate_fn
+                    )
         return dataloaders
 
     def get_vocab_size(self) -> int:

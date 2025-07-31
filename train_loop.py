@@ -281,41 +281,48 @@ class Trainer:
     
     def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step."""
+        loss = None
+        device = self.config.device
+        use_amp = self.config.use_amp and self.config.scaler is not None
+
+        autocast_context = torch.amp.autocast('cuda') if use_amp else torch.no_grad()
+
         if task_name == 'cocktail_party':
             inputs, spans, correct_idx = batch
-            inputs, spans, correct_idx = inputs.to(self.config.device), spans.to(self.config.device), correct_idx.to(self.config.device)
+            inputs, spans, correct_idx = inputs.to(device), spans.to(device), correct_idx.to(device)
+            with autocast_context:
+                _, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
 
-            if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
-            else:
-                scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
         elif task_name == 'soft_jigsaw':
             inputs, p_star = batch
-            inputs, p_star = inputs.to(self.config.device), p_star.to(self.config.device)
+            inputs, p_star = inputs.to(device), p_star.to(device)
+            tau = task_configs.get('soft_jigsaw', {}).get('tau', 0.1)
+            with autocast_context:
+                _, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
 
-            task_cfg = task_configs.get('soft_jigsaw', {})
-            tau = task_cfg.get('tau', 0.1)
+        elif task_name == 'next_k':
+            x_prefix, y_nextk = batch
+            if x_prefix.nelement() == 0: return torch.tensor(0.0)
+            x_prefix, y_nextk = x_prefix.to(device), y_nextk.to(device)
 
-            if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
-            else:
-                P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
-        else:
+            with autocast_context:
+                logits, _ = self.model(x_prefix, task_name='teacher_forcing')
+
+            # Predict the K tokens following the prefix
+            logits_for_next_k = logits[:, -y_nextk.size(1):, :]
+            loss = F.cross_entropy(
+                logits_for_next_k.reshape(-1, logits_for_next_k.size(-1)),
+                y_nextk.reshape(-1),
+                ignore_index=0  # PAD token ID
+            )
+
+        else: # Default to teacher_forcing
             x, y = batch
-            x, y = x.to(self.config.device), y.to(self.config.device)
+            x, y = x.to(device), y.to(device)
+            with autocast_context:
+                _, loss = self.model(x, targets=y, task_name=task_name)
 
-            if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    logits, loss = self.model(x, targets=y, task_name=task_name)
-            else:
-                logits, loss = self.model(x, targets=y, task_name=task_name)
-
-        if loss is None:
-            return 0.0
-
-        return loss
+        return loss if loss is not None else torch.tensor(0.0)
 
     def _calculate_accuracy(self, scores: torch.Tensor, correct_idx: torch.Tensor) -> Dict[str, float]:
         """Calculates accuracy for the contrastive task."""
@@ -361,24 +368,30 @@ class Trainer:
                         if inputs.size(0) == 0:
                             continue
                         inputs, p_star = inputs.to(self.config.device), p_star.to(self.config.device)
+                        tau = task_configs.get('soft_jigsaw', {}).get('tau', 0.1)
+                        with torch.amp.autocast('cuda'):
+                            _, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
 
-                        task_cfg = task_configs.get('soft_jigsaw', {})
-                        tau = task_cfg.get('tau', 0.1)
+                    elif task_name == 'next_k':
+                        x_prefix, y_nextk = batch
+                        if x_prefix.nelement() == 0:
+                            continue
+                        x_prefix, y_nextk = x_prefix.to(self.config.device), y_nextk.to(self.config.device)
+                        with torch.amp.autocast('cuda'):
+                            logits, _ = self.model(x_prefix, task_name='teacher_forcing')
 
-                        if self.config.use_amp:
-                            with torch.amp.autocast('cuda'):
-                                P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
-                        else:
-                            P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
+                        logits_for_next_k = logits[:, -y_nextk.size(1):, :]
+                        loss = F.cross_entropy(
+                            logits_for_next_k.reshape(-1, logits_for_next_k.size(-1)),
+                            y_nextk.reshape(-1),
+                            ignore_index=0
+                        )
+
                     else:
                         x, y = batch
                         x, y = x.to(self.config.device), y.to(self.config.device)
-
-                        if self.config.use_amp:
-                            with torch.amp.autocast('cuda'):
-                                logits, loss = self.model(x, targets=y, task_name=task_name)
-                        else:
-                            logits, loss = self.model(x, targets=y, task_name=task_name)
+                        with torch.amp.autocast('cuda'):
+                            _, loss = self.model(x, targets=y, task_name=task_name)
 
                     if loss is not None:
                         if isinstance(loss, dict):
