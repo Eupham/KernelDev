@@ -373,37 +373,36 @@ class DataBuilder:
             return datasets
 
     def _collate_fn_teacher_forcing(self, batch):
-        mask_span_prob = 0.5
+        inputs = torch.stack([item[0] for item in batch])
+        targets = torch.stack([item[1] for item in batch])
+        return inputs, targets
+
+    def _collate_fn_span_denoising(self, batch):
         ignore_index = -100
 
         new_inputs = []
         new_targets = []
 
         for x_i, y_i in batch:
-            if random.random() < mask_span_prob:
-                seq_len = x_i.size(0)
-                span_len = int(seq_len * 0.15)
+            seq_len = x_i.size(0)
+            span_len = int(seq_len * 0.15)
 
-                # Ensure span_len is at least 1 and does not exceed sequence length
-                if span_len == 0 and seq_len > 0:
-                    span_len = 1
+            if span_len == 0 and seq_len > 0:
+                span_len = 1
 
-                if span_len > 0:
-                    span_start = random.randint(0, seq_len - span_len)
+            if span_len > 0:
+                span_start = random.randint(0, seq_len - span_len)
 
-                    x_i_masked = x_i.clone()
-                    x_i_masked[span_start : span_start + span_len] = SPECIAL_TOKENS['[MASK]']
+                x_i_masked = x_i.clone()
+                x_i_masked[span_start : span_start + span_len] = SPECIAL_TOKENS['[MASK]']
 
-                    y_mask = torch.full_like(y_i, ignore_index)
-                    y_mask[span_start : span_start + span_len] = y_i[span_start : span_start + span_len]
+                y_mask = torch.full_like(y_i, ignore_index)
+                y_mask[span_start : span_start + span_len] = y_i[span_start : span_start + span_len]
 
-                    new_inputs.append(x_i_masked)
-                    new_targets.append(y_mask)
-                else:
-                    # If seq_len is 0 or span_len is 0, don't mask
-                    new_inputs.append(x_i)
-                    new_targets.append(y_i)
+                new_inputs.append(x_i_masked)
+                new_targets.append(y_mask)
             else:
+                # If seq_len is 0 or span_len is 0, don't mask
                 new_inputs.append(x_i)
                 new_targets.append(y_i)
 
@@ -585,6 +584,22 @@ class DataBuilder:
                     dataset_obj, batch_size=8, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_soft_jigsaw
+                )
+
+            # Span denoising dataloader
+            if 'span_denoising' in self.task_configs:
+                dataloaders[split_name]['span_denoising'] = DataLoader(
+                    dataset_obj, batch_size=16, shuffle=shuffle,
+                    num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                    collate_fn=self._collate_fn_span_denoising
+                )
+
+            # Next-K prediction dataloader
+            if 'next_k_prediction' in self.task_configs:
+                dataloaders[split_name]['next_k_prediction'] = DataLoader(
+                    dataset_obj, batch_size=16, shuffle=shuffle,
+                    num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                    collate_fn=self._collate_fn_teacher_forcing
                 )
 
         return dataloaders

@@ -4,7 +4,6 @@ from torch.utils.data import DataLoader
 from data_builder import BIO_TAGS, SPECIAL_TOKENS
 from torch.distributions import Bernoulli
 import torch.distributed as dist
-import random
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
@@ -303,39 +302,20 @@ class Trainer:
                     P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
             else:
                 P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
-        else:
+        else: # Handles teacher_forcing, span_denoising, and next_k_prediction
             x, y = batch
             x, y = x.to(self.config.device), y.to(self.config.device)
 
+            ignore_idx = SPECIAL_TOKENS['[PAD]']
+            if task_name == 'span_denoising':
+                ignore_idx = -100
+
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    logits, loss = self.model(x, targets=y, task_name=task_name)
+                    logits, loss = self.model(x, targets=y, task_name=task_name, ignore_index=ignore_idx)
             else:
-                logits, loss = self.model(x, targets=y, task_name=task_name)
+                logits, loss = self.model(x, targets=y, task_name=task_name, ignore_index=ignore_idx)
 
-            # Next-K Token Prediction Logic
-            if loss is not None:
-                nextk_prob = 0.25
-                if random.random() < nextk_prob:
-                    K = 4
-                    extra_loss = 0.0
-                    V = logits.size(-1) # Vocabulary size
-                    for k in range(2, K + 1):
-                        # Ensure sequence is long enough for the shift
-                        if logits.size(1) > k:
-                            logits_k = logits[:, :-k, :]
-                            targets_k = y[:, k:]
-
-                            # Add the cross-entropy loss for this offset
-                            extra_loss += F.cross_entropy(
-                                logits_k.reshape(-1, V),
-                                targets_k.reshape(-1),
-                                ignore_index=-100
-                            )
-
-                    # Add the extra loss to the main teacher-forcing loss
-                    if isinstance(extra_loss, torch.Tensor):
-                        loss = loss + extra_loss
 
         if loss is None:
             return 0.0

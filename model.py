@@ -147,7 +147,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1):
+    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, ignore_index=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -180,6 +180,24 @@ class GPTModel(nn.Module):
                 loss = F.cross_entropy(scores, correct_idx)
 
             return scores, loss
+        elif task_name == 'next_k_prediction':
+            logits = self.head(x_embed)
+            loss = None
+            if targets is not None:
+                K = 4
+                extra_loss = 0.0
+                V = logits.size(-1)
+                for k in range(2, K + 1):
+                    if logits.size(1) > k:
+                        logits_k = logits[:, :-k, :]
+                        targets_k = targets[:, k:]
+                        extra_loss += F.cross_entropy(
+                            logits_k.reshape(-1, V),
+                            targets_k.reshape(-1),
+                            ignore_index=SPECIAL_TOKENS['[PAD]']
+                        )
+                loss = extra_loss
+            return logits, loss
         elif task_name == 'soft_jigsaw':
             # Simplified sentence pooling
             span_token_id = SPECIAL_TOKENS['[SPAN]']
@@ -228,7 +246,7 @@ class GPTModel(nn.Module):
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     targets.view(-1),
-                    ignore_index=-100
+                    ignore_index=ignore_index if ignore_index is not None else SPECIAL_TOKENS['[PAD]']
                 )
             return logits, loss
     
