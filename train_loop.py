@@ -309,9 +309,9 @@ class Trainer:
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    logits, loss = self.model(x, targets=y, task_name=task_name)
+                    logits, loss = self.model(x, targets=y, task_name=task_name, ignore_index=SPECIAL_TOKENS['[PAD]'])
             else:
-                logits, loss = self.model(x, targets=y, task_name=task_name)
+                logits, loss = self.model(x, targets=y, task_name=task_name, ignore_index=SPECIAL_TOKENS['[PAD]'])
 
             if random.random() < 0.25:
                 K = 4
