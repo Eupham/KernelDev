@@ -330,7 +330,7 @@ class Trainer:
                             extra_loss += F.cross_entropy(
                                 logits_k.reshape(-1, V),
                                 targets_k.reshape(-1),
-                                ignore_index=SPECIAL_TOKENS['[PAD]']
+                                ignore_index=-100
                             )
 
                     # Add the extra loss to the main teacher-forcing loss
