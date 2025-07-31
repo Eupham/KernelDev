@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from data_builder import BIO_TAGS
+from data_builder import BIO_TAGS, SPECIAL_TOKENS
 from torch.distributions import Bernoulli
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -13,6 +13,7 @@ import time
 import os
 import json
 import math
+import random
 from pathlib import Path
 
 
@@ -311,6 +312,19 @@ class Trainer:
                     logits, loss = self.model(x, targets=y, task_name=task_name)
             else:
                 logits, loss = self.model(x, targets=y, task_name=task_name)
+
+            if random.random() < 0.25:
+                K = 4
+                extra_loss = 0.0
+                for k in range(2, K + 1):
+                    logits_k = logits[:, :-k, :]
+                    targets_k = y[:, k:]
+                    extra_loss += F.cross_entropy(
+                        logits_k.reshape(-1, logits_k.size(-1)),
+                        targets_k.reshape(-1),
+                        ignore_index=SPECIAL_TOKENS['[PAD]']
+                    )
+                loss = loss + extra_loss
 
         if loss is None:
             return 0.0

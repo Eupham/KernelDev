@@ -373,8 +373,32 @@ class DataBuilder:
             return datasets
 
     def _collate_fn_teacher_forcing(self, batch):
-        inputs = torch.stack([item[0] for item in batch])
-        targets = torch.stack([item[1] for item in batch])
+        mask_span_prob = 0.5
+        ignore_index = -100  # Typically used by CrossEntropyLoss
+
+        modified_inputs = []
+        modified_targets = []
+
+        for x_i, y_i in batch:
+            if random.random() < mask_span_prob:
+                seq_len = len(x_i)
+                span_len = int(seq_len * 0.15)
+                span_start = random.randint(0, int(seq_len * 0.85))
+
+                x_i_masked = x_i.clone()
+                x_i_masked[span_start:span_start + span_len] = SPECIAL_TOKENS['[MASK]']
+
+                y_mask = torch.full_like(y_i, ignore_index)
+                y_mask[span_start:span_start + span_len] = y_i[span_start:span_start + span_len]
+
+                modified_inputs.append(x_i_masked)
+                modified_targets.append(y_mask)
+            else:
+                modified_inputs.append(x_i)
+                modified_targets.append(y_i)
+
+        inputs = torch.stack(modified_inputs)
+        targets = torch.stack(modified_targets)
         return inputs, targets
 
     def _collate_fn_cocktail_party(self, batch):
