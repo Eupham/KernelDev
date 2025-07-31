@@ -303,11 +303,14 @@ class Trainer:
                 if x_prefix.nelement() == 0: return torch.tensor(0.0)
                 x_prefix, y_nextk = x_prefix.to(device), y_nextk.to(device)
 
-                x_combined = torch.cat([x_prefix, y_nextk[:, :-1]], dim=1)
-                prefix_padding = torch.full_like(x_prefix, SPECIAL_TOKENS['[PAD]'])
-                y_combined = torch.cat([prefix_padding, y_nextk], dim=1)
+                long_seq = torch.cat([x_prefix, y_nextk], dim=1)
+                x = long_seq[:, :-1]
+                y = long_seq[:, 1:].clone() # Use clone to avoid modifying the original tensor
 
-                _, loss = self.model(x_combined, targets=y_combined, task_name='teacher_forcing')
+                # Mask out the prefix part of the loss
+                y[:, :x_prefix.size(1)-1] = SPECIAL_TOKENS['[PAD]']
+
+                _, loss = self.model(x, targets=y, task_name='teacher_forcing')
 
             else: # Default to teacher_forcing
                 x, y = batch
@@ -370,12 +373,14 @@ class Trainer:
                             continue
                         x_prefix, y_nextk = x_prefix.to(self.config.device), y_nextk.to(self.config.device)
 
-                        x_combined = torch.cat([x_prefix, y_nextk[:, :-1]], dim=1)
-                        prefix_padding = torch.full_like(x_prefix, SPECIAL_TOKENS['[PAD]'])
-                        y_combined = torch.cat([prefix_padding, y_nextk], dim=1)
+                        long_seq = torch.cat([x_prefix, y_nextk], dim=1)
+                        x = long_seq[:, :-1]
+                        y = long_seq[:, 1:].clone()
+
+                        y[:, :x_prefix.size(1)-1] = SPECIAL_TOKENS['[PAD]']
 
                         with torch.amp.autocast('cuda'):
-                            _, loss = self.model(x_combined, targets=y_combined, task_name='teacher_forcing')
+                            _, loss = self.model(x, targets=y, task_name='teacher_forcing')
 
                     else:
                         x, y = batch
