@@ -304,7 +304,7 @@ class Trainer:
             tau = task_cfg.get('tau', 0.1)
 
             if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocautocast('cuda'):
+                with torch.amp.autocast('cuda'):
                     P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
             else:
                 P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
