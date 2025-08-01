@@ -153,6 +153,7 @@ class TrainingMetrics:
         self.train_losses = []
         self.val_losses = []
         self.cocktail_party_metrics = []
+        self.distractor_loc_metrics = []
         self.learning_rates = []
         self.step_times = []
         self.total_steps = 0
@@ -166,6 +167,7 @@ class TrainingMetrics:
         train_loss: Optional[float] = None,
         val_loss: Optional[float] = None,
         cocktail_party_metrics: Optional[Dict[str, float]] = None,
+        distractor_loc_metrics: Optional[Dict[str, float]] = None,
         learning_rate: Optional[float] = None,
         step_time: Optional[float] = None
     ):
@@ -184,6 +186,9 @@ class TrainingMetrics:
         
         if cocktail_party_metrics is not None:
             self.cocktail_party_metrics.append(cocktail_party_metrics)
+
+        if distractor_loc_metrics is not None:
+            self.distractor_loc_metrics.append(distractor_loc_metrics)
 
         if learning_rate is not None:
             self.learning_rates.append(learning_rate)
@@ -216,6 +221,7 @@ class TrainingMetrics:
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'cocktail_party_metrics': self.cocktail_party_metrics,
+            'distractor_loc_metrics': self.distractor_loc_metrics,
             'learning_rates': self.learning_rates,
             'step_times': self.step_times,
             'total_steps': self.total_steps,
@@ -298,10 +304,26 @@ class Trainer:
             tau = task_cfg.get('tau', 0.1)
 
             if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocautocast('cuda'):
                     P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
             else:
                 P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
+        elif task_name == 'distractor_loc':
+            x_prime, m_star, c_true, l_true = batch
+            if x_prime is None: return 0.0
+
+            x_prime, m_star, c_true, l_true = (
+                x_prime.to(self.config.device),
+                m_star.to(self.config.device),
+                c_true.to(self.config.device),
+                l_true.to(self.config.device),
+            )
+
+            if self.config.use_amp and self.config.scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    predictions, loss = self.model(x_prime, task_name=task_name, m_star=m_star, c_true=c_true, l_true=l_true)
+            else:
+                predictions, loss = self.model(x_prime, task_name=task_name, m_star=m_star, c_true=c_true, l_true=l_true)
         else:
             x, y = batch
             x, y = x.to(self.config.device), y.to(self.config.device)
@@ -323,12 +345,13 @@ class Trainer:
         accuracy = (predicted_idx == correct_idx).float().mean().item()
         return {'accuracy': accuracy}
 
-    def evaluate(self, dataloaders: Dict[str, DataLoader], task_configs: Dict[str, Any], max_batches: Optional[int] = 50, task_to_evaluate: Optional[str] = None) -> Tuple[float, Dict[str, float]]:
+    def evaluate(self, dataloaders: Dict[str, DataLoader], task_configs: Dict[str, Any], max_batches: Optional[int] = 50, task_to_evaluate: Optional[str] = None) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         """Evaluate the model on a dataset."""
         self.model.eval()
         total_loss = 0
         num_batches = 0
         cocktail_party_metrics = {}
+        distractor_loc_metrics = {}
         
         with torch.no_grad():
             for task_name, dataloader in dataloaders.items():
@@ -370,6 +393,30 @@ class Trainer:
                                 P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
                         else:
                             P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
+                    elif task_name == 'distractor_loc':
+                        x_prime, m_star, c_true, l_true = batch
+                        if x_prime is None: continue
+                        x_prime, m_star, c_true, l_true = x_prime.to(self.config.device), m_star.to(self.config.device), c_true.to(self.config.device), l_true.to(self.config.device)
+
+                        if self.config.use_amp:
+                            with torch.amp.autocast('cuda'):
+                                predictions, loss = self.model(x_prime, task_name=task_name, m_star=m_star, c_true=c_true, l_true=l_true)
+                        else:
+                            predictions, loss = self.model(x_prime, task_name=task_name, m_star=m_star, c_true=c_true, l_true=l_true)
+
+                        if loss is not None:
+                            m_hat, (c_hat, l_hat) = predictions
+                            intersection = (m_hat * m_star).sum(dim=1)
+                            union = m_hat.sum(dim=1) + m_star.sum(dim=1) - intersection
+                            iou = (intersection / (union + 1e-6)).mean().item()
+                            c_mae = F.l1_loss(c_hat, c_true).item()
+                            l_mae = F.l1_loss(l_hat, l_true).item()
+
+                            metrics = {'mask_iou': iou, 'center_mae': c_mae, 'length_mae': l_mae, 'total_loss': loss.item()}
+                            for k, v in metrics.items():
+                                if k not in distractor_loc_metrics:
+                                    distractor_loc_metrics[k] = []
+                                distractor_loc_metrics[k].append(v)
                     else:
                         x, y = batch
                         x, y = x.to(self.config.device), y.to(self.config.device)
@@ -396,8 +443,9 @@ class Trainer:
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
 
         avg_cocktail_party_metrics = {k: np.mean(v) for k, v in cocktail_party_metrics.items()}
+        avg_distractor_loc_metrics = {k: np.mean(v) for k, v in distractor_loc_metrics.items()}
 
-        return avg_loss, avg_cocktail_party_metrics
+        return avg_loss, avg_cocktail_party_metrics, avg_distractor_loc_metrics
 
     
     def save_checkpoint(self, step: int, is_best: bool = False):
@@ -565,14 +613,20 @@ class Trainer:
             if (not self.is_distributed or dist.get_rank() == 0):
                 # Evaluation
                 if val_loaders is not None and self.metrics.total_steps % self.config.eval_every == 0:
-                    val_loss, cocktail_party_metrics = self.evaluate(val_loaders, task_configs)
-                    self.metrics.update(val_loss=val_loss)
+                    val_loss, cocktail_party_metrics, distractor_loc_metrics = self.evaluate(val_loaders, task_configs)
+                    self.metrics.update(val_loss=val_loss, cocktail_party_metrics=cocktail_party_metrics, distractor_loc_metrics=distractor_loc_metrics)
 
                     is_best = val_loss < self.metrics.best_val_loss
                     print(f"Validation Loss: {val_loss:.4f} {'(Best!)' if is_best else ''}")
                     if cocktail_party_metrics:
                         log_str = "Overall Cocktail Party Metrics: "
                         for k, v in cocktail_party_metrics.items():
+                            log_str += f"{k}: {v:.4f}, "
+                        print(log_str)
+
+                    if distractor_loc_metrics:
+                        log_str = "Overall Distractor Loc Metrics: "
+                        for k, v in distractor_loc_metrics.items():
                             log_str += f"{k}: {v:.4f}, "
                         print(log_str)
 
@@ -681,12 +735,17 @@ class Trainer:
 
         # Initial evaluation
         if val_loaders and (not self.is_distributed or dist.get_rank() == 0):
-            initial_val_loss, initial_val_metrics = self.evaluate(val_loaders, task_configs)
-            self.metrics.update(val_loss=initial_val_loss)
+            initial_val_loss, initial_cocktail_metrics, initial_distractor_metrics = self.evaluate(val_loaders, task_configs)
+            self.metrics.update(val_loss=initial_val_loss, cocktail_party_metrics=initial_cocktail_metrics, distractor_loc_metrics=initial_distractor_metrics)
             print(f"Initial validation loss: {initial_val_loss:.4f}")
-            if initial_val_metrics:
+            if initial_cocktail_metrics:
                 log_str = "Initial cocktail party metrics: "
-                for k, v in initial_val_metrics.items():
+                for k, v in initial_cocktail_metrics.items():
+                    log_str += f"{k}: {v:.4f}, "
+                print(log_str)
+            if initial_distractor_metrics:
+                log_str = "Initial distractor loc metrics: "
+                for k, v in initial_distractor_metrics.items():
                     log_str += f"{k}: {v:.4f}, "
                 print(log_str)
 

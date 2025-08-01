@@ -138,6 +138,10 @@ class GPTModel(nn.Module):
 
         # Head for soft jigsaw task
         self.permute_head = nn.Linear(dim, 5, bias=True) # M=5
+
+        # Heads for distractor localization task
+        self.mask_head = nn.Linear(dim, 1, bias=True)
+        self.ptr_head = nn.Linear(dim, 2, bias=True)
         
         self.apply(self._init_weights)
     
@@ -147,7 +151,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1):
+    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -219,6 +223,25 @@ class GPTModel(nn.Module):
             P_hat = sinkhorn(log_S, n_iters=10)
             loss = F.mse_loss(P_hat, p_star)
             return P_hat, loss
+        elif task_name == 'distractor_loc':
+            # Mask head
+            mask_logits = self.mask_head(x_embed).squeeze(-1)  # [B, T]
+            m_hat = torch.sigmoid(mask_logits)
+
+            # Pointer head
+            cls_h = x_embed[:, 0]
+            ptr_pred = self.ptr_head(cls_h)  # [B, 2]
+            ptr_pred = torch.sigmoid(ptr_pred)
+            c_hat, l_hat = ptr_pred[:, 0], ptr_pred[:, 1]
+
+            loss = None
+            if m_star is not None and c_true is not None and l_true is not None:
+                loss_mask = F.mse_loss(m_hat, m_star)
+                loss_ptr = F.mse_loss(c_hat, c_true) + F.mse_loss(l_hat, l_true)
+                loss = loss_mask + loss_ptr
+
+            predictions = (m_hat, (c_hat, l_hat))
+            return predictions, loss
         else:
             # Teacher forcing task (generative)
             logits = self.head(x_embed)

@@ -513,6 +513,72 @@ class DataBuilder:
 
         return inputs, p_star
 
+    def _collate_fn_distractor(self, batch):
+        task_config = self.task_configs.get('distractor_loc', {})
+        L_min = task_config.get('L_min', 10)
+        L_max = task_config.get('L_max', 50)
+        sigma_scale = task_config.get('sigma_scale', 4.0)
+
+        batch_x_prime = []
+        batch_m_star = []
+        batch_c = []
+        batch_l = []
+
+        for i in range(len(batch)):
+            original_tokens, _ = batch[i]
+            original_tokens = original_tokens.tolist()
+            T = self.seq_len
+
+            if T <= L_max:
+                continue
+
+            L = random.randint(L_min, L_max)
+            s = random.randint(0, T - L)
+
+            # Sample distractor from another example
+            distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
+            distractor_tokens, _ = batch[distractor_idx]
+            distractor_tokens = distractor_tokens.tolist()
+
+            distractor_start = random.randint(0, len(distractor_tokens) - L) if len(distractor_tokens) > L else 0
+            distractor_span = distractor_tokens[distractor_start : distractor_start + L]
+
+            # Pad distractor if necessary
+            if len(distractor_span) < L:
+                distractor_span.extend([SPECIAL_TOKENS['[PAD]']] * (L - len(distractor_span)))
+
+            x_prime_list = original_tokens[:s] + distractor_span + original_tokens[s + L:]
+            x_prime_list = x_prime_list[:T]
+
+            # Create soft mask
+            center_pos = s + L / 2.0
+            sigma = L / sigma_scale if sigma_scale > 0 else 1.0
+
+            indices = torch.arange(T, dtype=torch.float32)
+            m_star = torch.exp(-((indices - center_pos)**2) / (2 * sigma**2))
+
+            if m_star.max() > 0:
+                m_star = m_star / m_star.max()
+
+            # Create center and length targets
+            c = (s + L / 2.0) / T
+            l = L / T
+
+            batch_x_prime.append(torch.tensor(x_prime_list, dtype=torch.long))
+            batch_m_star.append(m_star)
+            batch_c.append(torch.tensor(c, dtype=torch.float32))
+            batch_l.append(torch.tensor(l, dtype=torch.float32))
+
+        if not batch_x_prime:
+            return None, None, None, None
+
+        x_prime_tensor = torch.stack(batch_x_prime)
+        m_star_tensor = torch.stack(batch_m_star)
+        c_tensor = torch.stack(batch_c)
+        l_tensor = torch.stack(batch_l)
+
+        return x_prime_tensor, m_star_tensor, c_tensor, l_tensor
+
     def create_dataloaders(
         self, batch_size: int = 8, num_workers: int = 0, shuffle_train: bool = True
     ) -> Dict[str, Dict[str, DataLoader]]:
@@ -551,6 +617,13 @@ class DataBuilder:
                     dataset_obj, batch_size=8, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_soft_jigsaw
+                )
+
+            if 'distractor_loc' in self.task_configs:
+                dataloaders[split_name]['distractor_loc'] = DataLoader(
+                    dataset_obj, batch_size=4, shuffle=shuffle,
+                    num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                    collate_fn=self._collate_fn_distractor
                 )
 
         return dataloaders
