@@ -86,14 +86,29 @@ class TransformerBlock(nn.Module):
 from data_builder import NUM_BIO_TAGS, SPECIAL_TOKENS, BIO_TAGS
 from torch.distributions import Bernoulli
 
-def sinkhorn(log_logits, n_iters=20):
-    """Sinkhorn-Knopp normalization."""
-    for _ in range(n_iters):
-        # Normalize rows in log-space
-        log_logits = log_logits - torch.logsumexp(log_logits, dim=2, keepdim=True)
-        # Normalize columns in log-space
-        log_logits = log_logits - torch.logsumexp(log_logits, dim=1, keepdim=True)
-    return torch.exp(log_logits)
+def soft_rank_to_perm(scores: torch.Tensor, tau: float):
+    """
+    scores:    [B, n]
+    tau:       temperature > 0
+    returns:
+      ranks:    [B, n]   soft ranks ∈ [1..n]
+      P_hat:    [B, n, n] row-stochastic permutation
+    """
+    B, n = scores.shape
+
+    # 1) soft pairwise wins: P_ij = σ((s_j - s_i) / τ)
+    diff = scores.unsqueeze(-1) - scores.unsqueeze(1)          # [B, n, n]
+    P_pair = torch.sigmoid(diff / tau)                         # [B, n, n]
+
+    # 2) soft rank = 1 + sum_j P_ij
+    ranks = 1 + P_pair.sum(dim=-1)                             # [B, n]
+
+    # 3) now convert ranks → a soft permutation matrix by
+    #    comparing each pair of ranks exactly as above
+    diff_r = ranks.unsqueeze(-1) - ranks.unsqueeze(1)          # [B, n, n]
+    P_hat  = torch.softmax(-diff_r / tau, dim=-1)              # [B, n, n]
+
+    return ranks, P_hat
 
 class GPTModel(nn.Module):
     """GPT-styled model using flash attention kernel."""
@@ -219,8 +234,7 @@ class GPTModel(nn.Module):
             H = torch.stack(sentence_embeddings)
 
             S = self.permute_head(H)
-            log_S = S / tau
-            P_hat = sinkhorn(log_S, n_iters=10)
+            ranks, P_hat = soft_rank_to_perm(S, tau)
             loss = F.mse_loss(P_hat, p_star)
             return P_hat, loss
         elif task_name == 'distractor_loc':
