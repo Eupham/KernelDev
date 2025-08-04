@@ -152,7 +152,7 @@ class GPTModel(nn.Module):
         self.head.weight = self.token_emb.weight
 
         # Head for soft jigsaw task
-        self.permute_head = nn.Linear(dim, 5, bias=True) # M=5
+        self.permute_head = nn.Linear(dim, 1, bias=True)
 
         # Heads for distractor localization task
         self.mask_head = nn.Linear(dim, 1, bias=True)
@@ -233,7 +233,7 @@ class GPTModel(nn.Module):
 
             H = torch.stack(sentence_embeddings)
 
-            S = self.permute_head(H)
+            S = self.permute_head(H).squeeze(-1)
             ranks, P_hat = soft_rank_to_perm(S, tau)
             loss = F.mse_loss(P_hat, p_star)
             return P_hat, loss
