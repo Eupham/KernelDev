@@ -287,27 +287,30 @@ class Trainer:
     
     def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step."""
+        attention_mask = None
         if task_name == 'cocktail_party':
-            inputs, spans, correct_idx = batch
-            inputs, spans, correct_idx = inputs.to(self.config.device), spans.to(self.config.device), correct_idx.to(self.config.device)
+            inputs, attention_mask, correct_idx, _ = batch
+            inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
+            attention_mask = attention_mask.to(self.config.device) if attention_mask is not None else None
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
+                    scores, loss = self.model(inputs, correct_idx=correct_idx, task_name=task_name, attention_mask=attention_mask)
             else:
-                scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
+                scores, loss = self.model(inputs, correct_idx=correct_idx, task_name=task_name, attention_mask=attention_mask)
         elif task_name == 'soft_jigsaw':
-            inputs, p_star = batch
+            inputs, attention_mask, p_star = batch
             inputs, p_star = inputs.to(self.config.device), p_star.to(self.config.device)
+            attention_mask = attention_mask.to(self.config.device) if attention_mask is not None else None
 
             task_cfg = task_configs.get('soft_jigsaw', {})
             tau = task_cfg.get('tau', 0.1)
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
+                    P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau, attention_mask=attention_mask)
             else:
-                P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
+                P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau, attention_mask=attention_mask)
         elif task_name == 'distractor_loc':
             x_prime, m_star, c_true, l_true = batch
             if x_prime is None: return 0.0
@@ -364,14 +367,16 @@ class Trainer:
                         break
 
                     loss = None
+                    attention_mask = None
                     if task_name == 'cocktail_party':
-                        inputs, spans, correct_idx = batch
-                        inputs, spans, correct_idx = inputs.to(self.config.device), spans.to(self.config.device), correct_idx.to(self.config.device)
+                        inputs, attention_mask, correct_idx, _ = batch
+                        inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
+                        attention_mask = attention_mask.to(self.config.device) if attention_mask is not None else None
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
-                                scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
+                                scores, loss = self.model(inputs, correct_idx=correct_idx, task_name=task_name, attention_mask=attention_mask)
                         else:
-                            scores, loss = self.model(inputs, spans=spans, correct_idx=correct_idx, task_name=task_name)
+                            scores, loss = self.model(inputs, correct_idx=correct_idx, task_name=task_name, attention_mask=attention_mask)
 
                         if loss is not None:
                             metrics = self._calculate_accuracy(scores, correct_idx)
@@ -380,19 +385,20 @@ class Trainer:
                                     cocktail_party_metrics[k] = []
                                 cocktail_party_metrics[k].append(v)
                     elif task_name == 'soft_jigsaw':
-                        inputs, p_star = batch
+                        inputs, attention_mask, p_star = batch
                         if inputs.size(0) == 0:
                             continue
                         inputs, p_star = inputs.to(self.config.device), p_star.to(self.config.device)
+                        attention_mask = attention_mask.to(self.config.device) if attention_mask is not None else None
 
                         task_cfg = task_configs.get('soft_jigsaw', {})
                         tau = task_cfg.get('tau', 0.1)
 
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
-                                P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
+                                P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau, attention_mask=attention_mask)
                         else:
-                            P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
+                            P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau, attention_mask=attention_mask)
                     elif task_name == 'distractor_loc':
                         x_prime, m_star, c_true, l_true = batch
                         if x_prime is None: continue
