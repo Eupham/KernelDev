@@ -384,17 +384,21 @@ class DataBuilder:
         max_span_size = task_config.get('max_span_size', 50)
 
         batch_inputs = []
-        batch_spans = []
+        batch_span_ids = []
         batch_correct_indices = []
 
         for i in range(len(batch)):
             original_tokens, _ = batch[i]
             original_tokens = original_tokens.tolist()
 
+            # Ensure there's a CLS token at the beginning
+            if not original_tokens or original_tokens[0] != SPECIAL_TOKENS['[CLS]']:
+                 original_tokens.insert(0, SPECIAL_TOKENS['[CLS]'])
+
             span_size = random.randint(min_span_size, max_span_size)
             if len(original_tokens) <= span_size:
                 continue
-            span_start = random.randint(0, len(original_tokens) - span_size)
+            span_start = random.randint(1, len(original_tokens) - span_size) # Avoid masking CLS
             true_span = original_tokens[span_start : span_start + span_size]
 
             distractors = []
@@ -411,58 +415,59 @@ class DataBuilder:
             if not distractors:
                 continue
 
+            # This is the context part of the sequence
             masked_sequence = original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
 
             all_spans_with_labels = [(true_span, 1)] + [(d, 0) for d in distractors]
             random.shuffle(all_spans_with_labels)
 
-            spans, is_positive = zip(*all_spans_with_labels)
-            correct_idx = is_positive.index(1)
+            correct_idx = -1
+            final_spans_sequence = []
+            final_span_ids = [0] * len(masked_sequence) # 0 for context tokens
 
-            # Pad masked_sequence
-            masked_sequence = masked_sequence[:self.seq_len]
-            seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(masked_sequence))
-            masked_sequence += seq_padding
+            span_counter = 1
+            for idx, (span_tokens, is_positive) in enumerate(all_spans_with_labels):
+                if is_positive == 1:
+                    correct_idx = idx # The index of the correct span in the shuffled list
 
-            # Pad spans
-            padded_spans = []
-            #This is the source of the bug, this should be batch-wide
-            max_len_for_a_given_span_in_batch = 0
-            if spans:
-                max_len_for_a_given_span_in_batch = max(len(s) for s in spans)
+                # Add [span] marker
+                final_spans_sequence.append(SPECIAL_TOKENS['[SPAN]'])
+                final_span_ids.append(span_counter)
 
-            for s in spans:
-                padded_s = s + [SPECIAL_TOKENS['[PAD]']] * (max_len_for_a_given_span_in_batch - len(s))
-                padded_spans.append(padded_s)
+                # Add span content
+                final_spans_sequence.extend(span_tokens)
+                final_span_ids.extend([span_counter] * len(span_tokens))
 
-            batch_inputs.append(torch.tensor(masked_sequence, dtype=torch.long))
-            batch_spans.append(torch.tensor(padded_spans, dtype=torch.long))
+                # Add [es] marker
+                final_spans_sequence.append(SPECIAL_TOKENS['[ES]'])
+                final_span_ids.append(span_counter)
+
+                span_counter += 1
+
+            # Combine context and spans
+            final_sequence = masked_sequence + final_spans_sequence
+
+            # Truncate or pad the final sequence and span_ids
+            if len(final_sequence) > self.seq_len:
+                final_sequence = final_sequence[:self.seq_len]
+                final_span_ids = final_span_ids[:self.seq_len]
+            else:
+                padding_len = self.seq_len - len(final_sequence)
+                final_sequence.extend([SPECIAL_TOKENS['[PAD]']] * padding_len)
+                final_span_ids.extend([0] * padding_len) # PAD tokens have span_id 0
+
+            batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
+            batch_span_ids.append(torch.tensor(final_span_ids, dtype=torch.long))
             batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
 
         if not batch_inputs:
-            # If no valid samples were created, return empty tensors
-            return torch.empty(0), torch.empty(0), torch.empty(0)
-
-        # Pad all span tensors in the batch to the same size
-        max_batch_span_len = 0
-        if batch_spans:
-            max_batch_span_len = max(s.size(1) for s in batch_spans)
-
-        padded_batch_spans = []
-        for s in batch_spans:
-            padding_size = max_batch_span_len - s.size(1)
-            if padding_size > 0:
-                # Pad on the right (dim 1)
-                padded_s = torch.nn.functional.pad(s, (0, padding_size), 'constant', SPECIAL_TOKENS['[PAD]'])
-                padded_batch_spans.append(padded_s)
-            else:
-                padded_batch_spans.append(s)
+            return torch.empty(0, self.seq_len, dtype=torch.long), torch.empty(0, self.seq_len, dtype=torch.long), torch.empty(0, dtype=torch.long)
 
         inputs = torch.stack(batch_inputs)
-        spans = torch.stack(padded_batch_spans)
+        span_ids = torch.stack(batch_span_ids)
         correct_indices = torch.stack(batch_correct_indices)
 
-        return inputs, spans, correct_indices
+        return inputs, span_ids, correct_indices
 
 
     def _collate_fn_soft_jigsaw(self, batch):
@@ -470,20 +475,35 @@ class DataBuilder:
         M = task_config.get('M', 5)
 
         batch_inputs = []
+        batch_span_ids = []
         batch_p_star = []
 
         for item in batch:
-            text, _ = item
-            text = self.decode_tokens(text.tolist())
-            sentences = [s.strip() for s in text.split('.') if s.strip()]
+            original_tokens, _ = item
+            # We work with tokens directly to avoid re-tokenization issues
+            original_tokens = original_tokens.tolist()
 
-            if len(sentences) < M:
+            # A simple way to split into sentences is to split by a period token.
+            # This is a simplification. A more robust way would be to use a proper sentence splitter.
+            # For this example, we find indices of '.' and split the token list.
+            # Let's assume a dummy sentence splitting logic for now.
+            # We'll split the token list into M chunks.
+
+            # We need to filter out padding tokens before splitting
+            try:
+                pad_token_idx = original_tokens.index(SPECIAL_TOKENS['[PAD]'])
+                tokens_no_pad = original_tokens[:pad_token_idx]
+            except ValueError:
+                tokens_no_pad = original_tokens
+
+            if len(tokens_no_pad) < M * 2: # Need at least 2 tokens per sentence
                 continue
 
-            start_index = random.randint(0, len(sentences) - M)
-            original_sentences = sentences[start_index : start_index + M]
+            # Split tokens into M segments
+            segment_len = len(tokens_no_pad) // M
+            sentences = [tokens_no_pad[i*segment_len : (i+1)*segment_len] for i in range(M)]
 
-            indexed_sentences = list(enumerate(original_sentences))
+            indexed_sentences = list(enumerate(sentences))
             random.shuffle(indexed_sentences)
 
             shuffled_sentences = [s for _, s in indexed_sentences]
@@ -493,25 +513,47 @@ class DataBuilder:
             for i in range(M):
                 p_star[i, original_indices[i]] = 1
 
-            # Create input sequence
-            input_text = f"[CLS] " + f" [SPAN] ".join(shuffled_sentences)
-            tokens = self._tokenize_text(input_text)
+            # Create input sequence with [span]...[es] wrappers
+            final_sequence = [SPECIAL_TOKENS['[CLS]']]
+            final_span_ids = [0] # for CLS token
 
-            if len(tokens) > self.seq_len:
-                tokens = tokens[:self.seq_len]
+            span_counter = 1
+            for sentence_tokens in shuffled_sentences:
+                # Add [span] marker
+                final_sequence.append(SPECIAL_TOKENS['[SPAN]'])
+                final_span_ids.append(span_counter)
+
+                # Add sentence content
+                final_sequence.extend(sentence_tokens)
+                final_span_ids.extend([span_counter] * len(sentence_tokens))
+
+                # Add [es] marker
+                final_sequence.append(SPECIAL_TOKENS['[ES]'])
+                final_span_ids.append(span_counter)
+
+                span_counter += 1
+
+            # Pad/truncate the sequence
+            if len(final_sequence) > self.seq_len:
+                final_sequence = final_sequence[:self.seq_len]
+                final_span_ids = final_span_ids[:self.seq_len]
             else:
-                tokens += [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
+                padding_len = self.seq_len - len(final_sequence)
+                final_sequence.extend([SPECIAL_TOKENS['[PAD]']] * padding_len)
+                final_span_ids.extend([0] * padding_len) # PAD tokens have span_id 0
 
-            batch_inputs.append(torch.tensor(tokens, dtype=torch.long))
+            batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
+            batch_span_ids.append(torch.tensor(final_span_ids, dtype=torch.long))
             batch_p_star.append(p_star)
 
         if not batch_inputs:
-            return None
+            return torch.empty(0, self.seq_len, dtype=torch.long), torch.empty(0, self.seq_len, dtype=torch.long), torch.empty(0, M, M, dtype=torch.float)
 
         inputs = torch.stack(batch_inputs)
-        p_star = torch.stack(batch_p_star)
+        span_ids = torch.stack(batch_span_ids)
+        p_star_tensor = torch.stack(batch_p_star)
 
-        return inputs, p_star
+        return inputs, span_ids, p_star_tensor
 
     def _collate_fn_distractor(self, batch):
         task_config = self.task_configs.get('distractor_loc', {})

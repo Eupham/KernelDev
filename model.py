@@ -43,14 +43,16 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        is_causal = self.causal
+        # If an attention mask is provided, causal should be False.
+        # The mask itself enforces the attention pattern.
+        is_causal = self.causal and attention_mask is None
 
         # Use flash attention kernel
         out = flash_attention(
@@ -58,7 +60,8 @@ class MultiHeadAttention(nn.Module):
             k=k,
             v=v,
             lens=None,
-            causal=is_causal
+            causal=is_causal,
+            attention_mask=attention_mask
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -75,9 +78,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), attention_mask=attention_mask)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -184,7 +187,7 @@ class GPTModel(nn.Module):
         
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed)
+            x_embed = block(x_embed, attention_mask=attention_mask)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
@@ -194,11 +197,23 @@ class GPTModel(nn.Module):
             mask_pos = (x == SPECIAL_TOKENS['[MASK]']).nonzero(as_tuple=True)[1]
             h_context = x_embed[torch.arange(batch_size), mask_pos]
 
-            # Embed spans
-            spans_embed = self.token_emb(spans)
-            h_spans = spans_embed.mean(dim=2)
+            # Find [SPAN] token positions to identify the start of each span
+            span_start_indices = (x == SPECIAL_TOKENS['[SPAN]']).nonzero(as_tuple=False)
 
-            # Compute scores
+            # Since the number of spans is fixed per batch, we can reshape
+            num_spans_per_example = (x == SPECIAL_TOKENS['[SPAN]']).sum(dim=1).max()
+
+            h_spans_list = []
+            for i in range(batch_size):
+                # Get embeddings of the [SPAN] tokens themselves
+                example_span_indices = span_start_indices[span_start_indices[:, 0] == i][:, 1]
+                # The embedding of the [SPAN] token can act as a representation of the whole span
+                span_embeddings = x_embed[i, example_span_indices]
+                h_spans_list.append(span_embeddings)
+
+            h_spans = torch.stack(h_spans_list) # Shape: [B, num_spans, D]
+
+            # Compute scores by comparing context with each span representation
             scores = (h_context.unsqueeze(1) * h_spans).sum(-1)
 
             loss = None
