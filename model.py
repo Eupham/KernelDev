@@ -232,6 +232,8 @@ class GPTModel(nn.Module):
 
             loss = None
             if correct_idx is not None:
+                print(f"h_spans shape: {h_spans.shape}")
+                print(f"correct_idx: {correct_idx}")
                 loss = F.cross_entropy(scores, correct_idx)
 
             return scores, loss
