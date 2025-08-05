@@ -658,7 +658,7 @@ class DataBuilder:
         attention_mask |= cls_token_mask[:, :, None]
         attention_mask |= cls_token_mask[:, None, :]
 
-        return attention_mask.unsqueeze(1) # for broadcasting to (B, H, T, T)
+        return attention_mask
 
     def get_vocab_size(self) -> int:
         return self.vocab_size
