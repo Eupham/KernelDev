@@ -180,9 +180,9 @@ class GPTModel(nn.Module):
         attention_mask = None
         if span_ids is not None:
             span_ids = span_ids.to(x.device)
-            same_span = span_ids.unsqueeze(2) == span_ids.unsqueeze(1)
-            outside_span = span_ids == 0
-            attention_mask = same_span | outside_span.unsqueeze(2) | outside_span.unsqueeze(1)
+            # Create a mask that is True only for tokens within the same span (span_id > 0).
+            # The kernel itself will handle making non-span tokens (span_id == 0) attend to everything.
+            attention_mask = (span_ids.unsqueeze(2) == span_ids.unsqueeze(1)) & (span_ids.unsqueeze(2) != 0)
             attention_mask = attention_mask.to(torch.bool)
 
         pos = torch.arange(0, seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
