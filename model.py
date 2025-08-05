@@ -204,14 +204,25 @@ class GPTModel(nn.Module):
             num_spans_per_example = (x == SPECIAL_TOKENS['[SPAN]']).sum(dim=1).max()
 
             h_spans_list = []
+            max_spans = 0
             for i in range(batch_size):
-                # Get embeddings of the [SPAN] tokens themselves
                 example_span_indices = span_start_indices[span_start_indices[:, 0] == i][:, 1]
-                # The embedding of the [SPAN] token can act as a representation of the whole span
                 span_embeddings = x_embed[i, example_span_indices]
                 h_spans_list.append(span_embeddings)
+                if span_embeddings.shape[0] > max_spans:
+                    max_spans = span_embeddings.shape[0]
 
-            h_spans = torch.stack(h_spans_list) # Shape: [B, num_spans, D]
+            padded_h_spans = []
+            for spans_tensor in h_spans_list:
+                padding_needed = max_spans - spans_tensor.shape[0]
+                if padding_needed > 0:
+                    padding = torch.zeros(padding_needed, self.dim, device=x.device, dtype=x_embed.dtype)
+                    padded_spans = torch.cat([spans_tensor, padding], dim=0)
+                    padded_h_spans.append(padded_spans)
+                else:
+                    padded_h_spans.append(spans_tensor)
+
+            h_spans = torch.stack(padded_h_spans)
 
             # Compute scores by comparing context with each span representation
             scores = (h_context.unsqueeze(1) * h_spans).sum(-1)
