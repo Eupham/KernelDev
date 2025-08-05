@@ -201,9 +201,30 @@ class GPTModel(nn.Module):
             mask_pos = (x == SPECIAL_TOKENS['[MASK]']).nonzero(as_tuple=True)[1]
             h_context = x_embed[torch.arange(batch_size), mask_pos]
 
-            # Embed spans
-            spans_embed = self.token_emb(spans)
-            h_spans = spans_embed.mean(dim=2)
+            # Find span representations
+            span_token_id = SPECIAL_TOKENS['[SPAN]']
+            es_token_id = SPECIAL_TOKENS['[ES]']
+
+            batch_h_spans = []
+            for i in range(batch_size):
+                span_starts = (x[i] == span_token_id).nonzero(as_tuple=True)[0]
+                span_ends = (x[i] == es_token_id).nonzero(as_tuple=True)[0]
+
+                h_spans = []
+                for start, end in zip(span_starts, span_ends):
+                    span_embed = x_embed[i, start+1:end]
+                    if span_embed.numel() > 0:
+                        h_spans.append(span_embed.mean(dim=0))
+                    else:
+                        h_spans.append(torch.zeros_like(h_context[i]))
+
+                if not h_spans:
+                    # Append dummy spans if none are found to avoid errors
+                    h_spans.append(torch.zeros_like(h_context[i]))
+
+                batch_h_spans.append(torch.stack(h_spans))
+
+            h_spans = torch.stack(batch_h_spans)
 
             # Compute scores
             scores = (h_context.unsqueeze(1) * h_spans).sum(-1)
