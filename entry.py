@@ -234,6 +234,20 @@ def start_actual_training(cli_args):
     model_config['task_names'] = list(task_configs.keys())
     model = GPTModel(**model_config)
     
+    # Create dataloaders
+    try:
+        dataloaders = data_builder.create_dataloaders(
+            batch_size=batch_size,
+            num_workers=data_cfg.get('num_workers', 0),
+            shuffle_train=data_cfg.get('shuffle_train', True)
+        )
+
+    except Exception as e:
+        print(f"Error creating dataloaders: {e}")
+        print("This might be due to missing datasets library or network issues.")
+        print("Please install with: pip install datasets")
+        return
+
     # Setup precision and mixed precision training
     print(f"\n=== Setting up Precision ===")
     dtype, scaler, use_amp = setup_precision(model, precision)
