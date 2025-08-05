@@ -384,7 +384,7 @@ class DataBuilder:
         max_span_size = task_config.get('max_span_size', 50)
 
         batch_inputs = []
-        batch_spans = []
+        batch_span_ids = []
         batch_correct_indices = []
 
         for i in range(len(batch)):
@@ -416,53 +416,37 @@ class DataBuilder:
             all_spans_with_labels = [(true_span, 1)] + [(d, 0) for d in distractors]
             random.shuffle(all_spans_with_labels)
 
-            spans, is_positive = zip(*all_spans_with_labels)
-            correct_idx = is_positive.index(1)
+            correct_idx = [label for _, label in all_spans_with_labels].index(1)
 
-            # Pad masked_sequence
-            masked_sequence = masked_sequence[:self.seq_len]
-            seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(masked_sequence))
-            masked_sequence += seq_padding
+            final_sequence = masked_sequence
+            span_ids = [0] * len(final_sequence)
 
-            # Pad spans
-            padded_spans = []
-            #This is the source of the bug, this should be batch-wide
-            max_len_for_a_given_span_in_batch = 0
-            if spans:
-                max_len_for_a_given_span_in_batch = max(len(s) for s in spans)
+            span_counter = 1
+            for span, _ in all_spans_with_labels:
+                final_sequence += [SPECIAL_TOKENS['[SPAN]']] + span + [SPECIAL_TOKENS['[ES]']]
+                span_ids += [span_counter] * (len(span) + 2)
+                span_counter += 1
 
-            for s in spans:
-                padded_s = s + [SPECIAL_TOKENS['[PAD]']] * (max_len_for_a_given_span_in_batch - len(s))
-                padded_spans.append(padded_s)
+            # Pad/truncate final_sequence and span_ids
+            final_sequence = final_sequence[:self.seq_len]
+            span_ids = span_ids[:self.seq_len]
 
-            batch_inputs.append(torch.tensor(masked_sequence, dtype=torch.long))
-            batch_spans.append(torch.tensor(padded_spans, dtype=torch.long))
+            seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_sequence))
+            final_sequence += seq_padding
+            span_ids += [0] * (self.seq_len - len(span_ids))
+
+            batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
+            batch_span_ids.append(torch.tensor(span_ids, dtype=torch.long))
             batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
 
         if not batch_inputs:
-            # If no valid samples were created, return empty tensors
             return torch.empty(0), torch.empty(0), torch.empty(0)
 
-        # Pad all span tensors in the batch to the same size
-        max_batch_span_len = 0
-        if batch_spans:
-            max_batch_span_len = max(s.size(1) for s in batch_spans)
-
-        padded_batch_spans = []
-        for s in batch_spans:
-            padding_size = max_batch_span_len - s.size(1)
-            if padding_size > 0:
-                # Pad on the right (dim 1)
-                padded_s = torch.nn.functional.pad(s, (0, padding_size), 'constant', SPECIAL_TOKENS['[PAD]'])
-                padded_batch_spans.append(padded_s)
-            else:
-                padded_batch_spans.append(s)
-
         inputs = torch.stack(batch_inputs)
-        spans = torch.stack(padded_batch_spans)
+        span_ids = torch.stack(batch_span_ids)
         correct_indices = torch.stack(batch_correct_indices)
 
-        return inputs, spans, correct_indices
+        return inputs, span_ids, correct_indices
 
 
     def _collate_fn_soft_jigsaw(self, batch):
@@ -470,6 +454,7 @@ class DataBuilder:
         M = task_config.get('M', 5)
 
         batch_inputs = []
+        batch_span_ids = []
         batch_p_star = []
 
         for item in batch:
@@ -494,24 +479,37 @@ class DataBuilder:
                 p_star[i, original_indices[i]] = 1
 
             # Create input sequence
-            input_text = f"[CLS] " + f" [SPAN] ".join(shuffled_sentences)
-            tokens = self._tokenize_text(input_text)
+            final_sequence = [SPECIAL_TOKENS['[CLS]']]
+            span_ids = [0]
 
-            if len(tokens) > self.seq_len:
-                tokens = tokens[:self.seq_len]
-            else:
-                tokens += [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
+            span_counter = 1
+            for sent in shuffled_sentences:
+                sent_tokens = self._tokenize_text(sent)
+                final_sequence += [SPECIAL_TOKENS['[SPAN]']] + sent_tokens + [SPECIAL_TOKENS['[ES]']]
+                span_ids += [span_counter] * (len(sent_tokens) + 2)
+                span_counter += 1
 
-            batch_inputs.append(torch.tensor(tokens, dtype=torch.long))
+            # Pad/truncate
+            final_sequence = final_sequence[:self.seq_len]
+            span_ids = span_ids[:self.seq_len]
+
+            seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_sequence))
+            final_sequence += seq_padding
+            span_ids += [0] * (self.seq_len - len(span_ids))
+
+
+            batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
+            batch_span_ids.append(torch.tensor(span_ids, dtype=torch.long))
             batch_p_star.append(p_star)
 
         if not batch_inputs:
-            return None
+            return None, None, None
 
         inputs = torch.stack(batch_inputs)
+        span_ids = torch.stack(batch_span_ids)
         p_star = torch.stack(batch_p_star)
 
-        return inputs, p_star
+        return inputs, span_ids, p_star
 
     def _collate_fn_distractor(self, batch):
         task_config = self.task_configs.get('distractor_loc', {})
@@ -606,7 +604,7 @@ class DataBuilder:
             # Cocktail party dataloader
             if 'cocktail_party' in self.task_configs:
                 dataloaders[split_name]['cocktail_party'] = DataLoader(
-                    dataset_obj, batch_size=8, shuffle=shuffle,
+                    dataset_obj, batch_size=4, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_cocktail_party
                 )
@@ -614,7 +612,7 @@ class DataBuilder:
             # Soft jigsaw dataloader
             if 'soft_jigsaw' in self.task_configs:
                 dataloaders[split_name]['soft_jigsaw'] = DataLoader(
-                    dataset_obj, batch_size=8, shuffle=shuffle,
+                    dataset_obj, batch_size=4, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_soft_jigsaw
                 )
