@@ -218,9 +218,10 @@ class GPTModel(nn.Module):
                     else:
                         h_spans.append(torch.zeros_like(h_context[i]))
 
-                if not h_spans:
-                    # Append dummy spans if none are found to avoid errors
-                    h_spans.append(torch.zeros_like(h_context[i]))
+                # Pad h_spans to ensure consistent size
+                num_spans_to_add = (self.log_sigmas.get('cocktail_party').shape[0] if 'cocktail_party' in self.log_sigmas else 4) - len(h_spans)
+                if num_spans_to_add > 0:
+                    h_spans.extend([torch.zeros_like(h_context[i])] * num_spans_to_add)
 
                 batch_h_spans.append(torch.stack(h_spans))
 
