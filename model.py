@@ -207,16 +207,21 @@ class GPTModel(nn.Module):
 
             batch_h_spans = []
             for i in range(batch_size):
-                span_starts = (x[i] == span_token_id).nonzero(as_tuple=True)[0]
-                span_ends = (x[i] == es_token_id).nonzero(as_tuple=True)[0]
-
                 h_spans = []
-                for start, end in zip(span_starts, span_ends):
-                    span_embed = x_embed[i, start+1:end]
-                    if span_embed.numel() > 0:
-                        h_spans.append(span_embed.mean(dim=0))
-                    else:
-                        h_spans.append(torch.zeros_like(h_context[i]))
+                in_span = False
+                span_start = -1
+                for j in range(seq_len):
+                    token = x[i, j].item()
+                    if token == span_token_id:
+                        in_span = True
+                        span_start = j
+                    elif token == es_token_id and in_span:
+                        span_embed = x_embed[i, span_start+1:j]
+                        if span_embed.numel() > 0:
+                            h_spans.append(span_embed.mean(dim=0))
+                        else:
+                            h_spans.append(torch.zeros_like(h_context[i]))
+                        in_span = False
 
                 # Pad h_spans to ensure consistent size
                 num_spans_to_add = (self.log_sigmas.get('cocktail_party').shape[0] if 'cocktail_party' in self.log_sigmas else 4) - len(h_spans)
