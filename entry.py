@@ -208,17 +208,6 @@ def start_actual_training(cli_args):
         'on_the_fly_tokenization': data_cfg.get('on_the_fly_tokenization', True) # Default to True for faster iteration
     }
     
-    # Model configuration
-    model_config = {
-        'vocab_size': model_cfg.get('vocab_size', 256),
-        'dim': model_cfg.get('dim', 512),
-        'n_layers': model_cfg.get('n_layers', 12),
-        'n_heads': model_cfg.get('n_heads', 16),
-        'max_seq_len': model_cfg.get('max_seq_len', 2048),
-        'mlp_ratio': model_cfg.get('mlp_ratio', 4),
-        'causal': model_cfg.get('causal', True)
-    }
-    
     # Create data builder
     print("\n=== Loading and Processing Data ===")
     task_configs = config.get('tasks', {})
@@ -228,28 +217,6 @@ def start_actual_training(cli_args):
     actual_vocab_size = data_builder.get_vocab_size()
     model_config['vocab_size'] = actual_vocab_size
     print(f"Confirmed vocab_size: {actual_vocab_size} (UTF-8 bytes)")
-
-    # Estimate optimal batch size with precision consideration
-    if logging_cfg.get('show_memory_estimation', True):
-        estimated_batch_size, memory_info = estimate_optimal_batch_size(
-            model_config,
-            available_memory_gb=hardware_cfg.get('available_memory_gb', 15),
-            precision=precision
-        )
-        print(f"\n=== Memory Estimation ===")
-        print(memory_info)
-    else:
-        estimated_batch_size = 8  # Fallback default
-
-    # Determine batch size
-    config_batch_size = training_cfg.get('batch_size')
-    if config_batch_size is not None:
-        batch_size = config_batch_size
-        print(f"Using configured batch_size: {batch_size}")
-    else:
-        # Use a conservative batch size (slightly lower than estimated)
-        batch_size = min(estimated_batch_size, 16)  # Cap at 16 for safety
-        print(f"Using estimated batch_size: {batch_size}")
 
     # Initialize model
     print(f"\n=== Initializing Model ===")
@@ -295,6 +262,10 @@ def start_actual_training(cli_args):
         print("This might be due to missing datasets library or network issues.")
         print("Please install with: pip install datasets")
         return
+
+    # Setup precision and mixed precision training
+    print(f"\n=== Setting up Precision ===")
+    dtype, scaler, use_amp = setup_precision(model, precision)
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
