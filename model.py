@@ -54,14 +54,19 @@ class MultiHeadAttention(nn.Module):
         is_causal = self.causal and attention_mask is None
 
         # Use flash attention kernel
-        out, _ = flash_attention(
+        output = flash_attention(
             q=q,
             k=k,
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            return_lse=False
         )
+        if isinstance(output, tuple):
+            out, _ = output
+        else:
+            out = output
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(out)
