@@ -43,14 +43,14 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        is_causal = self.causal
+        is_causal = self.causal and attention_mask is None
 
         # Use flash attention kernel
         out = flash_attention(
@@ -58,7 +58,8 @@ class MultiHeadAttention(nn.Module):
             k=k,
             v=v,
             lens=None,
-            causal=is_causal
+            causal=is_causal,
+            attention_mask=attention_mask
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -75,9 +76,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), attention_mask=attention_mask)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -173,33 +174,54 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
+    def forward(self, x, targets=None, span_ids=None, task_name=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
         batch_size, seq_len = x.shape
         
-        # Create position indices
+        attention_mask = None
+        if span_ids is not None:
+            span_ids = span_ids.to(x.device)
+            same_span = span_ids.unsqueeze(2) == span_ids.unsqueeze(1)
+            outside_span = span_ids == 0
+            attention_mask = same_span | outside_span.unsqueeze(2) | outside_span.unsqueeze(1)
+            attention_mask = attention_mask.to(torch.bool)
+
         pos = torch.arange(0, seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
         
-        # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed)
+            x_embed = block(x_embed, attention_mask=attention_mask)
         
-        # Final normalization
         x_embed = self.norm_out(x_embed)
         
         if task_name == 'cocktail_party':
-            # Find [MASK] token positions
-            mask_pos = (x == SPECIAL_TOKENS['[MASK]']).nonzero(as_tuple=True)[1]
-            h_context = x_embed[torch.arange(batch_size), mask_pos]
+            mask_token_id = SPECIAL_TOKENS['[MASK]']
+            mask_positions = (x == mask_token_id).nonzero(as_tuple=True)
 
-            # Embed spans
-            spans_embed = self.token_emb(spans)
-            h_spans = spans_embed.mean(dim=2)
+            if mask_positions[0].numel() == 0:
+                # No mask token found, cannot proceed with this task
+                return torch.empty(batch_size, 0, device=x.device), torch.tensor(0.0, device=x.device)
 
-            # Compute scores
-            scores = (h_context.unsqueeze(1) * h_spans).sum(-1)
+            batch_indices = mask_positions[0]
+            sequence_indices = mask_positions[1]
+            h_context = x_embed[batch_indices, sequence_indices]
+
+            num_spans = span_ids.max()
+            if num_spans == 0: # No spans found
+                 return torch.empty(batch_size, 0, device=x.device), torch.tensor(0.0, device=x.device)
+
+            span_embeddings = []
+
+            for i in range(1, num_spans + 1):
+                span_mask = (span_ids == i).unsqueeze(-1)
+                masked_embeddings = x_embed * span_mask
+                span_lengths = span_mask.sum(dim=1)
+                summed_embeddings = masked_embeddings.sum(dim=1)
+                avg_embeddings = summed_embeddings / (span_lengths + 1e-9)
+                span_embeddings.append(avg_embeddings)
+
+            h_spans = torch.stack(span_embeddings, dim=1)
+            scores = (h_context.unsqueeze(1) * h_spans).sum(dim=-1)
 
             loss = None
             if correct_idx is not None:
@@ -207,68 +229,57 @@ class GPTModel(nn.Module):
 
             return scores, loss
         elif task_name == 'soft_jigsaw':
-            # Simplified sentence pooling
-            span_token_id = SPECIAL_TOKENS['[SPAN]']
+            num_segments = span_ids.max()
+            if num_segments == 0:
+                return torch.empty(batch_size, 0, 0, device=x.device), torch.tensor(0.0, device=x.device)
 
-            sentence_embeddings = []
-            for i in range(batch_size):
-                span_indices = (x[i] == span_token_id).nonzero(as_tuple=False).squeeze(-1)
+            segment_embeddings = []
 
-                # Add start and end of sequence for pooling
-                sentence_boundaries = [0] + span_indices.tolist() + [seq_len]
+            for i in range(1, num_segments + 1):
+                segment_mask = (span_ids == i).unsqueeze(-1)
+                masked_embeddings = x_embed * segment_mask
+                segment_lengths = segment_mask.sum(dim=1)
+                summed_embeddings = masked_embeddings.sum(dim=1)
+                avg_embeddings = summed_embeddings / (segment_lengths + 1e-9)
+                segment_embeddings.append(avg_embeddings)
 
-                pooled_embeddings = []
-                for j in range(len(sentence_boundaries) - 1):
-                    start, end = sentence_boundaries[j], sentence_boundaries[j+1]
-                    span_tokens = x_embed[i, start+1:end]
-                    if span_tokens.numel() > 0:
-                        emb = span_tokens.mean(dim=0)
-                    else:
-                        # fallback: zero‑vector of same dimension
-                        emb = x_embed.new_zeros(x_embed.size(-1))
-                    pooled_embeddings.append(emb)
+            H = torch.stack(segment_embeddings, dim=1)
 
-                M = p_star.size(1)
-                L = len(pooled_embeddings)
-                if L < M:
-                    zero = x_embed.new_zeros(x_embed.size(-1))
-                    pooled_embeddings += [zero] * (M - L)
-                elif L > M:
-                    pooled_embeddings = pooled_embeddings[:M]
+            M_from_p_star = p_star.size(1)
+            M_from_spans = H.size(1)
 
-                sentence_embeddings.append(torch.stack(pooled_embeddings))
-
-            H = torch.stack(sentence_embeddings)
+            if M_from_spans < M_from_p_star:
+                padding_size = M_from_p_star - M_from_spans
+                padding = torch.zeros(H.size(0), padding_size, H.size(2), device=H.device, dtype=H.dtype)
+                H = torch.cat([H, padding], dim=1)
+            elif M_from_spans > M_from_p_star:
+                H = H[:, :M_from_p_star, :]
 
             S = self.permute_head(H).squeeze(-1)
             ranks, P_hat = soft_rank_to_perm(S, tau)
             loss = F.mse_loss(P_hat, p_star)
             return P_hat, loss
         elif task_name == 'distractor_loc':
-            # Mask head
-            mask_logits = self.mask_head(x_embed).squeeze(-1)  # [B, T]
+            mask_logits = self.mask_head(x_embed).squeeze(-1)
             m_hat = torch.sigmoid(mask_logits)
 
-            # Pointer head
             cls_h = x_embed[:, 0]
-            ptr_pred = self.ptr_head(cls_h)  # [B, 2]
+            ptr_pred = self.ptr_head(cls_h)
             ptr_pred = torch.sigmoid(ptr_pred)
             c_hat, l_hat = ptr_pred[:, 0], ptr_pred[:, 1]
 
             loss = None
             if m_star is not None and c_true is not None and l_true is not None:
                 loss_mask = F.mse_loss(m_hat, m_star)
-                loss_ptr = F.mse_loss(c_hat, c_true) + F.mse_loss(l_hat, l_true)
+                loss_ptr = F.l1_loss(c_hat, c_true) + F.l1_loss(l_hat, l_true)
                 loss = loss_mask + loss_ptr
 
             predictions = (m_hat, (c_hat, l_hat))
             return predictions, loss
         else:
-            # Teacher forcing task (generative)
             logits = self.head(x_embed)
             loss = None
             if targets is not None:
-                # Compute cross-entropy loss
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     targets.view(-1),
