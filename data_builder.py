@@ -398,18 +398,16 @@ class DataBuilder:
             true_span = original_tokens[span_start : span_start + span_size]
 
             distractors = []
-            for _ in range(num_distractors):
+            while len(distractors) < num_distractors:
                 distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
                 distractor_tokens, _ = batch[distractor_idx]
                 distractor_tokens = distractor_tokens.tolist()
                 if len(distractor_tokens) <= span_size:
+                    distractors.append([SPECIAL_TOKENS['[PAD]']] * span_size)
                     continue
                 distractor_start = random.randint(0, len(distractor_tokens) - span_size)
                 distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
                 distractors.append(distractor_span)
-
-            if not distractors:
-                continue
 
             # Create the masked sequence with [CLS] token at the beginning
             masked_sequence = [SPECIAL_TOKENS['[CLS]']] + original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
