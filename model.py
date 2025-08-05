@@ -43,14 +43,14 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        is_causal = self.causal
+        is_causal = self.causal if attention_mask is None else False
 
         # Use flash attention kernel
         out = flash_attention(
@@ -58,7 +58,8 @@ class MultiHeadAttention(nn.Module):
             k=k,
             v=v,
             lens=None,
-            causal=is_causal
+            causal=is_causal,
+            attention_mask=attention_mask
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -75,9 +76,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), attention_mask=attention_mask)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -173,7 +174,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
+    def forward(self, x, targets=None, span_ids=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -181,10 +182,23 @@ class GPTModel(nn.Module):
         
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
+
+        # Generate attention mask from span_ids if provided
+        if span_ids is not None:
+            # Same span mask
+            same_span = span_ids.unsqueeze(2) == span_ids.unsqueeze(1)
+
+            # Tokens outside any span can attend to all
+            outside_span = span_ids == 0
+            outside_mask = outside_span.unsqueeze(2) | outside_span.unsqueeze(1)
+
+            # Combine masks
+            attention_mask = same_span | outside_mask
+            attention_mask = attention_mask.unsqueeze(1) # for multi-head broadcasting
         
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed)
+            x_embed = block(x_embed, attention_mask=attention_mask)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
