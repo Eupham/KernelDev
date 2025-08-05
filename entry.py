@@ -208,6 +208,17 @@ def start_actual_training(cli_args):
         'on_the_fly_tokenization': data_cfg.get('on_the_fly_tokenization', True) # Default to True for faster iteration
     }
     
+    # Model configuration
+    model_config = {
+        'vocab_size': model_cfg.get('vocab_size', 256),
+        'dim': model_cfg.get('dim', 512),
+        'n_layers': model_cfg.get('n_layers', 12),
+        'n_heads': model_cfg.get('n_heads', 16),
+        'max_seq_len': model_cfg.get('max_seq_len', 2048),
+        'mlp_ratio': model_cfg.get('mlp_ratio', 4),
+        'causal': model_cfg.get('causal', True)
+    }
+
     # Create data builder
     print("\n=== Loading and Processing Data ===")
     task_configs = config.get('tasks', {})
