@@ -384,17 +384,27 @@ class DataBuilder:
         max_span_size = task_config.get('max_span_size', 50)
 
         batch_inputs = []
-        batch_spans = []
+        batch_attention_masks = []
         batch_correct_indices = []
 
         for i in range(len(batch)):
             original_tokens, _ = batch[i]
             original_tokens = original_tokens.tolist()
 
-            span_size = random.randint(min_span_size, max_span_size)
-            if len(original_tokens) <= span_size:
+            try:
+                pad_index = original_tokens.index(SPECIAL_TOKENS['[PAD]'])
+                original_tokens = original_tokens[:pad_index]
+            except ValueError:
+                pass
+
+            if len(original_tokens) <= min_span_size + 1:
                 continue
-            span_start = random.randint(0, len(original_tokens) - span_size)
+
+            span_size = random.randint(min_span_size, max_span_size)
+            if len(original_tokens) <= span_size + 1:
+                span_size = len(original_tokens) - 2
+
+            span_start = random.randint(1, len(original_tokens) - span_size)
             true_span = original_tokens[span_start : span_start + span_size]
 
             distractors = []
@@ -402,9 +412,15 @@ class DataBuilder:
                 distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
                 distractor_tokens, _ = batch[distractor_idx]
                 distractor_tokens = distractor_tokens.tolist()
-                if len(distractor_tokens) <= span_size:
+                try:
+                    pad_index = distractor_tokens.index(SPECIAL_TOKENS['[PAD]'])
+                    distractor_tokens = distractor_tokens[:pad_index]
+                except ValueError:
+                    pass
+
+                if len(distractor_tokens) <= span_size + 1:
                     continue
-                distractor_start = random.randint(0, len(distractor_tokens) - span_size)
+                distractor_start = random.randint(1, len(distractor_tokens) - span_size)
                 distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
                 distractors.append(distractor_span)
 
@@ -419,50 +435,43 @@ class DataBuilder:
             spans, is_positive = zip(*all_spans_with_labels)
             correct_idx = is_positive.index(1)
 
-            # Pad masked_sequence
-            masked_sequence = masked_sequence[:self.seq_len]
-            seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(masked_sequence))
-            masked_sequence += seq_padding
-
-            # Pad spans
-            padded_spans = []
-            #This is the source of the bug, this should be batch-wide
-            max_len_for_a_given_span_in_batch = 0
-            if spans:
-                max_len_for_a_given_span_in_batch = max(len(s) for s in spans)
-
+            final_tokens = masked_sequence
+            span_ids = [0] * len(final_tokens)
+            span_id_counter = 1
             for s in spans:
-                padded_s = s + [SPECIAL_TOKENS['[PAD]']] * (max_len_for_a_given_span_in_batch - len(s))
-                padded_spans.append(padded_s)
+                final_tokens.append(SPECIAL_TOKENS['[SPAN]'])
+                span_ids.append(span_id_counter)
+                final_tokens.extend(s)
+                span_ids.extend([span_id_counter] * len(s))
+                final_tokens.append(SPECIAL_TOKENS['[ES]'])
+                span_ids.append(span_id_counter)
+                span_id_counter += 1
 
-            batch_inputs.append(torch.tensor(masked_sequence, dtype=torch.long))
-            batch_spans.append(torch.tensor(padded_spans, dtype=torch.long))
+            if len(final_tokens) > self.seq_len:
+                final_tokens = final_tokens[:self.seq_len]
+                span_ids = span_ids[:self.seq_len]
+            else:
+                padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_tokens))
+                final_tokens.extend(padding)
+                span_ids.extend([0] * (self.seq_len - len(span_ids)))
+
+            batch_inputs.append(torch.tensor(final_tokens, dtype=torch.long))
             batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
 
+            span_ids_tensor = torch.tensor(span_ids, dtype=torch.long)
+            same_span = span_ids_tensor[None, :, None] == span_ids_tensor[None, None, :]
+            outside = span_ids_tensor == 0
+            attention_mask = same_span | outside[None, :, None] | outside[None, None, :]
+            batch_attention_masks.append(attention_mask)
+
         if not batch_inputs:
-            # If no valid samples were created, return empty tensors
             return torch.empty(0), torch.empty(0), torch.empty(0)
 
-        # Pad all span tensors in the batch to the same size
-        max_batch_span_len = 0
-        if batch_spans:
-            max_batch_span_len = max(s.size(1) for s in batch_spans)
-
-        padded_batch_spans = []
-        for s in batch_spans:
-            padding_size = max_batch_span_len - s.size(1)
-            if padding_size > 0:
-                # Pad on the right (dim 1)
-                padded_s = torch.nn.functional.pad(s, (0, padding_size), 'constant', SPECIAL_TOKENS['[PAD]'])
-                padded_batch_spans.append(padded_s)
-            else:
-                padded_batch_spans.append(s)
-
         inputs = torch.stack(batch_inputs)
-        spans = torch.stack(padded_batch_spans)
+        attention_mask = torch.cat(batch_attention_masks, dim=0)
         correct_indices = torch.stack(batch_correct_indices)
 
-        return inputs, spans, correct_indices
+        return inputs, attention_mask, correct_indices
 
 
     def _collate_fn_soft_jigsaw(self, batch):
@@ -470,6 +479,7 @@ class DataBuilder:
         M = task_config.get('M', 5)
 
         batch_inputs = []
+        batch_attention_masks = []
         batch_p_star = []
 
         for item in batch:
@@ -494,24 +504,52 @@ class DataBuilder:
                 p_star[i, original_indices[i]] = 1
 
             # Create input sequence
-            input_text = f"[CLS] " + f" [SPAN] ".join(shuffled_sentences)
+            wrapped_sentences = [f"[SPAN]{s}[ES]" for s in shuffled_sentences]
+            input_text = "[CLS] " + "".join(wrapped_sentences)
+
             tokens = self._tokenize_text(input_text)
+
+            span_ids = []
+            span_id_counter = 1
+            in_span = False
+            for token_id in tokens:
+                if token_id == SPECIAL_TOKENS['[SPAN]']:
+                    in_span = True
+                    span_ids.append(span_id_counter)
+                elif token_id == SPECIAL_TOKENS['[ES]']:
+                    span_ids.append(span_id_counter)
+                    in_span = False
+                    span_id_counter += 1
+                elif in_span:
+                    span_ids.append(span_id_counter)
+                else:
+                    span_ids.append(0)
 
             if len(tokens) > self.seq_len:
                 tokens = tokens[:self.seq_len]
+                span_ids = span_ids[:self.seq_len]
             else:
-                tokens += [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
+                padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
+                tokens.extend(padding)
+                span_ids.extend([0] * (self.seq_len - len(span_ids)))
 
             batch_inputs.append(torch.tensor(tokens, dtype=torch.long))
             batch_p_star.append(p_star)
 
+            span_ids_tensor = torch.tensor(span_ids, dtype=torch.long)
+            same_span = span_ids_tensor[None, :, None] == span_ids_tensor[None, None, :]
+            outside = span_ids_tensor == 0
+            attention_mask = same_span | outside[None, :, None] | outside[None, None, :]
+            batch_attention_masks.append(attention_mask)
+
         if not batch_inputs:
-            return None
+            return None, None, None
 
         inputs = torch.stack(batch_inputs)
+        attention_mask = torch.cat(batch_attention_masks, dim=0)
         p_star = torch.stack(batch_p_star)
 
-        return inputs, p_star
+        return inputs, attention_mask, p_star
 
     def _collate_fn_distractor(self, batch):
         task_config = self.task_configs.get('distractor_loc', {})
