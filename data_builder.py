@@ -68,6 +68,7 @@ class DataBuilder:
         self.max_eval_tokens = max_eval_tokens
         self.task_configs = task_configs or {}
         self._cached_splits = None
+        self._cached_splits = None
 
         print(f"Using UTF-8 byte tokenization with vocabulary size: {self.vocab_size}")
         print(f"Max evaluation tokens per split: {self.max_eval_tokens}")
