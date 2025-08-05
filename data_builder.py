@@ -67,6 +67,7 @@ class DataBuilder:
         self.vocab_size = vocab_size + NUM_SPECIAL_TOKENS
         self.max_eval_tokens = max_eval_tokens
         self.task_configs = task_configs or {}
+        self._cached_splits = None
 
         print(f"Using UTF-8 byte tokenization with vocabulary size: {self.vocab_size}")
         print(f"Max evaluation tokens per split: {self.max_eval_tokens}")
@@ -140,6 +141,9 @@ class DataBuilder:
         return samples
 
     def load_raw_dataset(self):
+        if self._cached_splits:
+            return self._cached_splits
+
         print(f"Loading dataset: {self.dataset_name}/{self.dataset_config}")
         loaded_samples = []
 
@@ -250,11 +254,13 @@ class DataBuilder:
         if not final_test_data and final_train_data: final_test_data = final_train_data[:max(1, len(final_train_data)//10)] # 10% of train for test
 
         print(f"Returning dataset splits: train={len(final_train_data)}, val={len(final_val_data)}, test={len(final_test_data)}")
-        return {
+        splits = {
             'train': final_train_data,
             'validation': final_val_data,
             'test': final_test_data
         }
+        self._cached_splits = splits
+        return splits
 
     def _create_fallback_dataset(self):
         # ... (method content as in original file, ensure it uses self.max_samples correctly)
