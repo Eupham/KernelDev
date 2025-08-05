@@ -161,7 +161,6 @@ class TrainingMetrics:
         self.best_step = 0
         self.moving_avg_window = moving_avg_window
         self.recent_train_losses = []
-        self.task_loss_moving_averages = {}
     
     def update(
         self,
@@ -227,8 +226,7 @@ class TrainingMetrics:
             'step_times': self.step_times,
             'total_steps': self.total_steps,
             'best_val_loss': self.best_val_loss,
-            'best_step': self.best_step,
-            'task_loss_moving_averages': self.task_loss_moving_averages
+            'best_step': self.best_step
         }
         torch.save(metrics_dict, filepath)
 
@@ -542,8 +540,6 @@ class Trainer:
             
             total_loss = 0
             individual_losses = {}
-            normalized_losses = {}
-            ema_decay = 0.99
 
             for task_name, task_iter in train_iters.items():
                 try:
@@ -557,21 +553,13 @@ class Trainer:
                 if loss is None or (isinstance(loss, float) and loss == 0.0):
                     continue
 
-                unnormalized_loss_val = loss.item()
-                individual_losses[task_name] = unnormalized_loss_val
+                individual_losses[task_name] = loss.item()
 
-                # Update moving average
-                current_ema = self.metrics.task_loss_moving_averages.get(task_name, 1.0)
-                new_ema = ema_decay * current_ema + (1 - ema_decay) * unnormalized_loss_val
-                self.metrics.task_loss_moving_averages[task_name] = new_ema
+                # Uncertainty-based weighting
+                log_sigma = self.model.module.log_sigmas[task_name] if isinstance(self.model, DDP) else self.model.log_sigmas[task_name]
+                weighted_loss = 0.5 * torch.exp(-2 * log_sigma) * loss + log_sigma
 
-                # Normalize loss
-                normalized_loss = loss / (new_ema + 1e-6)
-                normalized_losses[task_name] = normalized_loss.item()
-
-                # Apply weight to normalized loss
-                task_weight = task_configs.get(task_name, {}).get('weight', 1.0)
-                total_loss += task_weight * normalized_loss
+                total_loss += weighted_loss.squeeze()
 
             epoch_losses.append(total_loss.item())
 
@@ -614,8 +602,9 @@ class Trainer:
                 log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
                 log_str += f"Total Loss: {total_loss.item():.4f} (MA: {loss_ma:.4f}, Var: {loss_var:.4f}), "
                 for task_name, loss_value in individual_losses.items():
-                    norm_loss = normalized_losses.get(task_name, 0.0)
-                    log_str += f"{task_name}: {loss_value:.4f} (norm: {norm_loss:.4f}), "
+                    log_sigma = self.model.module.log_sigmas[task_name].item() if isinstance(self.model, DDP) else self.model.log_sigmas[task_name].item()
+                    sigma = math.exp(log_sigma)
+                    log_str += f"{task_name}: {loss_value:.4f} (σ: {sigma:.4f}), "
 
                 log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
@@ -736,11 +725,6 @@ class Trainer:
         self.steps_per_epoch = max(len(loader) for loader in train_loaders.values())
         if not self.is_distributed or dist.get_rank() == 0:
             print(f"Calculated steps_per_epoch: {self.steps_per_epoch}")
-
-        # Initialize moving averages for task losses
-        for task_name in train_loaders.keys():
-            if task_name not in self.metrics.task_loss_moving_averages:
-                self.metrics.task_loss_moving_averages[task_name] = 1.0
 
         total_steps = self.steps_per_epoch * self.config.num_epochs
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

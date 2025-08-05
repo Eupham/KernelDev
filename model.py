@@ -122,13 +122,20 @@ class GPTModel(nn.Module):
         max_seq_len=2048,
         mlp_ratio=4,
         causal=True,
-        bidirectional_prefix_len=0
+        bidirectional_prefix_len=0,
+        task_names: list = None
     ):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.bidirectional_prefix_len = bidirectional_prefix_len
         
+        # Learnable uncertainty parameters for each task
+        if task_names:
+            self.log_sigmas = nn.ParameterDict({
+                task: nn.Parameter(torch.zeros(1)) for task in task_names
+            })
+
         # Token and position embeddings (no bias)
         self.token_emb = nn.Embedding(vocab_size, dim)
         self.pos_emb = nn.Embedding(max_seq_len, dim)
