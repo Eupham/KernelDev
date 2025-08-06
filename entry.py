@@ -333,11 +333,11 @@ def start_actual_training(cli_args):
     if 'train' in dataloaders and 'cocktail_party' in dataloaders['train']:
         print("\n=== Data Sample (Cocktail Party) ===")
         for batch in dataloaders['train']['cocktail_party']:
-            inputs, spans, correct_idx = batch
+            inputs, correct_idx, attn_mask = batch
             print(f"Batch shape: {inputs.shape}")
-            print(f"Spans shape: {spans.shape}")
+            print(f"Attention mask shape: {attn_mask.shape}")
             print(f"Sample tokens: {inputs[0][:20].tolist()}")
-            print(f"Sample correct_idx: {correct_idx[0].tolist()}")
+            print(f"Sample correct_idx: {correct_idx[0].item()}")
             
             # Decode sample text
             sample_text = data_builder.decode_tokens(inputs[0][:50])
