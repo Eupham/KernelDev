@@ -341,6 +341,21 @@ class Trainer:
 
     def _calculate_accuracy(self, scores: torch.Tensor, correct_idx: torch.Tensor) -> Dict[str, float]:
         """Calculates accuracy for the contrastive task."""
+        # ─── DEBUGGING HOOK ────────────────────────────────────────────────
+        # Print shapes and value ranges so we can see what's about to feed into the loss
+        print(f"[DEBUG cocktail_party] scores.shape={scores.shape}, "
+              f"correct_idx.min={correct_idx.min().item()}, "
+              f"correct_idx.max={correct_idx.max().item()}")
+
+        # Make sure no target index is out of bounds
+        if (correct_idx < 0).any() or (correct_idx >= scores.size(1)).any():
+            raise ValueError(
+                f"Out-of-range correct_idx in cocktail_party: "
+                f"min={correct_idx.min().item()}, "
+                f"max={correct_idx.max().item()}, "
+                f"allowed=[0..{scores.size(1)-1}]"
+            )
+        # ───────────────────────────────────────────────────────────────────
         predicted_idx = torch.argmax(scores, dim=1)
         accuracy = (predicted_idx == correct_idx).float().mean().item()
         return {'accuracy': accuracy}
