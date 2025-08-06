@@ -219,9 +219,18 @@ def start_actual_training(cli_args):
         'causal': model_cfg.get('causal', True)
     }
     
+    # Create data builder
+    print("\n=== Loading and Processing Data ===")
+    task_configs = config.get('tasks', {})
+    data_builder = create_data_builder(**data_config, task_configs=task_configs)
+
+    # Update vocab size in model_config and re-initialize model
+    actual_vocab_size = data_builder.get_vocab_size()
+    model_config['vocab_size'] = actual_vocab_size
+    print(f"Confirmed vocab_size: {actual_vocab_size} (UTF-8 bytes)")
+
     # Initialize model
     print(f"\n=== Initializing Model ===")
-    task_configs = config.get('tasks', {})
     model_config['task_names'] = list(task_configs.keys())
     model = GPTModel(**model_config)
     
@@ -287,11 +296,6 @@ def start_actual_training(cli_args):
     print(f"Data config: {data_config}")
     print(f"Training config: batch_size={batch_size}, epochs={training_config.num_epochs}")
     
-    # Create data builder
-    print("\n=== Loading and Processing Data ===")
-    task_configs = config.get('tasks', {})
-    data_builder = create_data_builder(**data_config, task_configs=task_configs)
-    
     # Create dataloaders
     try:
         dataloaders = data_builder.create_dataloaders(
@@ -299,11 +303,6 @@ def start_actual_training(cli_args):
             num_workers=data_cfg.get('num_workers', 0),
             shuffle_train=data_cfg.get('shuffle_train', True)
         )
-        
-        # Update vocab size based on actual tokenizer
-        actual_vocab_size = data_builder.get_vocab_size()
-        model_config['vocab_size'] = actual_vocab_size
-        print(f"Confirmed vocab_size: {actual_vocab_size} (UTF-8 bytes)")
         
     except Exception as e:
         print(f"Error creating dataloaders: {e}")

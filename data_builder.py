@@ -629,7 +629,7 @@ class DataBuilder:
 
             # Teacher forcing dataloader
             dataloaders[split_name]['teacher_forcing'] = DataLoader(
-                dataset_obj, batch_size=16, shuffle=shuffle,
+                dataset_obj, batch_size=batch_size, shuffle=shuffle,
                 num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                 collate_fn=self._collate_fn_teacher_forcing
             )
@@ -637,7 +637,7 @@ class DataBuilder:
             # Cocktail party dataloader
             if 'cocktail_party' in self.task_configs:
                 dataloaders[split_name]['cocktail_party'] = DataLoader(
-                    dataset_obj, batch_size=8, shuffle=shuffle,
+                    dataset_obj, batch_size=batch_size, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_cocktail_party
                 )
@@ -645,14 +645,14 @@ class DataBuilder:
             # Soft jigsaw dataloader
             if 'soft_jigsaw' in self.task_configs:
                 dataloaders[split_name]['soft_jigsaw'] = DataLoader(
-                    dataset_obj, batch_size=8, shuffle=shuffle,
+                    dataset_obj, batch_size=batch_size, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_soft_jigsaw
                 )
 
             if 'distractor_loc' in self.task_configs:
                 dataloaders[split_name]['distractor_loc'] = DataLoader(
-                    dataset_obj, batch_size=4, shuffle=shuffle,
+                    dataset_obj, batch_size=batch_size, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_distractor
                 )
