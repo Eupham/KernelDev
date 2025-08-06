@@ -415,6 +415,11 @@ class DataBuilder:
             masked_context = original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
 
             all_spans_with_labels = [(true_span, 1)] + [(d, i + 2) for i, d in enumerate(distractors)]
+
+            # Pad the spans to ensure all batch items have the same number of spans
+            while len(all_spans_with_labels) < num_distractors + 1:
+                all_spans_with_labels.append(([], 0)) # Pad with empty spans and a dummy label
+
             random.shuffle(all_spans_with_labels)
 
             correct_idx = -1
