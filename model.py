@@ -175,7 +175,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, span_ids=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
+    def forward(self, x, targets=None, attention_mask=None, task_name=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
         batch_size, seq_len = x.shape
         
         # Create position indices

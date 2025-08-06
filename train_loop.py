@@ -290,30 +290,30 @@ class Trainer:
         model_to_call = self.model.module if isinstance(self.model, DDP) else self.model
 
         if task_name == 'cocktail_party':
-            inputs, span_ids, correct_idx, attn_mask = batch
-            inputs, span_ids, correct_idx, attn_mask = (
+            inputs, correct_idx, attn_mask = batch
+            inputs, correct_idx, attn_mask = (
                 inputs.to(self.config.device),
-                span_ids.to(self.config.device),
                 correct_idx.to(self.config.device),
                 attn_mask.to(self.config.device)
             )
 
-            attn_mask = attn_mask.unsqueeze(1).expand(-1, model_to_call.n_heads, -1, -1)
+            attn_mask = attn_mask.unsqueeze(1).expand(-1, model_to_call.n_heads, -1, -1).contiguous()
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    scores, loss = self.model(inputs, span_ids=span_ids, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                    scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
             else:
-                scores, loss = self.model(inputs, span_ids=span_ids, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
 
         elif task_name == 'soft_jigsaw':
             inputs, p_star, attn_mask = batch
+            if inputs is None: return 0.0
             inputs, p_star, attn_mask = inputs.to(self.config.device), p_star.to(self.config.device), attn_mask.to(self.config.device)
 
             task_cfg = task_configs.get('soft_jigsaw', {})
             tau = task_cfg.get('tau', 0.1)
 
-            attn_mask = attn_mask.unsqueeze(1).expand(-1, model_to_call.n_heads, -1, -1)
+            attn_mask = attn_mask.unsqueeze(1).expand(-1, model_to_call.n_heads, -1, -1).contiguous()
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
@@ -379,20 +379,20 @@ class Trainer:
 
                     loss = None
                     if task_name == 'cocktail_party':
-                        inputs, span_ids, correct_idx, attn_mask = batch
-                        inputs, span_ids, correct_idx, attn_mask = (
+                        inputs, correct_idx, attn_mask = batch
+                        if inputs.numel() == 0: continue
+                        inputs, correct_idx, attn_mask = (
                             inputs.to(self.config.device),
-                            span_ids.to(self.config.device),
                             correct_idx.to(self.config.device),
                             attn_mask.to(self.config.device)
                         )
-                        attn_mask = attn_mask.unsqueeze(1).expand(-1, model_to_call.n_heads, -1, -1)
+                        attn_mask = attn_mask.unsqueeze(1).expand(-1, model_to_call.n_heads, -1, -1).contiguous()
 
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
-                                scores, loss = self.model(inputs, span_ids=span_ids, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
                         else:
-                            scores, loss = self.model(inputs, span_ids=span_ids, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                            scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
 
                         if loss is not None:
                             metrics = self._calculate_accuracy(scores, correct_idx)
@@ -402,13 +402,13 @@ class Trainer:
                                 cocktail_party_metrics[k].append(v)
                     elif task_name == 'soft_jigsaw':
                         inputs, p_star, attn_mask = batch
-                        if inputs.size(0) == 0:
+                        if inputs is None or inputs.size(0) == 0:
                             continue
                         inputs, p_star, attn_mask = inputs.to(self.config.device), p_star.to(self.config.device), attn_mask.to(self.config.device)
 
                         task_cfg = task_configs.get('soft_jigsaw', {})
                         tau = task_cfg.get('tau', 0.1)
-                        attn_mask = attn_mask.unsqueeze(1).expand(-1, model_to_call.n_heads, -1, -1)
+                        attn_mask = attn_mask.unsqueeze(1).expand(-1, model_to_call.n_heads, -1, -1).contiguous()
 
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):

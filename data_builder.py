@@ -384,7 +384,6 @@ class DataBuilder:
         max_span_size = task_config.get('max_span_size', 50)
 
         batch_inputs = []
-        batch_span_ids = []
         batch_correct_indices = []
         batch_attn_masks = []
 
@@ -412,6 +411,7 @@ class DataBuilder:
             if not distractors:
                 continue
 
+            # This is the context, with the true span replaced by [MASK]
             masked_context = original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
 
             all_spans_with_labels = [(true_span, 1)] + [(d, i + 2) for i, d in enumerate(distractors)]
@@ -419,18 +419,32 @@ class DataBuilder:
 
             correct_idx = -1
 
+            # Start with the masked context
             final_tokens = list(masked_context)
-            span_ids = [0] * len(masked_context)
+            span_ids = [0] * len(masked_context) # 0 for context tokens
+
+            # Find the index of the [MASK] token
+            mask_token_idx = final_tokens.index(SPECIAL_TOKENS['[MASK]'])
+
+            # Insert wrapped spans immediately after the [MASK] token
+            spans_insert_pos = mask_token_idx + 1
+
+            spans_to_insert = []
+            span_ids_to_insert = []
 
             shuffled_spans, shuffled_span_ids = zip(*all_spans_with_labels)
 
             for i, span in enumerate(shuffled_spans):
                 span_id = shuffled_span_ids[i]
                 if span_id == 1:
-                    correct_idx = i
+                    correct_idx = i # The index of the true span in the shuffled list
 
-                final_tokens.extend([SPECIAL_TOKENS['[SPAN]']] + span + [SPECIAL_TOKENS['[ES]']])
-                span_ids.extend([span_id] * (len(span) + 2))
+                wrapped_span = [SPECIAL_TOKENS['[SPAN]']] + span + [SPECIAL_TOKENS['[ES]']]
+                spans_to_insert.extend(wrapped_span)
+                span_ids_to_insert.extend([span_id] * len(wrapped_span))
+
+            final_tokens = final_tokens[:spans_insert_pos] + spans_to_insert + final_tokens[spans_insert_pos:]
+            span_ids = span_ids[:spans_insert_pos] + span_ids_to_insert + span_ids[spans_insert_pos:]
 
             if len(final_tokens) > self.seq_len:
                 final_tokens = final_tokens[:self.seq_len]
@@ -442,26 +456,22 @@ class DataBuilder:
 
             span_ids_tensor = torch.tensor(span_ids, dtype=torch.long)
 
-            # Build attention mask
-            # Attend if same span_id or either is 0 (not in a span)
             attention_mask = (span_ids_tensor.unsqueeze(1) == span_ids_tensor.unsqueeze(0)) | \
                              (span_ids_tensor.unsqueeze(1) == 0) | \
                              (span_ids_tensor.unsqueeze(0) == 0)
 
             batch_inputs.append(torch.tensor(final_tokens, dtype=torch.long))
-            batch_span_ids.append(span_ids_tensor)
             batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
             batch_attn_masks.append(attention_mask)
 
         if not batch_inputs:
-            return torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0)
+            return torch.empty(0), torch.empty(0), torch.empty(0)
 
         inputs = torch.stack(batch_inputs)
-        span_ids = torch.stack(batch_span_ids)
         correct_indices = torch.stack(batch_correct_indices)
         attention_masks = torch.stack(batch_attn_masks)
 
-        return inputs, span_ids, correct_indices, attention_masks
+        return inputs, correct_indices, attention_masks
 
 
     def _collate_fn_soft_jigsaw(self, batch):
