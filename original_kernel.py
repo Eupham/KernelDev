@@ -444,7 +444,7 @@ def _flash_attn_fwd(
     stride_mb: int, stride_mh: int, stride_mt: int,  #
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
     lens_stride: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_qt: int, mask_stride_kt: int,
     T: int,  #
     TIME_BUCKET:  int,  #
     HEAD_DIM: tl.constexpr,  #
@@ -574,38 +574,26 @@ def _flash_attn_fwd(
 
         kv_indices = kv_token_idx + tile_k_arange
         if ATTN_MASK is not None:
-            mask_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h
-            # Load the original mask which defines span-to-span visibility
-            span_mask = tl.load(mask_ptr + q_tile_indices[:, None] * T + kv_indices[None, :])
-
-            # Check which key tokens are not part of any span.
-            # A token `j` is not in a span if `ATTN_MASK[j, j] == 0`.
-            # We load the diagonal of the attention mask for the current key block.
-            diag_block_ptr = tl.make_block_ptr(
+            mask_ptr = tl.make_block_ptr(
                 base=ATTN_MASK + batch * mask_stride_b + head * mask_stride_h,
                 shape=(T, T),
-                strides=(T, 1),
-                offsets=(kv_token_idx, kv_token_idx),
-                block_shape=(TILE_K_SIZE, TILE_K_SIZE),
+                strides=(mask_stride_qt, mask_stride_kt),
+                offsets=(q_token_idx, 0),
+                block_shape=(TILE_Q_SIZE, TILE_K_SIZE),
                 order=(1, 0)
             )
-            diag_block = tl.load(diag_block_ptr, boundary_check=(0, 1))
+            span_mask = tl.load(mask_ptr, boundary_check=(0,1))
 
-            # Extract the diagonal to see which keys are in spans
-            row_indices = tl.arange(0, TILE_K_SIZE)[:, None]
-            col_indices = tl.arange(0, TILE_K_SIZE)[None, :]
-            diag_mask = row_indices == col_indices
-            is_key_in_span_diag = tl.reduce(diag_block * diag_mask, 1, tl.sum)
-
-            # A key is not in a span if its diagonal element is 0
-            is_key_not_in_span = (is_key_in_span_diag == 0)[None, :]
-
-            # The final mask allows attention to same-span tokens OR non-span tokens
-            mask = span_mask | is_key_not_in_span
+            # This logic is flawed, as it assumes the diagonal indicates a span.
+            # The provided mask already encodes the full logic:
+            # "allow attend-to-attend only if same span or either token has span_id 0"
+            # The span_mask loaded above already represents this.
+            mask = span_mask
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
         else:
             mask = True
+
 
         mask = mask & (q_lens_mask & (kv_indices[None, :] < seq_len))
         
