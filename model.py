@@ -43,14 +43,14 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        is_causal = self.causal
+        is_causal = self.causal and attention_mask is None
 
         # Use flash attention kernel
         out = flash_attention(
@@ -58,7 +58,8 @@ class MultiHeadAttention(nn.Module):
             k=k,
             v=v,
             lens=None,
-            causal=is_causal
+            causal=is_causal,
+            attention_mask=attention_mask
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -75,9 +76,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), attention_mask=attention_mask)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -127,6 +128,7 @@ class GPTModel(nn.Module):
     ):
         super().__init__()
         self.dim = dim
+        self.n_heads = n_heads
         self.max_seq_len = max_seq_len
         self.bidirectional_prefix_len = bidirectional_prefix_len
         
@@ -173,7 +175,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
+    def forward(self, x, targets=None, attention_mask=None, task_name=None, span_ids=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -184,7 +186,7 @@ class GPTModel(nn.Module):
         
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed)
+            x_embed = block(x_embed, attention_mask=attention_mask)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
@@ -194,9 +196,27 @@ class GPTModel(nn.Module):
             mask_pos = (x == SPECIAL_TOKENS['[MASK]']).nonzero(as_tuple=True)[1]
             h_context = x_embed[torch.arange(batch_size), mask_pos]
 
-            # Embed spans
-            spans_embed = self.token_emb(spans)
-            h_spans = spans_embed.mean(dim=2)
+            # Embed spans by finding them in the input
+            span_token_id = SPECIAL_TOKENS['[SPAN]']
+            es_token_id = SPECIAL_TOKENS['[ES]']
+
+            batch_h_spans = []
+            for i in range(batch_size):
+                span_starts = (x[i] == span_token_id).nonzero(as_tuple=False).squeeze(-1)
+                span_ends = (x[i] == es_token_id).nonzero(as_tuple=False).squeeze(-1)
+
+                h_spans_i = []
+                for start, end in zip(span_starts, span_ends):
+                    span_tokens = x_embed[i, start + 1 : end]
+                    if span_tokens.numel() > 0:
+                        h_spans_i.append(span_tokens.mean(dim=0))
+                    else:
+                        h_spans_i.append(x_embed.new_zeros(x_embed.size(-1)))
+
+                if h_spans_i:
+                    batch_h_spans.append(torch.stack(h_spans_i))
+
+            h_spans = torch.stack(batch_h_spans)
 
             # Compute scores
             scores = (h_context.unsqueeze(1) * h_spans).sum(-1)
@@ -209,22 +229,19 @@ class GPTModel(nn.Module):
         elif task_name == 'soft_jigsaw':
             # Simplified sentence pooling
             span_token_id = SPECIAL_TOKENS['[SPAN]']
+            es_token_id = SPECIAL_TOKENS['[ES]']
 
             sentence_embeddings = []
             for i in range(batch_size):
-                span_indices = (x[i] == span_token_id).nonzero(as_tuple=False).squeeze(-1)
-
-                # Add start and end of sequence for pooling
-                sentence_boundaries = [0] + span_indices.tolist() + [seq_len]
+                span_starts = (x[i] == span_token_id).nonzero(as_tuple=False).squeeze(-1)
+                span_ends = (x[i] == es_token_id).nonzero(as_tuple=False).squeeze(-1)
 
                 pooled_embeddings = []
-                for j in range(len(sentence_boundaries) - 1):
-                    start, end = sentence_boundaries[j], sentence_boundaries[j+1]
-                    span_tokens = x_embed[i, start+1:end]
+                for start, end in zip(span_starts, span_ends):
+                    span_tokens = x_embed[i, start + 1: end]
                     if span_tokens.numel() > 0:
                         emb = span_tokens.mean(dim=0)
                     else:
-                        # fallback: zero‑vector of same dimension
                         emb = x_embed.new_zeros(x_embed.size(-1))
                     pooled_embeddings.append(emb)
 
