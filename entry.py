@@ -220,29 +220,6 @@ def start_actual_training(cli_args):
     }
     
     
-    # Training configuration
-    inference_cfg = config.get('inference', {})
-    training_config = TrainingConfig(
-        num_epochs=training_cfg.get('epochs', 3),
-        learning_rate=training_cfg.get('learning_rate', 3e-4),
-        weight_decay=training_cfg.get('weight_decay', 0.01),
-        warmup_steps=training_cfg.get('warmup_steps', 100),
-        max_grad_norm=training_cfg.get('max_grad_norm', 1.0),
-        save_every=training_cfg.get('save_every', 500),
-        eval_every=training_cfg.get('eval_every', 200),
-        log_every=training_cfg.get('log_every', 50),
-        inference_every=training_cfg.get('inference_every', 500),
-        checkpoint_dir=training_cfg.get('checkpoint_dir', "checkpoints"),
-        device=hardware_cfg.get('device', 'auto'),
-        use_amp=use_amp,
-        scaler=scaler,
-        # Inference sampling parameters
-        inference_prompts=inference_cfg.get('prompts', ["", "The", "In", "Once upon a time"]),
-        inference_max_length=inference_cfg.get('max_length', 100),
-        inference_temperature=inference_cfg.get('temperature', 0.8),
-        inference_top_k=inference_cfg.get('top_k', 50),
-        inference_top_p=inference_cfg.get('top_p', 0.9)
-    )
     
     # Estimate optimal batch size with precision consideration
     if logging_cfg.get('show_memory_estimation', True):
@@ -345,6 +322,30 @@ def start_actual_training(cli_args):
             print(f"Sample text: '{sample_text[:100]}...'")
             break
     
+    # Training configuration
+    inference_cfg = config.get('inference', {})
+    training_config = TrainingConfig(
+        num_epochs=training_cfg.get('epochs', 3),
+        learning_rate=training_cfg.get('learning_rate', 3e-4),
+        weight_decay=training_cfg.get('weight_decay', 0.01),
+        warmup_steps=training_cfg.get('warmup_steps', 100),
+        max_grad_norm=training_cfg.get('max_grad_norm', 1.0),
+        save_every=training_cfg.get('save_every', 500),
+        eval_every=training_cfg.get('eval_every', 200),
+        log_every=training_cfg.get('log_every', 50),
+        inference_every=training_cfg.get('inference_every', 500),
+        checkpoint_dir=training_cfg.get('checkpoint_dir', "checkpoints"),
+        device=hardware_cfg.get('device', 'auto'),
+        use_amp=use_amp,
+        scaler=scaler,
+        # Inference sampling parameters
+        inference_prompts=inference_cfg.get('prompts', ["", "The", "In", "Once upon a time"]),
+        inference_max_length=inference_cfg.get('max_length', 100),
+        inference_temperature=inference_cfg.get('temperature', 0.8),
+        inference_top_k=inference_cfg.get('top_k', 50),
+        inference_top_p=inference_cfg.get('top_p', 0.9)
+    )
+
     # Create trainer
     print(f"\n=== Setting up Trainer ===")
     trainer = create_trainer(
