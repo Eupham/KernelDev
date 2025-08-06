@@ -600,7 +600,11 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
 
-            # Get current LR *before* scheduler steps to log the correct value for the current step
+            if self.config.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            self.optimizer.step()
+
+            # Get current LR *after* potential warmup adjustments but *before* scheduler steps
             current_lr = self.optimizer.param_groups[0]['lr']
 
             if self.scheduler is not None:

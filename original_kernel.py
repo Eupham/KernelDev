@@ -588,8 +588,7 @@ def _flash_attn_fwd(
         else:
             mask = True
 
-
-        mask = mask & (q_lens_mask & (kv_indices[None, :] < seq_len))
+        mask = (mask & (q_lens_mask & (kv_indices[None, :] < seq_len))).to(tl.int1)
         
         if not PERFECT_MATCHING:
             q_attended |= tl.max(mask, 1) > 0
@@ -1278,7 +1277,7 @@ def _flash_attn_bwd_dq(
         else:
             mask = True
 
-        mask = mask & (q_len_mask & (kv_indices[None, :] < seq_len))
+        mask = (mask & (q_len_mask & (kv_indices[None, :] < seq_len))).to(tl.int1)
 
         p = tl.where(mask, p, 0.0)
         dp = tl.dot(do, vT.to(do.dtype), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
@@ -1393,7 +1392,7 @@ def _flash_attn_bwd_dkdv(
         else:
             mask = True
 
-        mask = mask & (kv_lens_mask & (q_tile_indices[None, :] < seq_len))
+        mask = (mask & (kv_lens_mask & (q_tile_indices[None, :] < seq_len))).to(tl.int1)
         pT = tl.where(mask, pT, 0.0)
 
         dv = tl.dot(pT, do.to(pT.dtype), dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
