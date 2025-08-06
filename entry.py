@@ -243,10 +243,6 @@ def start_actual_training(cli_args):
         batch_size = min(estimated_batch_size, 16)  # Cap at 16 for safety
         print(f"Using estimated batch_size: {batch_size}")
     
-    print(f"Device: {training_config.device}")
-    print(f"Model config: {model_config}")
-    print(f"Data config: {data_config}")
-    print(f"Training config: batch_size={batch_size}, epochs={training_config.num_epochs}")
     
     # Create data builder
     print("\n=== Loading and Processing Data ===")
@@ -345,6 +341,11 @@ def start_actual_training(cli_args):
         inference_top_k=inference_cfg.get('top_k', 50),
         inference_top_p=inference_cfg.get('top_p', 0.9)
     )
+
+    print(f"Device: {training_config.device}")
+    print(f"Model config: {model_config}")
+    print(f"Data config: {data_config}")
+    print(f"Training config: batch_size={batch_size}, epochs={training_config.num_epochs}")
 
     # Create trainer
     print(f"\n=== Setting up Trainer ===")
