@@ -582,13 +582,7 @@ def _flash_attn_fwd(
                 block_shape=(TILE_Q_SIZE, TILE_K_SIZE),
                 order=(1, 0)
             )
-            span_mask = tl.load(mask_ptr, boundary_check=(0,1))
-
-            # This logic is flawed, as it assumes the diagonal indicates a span.
-            # The provided mask already encodes the full logic:
-            # "allow attend-to-attend only if same span or either token has span_id 0"
-            # The span_mask loaded above already represents this.
-            mask = span_mask
+            mask = tl.load(mask_ptr, boundary_check=(0,1))
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
         else:
@@ -791,7 +785,7 @@ def _flash_attn_bwd(
     stride_dkb: int, stride_dkh: int, stride_dkt: int, stride_dkk: int,  #
     stride_dvb: int, stride_dvh: int, stride_dvt: int, stride_dvk: int,  #
     lens_stride: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_qt: int, mask_stride_kt: int,
     T: int,  #
     TIME_BUCKET: int,  #
     DQ_TILES_NUM: int,  #
@@ -835,7 +829,7 @@ def _flash_attn_bwd(
             stride_dob, stride_doh, stride_dot, stride_dok,
             stride_dkb, stride_dkh, stride_dkt, stride_dkk,
             stride_dvb, stride_dvh, stride_dvt, stride_dvk,
-            mask_stride_b, mask_stride_h, mask_stride_t,
+            mask_stride_b, mask_stride_h, mask_stride_qt, mask_stride_kt,
             batch=batch,
             head=head,
             tile_id=tile_id,
@@ -866,7 +860,7 @@ def _flash_attn_bwd(
             stride_mb, stride_mh, stride_mt,
             stride_dob, stride_doh, stride_dot, stride_dok,
             stride_dqb, stride_dqh, stride_dqt, stride_dqk,
-            mask_stride_b, mask_stride_h, mask_stride_t,
+            mask_stride_b, mask_stride_h, mask_stride_qt, mask_stride_kt,
             batch=batch,
             head=head,
             tile_id=tile_id,
@@ -901,7 +895,7 @@ def _flash_attn_bwd_dq_inner(
     stride_mb: int, stride_mh: int, stride_mt: int,
     stride_dob: int, stride_doh: int, stride_dot: int, stride_dok: int,
     stride_dqb: int, stride_dqh: int, stride_dqt: int, stride_dqk: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_qt: int, mask_stride_kt: int,
     batch: int,
     head: int,
     tile_id: int,
@@ -1001,7 +995,7 @@ def _flash_attn_bwd_dq_inner(
         dq, q, m, di, do,
         kt_tile_ptr, vt_tile_ptr,
         ATTN_MASK,
-        mask_stride_b, mask_stride_h, mask_stride_t,
+        mask_stride_b, mask_stride_h, mask_stride_qt, mask_stride_kt,
         batch, head,
         seq_len=seq_len,
         q_token_idx=q_token_idx,
@@ -1047,7 +1041,7 @@ def _flash_attn_bwd_dkdv_inner(
     stride_dok: int, stride_dkb: int, stride_dkh: int,
     stride_dkt: int, stride_dkk: int, stride_dvb: int,
     stride_dvh: int, stride_dvt: int, stride_dvk: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_qt: int, mask_stride_kt: int,
     batch: int,
     head: int,
     tile_id: int,
@@ -1154,7 +1148,7 @@ def _flash_attn_bwd_dkdv_inner(
         qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
         k, v,
         ATTN_MASK,
-        mask_stride_b, mask_stride_h, mask_stride_t,
+        mask_stride_b, mask_stride_h, mask_stride_qt, mask_stride_kt,
         batch, head,
         seq_len=seq_len,
         kv_token_idx=kv_token_idx,
@@ -1205,7 +1199,7 @@ def _flash_attn_bwd_dq(
     di: tl.tensor, do: tl.tensor,
     kt_tile_ptr: tl.tensor, vt_tile_ptr: tl.tensor,
     ATTN_MASK: tl.tensor,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_qt: int, mask_stride_kt: int,
     batch: int, head: int,
     seq_len: tl.tensor,
     q_token_idx: int,
@@ -1267,29 +1261,15 @@ def _flash_attn_bwd_dq(
 
         kv_indices = kv_token_idx + tile_k_arange
         if ATTN_MASK is not None:
-            mask_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h
-            span_mask = tl.load(mask_ptr + q_tile_indices[:, None] * T + kv_indices[None, :])
-
-            # Load a square block of the attention mask to get the diagonal for the keys
-            diag_block_ptr = tl.make_block_ptr(
+            mask_ptr = tl.make_block_ptr(
                 base=ATTN_MASK + batch * mask_stride_b + head * mask_stride_h,
                 shape=(T, T),
-                strides=(T, 1),
-                offsets=(kv_token_idx, kv_token_idx),
-                block_shape=(TILE_K_SIZE, TILE_K_SIZE),
+                strides=(mask_stride_qt, mask_stride_kt),
+                offsets=(q_token_idx, 0),
+                block_shape=(TILE_Q_SIZE, TILE_K_SIZE),
                 order=(1, 0)
             )
-            diag_block = tl.load(diag_block_ptr, boundary_check=(0, 1))
-
-            # A key is not in a span if its diagonal element is 0
-            row_indices = tl.arange(0, TILE_K_SIZE)[:, None]
-            col_indices = tl.arange(0, TILE_K_SIZE)[None, :]
-            diag_mask = row_indices == col_indices
-            is_key_in_span_diag = tl.reduce(diag_block * diag_mask, 1, tl.sum)
-            is_key_not_in_span = (is_key_in_span_diag == 0)[None, :]
-
-            # The final mask allows attention to same-span tokens OR non-span tokens
-            mask = span_mask | is_key_not_in_span
+            mask = tl.load(mask_ptr, boundary_check=(0,1))
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
         else:
@@ -1313,7 +1293,7 @@ def _flash_attn_bwd_dkdv(
     lse_tile_ptr: tl.tensor, delta_tile_ptr: tl.tensor,
     k: tl.tensor, v: tl.tensor,
     ATTN_MASK: tl.tensor,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
+    mask_stride_b: int, mask_stride_h: int, mask_stride_qt: int, mask_stride_kt: int,
     batch: int, head: int,
     seq_len: tl.tensor,
     kv_token_idx: int,
@@ -1394,29 +1374,16 @@ def _flash_attn_bwd_dkdv(
 
         q_tile_indices = q_token_idx + tile_q_arange
         if ATTN_MASK is not None:
-            mask_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h
-            span_mask = tl.load(mask_ptr + q_tile_indices[None, :] * T + kv_indices[:, None])
-
-            # Load a square block of the attention mask to get the diagonal for the keys
-            diag_block_ptr = tl.make_block_ptr(
+            mask_ptr = tl.make_block_ptr(
                 base=ATTN_MASK + batch * mask_stride_b + head * mask_stride_h,
                 shape=(T, T),
-                strides=(T, 1),
-                offsets=(kv_token_idx, kv_token_idx),
-                block_shape=(TILE_K_SIZE, TILE_K_SIZE),
-                order=(1, 0)
+                strides=(mask_stride_qt, mask_stride_kt),
+                offsets=(kv_token_idx, 0),
+                block_shape=(TILE_K_SIZE, TILE_Q_SIZE),
+                order=(0, 1)
             )
-            diag_block = tl.load(diag_block_ptr, boundary_check=(0, 1))
-
-            # A key is not in a span if its diagonal element is 0
-            row_indices = tl.arange(0, TILE_K_SIZE)[:, None]
-            col_indices = tl.arange(0, TILE_K_SIZE)[None, :]
-            diag_mask = row_indices == col_indices
-            is_key_in_span_diag = tl.reduce(diag_block * diag_mask, 1, tl.sum)
-            is_key_not_in_span = (is_key_in_span_diag == 0)[:, None]
-
-            # The final mask allows attention to same-span tokens OR non-span tokens
-            mask = span_mask | is_key_not_in_span
+            mask = tl.load(mask_ptr, boundary_check=(0,1))
+            mask = tl.trans(mask)
         elif CAUSAL:
             mask = q_tile_indices[None, :] >= kv_indices[:, None]
         else:
@@ -1658,7 +1625,7 @@ def attention_forward_adapter(
         *(strides(LSE, 3) if LSE is not None else [0] * 3),
         *strides(O, 4),
         *(strides(lens, 1) if lens is not None else [0]),
-        *(strides(attention_mask, 3) if attention_mask is not None else [0]*3),
+        *(strides(attention_mask, 4) if attention_mask is not None else [0]*4),
         T=T,
         HEAD_DIM=HEAD_DIM,
         CAUSAL=causal,
@@ -1767,7 +1734,7 @@ def attention_backward_adapter(
         *strides(DK, 4),
         *strides(DV, 4),
         *(strides(lens, 1) if lens is not None else [0]),
-        *(strides(attention_mask, 3) if attention_mask is not None else [0]*3),
+        *(strides(attention_mask, 4) if attention_mask is not None else [0]*4),
         T=T,
         HEAD_DIM=HEAD_DIM,
         CAUSAL=causal,
