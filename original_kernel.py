@@ -900,7 +900,7 @@ def _flash_attn_bwd_dq_inner(
     head: int,
     tile_id: int,
     seq_len: tl.tensor,
-    T: int,  #
+    T: int,
     HEAD_DIM: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
@@ -999,6 +999,7 @@ def _flash_attn_bwd_dq_inner(
         batch, head,
         seq_len=seq_len,
         q_token_idx=q_token_idx,
+        T=T,
         TILE_Q_SIZE=TILE_DQ_Q_SIZE,
         TILE_K_SIZE=TILE_DQ_K_SIZE,
         CAUSAL=CAUSAL,
@@ -1046,7 +1047,7 @@ def _flash_attn_bwd_dkdv_inner(
     head: int,
     tile_id: int,
     seq_len: tl.tensor,
-    T: int,  #
+    T: int,
     HEAD_DIM: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
@@ -1152,6 +1153,7 @@ def _flash_attn_bwd_dkdv_inner(
         batch, head,
         seq_len=seq_len,
         kv_token_idx=kv_token_idx,
+        T=T,
         TILE_Q_SIZE=TILE_DK_Q_SIZE,
         TILE_K_SIZE=TILE_DK_K_SIZE,
         CAUSAL=CAUSAL,
@@ -1203,6 +1205,7 @@ def _flash_attn_bwd_dq(
     batch: int, head: int,
     seq_len: tl.tensor,
     q_token_idx: int,
+    T: int,
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
     CAUSAL: tl.constexpr,
@@ -1297,6 +1300,7 @@ def _flash_attn_bwd_dkdv(
     batch: int, head: int,
     seq_len: tl.tensor,
     kv_token_idx: int,
+    T: int,
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
     CAUSAL: tl.constexpr,
