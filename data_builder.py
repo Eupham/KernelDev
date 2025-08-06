@@ -471,6 +471,7 @@ class DataBuilder:
 
         batch_inputs = []
         batch_p_star = []
+        batch_attn_masks = []
 
         for item in batch:
             text, _ = item
@@ -493,25 +494,52 @@ class DataBuilder:
             for i in range(M):
                 p_star[i, original_indices[i]] = 1
 
-            # Create input sequence
-            input_text = f"[CLS] " + f" [SPAN] ".join(shuffled_sentences)
-            tokens = self._tokenize_text(input_text)
+            # 1) Build token list with explicit [SPAN] … [ES] markers
+            tokens = [SPECIAL_TOKENS['[CLS]']]
+            span_positions = []
+            for span_idx, sent in enumerate(shuffled_sentences, start=1):
+                tokens.append(SPECIAL_TOKENS['[SPAN]'])
+                start = len(tokens)
+                sent_tokens = self._tokenize_text(sent)
+                tokens.extend(sent_tokens)
+                end = len(tokens)
+                tokens.append(SPECIAL_TOKENS['[ES]'])
+                span_positions.append((start, end))
 
+            # 2) Truncate / pad tokens to seq_len
             if len(tokens) > self.seq_len:
                 tokens = tokens[:self.seq_len]
             else:
                 tokens += [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
 
+            # 3) Build a per-token span_id array
+            span_id = [0] * len(tokens)
+            for span_idx, (st, en) in enumerate(span_positions, start=1):
+                for pos in range(st, min(en, self.seq_len)):
+                    span_id[pos] = span_idx
+
+            span_id += [0] * (self.seq_len - len(span_id))
+
+            # 4) Build 2D boolean attention mask: allow if same-span or either outside
+            mask = torch.zeros((self.seq_len, self.seq_len), dtype=torch.bool)
+            for i in range(self.seq_len):
+                for j in range(self.seq_len):
+                    si, sj = span_id[i], span_id[j]
+                    if si == sj or si == 0 or sj == 0:
+                        mask[i, j] = True
+
             batch_inputs.append(torch.tensor(tokens, dtype=torch.long))
             batch_p_star.append(p_star)
+            batch_attn_masks.append(mask)
 
         if not batch_inputs:
-            return None
+            return None, None, None
 
         inputs = torch.stack(batch_inputs)
         p_star = torch.stack(batch_p_star)
+        attn_masks = torch.stack(batch_attn_masks)
 
-        return inputs, p_star
+        return inputs, p_star, attn_masks
 
     def _collate_fn_distractor(self, batch):
         task_config = self.task_configs.get('distractor_loc', {})
