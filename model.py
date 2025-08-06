@@ -213,6 +213,10 @@ class GPTModel(nn.Module):
                 else:
                     span_embeddings.append(torch.empty(0, self.dim, device=x.device))
 
+            if max_spans == 0:
+                # No spans found in the entire batch, return 0 loss
+                return torch.empty(batch_size, 0, device=x.device), torch.tensor(0.0, device=x.device, requires_grad=True)
+
             # Pad span_embeddings
             padded_span_embeddings = []
             for s in span_embeddings:
