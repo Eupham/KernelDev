@@ -197,6 +197,7 @@ class GPTModel(nn.Module):
 
             # Find span embeddings
             span_embeddings = []
+            max_spans = 0
             for i in range(batch_size):
                 item_spans = []
                 span_starts = (x[i] == SPECIAL_TOKENS['[SPAN]']).nonzero(as_tuple=True)[0]
@@ -205,9 +206,24 @@ class GPTModel(nn.Module):
                 for start_idx, end_idx in zip(span_starts, es_tokens):
                     span_embed = x_embed[i, start_idx+1:end_idx].mean(dim=0)
                     item_spans.append(span_embed)
-                span_embeddings.append(torch.stack(item_spans))
 
-            h_spans = torch.stack(span_embeddings)
+                if item_spans:
+                    max_spans = max(max_spans, len(item_spans))
+                    span_embeddings.append(torch.stack(item_spans))
+                else:
+                    span_embeddings.append(torch.empty(0, self.dim, device=x.device))
+
+            # Pad span_embeddings
+            padded_span_embeddings = []
+            for s in span_embeddings:
+                if s.size(0) < max_spans:
+                    padding = torch.zeros(max_spans - s.size(0), self.dim, device=x.device)
+                    padded_s = torch.cat([s, padding], dim=0)
+                    padded_span_embeddings.append(padded_s)
+                else:
+                    padded_span_embeddings.append(s)
+
+            h_spans = torch.stack(padded_span_embeddings)
 
             # Compute scores
             scores = (h_context.unsqueeze(1) * h_spans).sum(-1)
