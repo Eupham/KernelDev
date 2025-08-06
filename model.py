@@ -234,9 +234,6 @@ class GPTModel(nn.Module):
 
             loss = None
             if correct_idx is not None:
-                num_spans = torch.tensor([s.size(0) for s in span_embeddings], device=x.device)
-                mask = torch.arange(max_spans, device=x.device)[None, :] < num_spans[:, None]
-                scores = scores.masked_fill(~mask, -float('inf'))
                 loss = F.cross_entropy(scores, correct_idx)
 
             return scores, loss

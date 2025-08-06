@@ -366,8 +366,6 @@ class Trainer:
                     loss = None
                     if task_name == 'cocktail_party':
                         inputs, attention_mask, correct_idx = batch
-                        print(f"Cocktail Party Batch shapes: inputs={inputs.shape}, attention_mask={attention_mask.shape}, correct_idx={correct_idx.shape}")
-                        print(f"Cocktail Party correct_idx values: {correct_idx}")
                         inputs, attention_mask, correct_idx = inputs.to(self.config.device), attention_mask.to(self.config.device), correct_idx.to(self.config.device)
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
@@ -376,10 +374,6 @@ class Trainer:
                             scores, loss = self.model(inputs, attention_mask=attention_mask, correct_idx=correct_idx, task_name=task_name)
 
                         if loss is not None:
-                            print(f"Cocktail Party scores shape: {scores.shape}")
-                            ci_max = correct_idx.max().item()
-                            if ci_max >= scores.size(1) or correct_idx.min().item() < 0:
-                                raise ValueError(f"Bad correct_idx: min={correct_idx.min()}, max={ci_max}, n_spans={scores.size(1)}")
                             metrics = self._calculate_accuracy(scores, correct_idx)
                             for k, v in metrics.items():
                                 if k not in cocktail_party_metrics:
@@ -433,10 +427,6 @@ class Trainer:
                         else:
                             logits, loss = self.model(x, targets=y, task_name=task_name)
 
-                        if loss is not None:
-                            y_max = y.max().item()
-                            if y_max >= logits.size(-1) or y.min().item() < 0:
-                                raise ValueError(f"Found out-of-range target in teacher_forcing: min={y.min()}, max={y_max}, n_classes={logits.size(-1)}")
 
                     if loss is not None:
                         if isinstance(loss, dict):
