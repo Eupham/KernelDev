@@ -219,22 +219,6 @@ def start_actual_training(cli_args):
         'causal': model_cfg.get('causal', True)
     }
     
-    # Initialize model
-    print(f"\n=== Initializing Model ===")
-    task_configs = config.get('tasks', {})
-    model_config['task_names'] = list(task_configs.keys())
-    model = GPTModel(**model_config)
-    
-    # Setup precision and mixed precision training
-    print(f"\n=== Setting up Precision ===")
-    dtype, scaler, use_amp = setup_precision(model, precision)
-    
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Parameter dtype: {next(model.parameters()).dtype}")
     
     # Training configuration
     inference_cfg = config.get('inference', {})
@@ -310,6 +294,23 @@ def start_actual_training(cli_args):
         print("This might be due to missing datasets library or network issues.")
         print("Please install with: pip install datasets")
         return
+
+    # Initialize model
+    print(f"\n=== Initializing Model ===")
+    task_configs = config.get('tasks', {})
+    model_config['task_names'] = list(task_configs.keys())
+    model = GPTModel(**model_config)
+
+    # Setup precision and mixed precision training
+    print(f"\n=== Setting up Precision ===")
+    dtype, scaler, use_amp = setup_precision(model, precision)
+
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Parameter dtype: {next(model.parameters()).dtype}")
     
     # Show data info
     for split_name, task_dataloaders in dataloaders.items():
