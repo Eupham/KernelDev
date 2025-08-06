@@ -374,6 +374,9 @@ class Trainer:
                             scores, loss = self.model(inputs, attention_mask=attention_mask, correct_idx=correct_idx, task_name=task_name)
 
                         if loss is not None:
+                            ci_max = correct_idx.max().item()
+                            if ci_max >= scores.size(1) or correct_idx.min().item() < 0:
+                                raise ValueError(f"Bad correct_idx: min={correct_idx.min()}, max={ci_max}, n_spans={scores.size(1)}")
                             metrics = self._calculate_accuracy(scores, correct_idx)
                             for k, v in metrics.items():
                                 if k not in cocktail_party_metrics:
@@ -426,6 +429,11 @@ class Trainer:
                                 logits, loss = self.model(x, targets=y, task_name=task_name)
                         else:
                             logits, loss = self.model(x, targets=y, task_name=task_name)
+
+                        if loss is not None:
+                            y_max = y.max().item()
+                            if y_max >= logits.size(-1) or y.min().item() < 0:
+                                raise ValueError(f"Found out-of-range target in teacher_forcing: min={y.min()}, max={y_max}, n_classes={logits.size(-1)}")
 
                     if loss is not None:
                         if isinstance(loss, dict):
