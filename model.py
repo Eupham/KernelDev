@@ -219,16 +219,24 @@ class GPTModel(nn.Module):
                     # Handle cases with no spans found
                     batch_h_spans.append(torch.empty(0, x_embed.size(-1), device=x_embed.device))
 
-            h_spans = torch.stack(batch_h_spans)
+            # Pad h_spans before stacking
+            max_spans = max(s.size(0) for s in batch_h_spans if s.numel() > 0) if any(s.numel() > 0 for s in batch_h_spans) else 0
+            if max_spans > 0:
+                padded_batch_h_spans = []
+                for s in batch_h_spans:
+                    padding_needed = max_spans - s.size(0)
+                    if padding_needed > 0:
+                        padding = torch.zeros(padding_needed, x_embed.size(-1), device=x_embed.device, dtype=x_embed.dtype)
+                        padded_s = torch.cat([s, padding], dim=0)
+                        padded_batch_h_spans.append(padded_s)
+                    else:
+                        padded_batch_h_spans.append(s)
+                h_spans = torch.stack(padded_batch_h_spans)
+            else:
+                h_spans = torch.empty(batch_size, 0, x_embed.size(-1), device=x_embed.device)
 
             # Compute scores
             scores = (h_context.unsqueeze(1) * h_spans).sum(-1)
-
-            # Mask out scores for padded spans
-            for i in range(batch_size):
-                num_real_spans = (x[i] == span_token_id).sum()
-                if num_real_spans < scores.size(1):
-                    scores[i, num_real_spans:] = -1e9 # A large negative number
 
             loss = None
             if correct_idx is not None:
