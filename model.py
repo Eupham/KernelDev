@@ -192,16 +192,62 @@ class GPTModel(nn.Module):
         x_embed = self.norm_out(x_embed)
         
         if task_name == 'cocktail_party':
-            # Find [MASK] token positions
-            mask_pos = (x == SPECIAL_TOKENS['[MASK]']).nonzero(as_tuple=True)[1]
-            h_context = x_embed[torch.arange(batch_size), mask_pos]
+            mask_token_id = SPECIAL_TOKENS['[MASK]']
+            span_start_id = SPECIAL_TOKENS['[SPAN]']
+            span_end_id = SPECIAL_TOKENS['[ES]']
 
-            # Embed spans
-            spans_embed = self.token_emb(spans)
-            h_spans = spans_embed.mean(dim=2)
+            # Find [MASK] token positions
+            mask_positions = (x == mask_token_id).nonzero(as_tuple=True)
+            if len(mask_positions[0]) == 0: # No mask tokens found
+                 return torch.empty(0), torch.tensor(0.0, device=x.device)
+
+            h_context = x_embed[mask_positions] # Get embeddings of all [MASK] tokens
+
+            all_h_spans = []
+            max_spans_in_batch = 0 # To handle padding
+
+            for i in range(batch_size):
+                # Find all span starts and ends for this example
+                starts = (x[i] == span_start_id).nonzero(as_tuple=False).squeeze(-1)
+                ends = (x[i] == span_end_id).nonzero(as_tuple=False).squeeze(-1)
+
+                h_spans_i = []
+                # If starts or ends is empty, this loop is skipped
+                for start, end in zip(starts, ends):
+                    if start + 1 < end: # Ensure span is not empty
+                        span_embeds = x_embed[i, start + 1:end]
+                        h_span = span_embeds.mean(dim=0)
+                        h_spans_i.append(h_span)
+
+                if h_spans_i:
+                    all_h_spans.append(torch.stack(h_spans_i))
+                    if len(h_spans_i) > max_spans_in_batch:
+                        max_spans_in_batch = len(h_spans_i)
+                else:
+                    # Handle cases with no spans found
+                    all_h_spans.append(None)
+
+            if not all_h_spans or max_spans_in_batch == 0:
+                # No spans found in the entire batch
+                return torch.empty(0), torch.tensor(0.0, device=x.device)
+
+            # Pad h_spans to be uniform for stacking
+            padded_h_spans = []
+            for h_s in all_h_spans:
+                if h_s is not None:
+                    num_spans, dim = h_s.shape
+                    padding_needed = max_spans_in_batch - num_spans
+                    if padding_needed > 0:
+                        padding = torch.zeros(padding_needed, dim, device=x.device, dtype=h_s.dtype)
+                        h_s = torch.cat([h_s, padding], dim=0)
+                    padded_h_spans.append(h_s)
+                else: # This case should be rare if collate_fn guarantees spans
+                    padded_h_spans.append(torch.zeros(max_spans_in_batch, self.dim, device=x.device))
+
+            h_spans = torch.stack(padded_h_spans) # (B, num_spans, D)
 
             # Compute scores
-            scores = (h_context.unsqueeze(1) * h_spans).sum(-1)
+            scores = torch.einsum('bd,bnd->bn', h_context, h_spans) # (B, num_spans)
 
             loss = None
             if correct_idx is not None:
