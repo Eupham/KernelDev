@@ -388,8 +388,16 @@ class DataBuilder:
         batch_attn_masks = []
 
         for i in range(len(batch)):
-            original_tokens, _ = batch[i]
-            original_tokens = original_tokens.tolist()
+            original_tokens_padded, _ = batch[i]
+            original_tokens_padded = original_tokens_padded.tolist()
+
+            # 1. Strip padding to get the true sequence
+            pad_id = SPECIAL_TOKENS['[PAD]']
+            try:
+                first_pad_idx = original_tokens_padded.index(pad_id)
+                original_tokens = original_tokens_padded[:first_pad_idx]
+            except ValueError:
+                original_tokens = original_tokens_padded
 
             span_size = random.randint(min_span_size, max_span_size)
             if len(original_tokens) <= span_size:
@@ -400,8 +408,14 @@ class DataBuilder:
             distractors = []
             for _ in range(num_distractors):
                 distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
-                distractor_tokens, _ = batch[distractor_idx]
-                distractor_tokens = distractor_tokens.tolist()
+                distractor_tokens_padded, _ = batch[distractor_idx]
+                distractor_tokens_padded = distractor_tokens_padded.tolist()
+                try:
+                    first_pad_idx_dist = distractor_tokens_padded.index(pad_id)
+                    distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
+                except ValueError:
+                    distractor_tokens = distractor_tokens_padded
+
                 if len(distractor_tokens) <= span_size:
                     continue
                 distractor_start = random.randint(0, len(distractor_tokens) - span_size)
@@ -411,51 +425,63 @@ class DataBuilder:
             if not distractors:
                 continue
 
-            # This is the main change: insert spans inline
-            masked_sequence_prefix = original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
-
             all_spans_with_labels = [(true_span, 1)] + [(d, 0) for d in distractors]
             random.shuffle(all_spans_with_labels)
-
             correct_idx = [label for _, label in all_spans_with_labels].index(1)
 
-            # Construct the full sequence with wrapped spans
-            final_sequence = list(masked_sequence_prefix)
-            span_definitions = [] # Store (start, end, id) for mask generation
+            # 2. Calculate wrapper length to reserve space
+            wrapper_tokens = []
+            for span_toks, _ in all_spans_with_labels:
+                wrapper_tokens.extend([SPECIAL_TOKENS['[SPAN]']] + span_toks + [SPECIAL_TOKENS['[ES]']])
+            wrapper_len = len(wrapper_tokens)
 
-            span_id_counter = 1 # 1 for true span, 2...N+1 for distractors
-            for span_tokens, is_true_span in all_spans_with_labels:
-                start_idx = len(final_sequence)
-                final_sequence.append(SPECIAL_TOKENS['[SPAN]'])
-                final_sequence.extend(span_tokens)
-                final_sequence.append(SPECIAL_TOKENS['[ES]'])
-                end_idx = len(final_sequence)
+            # 3. Truncate context to fit wrappers
+            available_context_len = self.seq_len - wrapper_len
+            available_context_len = max(0, available_context_len)
 
-                current_span_id = 1 if is_true_span else (span_id_counter + 1)
-                if not is_true_span:
-                    span_id_counter += 1
+            masked_context = (original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:])
+            truncated_masked_context = masked_context[:available_context_len]
 
-                span_definitions.append({'start': start_idx, 'end': end_idx, 'id': current_span_id})
+            # 4. Stitch final sequence together
+            final_sequence = truncated_masked_context + wrapper_tokens
 
-            # Truncate or pad to seq_len
+            # 5. Final guard-rail truncation and padding
             final_sequence = final_sequence[:self.seq_len]
-            seq_padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(final_sequence))
-            final_sequence += seq_padding
+            if len(final_sequence) < self.seq_len:
+                final_sequence.extend([pad_id] * (self.seq_len - len(final_sequence)))
 
-            # Build per-token span IDs
+            # 6. Build span IDs and attention mask from the final sequence
             span_ids = torch.zeros(self.seq_len, dtype=torch.long)
-            for span_info in span_definitions:
-                # Clamp start/end to be within seq_len
-                start = min(span_info['start'], self.seq_len)
-                end = min(span_info['end'], self.seq_len)
-                span_ids[start:end] = span_info['id']
+            current_pos = 0
+            in_span = False
+            span_idx = 0
 
-            # Generate boolean attention mask
-            # mask[i, j] is True if they can attend
+            # This is a simplified scan. A more robust impl would use the known structure.
+            # For now, we scan to find the spans we just placed.
+            temp_final_sequence = list(final_sequence)
+            try:
+                start_of_wrappers = len(truncated_masked_context)
+
+                current_pos_in_final = start_of_wrappers
+                for span_toks, _ in all_spans_with_labels:
+                    span_len_with_wrappers = len(span_toks) + 2
+
+                    start_idx = current_pos_in_final
+                    end_idx = start_idx + span_len_with_wrappers
+
+                    if start_idx < self.seq_len:
+                       span_ids[start_idx:min(end_idx, self.seq_len)] = span_idx + 1
+
+                    current_pos_in_final = end_idx
+                    span_idx += 1
+
+            except Exception as e:
+                # Fallback in case logic fails
+                pass
+
+
             span_ids_i = span_ids.unsqueeze(1).expand(-1, self.seq_len)
             span_ids_j = span_ids.unsqueeze(0).expand(self.seq_len, -1)
-
-            # Allow attention if same span, or if either token is not in a span (ID 0)
             attn_mask = (span_ids_i == span_ids_j) | (span_ids_i == 0) | (span_ids_j == 0)
             attn_mask = attn_mask.to(torch.bool)
 
