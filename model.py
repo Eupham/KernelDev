@@ -128,6 +128,7 @@ class GPTModel(nn.Module):
     ):
         super().__init__()
         self.dim = dim
+        self.n_heads = n_heads
         self.max_seq_len = max_seq_len
         self.bidirectional_prefix_len = bidirectional_prefix_len
         
