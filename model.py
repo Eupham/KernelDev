@@ -219,16 +219,17 @@ class GPTModel(nn.Module):
                     batch_h_spans.append(torch.empty(0, x_embed.size(-1), device=x_embed.device))
 
             max_spans = max(s.size(0) for s in batch_h_spans if s.numel() > 0) if any(s.numel() > 0 for s in batch_h_spans) else 0
-            if max_spans > 0:
-                padded_batch_h_spans = []
-                for s in batch_h_spans:
-                    padding_needed = max_spans - s.size(0)
-                    if padding_needed > 0:
-                        padding = torch.zeros(padding_needed, x_embed.size(-1), device=x_embed.device, dtype=x_embed.dtype)
-                        padded_s = torch.cat([s, padding], dim=0)
-                        padded_batch_h_spans.append(padded_s)
-                    else:
-                        padded_batch_h_spans.append(s)
+            max_spans = max(s.size(0) for s in batch_h_spans if s.numel() > 0) if any(s.numel() > 0 for s in batch_h_spans) else 0
+
+            padded_batch_h_spans = []
+            for s in batch_h_spans:
+                padding_needed = max_spans - s.size(0)
+                if padding_needed > 0:
+                    padding = torch.zeros(padding_needed, x_embed.size(-1), device=x_embed.device, dtype=x_embed.dtype)
+                    s = torch.cat([s, padding], dim=0)
+                padded_batch_h_spans.append(s)
+
+            if padded_batch_h_spans:
                 h_spans = torch.stack(padded_batch_h_spans)
             else:
                 h_spans = torch.empty(batch_size, 0, x_embed.size(-1), device=x_embed.device)
