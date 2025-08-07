@@ -289,6 +289,8 @@ class Trainer:
         """Perform a single training step."""
         if task_name == 'cocktail_party':
             inputs, correct_idx, attn_mask = batch
+            if inputs.numel() == 0:
+                return 0.0
             inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
 
             if self.config.use_amp and self.config.scaler is not None:
@@ -368,6 +370,8 @@ class Trainer:
                     loss = None
                     if task_name == 'cocktail_party':
                         inputs, correct_idx, attn_mask = batch
+                        if inputs.numel() == 0:
+                            continue
                         inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
 
                         if self.config.use_amp:
@@ -376,7 +380,7 @@ class Trainer:
                         else:
                             scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
 
-                        if loss is not None:
+                        if loss is not None and scores.numel() > 0:
                             metrics = self._calculate_accuracy(scores, correct_idx)
                             for k, v in metrics.items():
                                 if k not in cocktail_party_metrics:
