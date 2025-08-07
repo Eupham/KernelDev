@@ -291,11 +291,6 @@ class Trainer:
             inputs, correct_idx, attn_mask = batch
             inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
 
-            # Expand mask for multi-head attention
-            B, T = attn_mask.shape[:2]
-            H = self.model.module.n_heads if isinstance(self.model, DDP) else self.model.n_heads
-            attn_mask = attn_mask.unsqueeze(1).expand(B, H, T, T)
-
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
                     scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
@@ -309,11 +304,6 @@ class Trainer:
 
             task_cfg = task_configs.get('soft_jigsaw', {})
             tau = task_cfg.get('tau', 0.1)
-
-            # Expand mask for multi-head attention
-            B, T = attn_mask.shape[:2]
-            H = self.model.module.n_heads if isinstance(self.model, DDP) else self.model.n_heads
-            attn_mask = attn_mask.unsqueeze(1).expand(B, H, T, T)
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
@@ -380,10 +370,6 @@ class Trainer:
                         inputs, correct_idx, attn_mask = batch
                         inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
 
-                        B, T = attn_mask.shape[:2]
-                        H = self.model.module.n_heads if isinstance(self.model, DDP) else self.model.n_heads
-                        attn_mask = attn_mask.unsqueeze(1).expand(B, H, T, T)
-
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
                                 scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
@@ -404,10 +390,6 @@ class Trainer:
 
                         task_cfg = task_configs.get('soft_jigsaw', {})
                         tau = task_cfg.get('tau', 0.1)
-
-                        B, T = attn_mask.shape[:2]
-                        H = self.model.module.n_heads if isinstance(self.model, DDP) else self.model.n_heads
-                        attn_mask = attn_mask.unsqueeze(1).expand(B, H, T, T)
 
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
