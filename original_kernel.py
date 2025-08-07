@@ -588,6 +588,7 @@ def _flash_attn_fwd(
         else:
             mask = True
 
+
         mask = mask & (q_lens_mask & (kv_indices[None, :] < seq_len))
         
         if not PERFECT_MATCHING:

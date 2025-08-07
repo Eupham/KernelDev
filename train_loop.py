@@ -291,6 +291,7 @@ class Trainer:
 
         if task_name == 'cocktail_party':
             inputs, correct_idx, attn_mask = batch
+            if inputs.numel() == 0: return 0.0
             inputs, correct_idx, attn_mask = (
                 inputs.to(self.config.device),
                 correct_idx.to(self.config.device),

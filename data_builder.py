@@ -411,7 +411,6 @@ class DataBuilder:
             if not distractors:
                 continue
 
-            # This is the context, with the true span replaced by [MASK]
             masked_context = original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:]
 
             all_spans_with_labels = [(true_span, 1)] + [(d, i + 2) for i, d in enumerate(distractors)]
@@ -419,32 +418,18 @@ class DataBuilder:
 
             correct_idx = -1
 
-            # Start with the masked context
             final_tokens = list(masked_context)
-            span_ids = [0] * len(masked_context) # 0 for context tokens
-
-            # Find the index of the [MASK] token
-            mask_token_idx = final_tokens.index(SPECIAL_TOKENS['[MASK]'])
-
-            # Insert wrapped spans immediately after the [MASK] token
-            spans_insert_pos = mask_token_idx + 1
-
-            spans_to_insert = []
-            span_ids_to_insert = []
+            span_ids = [0] * len(masked_context)
 
             shuffled_spans, shuffled_span_ids = zip(*all_spans_with_labels)
 
             for i, span in enumerate(shuffled_spans):
                 span_id = shuffled_span_ids[i]
                 if span_id == 1:
-                    correct_idx = i # The index of the true span in the shuffled list
+                    correct_idx = i
 
-                wrapped_span = [SPECIAL_TOKENS['[SPAN]']] + span + [SPECIAL_TOKENS['[ES]']]
-                spans_to_insert.extend(wrapped_span)
-                span_ids_to_insert.extend([span_id] * len(wrapped_span))
-
-            final_tokens = final_tokens[:spans_insert_pos] + spans_to_insert + final_tokens[spans_insert_pos:]
-            span_ids = span_ids[:spans_insert_pos] + span_ids_to_insert + span_ids[spans_insert_pos:]
+                final_tokens.extend([SPECIAL_TOKENS['[SPAN]']] + span + [SPECIAL_TOKENS['[ES]']])
+                span_ids.extend([span_id] * (len(span) + 2))
 
             if len(final_tokens) > self.seq_len:
                 final_tokens = final_tokens[:self.seq_len]
@@ -467,10 +452,8 @@ class DataBuilder:
         if not batch_inputs:
             return torch.empty(0), torch.empty(0), torch.empty(0)
 
-        # Check for consistent number of spans
         num_spans_per_item = [((item == SPECIAL_TOKENS['[SPAN]']).sum()) for item in batch_inputs]
         if len(set(num_spans_per_item)) > 1:
-            print("Skipping batch with inconsistent number of spans.")
             return torch.empty(0), torch.empty(0), torch.empty(0)
 
         inputs = torch.stack(batch_inputs)
@@ -509,7 +492,6 @@ class DataBuilder:
             for i in range(M):
                 p_star[i, original_indices[i]] = 1
 
-            # Create input sequence
             tokenized_sentences = [self._tokenize_text(s) for s in shuffled_sentences]
 
             final_tokens = [SPECIAL_TOKENS['[CLS]']]
@@ -532,7 +514,6 @@ class DataBuilder:
 
             span_ids_tensor = torch.tensor(span_ids, dtype=torch.long)
 
-            # Build attention mask
             attention_mask = (span_ids_tensor.unsqueeze(1) == span_ids_tensor.unsqueeze(0)) | \
                              (span_ids_tensor.unsqueeze(1) == 0) | \
                              (span_ids_tensor.unsqueeze(0) == 0)
@@ -635,7 +616,7 @@ class DataBuilder:
 
             # Teacher forcing dataloader
             dataloaders[split_name]['teacher_forcing'] = DataLoader(
-                dataset_obj, batch_size=16, shuffle=shuffle,
+                dataset_obj, batch_size=batch_size, shuffle=shuffle,
                 num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                 collate_fn=self._collate_fn_teacher_forcing
             )
@@ -643,7 +624,7 @@ class DataBuilder:
             # Cocktail party dataloader
             if 'cocktail_party' in self.task_configs:
                 dataloaders[split_name]['cocktail_party'] = DataLoader(
-                    dataset_obj, batch_size=8, shuffle=shuffle,
+                    dataset_obj, batch_size=batch_size, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_cocktail_party
                 )
@@ -651,14 +632,14 @@ class DataBuilder:
             # Soft jigsaw dataloader
             if 'soft_jigsaw' in self.task_configs:
                 dataloaders[split_name]['soft_jigsaw'] = DataLoader(
-                    dataset_obj, batch_size=8, shuffle=shuffle,
+                    dataset_obj, batch_size=batch_size, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_soft_jigsaw
                 )
 
             if 'distractor_loc' in self.task_configs:
                 dataloaders[split_name]['distractor_loc'] = DataLoader(
-                    dataset_obj, batch_size=4, shuffle=shuffle,
+                    dataset_obj, batch_size=batch_size, shuffle=shuffle,
                     num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                     collate_fn=self._collate_fn_distractor
                 )

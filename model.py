@@ -216,10 +216,8 @@ class GPTModel(nn.Module):
                 if h_spans_i:
                     batch_h_spans.append(torch.stack(h_spans_i))
                 else:
-                    # Handle cases with no spans found
                     batch_h_spans.append(torch.empty(0, x_embed.size(-1), device=x_embed.device))
 
-            # Pad h_spans before stacking
             max_spans = max(s.size(0) for s in batch_h_spans if s.numel() > 0) if any(s.numel() > 0 for s in batch_h_spans) else 0
             if max_spans > 0:
                 padded_batch_h_spans = []
@@ -235,7 +233,6 @@ class GPTModel(nn.Module):
             else:
                 h_spans = torch.empty(batch_size, 0, x_embed.size(-1), device=x_embed.device)
 
-            # Compute scores
             scores = (h_context.unsqueeze(1) * h_spans).sum(-1)
 
             loss = None
