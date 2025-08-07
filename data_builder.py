@@ -467,6 +467,12 @@ class DataBuilder:
         if not batch_inputs:
             return torch.empty(0), torch.empty(0), torch.empty(0)
 
+        # Check for consistent number of spans
+        num_spans_per_item = [((item == SPECIAL_TOKENS['[SPAN]']).sum()) for item in batch_inputs]
+        if len(set(num_spans_per_item)) > 1:
+            print("Skipping batch with inconsistent number of spans.")
+            return torch.empty(0), torch.empty(0), torch.empty(0)
+
         inputs = torch.stack(batch_inputs)
         correct_indices = torch.stack(batch_correct_indices)
         attention_masks = torch.stack(batch_attn_masks)
