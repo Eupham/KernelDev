@@ -244,7 +244,11 @@ class GPTModel(nn.Module):
                 else: # This case should be rare if collate_fn guarantees spans
                     padded_h_spans.append(torch.zeros(max_spans_in_batch, self.dim, device=x.device))
 
-            h_spans = torch.stack(padded_h_spans) # (B, num_spans, D)
+            h_spans = torch.stack(padded_h_spans) # Should be (B, N, D) but is sometimes (N, B, D)
+
+            # Fix for dimension mismatch if batch is not the first dimension
+            if h_spans.size(0) != batch_size and h_spans.size(1) == batch_size:
+                h_spans = h_spans.permute(1, 0, 2).contiguous()
 
             # Compute scores
             scores = torch.einsum('bd,bnd->bn', h_context, h_spans) # (B, num_spans)
