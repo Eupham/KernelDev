@@ -192,54 +192,66 @@ class GPTModel(nn.Module):
         x_embed = self.norm_out(x_embed)
         
         if task_name == 'cocktail_party':
+            B, T = x.shape
+            D = x_embed.size(-1)
             mask_token_id = SPECIAL_TOKENS['[MASK]']
             span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id = SPECIAL_TOKENS['[ES]']
+            span_end_id   = SPECIAL_TOKENS['[ES]']
 
-            # Find [MASK] token positions
-            mask_positions = (x == mask_token_id).nonzero(as_tuple=True)
-            if len(mask_positions[0]) == 0: # No mask tokens found
-                 return torch.empty(0), torch.tensor(0.0, device=x.device)
-
-            h_context = x_embed[mask_positions] # Get embeddings of all [MASK] tokens
-
-            # Robustly build h_spans with shape (B, N, D)
-            all_h_spans = []
-            max_spans_in_batch = 0
-            for i in range(batch_size):
-                starts = (x[i] == span_start_id).nonzero(as_tuple=False).view(-1)
-                ends = (x[i] == span_end_id).nonzero(as_tuple=False).view(-1)
-
-                h_spans_i = []
-                for start, end in zip(starts, ends):
-                    if start + 1 < end:
-                        span_embeds = x_embed[i, start + 1:end]
-                        h_span = span_embeds.mean(dim=0)
-                        h_spans_i.append(h_span)
-
-                if h_spans_i:
-                    all_h_spans.append(torch.stack(h_spans_i, dim=0))
-                    max_spans_in_batch = max(max_spans_in_batch, len(h_spans_i))
+            # 1) Build one h_context per example
+            h_context_list = []
+            for i in range(B):
+                # find the first [MASK] in example i
+                mask_pos = (x[i] == mask_token_id).nonzero(as_tuple=False)
+                if mask_pos.numel() == 0:
+                    # no mask found—fall back to zero vector
+                    h_context_list.append(x_embed.new_zeros(D))
                 else:
-                    all_h_spans.append(torch.empty(0, self.dim, device=x.device))
+                    p = mask_pos[0,0].item()
+                    h_context_list.append(x_embed[i, p])
 
-            if max_spans_in_batch == 0:
+            h_context = torch.stack(h_context_list, dim=0)  # [B, D]
+
+            # 2) Collect all spans per example
+            all_spans = []
+            max_spans = 0
+            for i in range(B):
+                starts = (x[i] == span_start_id).nonzero(as_tuple=False).squeeze(-1)
+                ends   = (x[i] == span_end_id).  nonzero(as_tuple=False).squeeze(-1)
+
+                spans_i = []
+                # Use .tolist() to handle potential tensor on different devices or empty tensors
+                for st, ed in zip(starts.tolist(), ends.tolist()):
+                    if st+1 < ed:
+                        span_emb = x_embed[i, st+1:ed].mean(dim=0)
+                        spans_i.append(span_emb)
+                all_spans.append(spans_i)
+                max_spans = max(max_spans, len(spans_i))
+
+            if max_spans == 0:
+                # no spans at all—nothing to score
                 return torch.empty(0), torch.tensor(0.0, device=x.device)
 
-            # Pad and stack
-            batch_h_spans = []
-            for h_s in all_h_spans:
-                num_spans_i = h_s.size(0)
-                pad_len = max_spans_in_batch - num_spans_i
+            # 3) Pad each per-example span list up to max_spans
+            h_spans_list = []
+            for spans_i in all_spans:
+                if spans_i:
+                    stacked = torch.stack(spans_i, dim=0)      # [Ni, D]
+                else:
+                    stacked = x_embed.new_zeros(0, D)          # zero rows
+
+                pad_len = max_spans - stacked.size(0)
                 if pad_len > 0:
-                    pad = h_s.new_zeros(pad_len, self.dim)
-                    h_s = torch.cat([h_s, pad], dim=0)
-                batch_h_spans.append(h_s)
+                    padding = x_embed.new_zeros(pad_len, D)
+                    stacked = torch.cat([stacked, padding], dim=0)
+                h_spans_list.append(stacked)                  # each [max_spans, D]
 
-            h_spans = torch.stack(batch_h_spans, dim=0)
+            # Now stack across the batch
+            h_spans = torch.stack(h_spans_list, dim=0)       # [B, max_spans, D]
 
-            # Compute scores
-            scores = torch.einsum('bd,bnd->bn', h_context, h_spans) # (B, num_spans)
+            # 4) Compute scores via einsum
+            #    h_context: [B, D], h_spans: [B, N, D] → scores [B, N]
+            scores = torch.einsum('bd,bnd->bn', h_context, h_spans)
 
             loss = None
             if correct_idx is not None:
