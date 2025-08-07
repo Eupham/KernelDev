@@ -1928,6 +1928,12 @@ def _flash_attention(
     precision: str,
     attention_mask: torch.Tensor | None,
 ):
+    if attention_mask is not None and attention_mask.ndim == 4:
+        # The custom kernel expects a 3D mask (B, H, T*T) but receives (B, H, T, T).
+        # We reshape it here to match the kernel's expectation.
+        B, H, T_q, T_k = attention_mask.shape
+        attention_mask = attention_mask.view(B, H, T_q * T_k)
+
     requires_grad = any(i.requires_grad for i in (q, k, v))
     O, LSE = torch.ops.flash_attention.forward(
         q=q,
