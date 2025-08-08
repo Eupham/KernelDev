@@ -43,7 +43,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, span_id, span_begin, span_end, is_prefix):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -59,10 +59,10 @@ class MultiHeadAttention(nn.Module):
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=attention_mask,
-            in_span=in_span,
             span_id=span_id,
-            is_prefix=is_prefix
+            span_begin=span_begin,
+            span_end=span_end,
+            is_prefix=is_prefix,
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -79,9 +79,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, span_id, span_begin, span_end, is_prefix):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+        x = x + self.attn(self.norm1(x), span_id=span_id, span_begin=span_begin, span_end=span_end, is_prefix=is_prefix)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -187,25 +187,51 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Create metadata tensors
-        if attention_mask is not None:
-            span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id = SPECIAL_TOKENS['[ES]']
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
+        # Create 1D metadata tensors for sparse attention
+        span_start_id = SPECIAL_TOKENS['[SPAN]']
+        span_end_id = SPECIAL_TOKENS['[ES]']
+        cls_token_id = SPECIAL_TOKENS['[CLS]']
 
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
-            span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
-        else:
-            # Create dummy tensors when no attention mask is provided
-            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
-            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+        # is_prefix is a boolean flag for CLS tokens
+        is_prefix = (x == cls_token_id)
+
+        # Pre-calculate span start and end markers for the batch
+        is_span_start_batch = (x == span_start_id)
+        is_span_end_batch = (x == span_end_id)
+
+        # Calculate span_id for the whole batch.
+        # Spans get a unique positive ID, non-span tokens get 0.
+        in_span_counter = torch.cumsum(is_span_start_batch.int(), dim=1) - torch.cumsum(is_span_end_batch.int(), dim=1)
+        is_in_span = in_span_counter > 0
+        span_id_raw = torch.cumsum(is_span_start_batch.int(), dim=1)
+        span_id = span_id_raw * is_in_span
+
+        # Initialize span_begin and span_end tensors
+        span_begin = torch.zeros_like(x)
+        span_end = torch.zeros_like(x)
+
+        # This loop is required because the start/end indices for each span
+        # need to be broadcast to all tokens within that span, which is complex
+        # to do in a fully vectorized way without more advanced primitives.
+        for i in range(batch_size):
+            start_indices = (is_span_start_batch[i]).nonzero(as_tuple=True)[0]
+            end_indices = (is_span_end_batch[i]).nonzero(as_tuple=True)[0]
+
+            # This assumes spans are well-formed (non-nested, every start has an end)
+            for start_idx, end_idx in zip(start_indices, end_indices):
+                # Inclusive start and end indices
+                span_begin[i, start_idx:end_idx + 1] = start_idx
+                span_end[i, start_idx:end_idx + 1] = end_idx
+
+        # Convert to required dtype and ensure contiguity for the Triton kernel
+        span_id = span_id.to(torch.int32).contiguous()
+        span_begin = span_begin.to(torch.int32).contiguous()
+        span_end = span_end.to(torch.int32).contiguous()
+        is_prefix = is_prefix.to(torch.int32).contiguous()
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(x_embed, span_id=span_id, span_begin=span_begin, span_end=span_end, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)

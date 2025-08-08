@@ -2029,9 +2029,9 @@ def _flash_attention(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    attention_mask: torch.Tensor | None,
-    in_span: torch.Tensor | None,
     span_id: torch.Tensor | None,
+    span_begin: torch.Tensor | None,
+    span_end: torch.Tensor | None,
     is_prefix: torch.Tensor | None,
 ):
     requires_grad = any(i.requires_grad for i in (q, k, v))
@@ -2046,9 +2046,9 @@ def _flash_attention(
         prescale_qk=prescale_qk,
         return_lse=return_lse or requires_grad,
         precision=precision,
-        attention_mask=attention_mask,
-        in_span=in_span,
         span_id=span_id,
+        span_begin=span_begin,
+        span_end=span_end,
         is_prefix=is_prefix,
     )
     if return_lse:
@@ -2065,8 +2065,8 @@ class IncoherentFlashAttention(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
-        incoherent_processing, hadamard_signs_q, hadamard_signs_k, attention_mask,
-        in_span, span_id, is_prefix
+        incoherent_processing, hadamard_signs_q, hadamard_signs_k,
+        span_id, span_begin, span_end, is_prefix
     ):
         # Store context for backward pass
         ctx.incoherent_processing = incoherent_processing
@@ -2076,10 +2076,6 @@ class IncoherentFlashAttention(torch.autograd.Function):
         ctx.prescale_qk = prescale_qk
         ctx.precision = precision
         ctx.return_lse = return_lse
-        ctx.attention_mask = attention_mask
-        ctx.in_span = in_span
-        ctx.span_id = span_id
-        ctx.is_prefix = is_prefix
         
         # Apply Hadamard transform for incoherent processing
         q_transformed, k_transformed = q, k
@@ -2123,15 +2119,15 @@ class IncoherentFlashAttention(torch.autograd.Function):
             prescale_qk=prescale_qk,
             return_lse=return_lse or requires_grad,
             precision=precision,
-            attention_mask=attention_mask,
-            in_span=in_span,
             span_id=span_id,
+            span_begin=span_begin,
+            span_end=span_end,
             is_prefix=is_prefix,
         )
         
         # Save tensors for backward pass
         if requires_grad:
-            ctx.save_for_backward(q, k, v, O, LSE, lens)
+            ctx.save_for_backward(q, k, v, O, LSE, lens, span_id, span_begin, span_end, is_prefix)
         
         if return_lse:
             return O, LSE
@@ -2139,7 +2135,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
     
     @staticmethod 
     def backward(ctx, grad_output, grad_lse=None):
-        q, k, v, o, lse, lens = ctx.saved_tensors
+        q, k, v, o, lse, lens, span_id, span_begin, span_end, is_prefix = ctx.saved_tensors
         
         if ctx.incoherent_processing:
             # For incoherent processing, we need to apply the forward transform again
@@ -2161,10 +2157,10 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 autotune=ctx.autotune,
                 prescale_qk=ctx.prescale_qk,
                 precision=ctx.precision,
-                attention_mask=ctx.attention_mask,
-                in_span=ctx.in_span,
-                span_id=ctx.span_id,
-                is_prefix=ctx.is_prefix,
+                span_id=span_id,
+                span_begin=span_begin,
+                span_end=span_end,
+                is_prefix=is_prefix,
             )
             
             # Apply inverse Hadamard transform to gradients to get gradients w.r.t. original Q and K
@@ -2186,10 +2182,10 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 autotune=ctx.autotune,
                 prescale_qk=ctx.prescale_qk,
                 precision=ctx.precision,
-                attention_mask=ctx.attention_mask,
-                in_span=ctx.in_span,
-                span_id=ctx.span_id,
-                is_prefix=ctx.is_prefix,
+                span_id=span_id,
+                span_begin=span_begin,
+                span_end=span_end,
+                is_prefix=is_prefix,
             )
         
         return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None, None
@@ -2209,9 +2205,9 @@ def flash_attention(
     incoherent_processing: bool | None = None,
     hadamard_signs_q: torch.Tensor | None = None,
     hadamard_signs_k: torch.Tensor | None = None,
-    attention_mask: torch.Tensor | None = None,
-    in_span: torch.Tensor | None = None,
     span_id: torch.Tensor | None = None,
+    span_begin: torch.Tensor | None = None,
+    span_end: torch.Tensor | None = None,
     is_prefix: torch.Tensor | None = None,
 ):
     """
