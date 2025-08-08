@@ -1825,7 +1825,6 @@ def attention_backward_adapter(
         DQ,
         DK,
         DV,
-        None, # attention_mask
         span_id,
         is_prefix,
         span_begin,
