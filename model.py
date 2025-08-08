@@ -200,11 +200,11 @@ class GPTModel(nn.Module):
 
         if has_spans:
             in_span = (torch.cumsum(is_span_start.int(), dim=1) - torch.cumsum(is_span_end.int(), dim=1)) > 0
-            span_id = torch.cumsum(is_span_start.int(), dim=1)
+            span_id = torch.cumsum(is_span_start.int(), dim=1).to(torch.int32)
             span_id[~in_span] = 0  # 0 for non-span tokens as per critique
 
-            span_begin = torch.full_like(x, -1) # Using -1 as sentinel
-            span_end = torch.full_like(x, -1)   # Using -1 as sentinel
+            span_begin = torch.full_like(x, -1, dtype=torch.int32) # Using -1 as sentinel
+            span_end = torch.full_like(x, -1, dtype=torch.int32)   # Using -1 as sentinel
 
             for i in range(batch_size):
                 starts = torch.nonzero(is_span_start[i], as_tuple=True)[0]
@@ -221,9 +221,9 @@ class GPTModel(nn.Module):
                         span_end[i, start_idx:end_idx + 1] = end_idx
         else:
             # Create dummy tensors when no spans are present
-            span_id = torch.zeros_like(x)
-            span_begin = torch.full_like(x, -1)
-            span_end = torch.full_like(x, -1)
+            span_id = torch.zeros_like(x, dtype=torch.int32)
+            span_begin = torch.full_like(x, -1, dtype=torch.int32)
+            span_end = torch.full_like(x, -1, dtype=torch.int32)
 
         # Apply transformer blocks
         for block in self.blocks:
