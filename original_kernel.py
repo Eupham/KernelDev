@@ -490,7 +490,7 @@ def _flash_attn_fwd(
     q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
     # Decide loop bound per tile
-    q_tile_has_noncausal = tl.any(q_in_span | q_is_prefix)
+    q_tile_has_noncausal = tl.sum((q_in_span | q_is_prefix).to(tl.int32)) > 0
 
     kv_start_tile_idx = 0
     q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
