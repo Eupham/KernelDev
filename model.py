@@ -43,7 +43,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, span_id, span_begin, span_end, is_prefix):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -59,9 +59,10 @@ class MultiHeadAttention(nn.Module):
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=attention_mask,
-            in_span=in_span,
+            attention_mask=None, # This is now handled by the kernel using metadata
             span_id=span_id,
+            span_begin=span_begin,
+            span_end=span_end,
             is_prefix=is_prefix
         )
         
@@ -79,9 +80,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, span_id, span_begin, span_end, is_prefix):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+        x = x + self.attn(self.norm1(x), span_id=span_id, span_begin=span_begin, span_end=span_end, is_prefix=is_prefix)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -172,13 +173,48 @@ class GPTModel(nn.Module):
         
         self.apply(self._init_weights)
     
+    def _create_span_metadata(self, input_ids):
+        """
+        Creates span metadata tensors based on special tokens in the input.
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        span_start_id = SPECIAL_TOKENS['[SPAN]']
+        span_end_id = SPECIAL_TOKENS['[ES]']
+        cls_token_id = SPECIAL_TOKENS['[CLS]']
+
+        # Initialize metadata tensors
+        span_id = torch.zeros((batch_size, seq_len), dtype=torch.int32, device=device)
+        span_begin = torch.zeros((batch_size, seq_len), dtype=torch.int32, device=device)
+        span_end = torch.zeros((batch_size, seq_len), dtype=torch.int32, device=device)
+        is_prefix = (input_ids == cls_token_id).to(torch.int32)
+
+        for i in range(batch_size):
+            span_id_counter = 1
+            starts = (input_ids[i] == span_start_id).nonzero(as_tuple=True)[0]
+            ends = (input_ids[i] == span_end_id).nonzero(as_tuple=True)[0]
+
+            # Assuming spans are properly nested and ordered, we can pair them up.
+            # A more robust implementation would handle complex cases.
+            for start_idx, end_idx in zip(starts, ends):
+                if start_idx < end_idx:
+                    # inclusive span
+                    span_len = end_idx - start_idx + 1
+                    span_id[i, start_idx:end_idx+1] = span_id_counter
+                    span_begin[i, start_idx:end_idx+1] = start_idx
+                    span_end[i, start_idx:end_idx+1] = end_idx
+                    span_id_counter += 1
+
+        return span_id, span_begin, span_end, is_prefix
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
+    def forward(self, x, targets=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -188,24 +224,11 @@ class GPTModel(nn.Module):
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
         # Create metadata tensors
-        if attention_mask is not None:
-            span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id = SPECIAL_TOKENS['[ES]']
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
-
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
-            span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
-        else:
-            # Create dummy tensors when no attention mask is provided
-            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
-            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+        span_id, span_begin, span_end, is_prefix = self._create_span_metadata(x)
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(x_embed, span_id=span_id, span_begin=span_begin, span_end=span_end, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
