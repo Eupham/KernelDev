@@ -43,14 +43,14 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, attention_mask=None):
+    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None, key_is_in_span=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         
-        is_causal = self.causal if attention_mask is None else False
+        is_causal = self.causal
 
         # Use flash attention kernel
         out = flash_attention(
@@ -59,7 +59,11 @@ class MultiHeadAttention(nn.Module):
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            in_span=in_span,
+            span_id=span_id,
+            is_prefix=is_prefix,
+            key_is_in_span=key_is_in_span
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -76,9 +80,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, attention_mask=None):
+    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None, key_is_in_span=None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask)
+        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix, key_is_in_span=key_is_in_span)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -184,9 +188,28 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
+        # Create metadata tensors
+        key_is_in_span = None
+        if attention_mask is not None:
+            span_start_id = SPECIAL_TOKENS['[SPAN]']
+            span_end_id = SPECIAL_TOKENS['[ES]']
+            cls_token_id = SPECIAL_TOKENS['[CLS]']
+
+            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
+            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
+            span_id[~in_span] = -1
+            is_prefix = (x == cls_token_id)
+            key_is_in_span = torch.diagonal(attention_mask, dim1=-2, dim2=-1).bool()
+        else:
+            # Create dummy tensors when no attention mask is provided
+            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
+            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+            key_is_in_span = torch.zeros((batch_size, self.n_heads, seq_len), dtype=torch.bool, device=x.device)
+
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask)
+            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix, key_is_in_span=key_is_in_span)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
@@ -198,59 +221,39 @@ class GPTModel(nn.Module):
             span_start_id = SPECIAL_TOKENS['[SPAN]']
             span_end_id   = SPECIAL_TOKENS['[ES]']
 
-            # 1) Build one h_context per example
-            h_context_list = []
-            for i in range(B):
-                # find the first [MASK] in example i
-                mask_pos = (x[i] == mask_token_id).nonzero(as_tuple=False)
-                if mask_pos.numel() == 0:
-                    # no mask found—fall back to zero vector
-                    h_context_list.append(x_embed.new_zeros(D))
-                else:
-                    p = mask_pos[0,0].item()
-                    h_context_list.append(x_embed[i, p])
+            # 1) Vectorized context extraction
+            mask_positions = (x == mask_token_id).nonzero(as_tuple=True)
+            h_context = x_embed.new_zeros(B, D)
+            # Get the first mask for each batch item, if it exists
+            unique_batch_idx, counts = torch.unique(mask_positions[0], return_counts=True)
+            first_mask_indices = torch.cat((x.new_zeros(1, dtype=torch.long), torch.cumsum(counts, 0)[:-1]))
+            if unique_batch_idx.numel() > 0:
+                 h_context[unique_batch_idx] = x_embed[unique_batch_idx, mask_positions[1][first_mask_indices]]
 
-            h_context = torch.stack(h_context_list, dim=0)  # [B, D]
+            # 2) Vectorized span processing
+            span_starts = (x == span_start_id).nonzero()
+            span_ends = (x == span_end_id).nonzero()
 
-            # 2) Collect all spans per example
-            all_spans = []
-            max_spans = 0
-            for i in range(B):
-                starts = (x[i] == span_start_id).nonzero(as_tuple=False).squeeze(-1)
-                ends   = (x[i] == span_end_id).  nonzero(as_tuple=False).squeeze(-1)
-
-                spans_i = []
-                # Use .tolist() to handle potential tensor on different devices or empty tensors
-                for st, ed in zip(starts.tolist(), ends.tolist()):
-                    if st+1 < ed:
-                        span_emb = x_embed[i, st+1:ed].mean(dim=0)
-                        spans_i.append(span_emb)
-                all_spans.append(spans_i)
-                max_spans = max(max_spans, len(spans_i))
-
-            if max_spans == 0:
-                # no spans at all—nothing to score
+            if span_starts.numel() == 0:
                 return torch.empty(0), torch.tensor(0.0, device=x.device)
 
-            # 3) Pad each per-example span list up to max_spans
-            h_spans_list = []
-            for spans_i in all_spans:
-                if spans_i:
-                    stacked = torch.stack(spans_i, dim=0)      # [Ni, D]
-                else:
-                    stacked = x_embed.new_zeros(0, D)          # zero rows
+            # Create a tensor to map each span to its batch index
+            batch_indices = span_starts[:, 0]
 
-                pad_len = max_spans - stacked.size(0)
-                if pad_len > 0:
-                    padding = x_embed.new_zeros(pad_len, D)
-                    stacked = torch.cat([stacked, padding], dim=0)
-                h_spans_list.append(stacked)                  # each [max_spans, D]
+            # Calculate max number of spans for padding
+            max_spans = (x == span_start_id).sum(dim=1).max()
 
-            # Now stack across the batch
-            h_spans = torch.stack(h_spans_list, dim=0)       # [B, max_spans, D]
+            h_spans = x_embed.new_zeros(B, max_spans, D)
+
+            for i in range(B):
+                st_indices = span_starts[batch_indices == i, 1]
+                ed_indices = span_ends[batch_indices == i, 1]
+
+                for j, (st, ed) in enumerate(zip(st_indices, ed_indices)):
+                    if st + 1 < ed:
+                        h_spans[i, j] = x_embed[i, st + 1:ed].mean(dim=0)
 
             # 4) Compute scores via einsum
-            #    h_context: [B, D], h_spans: [B, N, D] → scores [B, N]
             scores = torch.einsum('bd,bnd->bn', h_context, h_spans)
 
             loss = None
