@@ -43,7 +43,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, span_id=None, is_prefix=None, span_begin=None, span_end=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -59,10 +59,10 @@ class MultiHeadAttention(nn.Module):
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=attention_mask,
-            in_span=in_span,
             span_id=span_id,
-            is_prefix=is_prefix
+            is_prefix=is_prefix,
+            span_begin=span_begin,
+            span_end=span_end
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -79,9 +79,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, span_id=None, is_prefix=None, span_begin=None, span_end=None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+        x = x + self.attn(self.norm1(x), span_id=span_id, is_prefix=is_prefix, span_begin=span_begin, span_end=span_end)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -178,7 +178,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
+    def forward(self, x, targets=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -187,25 +187,47 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Create metadata tensors
-        if attention_mask is not None:
-            span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id = SPECIAL_TOKENS['[ES]']
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
+        # Create metadata tensors for span-based attention
+        span_start_id = SPECIAL_TOKENS['[SPAN]']
+        span_end_id = SPECIAL_TOKENS['[ES]']
+        cls_token_id = SPECIAL_TOKENS['[CLS]']
 
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
-            span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
+        is_span_start = (x == span_start_id)
+        is_span_end = (x == span_end_id)
+
+        has_spans = torch.any(is_span_start | is_span_end)
+        is_prefix = (x == cls_token_id)
+
+        if has_spans:
+            in_span = (torch.cumsum(is_span_start.int(), dim=1) - torch.cumsum(is_span_end.int(), dim=1)) > 0
+            span_id = torch.cumsum(is_span_start.int(), dim=1)
+            span_id[~in_span] = 0  # 0 for non-span tokens as per critique
+
+            span_begin = torch.full_like(x, -1) # Using -1 as sentinel
+            span_end = torch.full_like(x, -1)   # Using -1 as sentinel
+
+            for i in range(batch_size):
+                starts = torch.nonzero(is_span_start[i], as_tuple=True)[0]
+                ends = torch.nonzero(is_span_end[i], as_tuple=True)[0]
+
+                if len(starts) != len(ends):
+                    min_len = min(len(starts), len(ends))
+                    starts = starts[:min_len]
+                    ends = ends[:min_len]
+
+                for start_idx, end_idx in zip(starts, ends):
+                    if start_idx < end_idx:
+                        span_begin[i, start_idx:end_idx + 1] = start_idx
+                        span_end[i, start_idx:end_idx + 1] = end_idx
         else:
-            # Create dummy tensors when no attention mask is provided
-            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
-            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+            # Create dummy tensors when no spans are present
+            span_id = torch.zeros_like(x)
+            span_begin = torch.full_like(x, -1)
+            span_end = torch.full_like(x, -1)
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(x_embed, span_id=span_id, is_prefix=is_prefix, span_begin=span_begin, span_end=span_end)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
