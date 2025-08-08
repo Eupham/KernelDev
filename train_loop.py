@@ -295,9 +295,9 @@ class Trainer:
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                    scores, loss = self.model(inputs, correct_idx=correct_idx, task_name=task_name)
             else:
-                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                scores, loss = self.model(inputs, correct_idx=correct_idx, task_name=task_name)
 
         elif task_name == 'soft_jigsaw':
             inputs, p_star, attn_mask = batch
@@ -309,9 +309,9 @@ class Trainer:
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    P_hat, loss = self.model(inputs, p_star=p_star, attention_mask=attn_mask, task_name=task_name, tau=tau)
+                    P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
             else:
-                P_hat, loss = self.model(inputs, p_star=p_star, attention_mask=attn_mask, task_name=task_name, tau=tau)
+                P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
         elif task_name == 'distractor_loc':
             x_prime, m_star, c_true, l_true = batch
             if x_prime is None: return 0.0
@@ -376,9 +376,9 @@ class Trainer:
 
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
-                                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                                scores, loss = self.model(inputs, correct_idx=correct_idx, task_name=task_name)
                         else:
-                            scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                            scores, loss = self.model(inputs, correct_idx=correct_idx, task_name=task_name)
 
                         if loss is not None and scores.numel() > 0:
                             metrics = self._calculate_accuracy(scores, correct_idx)
@@ -397,9 +397,9 @@ class Trainer:
 
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
-                                P_hat, loss = self.model(inputs, p_star=p_star, attention_mask=attn_mask, task_name=task_name, tau=tau)
+                                P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
                         else:
-                            P_hat, loss = self.model(inputs, p_star=p_star, attention_mask=attn_mask, task_name=task_name, tau=tau)
+                            P_hat, loss = self.model(inputs, p_star=p_star, task_name=task_name, tau=tau)
                     elif task_name == 'distractor_loc':
                         x_prime, m_star, c_true, l_true = batch
                         if x_prime is None: continue
