@@ -488,37 +488,20 @@ def _flash_attn_fwd(
     q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
     q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
-    # Decide loop bounds per tile based on span metadata
+    # Decide loop bounds per tile
     q_tile_has_span = tl.sum((q_span_id > 0).to(tl.int32)) > 0
     q_tile_has_prefix = tl.sum(q_is_prefix.to(tl.int32)) > 0
 
+    kv_start_tile_idx = 0
     q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
 
-    # Default to causal attention bounds
-    kv_start_tile_idx = 0
-    kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
-
-    if q_tile_has_prefix:
-        # Prefix queries can attend to all tokens
-        kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
-    elif q_tile_has_span:
-        # For span queries, widen the attention window to cover the full span
-        q_span_begin_ptr = SPAN_BEGIN + batch * span_begin_stride_b + q_tile_indices
-        q_span_begin = tl.load(q_span_begin_ptr, mask=q_tile_indices < seq_len, other=seq_len)
-
-        q_span_end_ptr = SPAN_END + batch * span_end_stride_b + q_tile_indices
-        q_span_end = tl.load(q_span_end_ptr, mask=q_tile_indices < seq_len, other=0)
-
-        min_span_begin = tl.min(tl.where(q_span_id > 0, q_span_begin, seq_len))
-        max_span_end = tl.max(q_span_end)
-
-        # Combine causal and span bounds
-        kv_start_tile_idx = min_span_begin // TILE_K_SIZE
-        kv_end_tile_idx = tl.cdiv(tl.maximum(q_tile_max_token, max_span_end + 1), TILE_K_SIZE)
-
-    if not CAUSAL:
-        # If not causal at all, attend to everything
-        kv_start_tile_idx = 0
+    # If the block is purely causal, we only need to attend up to the last query token.
+    # Otherwise, we might need to attend to the full sequence.
+    if CAUSAL and not q_tile_has_span and not q_tile_has_prefix:
+        kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
+    else:
+        # If there are spans or prefixes, attend to the full sequence.
+        # The masking logic inside the loop will handle visibility.
         kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
 
     qbatch_head_offset = batch * stride_qb + head * stride_qh
@@ -1283,17 +1266,21 @@ def _flash_attn_bwd_dq(
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
 ):
-    # Conditional attention range based on CAUSAL parameter
+    q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
+    q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
+    q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=0)
+    q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
+    q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
+
+    q_tile_has_span = tl.sum((q_span_id > 0).to(tl.int32)) > 0
+    q_tile_has_prefix = tl.sum(q_is_prefix.to(tl.int32)) > 0
+
     kv_start_tile_idx = 0
     q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
-    if CAUSAL:
-        # For causal attention, we can attend up to the last query token
+    if CAUSAL and not q_tile_has_span and not q_tile_has_prefix:
         kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
     else:
-        # For non-causal attention, attend to all tokens
         kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
-
-    q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
 
     q_len_mask = q_tile_indices[:, None] < seq_len
     tile_k_arange = tl.arange(0, TILE_K_SIZE)
@@ -1394,18 +1381,20 @@ def _flash_attn_bwd_dkdv(
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
 ):
-    # Conditional logic for backward pass based on CAUSAL parameter
-    kv_tile_max_token = min(kv_token_idx + TILE_K_SIZE, seq_len)
-    if CAUSAL:
-        # For causal attention: find which Q tiles can attend to this KV tile
-        q_start_tile_idx = kv_token_idx // TILE_Q_SIZE  # First Q tile that might attend to this KV
-        q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)  # All Q tiles can potentially attend
-    else:
-        # For non-causal attention: all Q tiles can attend to this KV tile
-        q_start_tile_idx = 0
-        q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)
-
     kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
+    k_span_id_ptr = SPAN_ID + batch * span_id_stride_b + kv_indices
+    k_span_id = tl.load(k_span_id_ptr, mask=kv_indices < seq_len, other=0)
+    k_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + kv_indices
+    k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
+
+    k_tile_has_span = tl.sum((k_span_id > 0).to(tl.int32)) > 0
+    k_tile_has_prefix = tl.sum(k_is_prefix.to(tl.int32)) > 0
+
+    q_start_tile_idx = 0
+    q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)
+
+    if CAUSAL and not k_tile_has_span and not k_tile_has_prefix:
+        q_start_tile_idx = kv_token_idx // TILE_Q_SIZE
 
     tile_q_arange = tl.arange(0, TILE_Q_SIZE)
 
