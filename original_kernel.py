@@ -1687,11 +1687,11 @@ def attention_forward_adapter(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    attention_mask: torch.Tensor = None, # Kept for signature compatibility, but will be None
-    span_id: torch.Tensor = None,
-    span_begin: torch.Tensor = None,
-    span_end: torch.Tensor = None,
-    is_prefix: torch.Tensor = None,
+    attention_mask: torch.Tensor | None = None,
+    span_id: torch.Tensor | None = None,
+    span_begin: torch.Tensor | None = None,
+    span_end: torch.Tensor | None = None,
+    is_prefix: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1767,11 +1767,11 @@ def attention_forward_adapter_abstract(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    attention_mask: torch.Tensor = None, # Kept for signature compatibility, but will be None
-    span_id: torch.Tensor | None,
-    span_begin: torch.Tensor = None,
-    span_end: torch.Tensor = None,
-    is_prefix: torch.Tensor | None,
+    attention_mask: torch.Tensor | None = None,
+    span_id: torch.Tensor | None = None,
+    span_begin: torch.Tensor | None = None,
+    span_end: torch.Tensor | None = None,
+    is_prefix: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
@@ -1795,11 +1795,11 @@ def attention_backward_adapter(
     autotune: bool,
     prescale_qk: bool,
     precision: str,
-    attention_mask: torch.Tensor,
-    span_id: torch.Tensor,
-    span_begin: torch.Tensor,
-    span_end: torch.Tensor,
-    is_prefix: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    span_id: torch.Tensor | None,
+    span_begin: torch.Tensor | None,
+    span_end: torch.Tensor | None,
+    is_prefix: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1891,11 +1891,11 @@ def attention_backward_adapter_abstract(
     autotune: bool,
     prescale_qk: bool,
     precision: str,
-    attention_mask: torch.Tensor,
-    span_id: torch.Tensor,
-    span_begin: torch.Tensor,
-    span_end: torch.Tensor,
-    is_prefix: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    span_id: torch.Tensor | None,
+    span_begin: torch.Tensor | None,
+    span_end: torch.Tensor | None,
+    is_prefix: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
     DK = torch.empty_like(k, memory_format=torch.contiguous_format)
@@ -2026,11 +2026,11 @@ def _flash_attention(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    attention_mask: torch.Tensor | None,
-    span_id: torch.Tensor | None,
-    span_begin: torch.Tensor | None,
-    span_end: torch.Tensor | None,
-    is_prefix: torch.Tensor | None,
+    attention_mask: torch.Tensor | None = None,
+    span_id: torch.Tensor | None = None,
+    span_begin: torch.Tensor | None = None,
+    span_end: torch.Tensor | None = None,
+    is_prefix: torch.Tensor | None = None,
 ):
     requires_grad = any(i.requires_grad for i in (q, k, v))
     O, LSE = torch.ops.flash_attention.forward(
@@ -2201,10 +2201,10 @@ def flash_attention(
     lens: torch.Tensor | None = None,
     sm_scale: float | None = None,
     causal: bool = True,
-    autotune=False,
-    return_lse=False,
-    prescale_qk=False,
-    precision="ieee",
+    autotune: bool = False,
+    return_lse: bool = False,
+    prescale_qk: bool = False,
+    precision: str = "ieee",
     incoherent_processing: bool | None = None,
     hadamard_signs_q: torch.Tensor | None = None,
     hadamard_signs_k: torch.Tensor | None = None,
