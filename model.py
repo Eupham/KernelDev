@@ -43,7 +43,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, span_id, span_begin, span_end, is_prefix):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -59,10 +59,10 @@ class MultiHeadAttention(nn.Module):
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=attention_mask,
-            in_span=in_span,
             span_id=span_id,
-            is_prefix=is_prefix
+            span_begin=span_begin,
+            span_end=span_end,
+            is_prefix=is_prefix,
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -79,9 +79,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, span_id, span_begin, span_end, is_prefix):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+        x = x + self.attn(self.norm1(x), span_id=span_id, span_begin=span_begin, span_end=span_end, is_prefix=is_prefix)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -187,25 +187,74 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Create metadata tensors
-        if attention_mask is not None:
-            span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id = SPECIAL_TOKENS['[ES]']
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
+        # Create 1D metadata tensors for sparse attention
+        span_start_id = SPECIAL_TOKENS['[SPAN]']
+        span_end_id = SPECIAL_TOKENS['[ES]']
+        cls_token_id = SPECIAL_TOKENS['[CLS]']
 
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
-            span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
+        # 1. is_prefix: [B, T] boolean tensor
+        is_prefix = (x == cls_token_id)
+
+        # 2. span_id: [B, T] integer tensor (0 for non-span, positive for spans)
+        is_span_starter = (x == span_start_id)
+        is_span_ender = (x == span_end_id)
+
+        # ID for each span is the cumulative sum of start tokens
+        span_id_raw = torch.cumsum(is_span_starter.int(), dim=1)
+
+        # Mask to identify tokens within any span (inclusive of [SPAN] and [ES])
+        in_span_mask = (torch.cumsum(is_span_starter.int(), dim=1) - torch.cumsum(is_span_ender.int(), dim=1)) > 0
+
+        # Final span_id is 0 for non-span tokens
+        span_id = span_id_raw * in_span_mask
+
+        # 3. span_begin and span_end: [B, T] integer tensors
+        # A loop over the batch dimension is acceptable here as batch sizes are small
+        # and this logic is run only once per forward pass. A fully vectorized
+        # version is complex and this is clearer and safer.
+        span_begin_list, span_end_list = [], []
+        for i in range(batch_size):
+            # Find start and end token positions for each span in the current sequence
+            s_starts = (x[i] == span_start_id).nonzero(as_tuple=True)[0]
+            s_ends = (x[i] == span_end_id).nonzero(as_tuple=True)[0]
+
+            # Create mapping from span_id (1-indexed) to its start/end position
+            # Note: Assumes spans are correctly nested and ordered, which is
+            # guaranteed by the data processing scripts.
+            starts_map = {span_idx + 1: pos.item() for span_idx, pos in enumerate(s_starts)}
+            ends_map = {span_idx + 1: pos.item() for span_idx, pos in enumerate(s_ends)}
+
+            # Use the map to create the per-token begin/end tensors
+            span_id_i = span_id[i]
+            begin_i = torch.zeros_like(span_id_i)
+            end_i = torch.zeros_like(span_id_i)
+
+            for t in range(seq_len):
+                sid = span_id_i[t].item()
+                if sid > 0: # If token is in a span
+                    begin_i[t] = starts_map.get(sid, 0)
+                    end_i[t] = ends_map.get(sid, 0)
+
+            span_begin_list.append(begin_i)
+            span_end_list.append(end_i)
+
+        if span_begin_list:
+            span_begin = torch.stack(span_begin_list)
+            span_end = torch.stack(span_end_list)
         else:
-            # Create dummy tensors when no attention mask is provided
-            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
-            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+            span_begin = torch.zeros_like(x)
+            span_end = torch.zeros_like(x)
+
+
+        # Ensure all metadata tensors are int32 and contiguous for the kernel
+        span_id = span_id.to(torch.int32).contiguous()
+        span_begin = span_begin.to(torch.int32).contiguous()
+        span_end = span_end.to(torch.int32).contiguous()
+        is_prefix = is_prefix.to(torch.int32).contiguous() # Pass as int32
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(x_embed, span_id=span_id, span_begin=span_begin, span_end=span_end, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
