@@ -187,22 +187,21 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Create metadata tensors if attention_mask is provided
-        in_span, span_id, is_prefix = None, None, None
+        # Create metadata tensors
         if attention_mask is not None:
             span_start_id = SPECIAL_TOKENS['[SPAN]']
             span_end_id = SPECIAL_TOKENS['[ES]']
             cls_token_id = SPECIAL_TOKENS['[CLS]']
 
-            # in_span: [B, T] bool
             in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-
-            # span_id: [B, T] int32
             span_id = torch.cumsum((x == span_start_id).int(), dim=1)
             span_id[~in_span] = -1
-
-            # is_prefix: [B, T] bool
             is_prefix = (x == cls_token_id)
+        else:
+            # Create dummy tensors when no attention mask is provided
+            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
+            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
 
         # Apply transformer blocks
         for block in self.blocks:
