@@ -203,11 +203,11 @@ class GPTModel(nn.Module):
 
         token_indices = torch.arange(seq_len, device=x.device, dtype=torch.int32).expand_as(x)
         span_start_locs = torch.where(is_span_start, token_indices, -1)
-        span_begin = torch.maximum.accumulate(span_start_locs, dim=1)
+        span_begin = torch.cummax(span_start_locs, dim=1).values
         span_begin[~in_span] = 0
 
         span_end_locs = torch.where(is_span_end, token_indices, seq_len * 2)
-        span_end = torch.minimum.accumulate(torch.fliplr(span_end_locs), dim=1)
+        span_end = torch.cummin(torch.fliplr(span_end_locs), dim=1).values
         span_end = torch.fliplr(span_end)
         span_end[~in_span] = 0
 
