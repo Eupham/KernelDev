@@ -76,32 +76,36 @@ class DataBuilder:
             print("Will attempt to load all available samples from the dataset.")
 
     def _tokenize_text(self, text: str) -> list:
-        # This is a simplified tokenizer. A real implementation would use a pre-trained tokenizer.
         tokens = []
         i = 0
         while i < len(text):
-            found = False
+            # Match specials greedily
             for token_str, token_id in SPECIAL_TOKENS.items():
-                if text[i:].startswith(token_str):
+                if text.startswith(token_str, i):
                     tokens.append(token_id)
                     i += len(token_str)
-                    found = True
                     break
-            if not found:
-                tokens.append(text[i].encode('utf-8')[0] + NUM_SPECIAL_TOKENS)
+            else:
+                # Emit *all* UTF-8 bytes for this codepoint
+                bs = text[i].encode('utf-8')
+                tokens.extend([b + NUM_SPECIAL_TOKENS for b in bs])
                 i += 1
         return tokens
 
     def _detokenize_bytes(self, tokens: list, skip_special_tokens=False) -> str:
-        special_token_map = {v: k for k, v in SPECIAL_TOKENS.items()}
-        decoded_tokens = []
+        special_map = {v: k for k, v in SPECIAL_TOKENS.items()}
+        out, buf = [], bytearray()
         for t in tokens:
-            if t in special_token_map:
+            if t in special_map:
                 if not skip_special_tokens:
-                    decoded_tokens.append(special_token_map[t])
+                    if buf:
+                        out.append(buf.decode('utf-8', errors='strict')); buf.clear()
+                    out.append(special_map[t])
             else:
-                decoded_tokens.append(chr(t - NUM_SPECIAL_TOKENS))
-        return "".join(decoded_tokens)
+                buf.append(int(t - NUM_SPECIAL_TOKENS))
+        if buf:
+            out.append(buf.decode('utf-8', errors='strict'))
+        return ''.join(out)
 
     def _process_iterable_dataset(self, dataset_iterable, dataset_name_logging: str) -> list:
         samples = []
@@ -385,7 +389,6 @@ class DataBuilder:
 
         batch_inputs = []
         batch_correct_indices = []
-        batch_attn_masks = []
 
         for i in range(len(batch)):
             original_tokens_padded, _ = batch[i]
@@ -450,51 +453,15 @@ class DataBuilder:
             if len(final_sequence) < self.seq_len:
                 final_sequence.extend([pad_id] * (self.seq_len - len(final_sequence)))
 
-            # 6. Build span IDs and attention mask from the final sequence
-            span_ids = torch.zeros(self.seq_len, dtype=torch.long)
-            current_pos = 0
-            in_span = False
-            span_idx = 0
-
-            # This is a simplified scan. A more robust impl would use the known structure.
-            # For now, we scan to find the spans we just placed.
-            temp_final_sequence = list(final_sequence)
-            try:
-                start_of_wrappers = len(truncated_masked_context)
-
-                current_pos_in_final = start_of_wrappers
-                for span_toks, _ in all_spans_with_labels:
-                    span_len_with_wrappers = len(span_toks) + 2
-
-                    start_idx = current_pos_in_final
-                    end_idx = start_idx + span_len_with_wrappers
-
-                    if start_idx < self.seq_len:
-                       span_ids[start_idx:min(end_idx, self.seq_len)] = span_idx + 1
-
-                    current_pos_in_final = end_idx
-                    span_idx += 1
-
-            except Exception as e:
-                # Fallback in case logic fails
-                pass
-
-
-            span_ids_i = span_ids.unsqueeze(1).expand(-1, self.seq_len)
-            span_ids_j = span_ids.unsqueeze(0).expand(self.seq_len, -1)
-            attn_mask = (span_ids_i == span_ids_j) | (span_ids_i == 0) | (span_ids_j == 0)
-            attn_mask = attn_mask.to(torch.bool)
-
             batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
             batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
-            batch_attn_masks.append(attn_mask)
 
         if not batch_inputs:
-            return torch.empty(0), torch.empty(0), torch.empty(0)
+            return torch.empty(0), torch.empty(0), None
 
         inputs = torch.stack(batch_inputs)
         correct_indices = torch.stack(batch_correct_indices)
-        attention_masks = torch.stack(batch_attn_masks)
+        attention_masks = None
 
         return inputs, correct_indices, attention_masks
 
@@ -505,7 +472,6 @@ class DataBuilder:
 
         batch_inputs = []
         batch_p_star = []
-        batch_attn_masks = []
 
         for item in batch:
             text, _ = item
@@ -538,49 +504,15 @@ class DataBuilder:
             padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
             tokens.extend(padding)
 
-            # Build per-token span IDs
-            span_ids = torch.zeros(self.seq_len, dtype=torch.long)
-            current_pos = 0
-            in_span = False
-            span_idx = 1
-            # We need to map shuffled position to original segment index for the mask
-            shuffled_to_original_map = {i: original_indices[i] + 1 for i in range(M)} # map shuffled pos to original_idx+1
-
-            temp_tokens = self._tokenize_text(f"[CLS]")
-            current_pos = len(temp_tokens)
-
-            for i, seg in enumerate(shuffled_sentences):
-                seg_tokens = self._tokenize_text(f"[SPAN]{seg}[ES]")
-                start_pos = current_pos
-                end_pos = start_pos + len(seg_tokens)
-
-                # Clamp to seq_len
-                start_pos = min(start_pos, self.seq_len)
-                end_pos = min(end_pos, self.seq_len)
-
-                # Use shuffled index + 1 as the span ID
-                span_ids[start_pos:end_pos] = i + 1
-                current_pos = end_pos
-                if current_pos >= self.seq_len:
-                    break
-
-            # Generate boolean attention mask
-            span_ids_i = span_ids.unsqueeze(1).expand(-1, self.seq_len)
-            span_ids_j = span_ids.unsqueeze(0).expand(self.seq_len, -1)
-
-            attn_mask = (span_ids_i == span_ids_j) | (span_ids_i == 0) | (span_ids_j == 0)
-            attn_mask = attn_mask.to(torch.bool)
-
             batch_inputs.append(torch.tensor(tokens, dtype=torch.long))
             batch_p_star.append(p_star)
-            batch_attn_masks.append(attn_mask)
 
         if not batch_inputs:
             return None, None, None
 
         inputs = torch.stack(batch_inputs)
         p_star = torch.stack(batch_p_star)
-        attention_masks = torch.stack(batch_attn_masks)
+        attention_masks = None
 
         return inputs, p_star, attention_masks
 
