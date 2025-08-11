@@ -494,14 +494,13 @@ def _flash_attn_fwd(
     q_tile_is_prefix = tl.sum(is_prefix_q.to(tl.int32)) > 0
     q_tile_has_span = tl.sum((span_id_q != 0).to(tl.int32)) > 0
 
-    # Determine KV loop bounds based on tile type
-    kv_start_tile_idx = tl.full((), 0, dtype=tl.int32)
-
-    # Case 1: Prefix tile -> global attention
+    # Determine KV loop bounds based on tile type using SSA-compliant logic
     if q_tile_is_prefix:
+        # Case 1: Prefix tile -> global attention
+        kv_start_tile_idx = tl.full((), 0, dtype=tl.int32)
         kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
-    # Case 2: Span tile -> bounded attention
     elif q_tile_has_span:
+        # Case 2: Span tile -> bounded attention
         span_begin_ptr = SPAN_BEGIN + batch * span_begin_stride_b + q_tile_indices
         span_begin_q = tl.load(span_begin_ptr, mask=q_tile_mask, other=0)
 
@@ -509,16 +508,16 @@ def _flash_attn_fwd(
         span_end_q = tl.load(span_end_ptr, mask=q_tile_mask, other=0)
 
         # Find the min begin and max end for all spans present in this tile
-        # Initialize min with a large value (T) and max with a small value (0)
         span_begin_min = tl.min(tl.where(span_id_q != 0, span_begin_q, T))
         span_end_max = tl.max(tl.where(span_id_q != 0, span_end_q, 0))
 
         # Set tile bounds for the span(s)
         kv_start_tile_idx = span_begin_min // TILE_K_SIZE
         kv_end_tile_idx = tl.cdiv(span_end_max + 1, TILE_K_SIZE)
-    # Case 3: Default non-span tile -> causal attention
     else:
+        # Case 3: Default non-span tile -> causal attention
         q_tile_max_token = tl.max(tl.where(q_tile_mask, q_tile_indices, -1)) + 1
+        kv_start_tile_idx = tl.full((), 0, dtype=tl.int32)
         kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
 
     qbatch_head_offset = batch * stride_qb + head * stride_qh
@@ -1305,9 +1304,8 @@ def _flash_attn_bwd_dq(
     q_tile_is_prefix = tl.sum(is_prefix_q.to(tl.int32)) > 0
     q_tile_has_span = tl.sum((span_id_q != 0).to(tl.int32)) > 0
 
-    kv_start_tile_idx = tl.full((), 0, dtype=tl.int32)
-
     if q_tile_is_prefix:
+        kv_start_tile_idx = tl.full((), 0, dtype=tl.int32)
         kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
     elif q_tile_has_span:
         span_begin_ptr = SPAN_BEGIN + batch * span_begin_stride_b + q_tile_indices
@@ -1320,6 +1318,7 @@ def _flash_attn_bwd_dq(
         kv_end_tile_idx = tl.cdiv(span_end_max + 1, TILE_K_SIZE)
     else:
         q_tile_max_token = tl.max(tl.where(q_tile_mask, q_tile_indices, -1)) + 1
+        kv_start_tile_idx = tl.full((), 0, dtype=tl.int32)
         kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
     tile_k_arange = tl.arange(0, TILE_K_SIZE)
 
