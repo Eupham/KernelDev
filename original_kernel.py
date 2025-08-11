@@ -614,7 +614,7 @@ def _flash_attn_fwd(
 
             if RULE_MODE == 1:
                 # Teacher/Distractor: CLS (query) sees all; others cannot see CLS (key)
-                row_allow_all = prefix_q
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_Q_SIZE, TILE_K_SIZE))
                 row_mask_core = same_span | span_to_ns | causal_ns      # NOTE: no prefix_k here
                 mask = tl.where(row_allow_all, True, row_mask_core)
 
@@ -626,7 +626,7 @@ def _flash_attn_fwd(
 
             else:
                 # Current default behavior
-                row_allow_all = prefix_q
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_Q_SIZE, TILE_K_SIZE))
                 row_mask_core = prefix_k | same_span | span_to_ns | causal_ns
                 mask = tl.where(row_allow_all, True, row_mask_core)
             # --- End of new mask computation ---
@@ -1379,7 +1379,7 @@ def _flash_attn_bwd_dq(
 
             if RULE_MODE == 1:
                 # Teacher/Distractor: CLS (query) sees all; others cannot see CLS (key)
-                row_allow_all = prefix_q
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_Q_SIZE, TILE_K_SIZE))
                 row_mask_core = same_span | span_to_ns | causal_ns      # NOTE: no prefix_k here
                 mask = tl.where(row_allow_all, True, row_mask_core)
 
@@ -1391,7 +1391,7 @@ def _flash_attn_bwd_dq(
 
             else:
                 # Current default behavior
-                row_allow_all = prefix_q
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_Q_SIZE, TILE_K_SIZE))
                 row_mask_core = prefix_k | same_span | span_to_ns | causal_ns
                 mask = tl.where(row_allow_all, True, row_mask_core)
             # --- End of new mask computation ---
@@ -1533,7 +1533,7 @@ def _flash_attn_bwd_dkdv(
 
             if RULE_MODE == 1:
                 # Teacher/Distractor: CLS (query) sees all; others cannot see CLS (key)
-                row_allow_all = prefix_q
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_K_SIZE, TILE_Q_SIZE))
                 row_mask_core = same_span | span_to_ns | causal_ns      # NOTE: no prefix_k here
                 mask = tl.where(row_allow_all, True, row_mask_core)
 
@@ -1545,7 +1545,7 @@ def _flash_attn_bwd_dkdv(
 
             else:
                 # Current default behavior
-                row_allow_all = prefix_q
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_K_SIZE, TILE_Q_SIZE))
                 row_mask_core = prefix_k | same_span | span_to_ns | causal_ns
                 mask = tl.where(row_allow_all, True, row_mask_core)
             # --- End of new mask computation ---
