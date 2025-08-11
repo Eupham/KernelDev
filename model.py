@@ -197,7 +197,7 @@ class GPTModel(nn.Module):
         is_span_end = (x == span_end_id)
         in_span = (torch.cumsum(is_span_start.int(), dim=1) - torch.cumsum(is_span_end.int(), dim=1)) > 0
 
-        span_id_raw = torch.cumsum(is_span_start.int(), dim=1)
+        span_id_raw = torch.cumsum(is_span_start.int(), dim=1).to(torch.int32)
         span_id = torch.zeros_like(x, dtype=torch.int32)
         span_id[in_span] = span_id_raw[in_span]
 
