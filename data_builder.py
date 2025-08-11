@@ -367,8 +367,12 @@ class DataBuilder:
                         def __len__(self):
                             return max(1, len(self.data) - self.seq_len)
                         def __getitem__(self, idx):
-                            x = torch.tensor(self.data[idx:idx + self.seq_len], dtype=torch.long)
-                            y = torch.tensor(self.data[idx + 1:idx + self.seq_len + 1], dtype=torch.long)
+                            CLS = SPECIAL_TOKENS['[CLS]']
+                            # Build a window that starts with CLS, then fill remaining with data
+                            window = [CLS] + self.data[idx: idx + self.seq_len]      # length = seq_len + 1
+                            window = window[:self.seq_len + 1]
+                            x = torch.tensor(window[:-1], dtype=torch.long)          # [CLS] + ...
+                            y = torch.tensor(window[1:],  dtype=torch.long)          # next-token targets
                             return x, y
 
                     datasets[split_name] = TokenizedDataset(tokens, self.seq_len)
@@ -440,10 +444,18 @@ class DataBuilder:
             wrapper_len = len(wrapper_tokens)
 
             # 3. Truncate context to fit wrappers
-            available_context_len = self.seq_len - wrapper_len
-            available_context_len = max(0, available_context_len)
+            # Reserve 1 slot for CLS in context
+            available_context_len = max(1, self.seq_len - wrapper_len)
 
-            masked_context = (original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:])
+            # Ensure CLS sits at position 0
+            CLS = SPECIAL_TOKENS['[CLS]']
+            masked_context = (original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] +
+                              original_tokens[span_start + span_size:])
+
+            # Guarantee CLS presence at index 0 (in case truncation would drop it)
+            if not masked_context or masked_context[0] != CLS:
+                masked_context = [CLS] + [t for t in masked_context if t != CLS]
+
             truncated_masked_context = masked_context[:available_context_len]
 
             # 4. Stitch final sequence together
@@ -536,8 +548,14 @@ class DataBuilder:
             if T <= L_max:
                 continue
 
+            CLS = SPECIAL_TOKENS['[CLS]']
+            # Make sure first token is CLS, and never write over it
+            if original_tokens[0] != CLS:
+                original_tokens = [CLS] + original_tokens[1:]
+
             L = random.randint(L_min, L_max)
-            s = random.randint(0, T - L)
+            # Sample s from 1..T-L to preserve CLS at index 0
+            s = random.randint(1, T - L)
 
             # Sample distractor from another example
             distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
@@ -553,6 +571,8 @@ class DataBuilder:
 
             x_prime_list = original_tokens[:s] + distractor_span + original_tokens[s + L:]
             x_prime_list = x_prime_list[:T]
+            # Double-check CLS survived
+            x_prime_list[0] = CLS
 
             # Create soft mask
             center_pos = s + L / 2.0

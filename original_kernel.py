@@ -450,6 +450,7 @@ def _flash_attn_fwd(
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
     T: int,  #
+    RULE_MODE: int,
     TIME_BUCKET:  int,  #
     HEAD_DIM: tl.constexpr,  #
     CAUSAL: tl.constexpr,  #
@@ -604,18 +605,30 @@ def _flash_attn_fwd(
             q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
 
             # --- Start of new mask computation ---
-            # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
             same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
             span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
             causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
 
-            prefix_keys = k_is_prefix[None, :]
             prefix_q = q_is_prefix[:, None]
+            prefix_k = k_is_prefix[None, :]
 
-            # Rows that are prefix queries get everything
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
+            if RULE_MODE == 1:
+                # Teacher/Distractor: CLS (query) sees all; others cannot see CLS (key)
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_Q_SIZE, TILE_K_SIZE))
+                row_mask_core = same_span | span_to_ns | causal_ns      # NOTE: no prefix_k here
+                mask = tl.where(row_allow_all, True, row_mask_core)
+
+            elif RULE_MODE == 2:
+                # Span tasks: CLS (query) cannot read inside spans, CLS remains a visible key
+                row_allow_all = prefix_q & (~k_in_span[None, :])         # CLS reads only non-span keys
+                row_mask_core = prefix_k | same_span | span_to_ns | causal_ns
+                mask = tl.where(row_allow_all, True, row_mask_core)
+
+            else:
+                # Current default behavior
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_Q_SIZE, TILE_K_SIZE))
+                row_mask_core = prefix_k | same_span | span_to_ns | causal_ns
+                mask = tl.where(row_allow_all, True, row_mask_core)
             # --- End of new mask computation ---
 
         elif CAUSAL:
@@ -825,6 +838,7 @@ def _flash_attn_bwd(
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
     T: int,  #
+    RULE_MODE: int,
     TIME_BUCKET: int,  #
     DQ_TILES_NUM: int,  #
     HEAD_DIM: tl.constexpr,  #
@@ -877,6 +891,7 @@ def _flash_attn_bwd(
             tile_id=tile_id,
             seq_len=seq_len,
             T=T,
+            RULE_MODE=RULE_MODE,
             HEAD_DIM=HEAD_DIM,
             INPUT_PRECISION=INPUT_PRECISION,
             SM_SCALE=SM_SCALE,
@@ -912,6 +927,7 @@ def _flash_attn_bwd(
             tile_id=tile_id,
             seq_len=seq_len,
             T=T,
+            RULE_MODE=RULE_MODE,
             HEAD_DIM=HEAD_DIM,
             INPUT_PRECISION=INPUT_PRECISION,
             SM_SCALE=SM_SCALE,
@@ -951,6 +967,7 @@ def _flash_attn_bwd_dq_inner(
     tile_id: int,
     seq_len: tl.tensor,
     T: int,  #
+    RULE_MODE: int,
     HEAD_DIM: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
@@ -1054,6 +1071,7 @@ def _flash_attn_bwd_dq_inner(
         seq_len=seq_len,
         T=T,
         q_token_idx=q_token_idx,
+        RULE_MODE=RULE_MODE,
         TILE_Q_SIZE=TILE_DQ_Q_SIZE,
         TILE_K_SIZE=TILE_DQ_K_SIZE,
         CAUSAL=CAUSAL,
@@ -1106,6 +1124,7 @@ def _flash_attn_bwd_dkdv_inner(
     tile_id: int,
     seq_len: tl.tensor,
     T: int,  #
+    RULE_MODE: int,
     HEAD_DIM: tl.constexpr,  #
     INPUT_PRECISION: tl.constexpr,  #
     SM_SCALE: tl.constexpr,  #
@@ -1216,6 +1235,7 @@ def _flash_attn_bwd_dkdv_inner(
         seq_len=seq_len,
         T=T,
         kv_token_idx=kv_token_idx,
+        RULE_MODE=RULE_MODE,
         TILE_Q_SIZE=TILE_DK_Q_SIZE,
         TILE_K_SIZE=TILE_DK_K_SIZE,
         CAUSAL=CAUSAL,
@@ -1272,6 +1292,7 @@ def _flash_attn_bwd_dq(
     seq_len: tl.tensor,
     T: tl.constexpr,
     q_token_idx: int,
+    RULE_MODE: int,
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
     CAUSAL: tl.constexpr,
@@ -1353,12 +1374,26 @@ def _flash_attn_bwd_dq(
             span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
             causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
 
-            prefix_keys = k_is_prefix[None, :]
             prefix_q = q_is_prefix[:, None]
+            prefix_k = k_is_prefix[None, :]
 
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
+            if RULE_MODE == 1:
+                # Teacher/Distractor: CLS (query) sees all; others cannot see CLS (key)
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_Q_SIZE, TILE_K_SIZE))
+                row_mask_core = same_span | span_to_ns | causal_ns      # NOTE: no prefix_k here
+                mask = tl.where(row_allow_all, True, row_mask_core)
+
+            elif RULE_MODE == 2:
+                # Span tasks: CLS (query) cannot read inside spans, CLS remains a visible key
+                row_allow_all = prefix_q & (~k_in_span[None, :])         # CLS reads only non-span keys
+                row_mask_core = prefix_k | same_span | span_to_ns | causal_ns
+                mask = tl.where(row_allow_all, True, row_mask_core)
+
+            else:
+                # Current default behavior
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_Q_SIZE, TILE_K_SIZE))
+                row_mask_core = prefix_k | same_span | span_to_ns | causal_ns
+                mask = tl.where(row_allow_all, True, row_mask_core)
             # --- End of new mask computation ---
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
@@ -1392,6 +1427,7 @@ def _flash_attn_bwd_dkdv(
     seq_len: tl.tensor,
     T: tl.constexpr,
     kv_token_idx: int,
+    RULE_MODE: int,
     TILE_Q_SIZE: tl.constexpr,
     TILE_K_SIZE: tl.constexpr,
     CAUSAL: tl.constexpr,
@@ -1492,12 +1528,26 @@ def _flash_attn_bwd_dkdv(
             span_to_ns = q_in_span[None, :] & ~k_in_span[:, None]
             causal_ns = ~q_in_span[None, :] & ~k_in_span[:, None] & (q_tile_indices[None, :] >= kv_indices[:, None])
 
-            prefix_keys = k_is_prefix[:, None]
             prefix_q = q_is_prefix[None, :]
+            prefix_k = k_is_prefix[:, None]
 
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
+            if RULE_MODE == 1:
+                # Teacher/Distractor: CLS (query) sees all; others cannot see CLS (key)
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_K_SIZE, TILE_Q_SIZE))
+                row_mask_core = same_span | span_to_ns | causal_ns      # NOTE: no prefix_k here
+                mask = tl.where(row_allow_all, True, row_mask_core)
+
+            elif RULE_MODE == 2:
+                # Span tasks: CLS (query) cannot read inside spans, CLS remains a visible key
+                row_allow_all = prefix_q & (~k_in_span[:, None])         # CLS reads only non-span keys
+                row_mask_core = prefix_k | same_span | span_to_ns | causal_ns
+                mask = tl.where(row_allow_all, True, row_mask_core)
+
+            else:
+                # Current default behavior
+                row_allow_all = tl.broadcast_to(prefix_q, (TILE_K_SIZE, TILE_Q_SIZE))
+                row_mask_core = prefix_k | same_span | span_to_ns | causal_ns
+                mask = tl.where(row_allow_all, True, row_mask_core)
             # --- End of new mask computation ---
         elif CAUSAL:
             mask = q_tile_indices[None, :] >= kv_indices[:, None]
@@ -1705,6 +1755,7 @@ def attention_forward_adapter(
     in_span: torch.Tensor = None,
     span_id: torch.Tensor = None,
     is_prefix: torch.Tensor = None,
+    rule_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1752,6 +1803,7 @@ def attention_forward_adapter(
         *(strides(is_prefix, 2) if is_prefix is not None else [0]*2),
         T=T,
         HEAD_DIM=HEAD_DIM,
+        RULE_MODE=rule_mode,
         CAUSAL=causal,
         INPUT_PRECISION=precision,
         PRESCALE_QK=prescale_qk,
@@ -1782,6 +1834,7 @@ def attention_forward_adapter_abstract(
     in_span: torch.Tensor | None,
     span_id: torch.Tensor | None,
     is_prefix: torch.Tensor | None,
+    rule_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
@@ -1809,6 +1862,7 @@ def attention_backward_adapter(
     in_span: torch.Tensor,
     span_id: torch.Tensor,
     is_prefix: torch.Tensor,
+    rule_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1879,6 +1933,7 @@ def attention_backward_adapter(
         DTYPE=q.dtype,
         SM_SCALE=sm_scale,
         PRESCALE_QK=prescale_qk,
+        RULE_MODE=rule_mode,
     )
 
     return DQ, DK, DV
@@ -1902,6 +1957,7 @@ def attention_backward_adapter_abstract(
     in_span: torch.Tensor,
     span_id: torch.Tensor,
     is_prefix: torch.Tensor,
+    rule_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
     DK = torch.empty_like(k, memory_format=torch.contiguous_format)
@@ -1926,6 +1982,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         in_span,
         span_id,
         is_prefix,
+        rule_mode,
     ) = inputs
     ctx.save_for_backward(
         q,
@@ -1944,6 +2001,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
     ctx.sm_scale = sm_scale
     ctx.prescale_qk = prescale_qk
     ctx.precision = precision
+    ctx.rule_mode = rule_mode
 
 
 def attention_backward_adapter_op(ctx, do, dlse):
@@ -1953,6 +2011,7 @@ def attention_backward_adapter_op(ctx, do, dlse):
     sm_scale = ctx.sm_scale
     prescale_qk = ctx.prescale_qk
     precision = ctx.precision
+    rule_mode = ctx.rule_mode
 
     DQ, DK, DV = torch.ops.flash_attention.backward(
         q=q,
@@ -1971,9 +2030,10 @@ def attention_backward_adapter_op(ctx, do, dlse):
         in_span=in_span,
         span_id=span_id,
         is_prefix=is_prefix,
+        rule_mode=rule_mode,
     )
 
-    return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None
+    return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 torch.library.register_autograd(
@@ -2033,6 +2093,7 @@ def _flash_attention(
     in_span: torch.Tensor | None,
     span_id: torch.Tensor | None,
     is_prefix: torch.Tensor | None,
+    rule_mode: int = 0,
 ):
     requires_grad = any(i.requires_grad for i in (q, k, v))
     O, LSE = torch.ops.flash_attention.forward(
@@ -2050,6 +2111,7 @@ def _flash_attention(
         in_span=in_span,
         span_id=span_id,
         is_prefix=is_prefix,
+        rule_mode=rule_mode,
     )
     if return_lse:
         return O, LSE
@@ -2066,7 +2128,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
     def forward(
         ctx, q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
         incoherent_processing, hadamard_signs_q, hadamard_signs_k, attention_mask,
-        in_span, span_id, is_prefix
+        in_span, span_id, is_prefix, rule_mode
     ):
         # Store context for backward pass
         ctx.incoherent_processing = incoherent_processing
@@ -2080,6 +2142,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
         ctx.in_span = in_span
         ctx.span_id = span_id
         ctx.is_prefix = is_prefix
+        ctx.rule_mode = rule_mode
         
         # Apply Hadamard transform for incoherent processing
         q_transformed, k_transformed = q, k
@@ -2127,6 +2190,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix,
+            rule_mode=rule_mode,
         )
         
         # Save tensors for backward pass
@@ -2165,6 +2229,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 in_span=ctx.in_span,
                 span_id=ctx.span_id,
                 is_prefix=ctx.is_prefix,
+                rule_mode=ctx.rule_mode,
             )
             
             # Apply inverse Hadamard transform to gradients to get gradients w.r.t. original Q and K
@@ -2190,9 +2255,10 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 in_span=ctx.in_span,
                 span_id=ctx.span_id,
                 is_prefix=ctx.is_prefix,
+                rule_mode=ctx.rule_mode,
             )
         
-        return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attention(
@@ -2213,6 +2279,7 @@ def flash_attention(
     in_span: torch.Tensor | None = None,
     span_id: torch.Tensor | None = None,
     is_prefix: torch.Tensor | None = None,
+    rule_mode: int = 0,
 ):
     """
     Computes self-attention with optional causal masking and flash attention optimization.
@@ -2264,7 +2331,7 @@ def flash_attention(
         return IncoherentFlashAttention.apply(
             q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
             use_incoherent, hadamard_signs_q, hadamard_signs_k, attention_mask,
-            in_span, span_id, is_prefix
+            in_span, span_id, is_prefix, rule_mode
         )
     else:
         # Use standard flash attention for normal case
@@ -2283,6 +2350,7 @@ def flash_attention(
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix,
+            rule_mode=rule_mode,
         )
 
 
