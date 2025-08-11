@@ -272,11 +272,11 @@ class GPTModel(nn.Module):
             span_token_id = SPECIAL_TOKENS['[SPAN]']
 
             sentence_embeddings = []
-            for i in range(batch_size):
+            for i in range(B):
                 span_indices = (x[i] == span_token_id).nonzero(as_tuple=False).squeeze(-1)
 
                 # Add start and end of sequence for pooling
-                sentence_boundaries = [0] + span_indices.tolist() + [seq_len]
+                sentence_boundaries = [0] + span_indices.tolist() + [T]
 
                 pooled_embeddings = []
                 for j in range(len(sentence_boundaries) - 1):
