@@ -632,8 +632,8 @@ def _flash_attn_fwd(
         mask = same_span | (k_is_nonspan & causal_mask)
 
         # Prefix override: a prefix Q can see all K, and any Q can see a prefix K.
-        q_is_prefix_b = is_prefix_q[:, None]
-        k_is_prefix_b = is_prefix_k[None, :]
+        q_is_prefix_b = is_prefix_q[:, None] != 0
+        k_is_prefix_b = is_prefix_k[None, :] != 0
         mask = mask | q_is_prefix_b | k_is_prefix_b
 
         # Final boundary checks
@@ -1368,8 +1368,8 @@ def _flash_attn_bwd_dq(
 
         mask = same_span | (k_is_nonspan & causal_mask)
 
-        q_is_prefix_b = is_prefix_q[:, None]
-        k_is_prefix_b = is_prefix_k[None, :]
+        q_is_prefix_b = is_prefix_q[:, None] != 0
+        k_is_prefix_b = is_prefix_k[None, :] != 0
         mask = mask | q_is_prefix_b | k_is_prefix_b
 
         mask = mask & (q_len_mask & (kv_indices[None, :] < seq_len))
@@ -1486,8 +1486,8 @@ def _flash_attn_bwd_dkdv(
 
         mask = same_span | (k_is_nonspan & causal_mask)
 
-        q_is_prefix_b = is_prefix_q[None, :]
-        k_is_prefix_b = is_prefix_k[:, None]
+        q_is_prefix_b = is_prefix_q[None, :] != 0
+        k_is_prefix_b = is_prefix_k[:, None] != 0
         mask = mask | q_is_prefix_b | k_is_prefix_b
 
         mask = mask & (kv_lens_mask & (q_tile_indices[None, :] < seq_len))
