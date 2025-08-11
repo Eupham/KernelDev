@@ -179,33 +179,43 @@ class GPTModel(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
-        batch_size, seq_len = x.shape
-        
-        # Create position indices
-        pos = torch.arange(0, seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
-        
-        # Token and position embeddings
+        B, T = x.shape
+        pos = torch.arange(0, T, dtype=torch.long, device=x.device).unsqueeze(0)
         x_embed = self.token_emb(x) + self.pos_emb(pos)
-        
-        # Create metadata tensors
-        if attention_mask is not None:
-            span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id = SPECIAL_TOKENS['[ES]']
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
 
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
+        # Use span/prefix rules for tasks that place [SPAN]/[ES]/[MASK] in-sequence
+        needs_span_mask = task_name in ('cocktail_party', 'soft_jigsaw')
+
+        if needs_span_mask:
+            span_start_id = SPECIAL_TOKENS['[SPAN]']
+            span_end_id   = SPECIAL_TOKENS['[ES]']
+            cls_token_id  = SPECIAL_TOKENS['[CLS]']
+
+            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) -
+                       torch.cumsum((x == span_end_id).int(), dim=1)) > 0
+            span_id = torch.cumsum((x == span_start_id).int(), dim=1).to(torch.int32)
             span_id[~in_span] = -1
             is_prefix = (x == cls_token_id)
-        else:
-            # Create dummy tensors when no attention mask is provided
-            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
-            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
 
-        # Apply transformer blocks
+            # Tiny 3D sentinel: [B, H, T] bool. Values are unused by the kernel.
+            # It only checks ATTN_MASK is not None and uses the metadata above.
+            h = self.n_heads
+            attn_sentinel = torch.zeros((B, h, T), dtype=torch.bool, device=x.device)
+        else:
+            in_span    = torch.zeros((B, T), dtype=torch.bool,   device=x.device)
+            span_id    = torch.full((B, T), -1, dtype=torch.int32, device=x.device)
+            is_prefix  = torch.zeros((B, T), dtype=torch.bool,   device=x.device)
+            attn_sentinel = None  # causal/non-causal will be used
+
+        # Transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(
+                x_embed,
+                attention_mask=attn_sentinel,
+                in_span=in_span,
+                span_id=span_id,
+                is_prefix=is_prefix
+            )
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
