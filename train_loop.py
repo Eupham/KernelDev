@@ -291,6 +291,7 @@ class Trainer:
             inputs, correct_idx, _ = batch # ignore mask
             if inputs.numel() == 0:
                 return 0.0
+            print(f"Sample correct_idx: {correct_idx[0].tolist()}")
             inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
             # pass attention_mask=None; model will generate a sentinel and span metadata
             if self.config.use_amp and self.config.scaler is not None:

@@ -99,13 +99,13 @@ class DataBuilder:
             if t in special_map:
                 if not skip_special_tokens:
                     if buf:
-                        out.append(buf.decode('utf-8', errors='strict'))
+                        out.append(buf.decode('utf-8', errors='replace'))
                         buf.clear()
                     out.append(special_map[t])
             else:
                 buf.append(int(t - NUM_SPECIAL_TOKENS))
         if buf:
-            out.append(buf.decode('utf-8', errors='strict'))
+            out.append(buf.decode('utf-8', errors='replace'))
         return ''.join(out)
 
     def _process_iterable_dataset(self, dataset_iterable, dataset_name_logging: str) -> list:
