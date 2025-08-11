@@ -337,7 +337,6 @@ def start_actual_training(cli_args):
             print(f"Batch shape: {inputs.shape}")
             print(f"Spans shape: {spans.shape}")
             print(f"Sample tokens: {inputs[0][:20].tolist()}")
-            print(f"Sample correct_idx: {correct_idx[0].tolist()}")
             
             # Decode sample text
             sample_text = data_builder.decode_tokens(inputs[0][:50])

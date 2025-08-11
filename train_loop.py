@@ -271,7 +271,7 @@ class Trainer:
             self.model.parameters(),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
-            fused=use_fused_adam
+            fused=True
         )
         if use_fused_adam and (not self.is_distributed or dist.get_rank() == 0):
             print("Using fused AdamW optimizer.")
