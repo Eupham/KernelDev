@@ -30,26 +30,26 @@ class SwiGLU(nn.Module):
 
 class MultiHeadAttention(nn.Module):
     """Multi-head attention using flash attention kernel."""
-    
+
     def __init__(self, dim, n_heads, head_dim=None, causal=True):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = head_dim or dim // n_heads
         self.causal = causal
-        
+
         self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
-    
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+
+    def forward(self, x, span_id, span_begin, span_end, is_prefix):
         batch_size, seq_len, _ = x.shape
-        
+
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        
+
         is_causal = self.causal
 
         # Use flash attention kernel
@@ -59,29 +59,32 @@ class MultiHeadAttention(nn.Module):
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=attention_mask,
-            in_span=in_span,
+            # No dense mask
+            attention_mask=None,
+            # New 1D metadata
             span_id=span_id,
+            span_begin=span_begin,
+            span_end=span_end,
             is_prefix=is_prefix
         )
-        
+
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(out)
 
 
 class TransformerBlock(nn.Module):
     """Transformer block with pre-normalization."""
-    
+
     def __init__(self, dim, n_heads, mlp_ratio=4, causal=True):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.attn = MultiHeadAttention(dim, n_heads, causal=causal)
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
-    
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+
+    def forward(self, x, span_id, span_begin, span_end, is_prefix):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+        x = x + self.attn(self.norm1(x), span_id=span_id, span_begin=span_begin, span_end=span_end, is_prefix=is_prefix)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -187,25 +190,50 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Create metadata tensors
-        if attention_mask is not None:
-            span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id = SPECIAL_TOKENS['[ES]']
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
+        # --- New metadata generation ---
+        # Get special token IDs
+        span_start_id = SPECIAL_TOKENS['[SPAN]']
+        span_end_id = SPECIAL_TOKENS['[ES]']
+        cls_token_id = SPECIAL_TOKENS['[CLS]']
 
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
-            span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
-        else:
-            # Create dummy tensors when no attention mask is provided
-            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
-            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+        # 1. is_prefix tensor
+        is_prefix = (x == cls_token_id)
+
+        # 2. span_id, span_begin, span_end tensors
+        is_span_start = (x == span_start_id)
+        is_span_end = (x == span_end_id)
+
+        # Efficiently create span_begin and span_end using a loop over the batch dimension
+        span_begin = torch.zeros_like(x, dtype=torch.int32)
+        span_end = torch.zeros_like(x, dtype=torch.int32)
+
+        for i in range(batch_size):
+            # Find start and end token locations for this batch item
+            # Assuming spans are non-overlapping and well-formed
+            b_starts = torch.where(is_span_start[i])[0]
+            b_ends = torch.where(is_span_end[i])[0]
+
+            # Associate each start with its corresponding end
+            for start_idx, end_idx in zip(b_starts, b_ends):
+                # The tokens from start_idx to end_idx (inclusive) belong to this span
+                span_begin[i, start_idx:end_idx + 1] = start_idx
+                span_end[i, start_idx:end_idx + 1] = end_idx
+
+        # Create span_id: 0 for non-span tokens, a unique positive integer for each span
+        span_id_values = torch.cumsum(is_span_start.to(torch.int32), dim=1)
+        is_in_a_span = (span_end > 0) # Tokens in a span have a non-zero end marker
+        span_id = span_id_values * is_in_a_span
+
+        # Ensure all metadata tensors are int32 and contiguous
+        span_id = span_id.to(torch.int32).contiguous()
+        span_begin = span_begin.to(torch.int32).contiguous()
+        span_end = span_end.to(torch.int32).contiguous()
+        is_prefix = is_prefix.to(torch.int32).contiguous()
+        # --- End of new metadata generation ---
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(x_embed, span_id=span_id, span_begin=span_begin, span_end=span_end, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
