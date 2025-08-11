@@ -437,17 +437,16 @@ def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
 def _flash_attn_fwd(
     Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, #
     LSE: tl.tensor, O: tl.tensor,  #
-    ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    SPAN_ID: tl.tensor, SPAN_BEGIN: tl.tensor, SPAN_END: tl.tensor, IS_PREFIX: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,  #
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
     stride_mb: int, stride_mh: int, stride_mt: int,  #
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
     lens_stride: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
-    in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
+    span_begin_stride_b: int, span_begin_stride_t: int,
+    span_end_stride_b: int, span_end_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
     T: int,  #
     TIME_BUCKET:  int,  #
@@ -483,24 +482,39 @@ def _flash_attn_fwd(
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
 
     # Load metadata for the current query tile
-    q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
-    q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
+    q_tile_indices_mask = q_tile_indices < seq_len
 
-    q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
-    q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
+    span_id_ptr = SPAN_ID + batch * span_id_stride_b
+    span_begin_ptr = SPAN_BEGIN + batch * span_begin_stride_b
+    span_end_ptr = SPAN_END + batch * span_end_stride_b
+    is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b
 
-    # Decide loop bound per tile
-    q_tile_has_noncausal = tl.sum((q_in_span | q_is_prefix).to(tl.int32)) > 0
+    span_id_q = tl.load(span_id_ptr + q_tile_indices, mask=q_tile_indices_mask, other=0)
+    span_begin_q = tl.load(span_begin_ptr + q_tile_indices, mask=q_tile_indices_mask, other=0)
+    span_end_q = tl.load(span_end_ptr + q_tile_indices, mask=q_tile_indices_mask, other=0)
+    is_prefix_q = tl.load(is_prefix_ptr + q_tile_indices, mask=q_tile_indices_mask, other=0)
 
-    kv_start_tile_idx = 0
-    q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
+    # --- KV loop bounds calculation ---
+    kv_start_tile_idx = tl.full((), 0, dtype=tl.int32)
+    q_tile_max_token = tl.minimum(q_token_idx + TILE_Q_SIZE, seq_len)
 
-    if CAUSAL and not q_tile_has_noncausal:
-        # For causal attention, we can attend up to the last query token
-        kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
-    else:
-        # For non-causal attention, attend to all tokens
+    kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE) # Default: causal
+
+    q_has_prefix = tl.sum(is_prefix_q.to(tl.int32)) > 0
+    if q_has_prefix:
         kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
+
+    q_has_span = tl.sum((span_id_q != 0).to(tl.int32)) > 0
+    if q_has_span and not q_has_prefix:
+        span_begin_min = tl.min(tl.where(span_id_q != 0, span_begin_q, seq_len), axis=0)
+        span_end_max = tl.max(tl.where(span_id_q != 0, span_end_q, 0), axis=0)
+
+        span_begin_min = span_begin_min.to(tl.int32)
+        span_end_max = span_end_max.to(tl.int32)
+
+        kv_start_tile_idx = span_begin_min // TILE_K_SIZE
+        kv_end_tile_idx = tl.cdiv(span_end_max + 1, TILE_K_SIZE)
+    # --- End KV loop bounds ---
 
     qbatch_head_offset = batch * stride_qb + head * stride_qh
     q_tile_ptr = tl.make_block_ptr(
@@ -587,43 +601,31 @@ def _flash_attn_fwd(
             q_tile, kt_tile, input_precision=INPUT_PRECISION, out_dtype=tl.float32
         )
 
+        # --- In-tile masking ---
         kv_indices = kv_token_idx + tile_k_arange
-        if ATTN_MASK is not None:
-            # Load metadata for the key tile
-            k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
-            k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
+        k_indices_mask = kv_indices < seq_len
+        span_id_k = tl.load(span_id_ptr + kv_indices, mask=k_indices_mask, other=0)
+        is_prefix_k = tl.load(is_prefix_ptr + kv_indices, mask=k_indices_mask, other=0)
 
-            k_span_id_ptr = SPAN_ID + batch * span_id_stride_b + kv_indices
-            k_span_id = tl.load(k_span_id_ptr, mask=kv_indices < seq_len, other=-1)
+        q_indices = q_tile_indices[:, None]
+        k_indices = kv_indices[None, :]
 
-            k_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + kv_indices
-            k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
+        qid = span_id_q[:, None]
+        kid = span_id_k[None, :]
 
-            # Load metadata for the query tile
-            q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
-            q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
+        q_is_prefix_mask = is_prefix_q[:, None]
+        k_is_prefix_mask = is_prefix_k[None, :]
 
-            # --- Start of new mask computation ---
-            # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
-            same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
-            span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
-            causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
+        same_span = (qid != 0) & (kid == qid)
 
-            prefix_keys = k_is_prefix[None, :]
-            prefix_q = q_is_prefix[:, None]
+        nonspan_q = (qid == 0)
+        nonspan_k = (kid == 0)
+        k_le_q = (k_indices <= q_indices)
+        nonspan_causal = nonspan_q & nonspan_k & k_le_q
 
-            # Rows that are prefix queries get everything
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
-
-        elif CAUSAL:
-            mask = q_tile_indices[:, None] >= kv_indices[None, :]
-        else:
-            mask = True
-
-        mask = mask & (q_lens_mask & (kv_indices[None, :] < seq_len))
+        mask = q_is_prefix_mask | k_is_prefix_mask | same_span | nonspan_causal
+        mask = mask & (q_indices < seq_len) & (k_indices < seq_len)
+        # --- End in-tile masking ---
         
         if not PERFECT_MATCHING:
             q_attended |= tl.max(mask, 1) > 0
@@ -808,8 +810,7 @@ def _flash_attn_bwd(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, L: tl.tensor, #
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor, DK: tl.tensor, DV: tl.tensor,
-    ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    SPAN_ID: tl.tensor, SPAN_BEGIN: tl.tensor, SPAN_END: tl.tensor, IS_PREFIX: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,  #
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
@@ -820,9 +821,9 @@ def _flash_attn_bwd(
     stride_dkb: int, stride_dkh: int, stride_dkt: int, stride_dkk: int,  #
     stride_dvb: int, stride_dvh: int, stride_dvt: int, stride_dvk: int,  #
     lens_stride: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
-    in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
+    span_begin_stride_b: int, span_begin_stride_t: int,
+    span_end_stride_b: int, span_end_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
     T: int,  #
     TIME_BUCKET: int,  #
@@ -858,8 +859,7 @@ def _flash_attn_bwd(
     if dkv_worker:
         _flash_attn_bwd_dkdv_inner(
             Q, K, V, DELTA, LSE, DO, DK, DV,
-            ATTN_MASK,
-            IN_SPAN, SPAN_ID, IS_PREFIX,
+            SPAN_ID, SPAN_BEGIN, SPAN_END, IS_PREFIX,
             stride_qb, stride_qh, stride_qt, stride_qk,
             stride_kb, stride_kh, stride_kt, stride_kk,
             stride_vb, stride_vh, stride_vt, stride_vk,
@@ -894,8 +894,7 @@ def _flash_attn_bwd(
         _flash_attn_bwd_dq_inner(
             Q, K, V, DELTA, LSE,
             DO, DQ,
-            ATTN_MASK,
-            IN_SPAN, SPAN_ID, IS_PREFIX,
+            SPAN_ID, SPAN_BEGIN, SPAN_END, IS_PREFIX,
             stride_qb, stride_qh, stride_qt, stride_qk,
             stride_kb, stride_kh, stride_kt, stride_kk,
             stride_vb, stride_vh, stride_vt, stride_vk,
@@ -933,8 +932,7 @@ def _flash_attn_bwd(
 def _flash_attn_bwd_dq_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor,
-    ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    SPAN_ID: tl.tensor, SPAN_BEGIN: tl.tensor, SPAN_END: tl.tensor, IS_PREFIX: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,
@@ -942,9 +940,9 @@ def _flash_attn_bwd_dq_inner(
     stride_mb: int, stride_mh: int, stride_mt: int,
     stride_dob: int, stride_doh: int, stride_dot: int, stride_dok: int,
     stride_dqb: int, stride_dqh: int, stride_dqt: int, stride_dqk: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
-    in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
+    span_begin_stride_b: int, span_begin_stride_t: int,
+    span_end_stride_b: int, span_end_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
     batch: int,
     head: int,
@@ -1044,11 +1042,10 @@ def _flash_attn_bwd_dq_inner(
     dq = _flash_attn_bwd_dq(
         dq, q, m, di, do,
         kt_tile_ptr, vt_tile_ptr,
-        ATTN_MASK,
-        IN_SPAN, SPAN_ID, IS_PREFIX,
-        mask_stride_b, mask_stride_h, mask_stride_t,
-        in_span_stride_b, in_span_stride_t,
+        SPAN_ID, SPAN_BEGIN, SPAN_END, IS_PREFIX,
         span_id_stride_b, span_id_stride_t,
+        span_begin_stride_b, span_begin_stride_t,
+        span_end_stride_b, span_end_stride_t,
         is_prefix_stride_b, is_prefix_stride_t,
         batch, head,
         seq_len=seq_len,
@@ -1086,8 +1083,7 @@ def _flash_attn_bwd_dkdv_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor,
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DK: tl.tensor, DV: tl.tensor,
-    ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    SPAN_ID: tl.tensor, SPAN_BEGIN: tl.tensor, SPAN_END: tl.tensor, IS_PREFIX: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,
@@ -1206,11 +1202,10 @@ def _flash_attn_bwd_dkdv_inner(
         dk, dv,
         qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
         k, v,
-        ATTN_MASK,
-        IN_SPAN, SPAN_ID, IS_PREFIX,
-        mask_stride_b, mask_stride_h, mask_stride_t,
-        in_span_stride_b, in_span_stride_t,
+        SPAN_ID, SPAN_BEGIN, SPAN_END, IS_PREFIX,
         span_id_stride_b, span_id_stride_t,
+        span_begin_stride_b, span_begin_stride_t,
+        span_end_stride_b, span_end_stride_t,
         is_prefix_stride_b, is_prefix_stride_t,
         batch, head,
         seq_len=seq_len,
@@ -1262,11 +1257,10 @@ def _flash_attn_bwd_dq(
     dq: tl.tensor, q: tl.tensor, m: tl.tensor,
     di: tl.tensor, do: tl.tensor,
     kt_tile_ptr: tl.tensor, vt_tile_ptr: tl.tensor,
-    ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
-    in_span_stride_b: int, in_span_stride_t: int,
+    SPAN_ID: tl.tensor, SPAN_BEGIN: tl.tensor, SPAN_END: tl.tensor, IS_PREFIX: tl.tensor,
     span_id_stride_b: int, span_id_stride_t: int,
+    span_begin_stride_b: int, span_begin_stride_t: int,
+    span_end_stride_b: int, span_end_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
     batch: int, head: int,
     seq_len: tl.tensor,
@@ -1283,17 +1277,35 @@ def _flash_attn_bwd_dq(
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
 ):
-    # Conditional attention range based on CAUSAL parameter
-    kv_start_tile_idx = 0
-    q_tile_max_token = min(q_token_idx + TILE_Q_SIZE, seq_len)
-    if CAUSAL:
-        # For causal attention, we can attend up to the last query token
-        kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
-    else:
-        # For non-causal attention, attend to all tokens
+    # The logic here mirrors the forward pass logic
+    q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
+
+    span_id_ptr = SPAN_ID + batch * span_id_stride_b
+    span_begin_ptr = SPAN_BEGIN + batch * span_begin_stride_b
+    span_end_ptr = SPAN_END + batch * span_end_stride_b
+    is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b
+
+    span_id_q = tl.load(span_id_ptr + q_tile_indices, mask=q_tile_indices < seq_len, other=0)
+    is_prefix_q = tl.load(is_prefix_ptr + q_tile_indices, mask=q_tile_indices < seq_len, other=0)
+
+    # --- KV loop bounds calculation (same as forward) ---
+    kv_start_tile_idx = tl.full((), 0, dtype=tl.int32)
+    q_tile_max_token = tl.minimum(q_token_idx + TILE_Q_SIZE, seq_len)
+    kv_end_tile_idx = tl.cdiv(q_tile_max_token, TILE_K_SIZE)
+
+    q_has_prefix = tl.sum(is_prefix_q.to(tl.int32)) > 0
+    if q_has_prefix:
         kv_end_tile_idx = tl.cdiv(seq_len, TILE_K_SIZE)
 
-    q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
+    q_has_span = tl.sum((span_id_q != 0).to(tl.int32)) > 0
+    if q_has_span and not q_has_prefix:
+        span_begin_q = tl.load(span_begin_ptr + q_tile_indices, mask=q_tile_indices < seq_len, other=0)
+        span_end_q = tl.load(span_end_ptr + q_tile_indices, mask=q_tile_indices < seq_len, other=0)
+        span_begin_min = tl.min(tl.where(span_id_q != 0, span_begin_q, seq_len), axis=0)
+        span_end_max = tl.max(tl.where(span_id_q != 0, span_end_q, 0), axis=0)
+        kv_start_tile_idx = span_begin_min.to(tl.int32) // TILE_K_SIZE
+        kv_end_tile_idx = tl.cdiv(span_end_max.to(tl.int32) + 1, TILE_K_SIZE)
+    # --- End KV loop bounds ---
 
     q_len_mask = q_tile_indices[:, None] < seq_len
     tile_k_arange = tl.arange(0, TILE_K_SIZE)
@@ -1307,65 +1319,39 @@ def _flash_attn_bwd_dq(
     ):
         kv_token_idx = kv_tile_idx * TILE_K_SIZE
         if K_BLOCK_DIVISIBLE:
-            kT = tl.load(
-                tl.advance(kt_tile_ptr, (0, kv_token_idx)),
-            )
-            vT = tl.load(
-                tl.advance(vt_tile_ptr, (0, kv_token_idx)),
-            )
+            kT = tl.load(tl.advance(kt_tile_ptr, (0, kv_token_idx)))
+            vT = tl.load(tl.advance(vt_tile_ptr, (0, kv_token_idx)))
         else:
-            kT = tl.load(
-                tl.advance(kt_tile_ptr, (0, kv_token_idx)),
-                boundary_check=(1,),
-            )
-            vT = tl.load(
-                tl.advance(vt_tile_ptr, (0, kv_token_idx,)),
-                boundary_check=(1,),
-            )
+            kT = tl.load(tl.advance(kt_tile_ptr, (0, kv_token_idx)), boundary_check=(1,))
+            vT = tl.load(tl.advance(vt_tile_ptr, (0, kv_token_idx,)), boundary_check=(1,))
 
         qk = tl.dot(q, kT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         if not PRESCALE_QK:
             qk = qk * softmax_scale * RCP_LN2
         p = tl.math.exp2(qk - m)
 
+        # --- In-tile masking (same as forward) ---
         kv_indices = kv_token_idx + tile_k_arange
-        if ATTN_MASK is not None:
-            # Load metadata for the key tile
-            k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
-            k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
+        k_indices_mask = kv_indices < seq_len
+        span_id_k = tl.load(span_id_ptr + kv_indices, mask=k_indices_mask, other=0)
+        is_prefix_k = tl.load(is_prefix_ptr + kv_indices, mask=k_indices_mask, other=0)
 
-            k_span_id_ptr = SPAN_ID + batch * span_id_stride_b + kv_indices
-            k_span_id = tl.load(k_span_id_ptr, mask=kv_indices < seq_len, other=-1)
+        q_indices = q_tile_indices[:, None]
+        k_indices = kv_indices[None, :]
+        qid = span_id_q[:, None]
+        kid = span_id_k[None, :]
+        q_is_prefix_mask = is_prefix_q[:, None]
+        k_is_prefix_mask = is_prefix_k[None, :]
 
-            k_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + kv_indices
-            k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
+        same_span = (qid != 0) & (kid == qid)
+        nonspan_q = (qid == 0)
+        nonspan_k = (kid == 0)
+        k_le_q = (k_indices <= q_indices)
+        nonspan_causal = nonspan_q & nonspan_k & k_le_q
 
-            # Load metadata for the query tile
-            q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
-            q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
-            q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
-            q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
-            q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
-            q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
-
-            # --- Start of new mask computation ---
-            same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
-            span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
-            causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
-
-            prefix_keys = k_is_prefix[None, :]
-            prefix_q = q_is_prefix[:, None]
-
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
-        elif CAUSAL:
-            mask = q_tile_indices[:, None] >= kv_indices[None, :]
-        else:
-            mask = True
-
-        mask = mask & (q_len_mask & (kv_indices[None, :] < seq_len))
+        mask = q_is_prefix_mask | k_is_prefix_mask | same_span | nonspan_causal
+        mask = mask & (q_indices < seq_len) & (k_indices < seq_len)
+        # --- End in-tile masking ---
 
         p = tl.where(mask, p, 0.0)
         dp = tl.dot(do, vT.to(do.dtype), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
@@ -1382,11 +1368,10 @@ def _flash_attn_bwd_dkdv(
     qt_tile_ptr: tl.tensor, do_tile_ptr: tl.tensor,
     lse_tile_ptr: tl.tensor, delta_tile_ptr: tl.tensor,
     k: tl.tensor, v: tl.tensor,
-    ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
-    in_span_stride_b: int, in_span_stride_t: int,
+    SPAN_ID: tl.tensor, SPAN_BEGIN: tl.tensor, SPAN_END: tl.tensor, IS_PREFIX: tl.tensor,
     span_id_stride_b: int, span_id_stride_t: int,
+    span_begin_stride_b: int, span_begin_stride_t: int,
+    span_end_stride_b: int, span_end_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
     batch: int, head: int,
     seq_len: tl.tensor,
@@ -1403,117 +1388,99 @@ def _flash_attn_bwd_dkdv(
     SM_SCALE: tl.constexpr,
     PRESCALE_QK: tl.constexpr,
 ):
-    # Conditional logic for backward pass based on CAUSAL parameter
-    kv_tile_max_token = min(kv_token_idx + TILE_K_SIZE, seq_len)
-    if CAUSAL:
-        # For causal attention: find which Q tiles can attend to this KV tile
-        q_start_tile_idx = kv_token_idx // TILE_Q_SIZE  # First Q tile that might attend to this KV
-        q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)  # All Q tiles can potentially attend
-    else:
-        # For non-causal attention: all Q tiles can attend to this KV tile
-        q_start_tile_idx = 0
-        q_end_tile_idx = tl.cdiv(seq_len, TILE_Q_SIZE)
-
+    # The logic here mirrors the forward pass logic
     kv_indices = kv_token_idx + tl.arange(0, TILE_K_SIZE)
-
     tile_q_arange = tl.arange(0, TILE_Q_SIZE)
+    kv_lens_mask = (kv_indices[:, None] < seq_len)
 
-    kv_lens_mask = (
-        kv_indices[:, None] < seq_len
-    )
+    span_id_ptr = SPAN_ID + batch * span_id_stride_b
+    is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b
+    span_id_k = tl.load(span_id_ptr + kv_indices, mask=kv_indices < TILE_K_SIZE, other=0)
+    is_prefix_k = tl.load(is_prefix_ptr + kv_indices, mask=kv_indices < TILE_K_SIZE, other=0)
 
     if PRESCALE_QK:
         k *= RCP_LN2 * SM_SCALE
 
-    for q_tile_idx in tl.range(q_start_tile_idx, q_end_tile_idx, num_stages=PIPELINING):
+    # This loop is now more complex due to the dynamic bounds per query tile
+    # We iterate over all query tiles and apply the bounds logic inside
+    for q_tile_idx in tl.range(0, tl.cdiv(seq_len, TILE_Q_SIZE), num_stages=PIPELINING):
         q_token_idx = q_tile_idx * TILE_Q_SIZE
-        # NOTE: triton will not reorder loads
-        # if there are problems with shared memory, do and Di loads can be moved just before usage
-        # (via constexpr flag)
-        if Q_BLOCK_DIVISIBLE:
-            qT = tl.load(
-                tl.advance(qt_tile_ptr, (0, q_token_idx)),
-            )
-            m = tl.load(
-                tl.advance(lse_tile_ptr, (q_token_idx,)),
-            )
-            do = tl.load(
-                tl.advance(do_tile_ptr, (q_token_idx, 0)),
-            )
-            Di = tl.load(
-                tl.advance(delta_tile_ptr, (q_token_idx,)),
-            )
-        else:
-            qT = tl.load(
-                tl.advance(qt_tile_ptr, (0, q_token_idx)),
-                boundary_check=(1,),
-            )
-            m = tl.load(
-                tl.advance(lse_tile_ptr, (q_token_idx,)),
-                boundary_check=(0,),
-            )
-            do = tl.load(
-                tl.advance(do_tile_ptr, (q_token_idx, 0)),
-                boundary_check=(0,),
-            )
-            Di = tl.load(
-                tl.advance(delta_tile_ptr, (q_token_idx,)),
-                boundary_check=(0,),
-            )
-        tl.static_assert(m.dtype == tl.float32)
 
-        qkT = tl.dot(k, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        if not PRESCALE_QK:
-            qkT *= RCP_LN2 * SM_SCALE
-        pT = tl.math.exp2(qkT - m[None, :])
+        # Check if this Q tile could have attended to the current K tile
+        # This requires loading the metadata for the Q tile
+        q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
+        q_tile_indices_mask = q_tile_indices < seq_len
 
-        q_tile_indices = q_token_idx + tile_q_arange
-        if ATTN_MASK is not None:
-            # Load metadata for the key tile
-            k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
-            k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
+        q_span_id = tl.load(span_id_ptr + q_tile_indices, mask=q_tile_indices_mask, other=0)
+        q_is_prefix = tl.load(is_prefix_ptr + q_tile_indices, mask=q_tile_indices_mask, other=0)
 
-            k_span_id_ptr = SPAN_ID + batch * span_id_stride_b + kv_indices
-            k_span_id = tl.load(k_span_id_ptr, mask=kv_indices < seq_len, other=-1)
+        # Recompute bounds for this Q tile to see if it overlaps with the current K tile
+        # This is inefficient but necessary for correctness in the backward pass
+        q_has_prefix = tl.sum(q_is_prefix.to(tl.int32)) > 0
+        q_has_span = tl.sum((q_span_id != 0).to(tl.int32)) > 0
 
-            k_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + kv_indices
-            k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
+        # Check for overlap
+        attends = False
+        if q_has_prefix:
+            attends = True
+        elif q_has_span:
+            q_span_begin_ptr = SPAN_BEGIN + batch * span_begin_stride_b
+            q_span_end_ptr = SPAN_END + batch * span_end_stride_b
+            q_span_begin = tl.load(q_span_begin_ptr + q_tile_indices, mask=q_tile_indices_mask, other=0)
+            q_span_end = tl.load(q_span_end_ptr + q_tile_indices, mask=q_tile_indices_mask, other=0)
 
-            # Load metadata for the query tile
-            q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
-            q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
-            q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
-            q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
-            q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
-            q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
+            span_begin_min = tl.min(tl.where(q_span_id != 0, q_span_begin, seq_len), axis=0)
+            span_end_max = tl.max(tl.where(q_span_id != 0, q_span_end, 0), axis=0)
 
-            # --- Start of new mask computation ---
-            same_span = (q_in_span[None, :] & k_in_span[:, None] & (q_span_id[None, :] == k_span_id[:, None]))
-            span_to_ns = q_in_span[None, :] & ~k_in_span[:, None]
-            causal_ns = ~q_in_span[None, :] & ~k_in_span[:, None] & (q_tile_indices[None, :] >= kv_indices[:, None])
+            kv_start_idx = (span_begin_min.to(tl.int32) // TILE_K_SIZE) * TILE_K_SIZE
+            kv_end_idx = tl.cdiv((span_end_max.to(tl.int32) + 1), TILE_K_SIZE) * TILE_K_SIZE
 
-            prefix_keys = k_is_prefix[:, None]
-            prefix_q = q_is_prefix[None, :]
+            if kv_token_idx >= kv_start_idx and kv_token_idx < kv_end_idx:
+                attends = True
+        else: # Causal case
+            if kv_token_idx <= q_token_idx:
+                 attends = True
 
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
-        elif CAUSAL:
-            mask = q_tile_indices[None, :] >= kv_indices[:, None]
-        else:
-            mask = True
+        if attends:
+            if Q_BLOCK_DIVISIBLE:
+                qT = tl.load(tl.advance(qt_tile_ptr, (0, q_token_idx)))
+                m = tl.load(tl.advance(lse_tile_ptr, (q_token_idx,)))
+                do = tl.load(tl.advance(do_tile_ptr, (q_token_idx, 0)))
+                Di = tl.load(tl.advance(delta_tile_ptr, (q_token_idx,)))
+            else:
+                qT = tl.load(tl.advance(qt_tile_ptr, (0, q_token_idx)), boundary_check=(1,))
+                m = tl.load(tl.advance(lse_tile_ptr, (q_token_idx,)), boundary_check=(0,))
+                do = tl.load(tl.advance(do_tile_ptr, (q_token_idx, 0)), boundary_check=(0,))
+                Di = tl.load(tl.advance(delta_tile_ptr, (q_token_idx,)), boundary_check=(0,))
 
-        mask = mask & (kv_lens_mask & (q_tile_indices[None, :] < seq_len))
-        pT = tl.where(mask, pT, 0.0)
+            qkT = tl.dot(k, qT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+            if not PRESCALE_QK:
+                qkT *= RCP_LN2 * SM_SCALE
+            pT = tl.math.exp2(qkT - m[None, :])
 
-        dv = tl.dot(pT, do.to(pT.dtype), dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        tl.static_assert(Di.dtype == tl.float32)
+            # In-tile masking
+            q_indices = q_tile_indices[None, :]
+            k_indices = kv_indices[:, None]
+            qid = q_span_id[None, :]
+            kid = span_id_k[:, None]
+            q_is_prefix_mask = q_is_prefix[None, :]
+            k_is_prefix_mask = is_prefix_k[:, None]
 
-        # Compute dP and dS.
-        dpT = tl.dot(v.to(do.dtype), tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        dsT = pT * (dpT - Di[None, :])
-        dk = tl.dot(dsT, tl.trans(qT).to(dsT.dtype), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+            same_span = (qid != 0) & (kid == qid)
+            nonspan_q = (qid == 0)
+            nonspan_k = (kid == 0)
+            k_le_q = (k_indices <= q_indices)
+            nonspan_causal = nonspan_q & nonspan_k & k_le_q
+
+            mask = q_is_prefix_mask | k_is_prefix_mask | same_span | nonspan_causal
+            mask = mask & (k_indices < seq_len) & (q_indices < seq_len)
+            pT = tl.where(mask, pT, 0.0)
+
+            dv = tl.dot(pT, do.to(pT.dtype), dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+            dpT = tl.dot(v.to(do.dtype), tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+            dsT = pT * (dpT - Di[None, :])
+            dk = tl.dot(dsT, tl.trans(qT).to(dsT.dtype), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+
     dk *= SM_SCALE
     return dk, dv
 # fmt: on
@@ -1701,9 +1668,9 @@ def attention_forward_adapter(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    attention_mask: torch.Tensor = None,
-    in_span: torch.Tensor = None,
     span_id: torch.Tensor = None,
+    span_begin: torch.Tensor = None,
+    span_end: torch.Tensor = None,
     is_prefix: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
@@ -1736,9 +1703,9 @@ def attention_forward_adapter(
         lens,
         LSE,
         O,
-        attention_mask,
-        in_span,
         span_id,
+        span_begin,
+        span_end,
         is_prefix,
         *strides(q, 4),
         *strides(kt, 4),
@@ -1746,9 +1713,9 @@ def attention_forward_adapter(
         *(strides(LSE, 3) if LSE is not None else [0] * 3),
         *strides(O, 4),
         *(strides(lens, 1) if lens is not None else [0]),
-        *(strides(attention_mask, 3) if attention_mask is not None else [0]*3),
-        *(strides(in_span, 2) if in_span is not None else [0]*2),
         *(strides(span_id, 2) if span_id is not None else [0]*2),
+        *(strides(span_begin, 2) if span_begin is not None else [0]*2),
+        *(strides(span_end, 2) if span_end is not None else [0]*2),
         *(strides(is_prefix, 2) if is_prefix is not None else [0]*2),
         T=T,
         HEAD_DIM=HEAD_DIM,

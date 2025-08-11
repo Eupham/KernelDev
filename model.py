@@ -43,7 +43,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, span_id, span_begin, span_end, is_prefix):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -59,9 +59,9 @@ class MultiHeadAttention(nn.Module):
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=attention_mask,
-            in_span=in_span,
             span_id=span_id,
+            span_begin=span_begin,
+            span_end=span_end,
             is_prefix=is_prefix
         )
         
@@ -79,9 +79,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, span_id, span_begin, span_end, is_prefix):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+        x = x + self.attn(self.norm1(x), span_id=span_id, span_begin=span_begin, span_end=span_end, is_prefix=is_prefix)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -188,24 +188,37 @@ class GPTModel(nn.Module):
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
         # Create metadata tensors
-        if attention_mask is not None:
-            span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id = SPECIAL_TOKENS['[ES]']
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
+        span_start_id = SPECIAL_TOKENS['[SPAN]']
+        span_end_id = SPECIAL_TOKENS['[ES]']
+        cls_token_id = SPECIAL_TOKENS['[CLS]']
 
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
-            span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
-        else:
-            # Create dummy tensors when no attention mask is provided
-            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
-            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+        is_prefix = (x == cls_token_id)
+        is_span_start = (x == span_start_id)
+        is_span_end = (x == span_end_id)
+        in_span = (torch.cumsum(is_span_start.int(), dim=1) - torch.cumsum(is_span_end.int(), dim=1)) > 0
+
+        span_id_raw = torch.cumsum(is_span_start.int(), dim=1)
+        span_id = torch.zeros_like(x, dtype=torch.int32)
+        span_id[in_span] = span_id_raw[in_span]
+
+        token_indices = torch.arange(seq_len, device=x.device, dtype=torch.int32).expand_as(x)
+        span_start_locs = torch.where(is_span_start, token_indices, -1)
+        span_begin = torch.maximum.accumulate(span_start_locs, dim=1)
+        span_begin[~in_span] = 0
+
+        span_end_locs = torch.where(is_span_end, token_indices, seq_len * 2)
+        span_end = torch.minimum.accumulate(torch.fliplr(span_end_locs), dim=1)
+        span_end = torch.fliplr(span_end)
+        span_end[~in_span] = 0
+
+        span_id = span_id.to(torch.int32).contiguous()
+        span_begin = span_begin.to(torch.int32).contiguous()
+        span_end = span_end.to(torch.int32).contiguous()
+        is_prefix = is_prefix.to(torch.int32).contiguous()
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(x_embed, span_id=span_id, span_begin=span_begin, span_end=span_end, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
