@@ -408,9 +408,11 @@ class DataBuilder:
                 original_tokens = original_tokens_padded
 
             span_size = random.randint(min_span_size, max_span_size)
-            if len(original_tokens) <= span_size:
+            # Sample from after the CLS token, so available length is -1.
+            if len(original_tokens) - 1 < span_size:
                 continue
-            span_start = random.randint(0, len(original_tokens) - span_size)
+            # Start sampling from index 1 to avoid CLS.
+            span_start = random.randint(1, len(original_tokens) - span_size)
             true_span = original_tokens[span_start : span_start + span_size]
 
             distractors = []
@@ -424,9 +426,11 @@ class DataBuilder:
                 except ValueError:
                     distractor_tokens = distractor_tokens_padded
 
-                if len(distractor_tokens) <= span_size:
+                # Sample from after the CLS token.
+                if len(distractor_tokens) - 1 < span_size:
                     continue
-                distractor_start = random.randint(0, len(distractor_tokens) - span_size)
+                # Start sampling from index 1 to avoid CLS.
+                distractor_start = random.randint(1, len(distractor_tokens) - span_size)
                 distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
                 distractors.append(distractor_span)
 
@@ -559,15 +563,28 @@ class DataBuilder:
 
             # Sample distractor from another example
             distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
-            distractor_tokens, _ = batch[distractor_idx]
-            distractor_tokens = distractor_tokens.tolist()
+            distractor_tokens_padded, _ = batch[distractor_idx]
+            distractor_tokens_padded = distractor_tokens_padded.tolist()
 
-            distractor_start = random.randint(0, len(distractor_tokens) - L) if len(distractor_tokens) > L else 0
-            distractor_span = distractor_tokens[distractor_start : distractor_start + L]
+            pad_id = SPECIAL_TOKENS['[PAD]']
+            try:
+                first_pad_idx = distractor_tokens_padded.index(pad_id)
+                distractor_tokens = distractor_tokens_padded[:first_pad_idx]
+            except ValueError:
+                distractor_tokens = distractor_tokens_padded
 
-            # Pad distractor if necessary
+            # We must not sample the CLS token, so we sample from tokens after index 0.
+            content_tokens = distractor_tokens[1:]
+            if len(content_tokens) >= L:
+                distractor_start = random.randint(0, len(content_tokens) - L)
+                distractor_span = content_tokens[distractor_start : distractor_start + L]
+            else:
+                # Not enough tokens, take what we have and pad.
+                distractor_span = content_tokens
+
+            # Pad distractor if necessary to ensure it has length L
             if len(distractor_span) < L:
-                distractor_span.extend([SPECIAL_TOKENS['[PAD]']] * (L - len(distractor_span)))
+                distractor_span.extend([pad_id] * (L - len(distractor_span)))
 
             x_prime_list = original_tokens[:s] + distractor_span + original_tokens[s + L:]
             x_prime_list = x_prime_list[:T]
