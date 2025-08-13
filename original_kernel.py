@@ -1760,6 +1760,14 @@ def attention_forward_adapter(
 
     kt = k.transpose(-1, -2)  # just stride tricks, same data
     fwd_fn = flash_forward_autotune if autotune else flash_forward
+
+    mask_strides = [0, 0, 0]
+    if attention_mask is not None:
+        s = attention_mask.stride()
+        mask_strides = [s[0], s[1], s[2]]
+        if attention_mask.shape[1] == 1:
+            mask_strides[1] = 0
+
     fwd_fn[grid](
         q,
         kt,
@@ -1777,7 +1785,7 @@ def attention_forward_adapter(
         *(strides(LSE, 3) if LSE is not None else [0] * 3),
         *strides(O, 4),
         *(strides(lens, 1) if lens is not None else [0]),
-        *(strides(attention_mask, 3) if attention_mask is not None else [0]*3),
+        *mask_strides,
         *(strides(in_span, 2) if in_span is not None else [0]*2),
         *(strides(span_id, 2) if span_id is not None else [0]*2),
         *(strides(is_prefix, 2) if is_prefix is not None else [0]*2),
@@ -1873,6 +1881,14 @@ def attention_backward_adapter(
     )
 
     fwd_fn = flash_backward_autotune if autotune else flash_backward
+
+    mask_strides = [0, 0, 0]
+    if attention_mask is not None:
+        s = attention_mask.stride()
+        mask_strides = [s[0], s[1], s[2]]
+        if attention_mask.shape[1] == 1:
+            mask_strides[1] = 0
+
     fwd_fn[grid](
         q,
         k,
@@ -1898,7 +1914,7 @@ def attention_backward_adapter(
         *strides(DK, 4),
         *strides(DV, 4),
         *(strides(lens, 1) if lens is not None else [0]),
-        *(strides(attention_mask, 3) if attention_mask is not None else [0]*3),
+        *mask_strides,
         *(strides(in_span, 2) if in_span is not None else [0]*2),
         *(strides(span_id, 2) if span_id is not None else [0]*2),
         *(strides(is_prefix, 2) if is_prefix is not None else [0]*2),
