@@ -43,7 +43,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None, is_cls_token=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -62,7 +62,8 @@ class MultiHeadAttention(nn.Module):
             attention_mask=attention_mask,
             in_span=in_span,
             span_id=span_id,
-            is_prefix=is_prefix
+            is_prefix=is_prefix,
+            is_cls_token=is_cls_token
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -79,9 +80,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None, is_cls_token=None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix, is_cls_token=is_cls_token)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -196,16 +197,23 @@ class GPTModel(nn.Module):
             in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
             span_id = torch.cumsum((x == span_start_id).int(), dim=1)
             span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
+
+            # New prefix/cls logic
+            is_cls_token = (x == cls_token_id)
+            has_cls = torch.any(is_cls_token, dim=1)
+            first_cls_indices = torch.argmax(is_cls_token.int(), dim=1)
+            is_prefix = torch.arange(seq_len, device=x.device)[None, :] <= first_cls_indices[:, None]
+            is_prefix[~has_cls, :] = False
         else:
             # Create dummy tensors when no attention mask is provided
             in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
             span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
             is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+            is_cls_token = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix, is_cls_token=is_cls_token)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
