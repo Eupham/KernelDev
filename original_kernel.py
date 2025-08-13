@@ -603,20 +603,26 @@ def _flash_attn_fwd(
             q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
             q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
 
-            # --- Start of new mask computation ---
-            # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
-            same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
+            # After-CLS vector: ATTN_MASK is [B,1,T]
+            k_after_cls_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h + kv_indices * mask_stride_t
+            q_after_cls_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h + q_tile_indices * mask_stride_t
+            k_after_cls = tl.load(k_after_cls_ptr, mask=kv_indices < seq_len, other=0)
+            q_after_cls = tl.load(q_after_cls_ptr, mask=q_tile_indices < seq_len, other=0)
+
+            # 1) Intra-island bidirectional
+            same_span = (q_in_span[:, None] & k_in_span[None, :] &
+                         (q_span_id[:, None] == k_span_id[None, :]))
+            # 2) Island → Ocean allowed
             span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
-            causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
-
-            prefix_keys = k_is_prefix[None, :]
-            prefix_q = q_is_prefix[:, None]
-
-            # Rows that are prefix queries get everything
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
+            # 3) Ocean → Ocean causal
+            causal_ns = (~q_in_span[:, None]) & (~k_in_span[None, :]) & (q_tile_indices[:, None] >= kv_indices[None, :])
+            #    3a) Post-CLS queries cannot see pre-CLS ocean; they must rely on CLS.
+            gate_precls = ((~q_after_cls[:, None]) | (k_after_cls[None, :] | k_is_prefix[None, :]))
+            causal_ns = causal_ns & gate_precls
+            # 4) Allow attending CLS key only if causally allowed
+            prefix_keys = k_is_prefix[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
+            # 5) No CLS-row override
+            mask = prefix_keys | same_span | span_to_ns | causal_ns
 
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
@@ -1348,18 +1354,26 @@ def _flash_attn_bwd_dq(
             q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
             q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
-            # --- Start of new mask computation ---
-            same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
+            # After-CLS vector: ATTN_MASK is [B,1,T]
+            k_after_cls_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h + kv_indices * mask_stride_t
+            q_after_cls_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h + q_tile_indices * mask_stride_t
+            k_after_cls = tl.load(k_after_cls_ptr, mask=kv_indices < seq_len, other=0)
+            q_after_cls = tl.load(q_after_cls_ptr, mask=q_tile_indices < seq_len, other=0)
+
+            # 1) Intra-island bidirectional
+            same_span = (q_in_span[:, None] & k_in_span[None, :] &
+                         (q_span_id[:, None] == k_span_id[None, :]))
+            # 2) Island → Ocean allowed
             span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
-            causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
-
-            prefix_keys = k_is_prefix[None, :]
-            prefix_q = q_is_prefix[:, None]
-
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
+            # 3) Ocean → Ocean causal
+            causal_ns = (~q_in_span[:, None]) & (~k_in_span[None, :]) & (q_tile_indices[:, None] >= kv_indices[None, :])
+            #    3a) Post-CLS queries cannot see pre-CLS ocean; they must rely on CLS.
+            gate_precls = ((~q_after_cls[:, None]) | (k_after_cls[None, :] | k_is_prefix[None, :]))
+            causal_ns = causal_ns & gate_precls
+            # 4) Allow attending CLS key only if causally allowed
+            prefix_keys = k_is_prefix[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
+            # 5) No CLS-row override
+            mask = prefix_keys | same_span | span_to_ns | causal_ns
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
         else:
@@ -1487,18 +1501,26 @@ def _flash_attn_bwd_dkdv(
             q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
             q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
-            # --- Start of new mask computation ---
-            same_span = (q_in_span[None, :] & k_in_span[:, None] & (q_span_id[None, :] == k_span_id[:, None]))
+            # After-CLS vector: ATTN_MASK is [B,1,T]
+            k_after_cls_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h + kv_indices * mask_stride_t
+            q_after_cls_ptr = ATTN_MASK + batch * mask_stride_b + head * mask_stride_h + q_tile_indices * mask_stride_t
+            k_after_cls = tl.load(k_after_cls_ptr, mask=kv_indices < seq_len, other=0)
+            q_after_cls = tl.load(q_after_cls_ptr, mask=q_tile_indices < seq_len, other=0)
+
+            # 1) Intra-island bidirectional
+            same_span = (q_in_span[None, :] & k_in_span[:, None] &
+                         (q_span_id[None, :] == k_span_id[:, None]))
+            # 2) Island → Ocean allowed
             span_to_ns = q_in_span[None, :] & ~k_in_span[:, None]
-            causal_ns = ~q_in_span[None, :] & ~k_in_span[:, None] & (q_tile_indices[None, :] >= kv_indices[:, None])
-
-            prefix_keys = k_is_prefix[:, None]
-            prefix_q = q_is_prefix[None, :]
-
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
+            # 3) Ocean → Ocean causal
+            causal_ns = (~q_in_span[None, :]) & (~k_in_span[:, None]) & (q_tile_indices[None, :] >= kv_indices[:, None])
+            #    3a) Post-CLS queries cannot see pre-CLS ocean; they must rely on CLS.
+            gate_precls = ((~q_after_cls[None, :]) | (k_after_cls[:, None] | k_is_prefix[:, None]))
+            causal_ns = causal_ns & gate_precls
+            # 4) Allow attending CLS key only if causally allowed
+            prefix_keys = k_is_prefix[:, None] & (q_tile_indices[None, :] >= kv_indices[:, None])
+            # 5) No CLS-row override
+            mask = prefix_keys | same_span | span_to_ns | causal_ns
         elif CAUSAL:
             mask = q_tile_indices[None, :] >= kv_indices[:, None]
         else:

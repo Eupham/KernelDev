@@ -23,6 +23,10 @@ SPECIAL_TOKENS = {
 }
 NUM_SPECIAL_TOKENS = len(SPECIAL_TOKENS)
 
+def _strip_specials(tok_list):
+    special_ids = set(SPECIAL_TOKENS.values())
+    return [t for t in tok_list if t not in special_ids]
+
 class OnTheFlyTokenizedDataset(Dataset):
     def __init__(self, raw_data, seq_len=512, tokenizer_fn=None):
         self.raw_data = raw_data
@@ -45,6 +49,10 @@ class OnTheFlyTokenizedDataset(Dataset):
 
         x = torch.tensor(tokens[:-1], dtype=torch.long)
         y = torch.tensor(tokens[1:], dtype=torch.long)
+
+        assert x[0] == SPECIAL_TOKENS['[CLS]']
+        # and ensure CLS appears only once:
+        assert (x == SPECIAL_TOKENS['[CLS]']).sum() == 1
         return x, y
 
 class DataBuilder:
@@ -362,8 +370,14 @@ class DataBuilder:
                         def __len__(self):
                             return max(1, len(self.data) - self.seq_len)
                         def __getitem__(self, idx):
-                            x = torch.tensor(self.data[idx:idx + self.seq_len], dtype=torch.long)
-                            y = torch.tensor(self.data[idx + 1:idx + self.seq_len + 1], dtype=torch.long)
+                            cls = SPECIAL_TOKENS['[CLS]']
+                            window = self.data[idx:idx + self.seq_len - 1]
+                            # sanitize: drop any stray CLS/MASK/PAD/SPAN/ES from the window
+                            window = _strip_specials(window)
+                            x_list = [cls] + window[:self.seq_len - 1]
+                            y_list = x_list[1:] + [SPECIAL_TOKENS['[PAD]']]
+                            x = torch.tensor(x_list, dtype=torch.long)
+                            y = torch.tensor(y_list, dtype=torch.long)
                             return x, y
 
                     datasets[split_name] = TokenizedDataset(tokens, self.seq_len)
@@ -393,17 +407,29 @@ class DataBuilder:
 
             # 1. Strip padding to get the true sequence
             pad_id = SPECIAL_TOKENS['[PAD]']
+            # strip PAD tail and keep the entire true sequence
             try:
                 first_pad_idx = original_tokens_padded.index(pad_id)
                 original_tokens = original_tokens_padded[:first_pad_idx]
             except ValueError:
                 original_tokens = original_tokens_padded
 
+            # enforce: leading CLS, unique
+            cls_id = SPECIAL_TOKENS['[CLS]']
+            if not original_tokens or original_tokens[0] != cls_id:
+                original_tokens = [cls_id] + [t for t in original_tokens if t != cls_id]
+            else:
+                # drop any stray CLS elsewhere
+                original_tokens = [t for i,t in enumerate(original_tokens) if (t != cls_id) or (i == 0)]
+
+            # never allow CLS in a cut span; exclude specials from span candidates
+            original_tokens_no_cls = [t for t in original_tokens if t != cls_id]
             span_size = random.randint(min_span_size, max_span_size)
-            if len(original_tokens) <= span_size:
+            if len(original_tokens_no_cls) <= span_size:
                 continue
-            span_start = random.randint(0, len(original_tokens) - span_size)
-            true_span = original_tokens[span_start : span_start + span_size]
+            span_start = random.randint(0, len(original_tokens_no_cls) - span_size)
+            true_span = original_tokens_no_cls[span_start : span_start + span_size]
+            true_span = _strip_specials(true_span)
 
             distractors = []
             for _ in range(num_distractors):
@@ -415,11 +441,13 @@ class DataBuilder:
                     distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
                 except ValueError:
                     distractor_tokens = distractor_tokens_padded
-
+                # Exclude CLS; sanitize specials from span source
+                distractor_tokens = [t for t in distractor_tokens if t != cls_id]
                 if len(distractor_tokens) <= span_size:
                     continue
                 distractor_start = random.randint(0, len(distractor_tokens) - span_size)
                 distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
+                distractor_span = _strip_specials(distractor_span)
                 distractors.append(distractor_span)
 
             if not distractors:
@@ -439,7 +467,11 @@ class DataBuilder:
             available_context_len = self.seq_len - wrapper_len
             available_context_len = max(0, available_context_len)
 
-            masked_context = (original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:])
+            # NOTE: span_start indexes original_tokens_no_cls; rebuild context from original_tokens but keep CLS at 0
+            masked_context = original_tokens[:1] + \
+                             original_tokens[1:][ :span_start] + \
+                             [SPECIAL_TOKENS['[MASK]']] + \
+                             original_tokens[1:][ span_start + span_size: ]
             truncated_masked_context = masked_context[:available_context_len]
 
             # 4. Stitch final sequence together
@@ -447,10 +479,17 @@ class DataBuilder:
 
             # 5. Final guard-rail truncation and padding
             final_sequence = final_sequence[:self.seq_len]
+            # enforce final invariants for safety:
+            #  - CLS at index 0 and unique
+            final_sequence = [cls_id] + [t for t in final_sequence if t != cls_id][:self.seq_len - 1]
             if len(final_sequence) < self.seq_len:
                 final_sequence.extend([pad_id] * (self.seq_len - len(final_sequence)))
 
-            # 6. Build span IDs and attention mask from the final sequence
+            # validate invariants (debug-only asserts are fine)
+            assert final_sequence[0] == cls_id
+            assert final_sequence.count(cls_id) == 1
+
+            # 6. Build span IDs (only for debugging / metrics); model will compute masks itself.
             span_ids = torch.zeros(self.seq_len, dtype=torch.long)
             current_pos = 0
             in_span = False
@@ -529,13 +568,24 @@ class DataBuilder:
                 p_star[i, original_indices[i]] = 1
 
             # Create input sequence with proper wrappers
-            wrapped_segments = "".join(f"[SPAN]{seg}[ES]" for seg in shuffled_sentences)
-            input_text = f"[CLS]{wrapped_segments}"
-            tokens = self._tokenize_text(input_text)
+            cls_id = SPECIAL_TOKENS['[CLS]']
+            span_id = SPECIAL_TOKENS['[SPAN]']
+            es_id = SPECIAL_TOKENS['[ES]']
+            pad_id = SPECIAL_TOKENS['[PAD]']
+
+            tokens = [cls_id]
+            for seg in shuffled_sentences:
+                seg_tokens = self._tokenize_text(seg)
+                sanitized_seg = _strip_specials(seg_tokens)
+                tokens.extend([span_id] + sanitized_seg + [es_id])
 
             # Truncate or pad
             tokens = tokens[:self.seq_len]
-            padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
+            # final asserts
+            assert tokens[0] == SPECIAL_TOKENS['[CLS]']
+            assert tokens.count(SPECIAL_TOKENS['[CLS]']) == 1
+
+            padding = [pad_id] * (self.seq_len - len(tokens))
             tokens.extend(padding)
 
             # Build per-token span IDs
@@ -619,7 +669,13 @@ class DataBuilder:
                 distractor_span.extend([SPECIAL_TOKENS['[PAD]']] * (L - len(distractor_span)))
 
             x_prime_list = original_tokens[:s] + distractor_span + original_tokens[s + L:]
-            x_prime_list = x_prime_list[:T]
+
+            cls = SPECIAL_TOKENS['[CLS]']
+            x_prime_list = [cls] + [t for t in x_prime_list if t != cls][:T-1]
+
+            # final asserts
+            assert x_prime_list[0] == SPECIAL_TOKENS['[CLS]']
+            assert x_prime_list.count(SPECIAL_TOKENS['[CLS]']) == 1
 
             # Create soft mask
             center_pos = s + L / 2.0
