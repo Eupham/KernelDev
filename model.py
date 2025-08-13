@@ -202,14 +202,16 @@ class GPTModel(nn.Module):
         # argmax will safely return 0 if CLS is at index 0 (we assume CLS exists)
         cls_pos = torch.argmax(is_prefix.int(), dim=1)                            # [B]
         after_cls_mask = positions >= cls_pos.unsqueeze(1)                        # [B,T] bool
-        # Shape to [B,1,T] to keep kernel strides simple & broadcast across heads
-        attention_mask = after_cls_mask.unsqueeze(1)
+        # Shape to [B,H,T] to be memory-safe for the kernel
+        attention_mask = after_cls_mask.unsqueeze(1).expand(-1, self.n_heads, -1)  # [B,H,T]
+        assert attention_mask.dim() == 3 and attention_mask.size(1) == self.n_heads, \
+            f"attention_mask must be [B,H,T], got {tuple(attention_mask.shape)}"
 
         # Apply transformer blocks
         for block in self.blocks:
             x_embed = block(
                 x_embed,
-                attention_mask=attention_mask,  # [B,1,T] = after-CLS vector
+                attention_mask=attention_mask,  # [B,H,T] = after-CLS vector
                 in_span=in_span,                # [B,T]
                 span_id=span_id,                # [B,T]
                 is_prefix=is_prefix             # [B,T]
