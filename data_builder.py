@@ -398,12 +398,15 @@ class DataBuilder:
                 original_tokens = original_tokens_padded[:first_pad_idx]
             except ValueError:
                 original_tokens = original_tokens_padded
+            # Ensure CLS is never inside any cut span
+            cls_id = SPECIAL_TOKENS['[CLS]']
+            original_tokens_no_cls = [t for t in original_tokens if t != cls_id]
 
             span_size = random.randint(min_span_size, max_span_size)
-            if len(original_tokens) <= span_size:
+            if len(original_tokens_no_cls) <= span_size:
                 continue
-            span_start = random.randint(0, len(original_tokens) - span_size)
-            true_span = original_tokens[span_start : span_start + span_size]
+            span_start = random.randint(0, len(original_tokens_no_cls) - span_size)
+            true_span = original_tokens_no_cls[span_start : span_start + span_size]
 
             distractors = []
             for _ in range(num_distractors):
@@ -415,6 +418,8 @@ class DataBuilder:
                     distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
                 except ValueError:
                     distractor_tokens = distractor_tokens_padded
+                # Also exclude CLS from distractor span sources
+                distractor_tokens = [t for t in distractor_tokens if t != cls_id]
 
                 if len(distractor_tokens) <= span_size:
                     continue

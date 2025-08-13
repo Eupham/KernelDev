@@ -187,25 +187,33 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Create metadata tensors
-        if attention_mask is not None:
-            span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id = SPECIAL_TOKENS['[ES]']
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
-
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
-            span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
-        else:
-            # Create dummy tensors when no attention mask is provided
-            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
-            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+        # Always compute metadata (uniform behavior across tasks)
+        span_start_id = SPECIAL_TOKENS['[SPAN]']
+        span_end_id   = SPECIAL_TOKENS['[ES]']
+        cls_token_id  = SPECIAL_TOKENS['[CLS]']
+        open_count = torch.cumsum((x == span_start_id).int(), dim=1)
+        close_count = torch.cumsum((x == span_end_id).int(), dim=1)
+        in_span = (open_count - close_count) > 0                                  # [B,T] bool
+        span_id = torch.cumsum((x == span_start_id).int(), dim=1)                 # [B,T] int
+        span_id = span_id.masked_fill(~in_span, -1)
+        is_prefix = (x == cls_token_id)                                           # [B,T] bool
+        # After-CLS mask: 1 at and after CLS position (per sequence)
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+        # argmax will safely return 0 if CLS is at index 0 (we assume CLS exists)
+        cls_pos = torch.argmax(is_prefix.int(), dim=1)                            # [B]
+        after_cls_mask = positions >= cls_pos.unsqueeze(1)                        # [B,T] bool
+        # Shape to [B,1,T] to keep kernel strides simple & broadcast across heads
+        attention_mask = after_cls_mask.unsqueeze(1)
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(
+                x_embed,
+                attention_mask=attention_mask,  # [B,1,T] = after-CLS vector
+                in_span=in_span,                # [B,T]
+                span_id=span_id,                # [B,T]
+                is_prefix=is_prefix             # [B,T]
+            )
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
