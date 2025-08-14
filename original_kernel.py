@@ -1996,6 +1996,8 @@ class IncoherentFlashAttention(torch.autograd.Function):
         ctx.in_span = in_span
         ctx.span_id = span_id
         ctx.is_prefix = is_prefix
+        ctx.is_maskq = is_maskq
+        ctx.is_maskmarker = is_maskmarker
         
         # Apply Hadamard transform for incoherent processing
         q_transformed, k_transformed = q, k
