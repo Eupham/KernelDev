@@ -303,9 +303,13 @@ class Trainer:
             inputs, p_star, roles = batch
             if inputs is None: return 0.0
             inputs, p_star = inputs.to(device), p_star.to(device)
-            roles = {k: v.to(device) for k, v in roles.items()}
-
-            tau = task_configs.get('soft_jigsaw', {}).get('tau', 0.1)
+            # Let attention be plain (no role masks) for this task
+            roles = None
+            # Warm → sharp anneal: start higher, cosine down
+            base_tau = task_configs.get('soft_jigsaw', {}).get('tau', 1.5)
+            steps = max(1, getattr(self, "steps_per_epoch", 1000) * self.config.num_epochs)
+            t = min(1.0, self.metrics.total_steps / steps)
+            tau = max(0.3, base_tau * 0.5 * (1 + math.cos(math.pi * t)))
             with torch.amp.autocast('cuda', enabled=use_amp):
                 P_hat, loss = self.model(inputs, p_star=p_star, roles=roles, task_name=task_name, tau=tau)
 

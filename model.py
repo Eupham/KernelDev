@@ -188,15 +188,7 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Use roles from dataloader, or create dummies if not provided
-        if roles is None:
-            roles = {
-                'in_span': torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device),
-                'span_id': torch.full((batch_size, seq_len), -1, dtype=torch.long, device=x.device),
-                'is_prefix': torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device),
-                'is_maskq': torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device),
-                'is_mask_marker': torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            }
+        # When roles are not needed, don't allocate anything — kernels skip role logic.
 
         # Apply transformer blocks
         for block in self.blocks:

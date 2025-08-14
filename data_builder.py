@@ -77,32 +77,41 @@ class DataBuilder:
             print("Will attempt to load all available samples from the dataset.")
 
     def _tokenize_text(self, text: str) -> list:
-        # This is a simplified tokenizer. A real implementation would use a pre-trained tokenizer.
-        tokens = []
+        tokens: list[int] = []
         i = 0
         while i < len(text):
-            found = False
-            for token_str, token_id in SPECIAL_TOKENS.items():
-                if text[i:].startswith(token_str):
-                    tokens.append(token_id)
-                    i += len(token_str)
-                    found = True
+            # greedy match special tokens first
+            matched = False
+            for tok, tok_id in SPECIAL_TOKENS.items():
+                if text.startswith(tok, i):
+                    tokens.append(tok_id)
+                    i += len(tok)
+                    matched = True
                     break
-            if not found:
-                tokens.append(text[i].encode('utf-8')[0] + NUM_SPECIAL_TOKENS)
-                i += 1
+            if matched:
+                continue
+            # ordinary character → emit all UTF-8 bytes
+            b = text[i].encode("utf-8")
+            tokens.extend([byte + NUM_SPECIAL_TOKENS for byte in b])
+            i += 1
         return tokens
 
     def _detokenize_bytes(self, tokens: list, skip_special_tokens=False) -> str:
         special_token_map = {v: k for k, v in SPECIAL_TOKENS.items()}
-        decoded_tokens = []
+        out_bytes = bytearray()
+        out_text_parts = []
         for t in tokens:
             if t in special_token_map:
+                if out_bytes:
+                    out_text_parts.append(out_bytes.decode("utf-8", errors="replace"))
+                    out_bytes.clear()
                 if not skip_special_tokens:
-                    decoded_tokens.append(special_token_map[t])
+                    out_text_parts.append(special_token_map[t])
             else:
-                decoded_tokens.append(chr(t - NUM_SPECIAL_TOKENS))
-        return "".join(decoded_tokens)
+                out_bytes.append(t - NUM_SPECIAL_TOKENS)
+        if out_bytes:
+            out_text_parts.append(out_bytes.decode("utf-8", errors="replace"))
+        return "".join(out_text_parts)
 
     def _process_iterable_dataset(self, dataset_iterable, dataset_name_logging: str) -> list:
         samples = []
