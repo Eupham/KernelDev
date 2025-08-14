@@ -1885,7 +1885,7 @@ def attention_backward_adapter_op(ctx, do, dlse):
         is_maskmarker=is_maskmarker,
     )
 
-    return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+    return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 torch.library.register_autograd(
@@ -2002,7 +2002,6 @@ class IncoherentFlashAttention(torch.autograd.Function):
         # Apply Hadamard transform for incoherent processing
         q_transformed, k_transformed = q, k
         if incoherent_processing:
-            # Double-check GPU capability for safety
             if not is_hopper_gpu():
                 logger.warning(
                     f"Incoherent processing requested on non-Hopper GPU "
@@ -2014,21 +2013,16 @@ class IncoherentFlashAttention(torch.autograd.Function):
             if HEAD_DIM & (HEAD_DIM - 1) != 0:
                 raise ValueError(f"Head dimension {HEAD_DIM} must be a power of 2 for incoherent processing")
             
-            # Use same signs for both Q and K as per research paper
             if hadamard_signs_q is None:
                 hadamard_signs = generate_hadamard_signs(HEAD_DIM, q.device, q.dtype)
             else:
                 hadamard_signs = hadamard_signs_q
             
-            # Save signs for backward pass
             ctx.hadamard_signs = hadamard_signs
             
-            # Use PyTorch implementation for better consistency
-            # Apply the same orthogonal transform to both Q and K
             q_transformed = hadamard_transform(q, hadamard_signs)
             k_transformed = hadamard_transform(k, hadamard_signs)
         
-        # Run flash attention on transformed tensors
         requires_grad = any(i.requires_grad for i in (q, k, v))
         O, LSE = torch.ops.flash_attention.forward(
             q=q_transformed,
@@ -2045,9 +2039,10 @@ class IncoherentFlashAttention(torch.autograd.Function):
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix,
+            is_maskq=is_maskq,
+            is_maskmarker=is_maskmarker,
         )
         
-        # Save tensors for backward pass
         if requires_grad:
             ctx.save_for_backward(q, k, v, O, LSE, lens)
         
@@ -2060,12 +2055,9 @@ class IncoherentFlashAttention(torch.autograd.Function):
         q, k, v, o, lse, lens = ctx.saved_tensors
         
         if ctx.incoherent_processing:
-            # For incoherent processing, we need to apply the forward transform again
-            # because the attention backward expects the transformed Q and K
             q_transformed = hadamard_transform(q, ctx.hadamard_signs)
             k_transformed = hadamard_transform(k, ctx.hadamard_signs)
             
-            # Compute gradients using transformed Q and K (matching forward pass)
             DQ, DK, DV = torch.ops.flash_attention.backward(
                 q=q_transformed,
                 k=k_transformed,
@@ -2085,12 +2077,9 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 is_prefix=ctx.is_prefix,
             )
             
-            # Apply inverse Hadamard transform to gradients to get gradients w.r.t. original Q and K
-            # This applies the chain rule: dL/dQ_orig = dL/dQ_transformed * dQ_transformed/dQ_orig
             DQ = hadamard_inverse_transform(DQ, ctx.hadamard_signs)
             DK = hadamard_inverse_transform(DK, ctx.hadamard_signs)
         else:
-            # Normal backward pass without incoherent processing
             DQ, DK, DV = torch.ops.flash_attention.backward(
                 q=q,
                 k=k,
