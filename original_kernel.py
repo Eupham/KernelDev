@@ -572,7 +572,7 @@ def _flash_attn_fwd(
         span_rule    = q_in_span[:,None] & (same_span | allow_prefix_key | span_to_hub)
         hub_rule     = q_is_maskq[:,None] & (hub_to_span | allow_prefix_key)
         mm_rule      = q_is_mm[:,None] & ((~k_in_span[None,:]) & (q_tile_indices[:,None] >= kv_indices[None,:] | allow_prefix_key))
-        
+
         plain_ctx_q = (~q_in_span[:,None]) & (~q_is_maskq[:,None]) & (~q_is_mm[:,None])
 
         row_core = (
@@ -1574,6 +1574,18 @@ def attention_forward_adapter(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
+    # Create dummy tensors for None inputs to prevent kernel crashes
+    if in_span is None:
+        in_span = torch.zeros((batch, T), dtype=torch.bool, device=q.device)
+    if span_id is None:
+        span_id = torch.full((batch, T), -1, dtype=torch.int32, device=q.device)
+    if is_prefix is None:
+        is_prefix = torch.zeros((batch, T), dtype=torch.bool, device=q.device)
+    if is_maskq is None:
+        is_maskq = torch.zeros((batch, T), dtype=torch.bool, device=q.device)
+    if is_maskmarker is None:
+        is_maskmarker = torch.zeros((batch, T), dtype=torch.bool, device=q.device)
+
     assert HEAD_DIM in {16, 32, 64, 128, 256}
     assert HEAD_DIM == k.shape[-1] and HEAD_DIM == v.shape[-1]
     assert T == k.shape[-2] and T == v.shape[-2]
@@ -1685,6 +1697,17 @@ def attention_backward_adapter(
     is_maskmarker: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
+
+    if in_span is None:
+        in_span = torch.zeros((batch, T), dtype=torch.bool, device=q.device)
+    if span_id is None:
+        span_id = torch.full((batch, T), -1, dtype=torch.int32, device=q.device)
+    if is_prefix is None:
+        is_prefix = torch.zeros((batch, T), dtype=torch.bool, device=q.device)
+    if is_maskq is None:
+        is_maskq = torch.zeros((batch, T), dtype=torch.bool, device=q.device)
+    if is_maskmarker is None:
+        is_maskmarker = torch.zeros((batch, T), dtype=torch.bool, device=q.device)
 
     delta = torch.empty(o.shape[:-1], dtype=torch.float32, device=o.device)
     grid = lambda args: (

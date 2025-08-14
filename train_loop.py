@@ -915,14 +915,16 @@ class Trainer:
                     if max_batches is not None and batch_idx >= max_batches:
                         break
 
-                    x, y = batch
+                    x, y, roles = batch
                     x, y = x.to(self.config.device), y.to(self.config.device)
-                    
+                    for k, v in roles.items():
+                        roles[k] = v.to(self.config.device)
+
                     if self.config.use_amp and self.config.scaler is not None:
                         with torch.amp.autocast('cuda'):
-                            logits, loss = self.model(x, targets=y, task_name=task_name)
+                            logits, loss = self.model(x, targets=y, roles=roles, task_name=task_name)
                     else:
-                        logits, loss = self.model(x, targets=y, task_name=task_name)
+                        logits, loss = self.model(x, targets=y, roles=roles, task_name=task_name)
 
                     if loss is not None:
                         total_loss += loss.item()
