@@ -1982,7 +1982,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
     def forward(
         ctx, q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
         incoherent_processing, hadamard_signs_q, hadamard_signs_k, attention_mask,
-        in_span, span_id, is_prefix
+        in_span, span_id, is_prefix, is_maskq, is_maskmarker
     ):
         # Store context for backward pass
         ctx.incoherent_processing = incoherent_processing
