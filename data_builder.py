@@ -17,9 +17,10 @@ NUM_BIO_TAGS = 3
 SPECIAL_TOKENS = {
     '[PAD]': 0,
     '[CLS]': 1,
-    '[MASK]': 2,
+    '[MASK]': 2,      # marker inside context
     '[SPAN]': 3,
     '[ES]': 4,
+    '[MASKQ]': 5      # global query / hub
 }
 NUM_SPECIAL_TOKENS = len(SPECIAL_TOKENS)
 
@@ -375,23 +376,37 @@ class DataBuilder:
     def _collate_fn_teacher_forcing(self, batch):
         inputs = torch.stack([item[0] for item in batch])
         targets = torch.stack([item[1] for item in batch])
-        return inputs, targets
+
+        batch_size, seq_len = inputs.shape
+        bidirectional_prefix_len = 1
+
+        is_prefix = torch.zeros_like(inputs, dtype=torch.bool)
+        is_prefix[:, :bidirectional_prefix_len] = True
+
+        roles = {
+            'in_span': torch.zeros_like(inputs, dtype=torch.bool),
+            'span_id': torch.full_like(inputs, -1, dtype=torch.long),
+            'is_prefix': is_prefix,
+            'is_maskq': torch.zeros_like(inputs, dtype=torch.bool),
+            'is_mask_marker': torch.zeros_like(inputs, dtype=torch.bool)
+        }
+        return inputs, targets, roles
 
     def _collate_fn_cocktail_party(self, batch):
         task_config = self.task_configs.get('cocktail_party', {})
         num_distractors = task_config.get('num_distractors', 3)
         min_span_size = task_config.get('min_span_size', 10)
         max_span_size = task_config.get('max_span_size', 50)
+        bidirectional_prefix_len = 1
 
         batch_inputs = []
         batch_correct_indices = []
-        batch_attn_masks = []
+        batch_roles = []
 
         for i in range(len(batch)):
             original_tokens_padded, _ = batch[i]
             original_tokens_padded = original_tokens_padded.tolist()
 
-            # 1. Strip padding to get the true sequence
             pad_id = SPECIAL_TOKENS['[PAD]']
             try:
                 first_pad_idx = original_tokens_padded.index(pad_id)
@@ -399,10 +414,13 @@ class DataBuilder:
             except ValueError:
                 original_tokens = original_tokens_padded
 
+            if not original_tokens or original_tokens[0] != SPECIAL_TOKENS['[CLS]']:
+                continue
+
             span_size = random.randint(min_span_size, max_span_size)
             if len(original_tokens) <= span_size:
                 continue
-            span_start = random.randint(0, len(original_tokens) - span_size)
+            span_start = random.randint(1, len(original_tokens) - span_size)
             true_span = original_tokens[span_start : span_start + span_size]
 
             distractors = []
@@ -429,88 +447,91 @@ class DataBuilder:
             random.shuffle(all_spans_with_labels)
             correct_idx = [label for _, label in all_spans_with_labels].index(1)
 
-            # 2. Calculate wrapper length to reserve space
             wrapper_tokens = []
             for span_toks, _ in all_spans_with_labels:
                 wrapper_tokens.extend([SPECIAL_TOKENS['[SPAN]']] + span_toks + [SPECIAL_TOKENS['[ES]']])
-            wrapper_len = len(wrapper_tokens)
 
-            # 3. Truncate context to fit wrappers
+            wrapper_len = len(wrapper_tokens) + 1
+
             available_context_len = self.seq_len - wrapper_len
-            available_context_len = max(0, available_context_len)
+            if available_context_len < 0:
+                continue
 
             masked_context = (original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:])
             truncated_masked_context = masked_context[:available_context_len]
 
-            # 4. Stitch final sequence together
-            final_sequence = truncated_masked_context + wrapper_tokens
+            final_sequence_list = truncated_masked_context + wrapper_tokens + [SPECIAL_TOKENS['[MASKQ]']]
 
-            # 5. Final guard-rail truncation and padding
-            final_sequence = final_sequence[:self.seq_len]
-            if len(final_sequence) < self.seq_len:
-                final_sequence.extend([pad_id] * (self.seq_len - len(final_sequence)))
+            if len(final_sequence_list) < self.seq_len:
+                final_sequence_list.extend([pad_id] * (self.seq_len - len(final_sequence_list)))
 
-            # 6. Build span IDs and attention mask from the final sequence
-            span_ids = torch.zeros(self.seq_len, dtype=torch.long)
-            current_pos = 0
-            in_span = False
-            span_idx = 0
+            final_sequence_list = final_sequence_list[:self.seq_len]
+            final_sequence = torch.tensor(final_sequence_list, dtype=torch.long)
 
-            # This is a simplified scan. A more robust impl would use the known structure.
-            # For now, we scan to find the spans we just placed.
-            temp_final_sequence = list(final_sequence)
-            try:
-                start_of_wrappers = len(truncated_masked_context)
+            is_prefix = torch.zeros(self.seq_len, dtype=torch.bool)
+            is_prefix[:bidirectional_prefix_len] = True
 
-                current_pos_in_final = start_of_wrappers
-                for span_toks, _ in all_spans_with_labels:
-                    span_len_with_wrappers = len(span_toks) + 2
+            is_mask_marker = (final_sequence == SPECIAL_TOKENS['[MASK]'])
+            is_maskq = (final_sequence == SPECIAL_TOKENS['[MASKQ]'])
 
-                    start_idx = current_pos_in_final
-                    end_idx = start_idx + span_len_with_wrappers
+            in_span = torch.zeros(self.seq_len, dtype=torch.bool)
+            span_id = torch.full((self.seq_len,), -1, dtype=torch.long)
 
-                    if start_idx < self.seq_len:
-                       span_ids[start_idx:min(end_idx, self.seq_len)] = span_idx + 1
+            current_pos = len(truncated_masked_context)
+            for span_idx, (span_toks, _) in enumerate(all_spans_with_labels):
+                start_pos = current_pos
+                end_pos = start_pos + len(span_toks) + 2
+                if start_pos < self.seq_len:
+                    in_span[start_pos:min(end_pos, self.seq_len)] = True
+                    span_id[start_pos:min(end_pos, self.seq_len)] = span_idx
+                current_pos = end_pos
 
-                    current_pos_in_final = end_idx
-                    span_idx += 1
+            roles = {
+                'in_span': in_span,
+                'span_id': span_id,
+                'is_prefix': is_prefix,
+                'is_maskq': is_maskq,
+                'is_mask_marker': is_mask_marker
+            }
 
-            except Exception as e:
-                # Fallback in case logic fails
-                pass
-
-
-            span_ids_i = span_ids.unsqueeze(1).expand(-1, self.seq_len)
-            span_ids_j = span_ids.unsqueeze(0).expand(self.seq_len, -1)
-            attn_mask = (span_ids_i == span_ids_j) | (span_ids_i == 0) | (span_ids_j == 0)
-            attn_mask = attn_mask.to(torch.bool)
-
-            batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
+            batch_inputs.append(final_sequence)
             batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
-            batch_attn_masks.append(attn_mask)
+            batch_roles.append(roles)
 
         if not batch_inputs:
-            return torch.empty(0), torch.empty(0), torch.empty(0)
+            return torch.empty(0), torch.empty(0), {}
 
         inputs = torch.stack(batch_inputs)
         correct_indices = torch.stack(batch_correct_indices)
-        attention_masks = torch.stack(batch_attn_masks)
 
-        return inputs, correct_indices, attention_masks
+        collated_roles = {}
+        if batch_roles:
+            for key in batch_roles[0].keys():
+                collated_roles[key] = torch.stack([r[key] for r in batch_roles])
 
+        return inputs, correct_indices, collated_roles
 
     def _collate_fn_soft_jigsaw(self, batch):
         task_config = self.task_configs.get('soft_jigsaw', {})
         M = task_config.get('M', 5)
+        bidirectional_prefix_len = 1
 
         batch_inputs = []
         batch_p_star = []
-        batch_attn_masks = []
+        batch_roles = []
 
         for item in batch:
-            text, _ = item
-            text = self.decode_tokens(text.tolist())
-            sentences = [s.strip() for s in text.split('.') if s.strip()]
+            original_tokens_padded, _ = item
+            original_tokens_padded = original_tokens_padded.tolist()
+
+            pad_id = SPECIAL_TOKENS['[PAD]']
+            try:
+                first_pad_idx = original_tokens_padded.index(pad_id)
+                text_content = self.decode_tokens(original_tokens_padded[:first_pad_idx], skip_special_tokens=True)
+            except ValueError:
+                text_content = self.decode_tokens(original_tokens_padded, skip_special_tokens=True)
+
+            sentences = [s.strip() for s in text_content.split('.') if s.strip() and len(s.split()) > 2]
 
             if len(sentences) < M:
                 continue
@@ -528,72 +549,82 @@ class DataBuilder:
             for i in range(M):
                 p_star[i, original_indices[i]] = 1
 
-            # Create input sequence with proper wrappers
-            wrapped_segments = "".join(f"[SPAN]{seg}[ES]" for seg in shuffled_sentences)
-            input_text = f"[CLS]{wrapped_segments}"
-            tokens = self._tokenize_text(input_text)
+            cls_token = self._tokenize_text("[CLS]")
+            wrapped_segments_tokens = []
+            for seg in shuffled_sentences:
+                wrapped_segments_tokens.extend(self._tokenize_text(f"[SPAN]{seg}[ES]"))
 
-            # Truncate or pad
-            tokens = tokens[:self.seq_len]
-            padding = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len - len(tokens))
-            tokens.extend(padding)
+            maskq_token = self._tokenize_text("[MASKQ]")
 
-            # Build per-token span IDs
-            span_ids = torch.zeros(self.seq_len, dtype=torch.long)
-            current_pos = 0
-            in_span = False
-            span_idx = 1
-            # We need to map shuffled position to original segment index for the mask
-            shuffled_to_original_map = {i: original_indices[i] + 1 for i in range(M)} # map shuffled pos to original_idx+1
+            tokens = cls_token + wrapped_segments_tokens + maskq_token
 
-            temp_tokens = self._tokenize_text(f"[CLS]")
-            current_pos = len(temp_tokens)
+            if len(tokens) > self.seq_len:
+                tokens = tokens[:self.seq_len]
+                if tokens[-1] != SPECIAL_TOKENS['[MASKQ]']:
+                    tokens[-1] = SPECIAL_TOKENS['[MASKQ]']
+            elif len(tokens) < self.seq_len:
+                tokens.extend([pad_id] * (self.seq_len - len(tokens)))
 
+            final_sequence = torch.tensor(tokens, dtype=torch.long)
+
+            is_prefix = torch.zeros(self.seq_len, dtype=torch.bool)
+            is_prefix[:bidirectional_prefix_len] = True
+
+            is_mask_marker = torch.zeros(self.seq_len, dtype=torch.bool)
+            is_maskq = (final_sequence == SPECIAL_TOKENS['[MASKQ]'])
+
+            in_span = torch.zeros(self.seq_len, dtype=torch.bool)
+            span_id = torch.full((self.seq_len,), -1, dtype=torch.long)
+
+            current_pos = len(cls_token)
             for i, seg in enumerate(shuffled_sentences):
                 seg_tokens = self._tokenize_text(f"[SPAN]{seg}[ES]")
                 start_pos = current_pos
                 end_pos = start_pos + len(seg_tokens)
-
-                # Clamp to seq_len
-                start_pos = min(start_pos, self.seq_len)
-                end_pos = min(end_pos, self.seq_len)
-
-                # Use shuffled index + 1 as the span ID
-                span_ids[start_pos:end_pos] = i + 1
+                if start_pos < self.seq_len:
+                    in_span[start_pos:min(end_pos, self.seq_len)] = True
+                    span_id[start_pos:min(end_pos, self.seq_len)] = i
                 current_pos = end_pos
                 if current_pos >= self.seq_len:
                     break
 
-            # Generate boolean attention mask
-            span_ids_i = span_ids.unsqueeze(1).expand(-1, self.seq_len)
-            span_ids_j = span_ids.unsqueeze(0).expand(self.seq_len, -1)
+            roles = {
+                'in_span': in_span,
+                'span_id': span_id,
+                'is_prefix': is_prefix,
+                'is_maskq': is_maskq,
+                'is_mask_marker': is_mask_marker
+            }
 
-            attn_mask = (span_ids_i == span_ids_j) | (span_ids_i == 0) | (span_ids_j == 0)
-            attn_mask = attn_mask.to(torch.bool)
-
-            batch_inputs.append(torch.tensor(tokens, dtype=torch.long))
+            batch_inputs.append(final_sequence)
             batch_p_star.append(p_star)
-            batch_attn_masks.append(attn_mask)
+            batch_roles.append(roles)
 
         if not batch_inputs:
-            return None, None, None
+            return None, None, {}
 
         inputs = torch.stack(batch_inputs)
         p_star = torch.stack(batch_p_star)
-        attention_masks = torch.stack(batch_attn_masks)
 
-        return inputs, p_star, attention_masks
+        collated_roles = {}
+        if batch_roles:
+            for key in batch_roles[0].keys():
+                collated_roles[key] = torch.stack([r[key] for r in batch_roles])
+
+        return inputs, p_star, collated_roles
 
     def _collate_fn_distractor(self, batch):
         task_config = self.task_configs.get('distractor_loc', {})
         L_min = task_config.get('L_min', 10)
         L_max = task_config.get('L_max', 50)
         sigma_scale = task_config.get('sigma_scale', 4.0)
+        bidirectional_prefix_len = 1
 
         batch_x_prime = []
         batch_m_star = []
         batch_c = []
         batch_l = []
+        batch_roles = []
 
         for i in range(len(batch)):
             original_tokens, _ = batch[i]
@@ -606,7 +637,6 @@ class DataBuilder:
             L = random.randint(L_min, L_max)
             s = random.randint(0, T - L)
 
-            # Sample distractor from another example
             distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
             distractor_tokens, _ = batch[distractor_idx]
             distractor_tokens = distractor_tokens.tolist()
@@ -614,14 +644,12 @@ class DataBuilder:
             distractor_start = random.randint(0, len(distractor_tokens) - L) if len(distractor_tokens) > L else 0
             distractor_span = distractor_tokens[distractor_start : distractor_start + L]
 
-            # Pad distractor if necessary
             if len(distractor_span) < L:
                 distractor_span.extend([SPECIAL_TOKENS['[PAD]']] * (L - len(distractor_span)))
 
             x_prime_list = original_tokens[:s] + distractor_span + original_tokens[s + L:]
             x_prime_list = x_prime_list[:T]
 
-            # Create soft mask
             center_pos = s + L / 2.0
             sigma = L / sigma_scale if sigma_scale > 0 else 1.0
 
@@ -631,24 +659,40 @@ class DataBuilder:
             if m_star.max() > 0:
                 m_star = m_star / m_star.max()
 
-            # Create center and length targets
             c = (s + L / 2.0) / T
             l = L / T
+
+            is_prefix = torch.zeros(self.seq_len, dtype=torch.bool)
+            is_prefix[:bidirectional_prefix_len] = True
+
+            roles = {
+                'in_span': torch.zeros(self.seq_len, dtype=torch.bool),
+                'span_id': torch.full((self.seq_len,), -1, dtype=torch.long),
+                'is_prefix': is_prefix,
+                'is_maskq': torch.zeros(self.seq_len, dtype=torch.bool),
+                'is_mask_marker': torch.zeros(self.seq_len, dtype=torch.bool)
+            }
 
             batch_x_prime.append(torch.tensor(x_prime_list, dtype=torch.long))
             batch_m_star.append(m_star)
             batch_c.append(torch.tensor(c, dtype=torch.float32))
             batch_l.append(torch.tensor(l, dtype=torch.float32))
+            batch_roles.append(roles)
 
         if not batch_x_prime:
-            return None, None, None, None
+            return None, None, None, None, {}
 
         x_prime_tensor = torch.stack(batch_x_prime)
         m_star_tensor = torch.stack(batch_m_star)
         c_tensor = torch.stack(batch_c)
         l_tensor = torch.stack(batch_l)
 
-        return x_prime_tensor, m_star_tensor, c_tensor, l_tensor
+        collated_roles = {}
+        if batch_roles:
+            for key in batch_roles[0].keys():
+                collated_roles[key] = torch.stack([r[key] for r in batch_roles])
+
+        return x_prime_tensor, m_star_tensor, c_tensor, l_tensor, collated_roles
 
     def create_dataloaders(
         self, batch_size: int = 8, num_workers: int = 0, shuffle_train: bool = True
