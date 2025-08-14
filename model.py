@@ -222,13 +222,17 @@ class GPTModel(nn.Module):
             if max_spans <= 0:
                  return torch.empty(0), torch.tensor(0.0, device=x.device)
 
+            # Sanitize indices for scatter_add_: replace -1 with 0 (dummy index)
+            scatter_indices = span_ids.clone()
+            scatter_indices[span_ids < 0] = 0
+
             h_spans = x_embed.new_zeros(B, max_spans, D)
             # Create a mask for valid spans (span_id > 0)
             valid_span_mask = span_ids > 0
 
             # Use scatter_add_ to sum embeddings for each span
             # Need to expand span_ids to match embedding dimension
-            span_ids_expanded = span_ids.unsqueeze(-1).expand_as(x_embed)
+            span_ids_expanded = scatter_indices.unsqueeze(-1).expand_as(x_embed)
             # We need to offset span_ids for scatter_add since it's 0-indexed
             # and our span_ids are 1-indexed.
             # We will use a tensor of size (B, max_spans+1, D) and ignore index 0
@@ -237,7 +241,7 @@ class GPTModel(nn.Module):
 
             # Count tokens in each span
             span_counts = x_embed.new_zeros(B, max_spans + 1).scatter_add_(
-                1, span_ids.long(), valid_span_mask.float()
+                1, scatter_indices.long(), valid_span_mask.float()
             )
 
             # Compute mean, avoiding division by zero
@@ -261,14 +265,18 @@ class GPTModel(nn.Module):
                 # No spans found, cannot proceed
                 return torch.zeros_like(p_star), torch.tensor(0.0, device=x.device)
 
+            # Sanitize indices for scatter_add_: replace -1 with 0 (dummy index)
+            scatter_indices = span_ids.clone()
+            scatter_indices[span_ids < 0] = 0
+
             h_spans = x_embed.new_zeros(B, max_spans_found + 1, D)
             valid_span_mask = span_ids > 0
-            span_ids_expanded = span_ids.unsqueeze(-1).expand_as(x_embed)
+            span_ids_expanded = scatter_indices.unsqueeze(-1).expand_as(x_embed)
 
             h_spans.scatter_add_(1, span_ids_expanded.long(), x_embed * valid_span_mask.unsqueeze(-1))
 
             span_counts = x_embed.new_zeros(B, max_spans_found + 1).scatter_add_(
-                1, span_ids.long(), valid_span_mask.float()
+                1, scatter_indices.long(), valid_span_mask.float()
             )
 
             H_pooled = h_spans[:, 1:] / span_counts[:, 1:].unsqueeze(-1).clamp(min=1)
