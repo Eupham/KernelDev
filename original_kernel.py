@@ -541,14 +541,14 @@ def _flash_attn_fwd(
 
     acc = acc / l_i[:, None]
 
-    o_ptr = O + batch_id * stride_ob + head_id * stride_oh
+    o_ptr = O + batch * stride_ob + head * stride_oh
     o_tile_ptr = tl.make_block_ptr(
         base=o_ptr, shape=(T, HEAD_DIM), strides=(stride_ot, stride_ok),
         offsets=(q_token_idx, 0), block_shape=(TILE_Q_SIZE, HEAD_DIM), order=(1, 0)
     )
     tl.store(o_tile_ptr, acc.to(o_ptr.type.element_ty), boundary_check=(0,))
 
-    lse_ptr = LSE + batch_id * stride_lseb + head_id * stride_lseh + q_token_idx
+    lse_ptr = LSE + batch * stride_lseb + head * stride_lseh + q_token_idx
     tl.store(lse_ptr, m_i + tl.log(l_i), boundary_check=(0,))
 
 # Backward pass implementation is complex and omitted for brevity.
