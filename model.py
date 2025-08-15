@@ -170,7 +170,7 @@ class GPTModel(nn.Module):
             summed_embs = torch.einsum('btd,btn->bnd', x_embed, masked_one_hot)
 
             # Count tokens per span
-            span_counts = masked_one_hot.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            span_counts = masked_one_hot.sum(dim=1).clamp_min(1e-6).unsqueeze(-1)
 
             # Compute mean pooled embeddings
             pooled_embs = summed_embs / span_counts
