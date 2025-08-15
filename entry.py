@@ -210,13 +210,14 @@ def start_actual_training(cli_args):
     
     # Model configuration
     model_config = {
-        'vocab_size': model_cfg.get('vocab_size', 256),
+        'vocab_size': model_cfg.get('vocab_size', 262),
         'dim': model_cfg.get('dim', 512),
         'n_layers': model_cfg.get('n_layers', 12),
         'n_heads': model_cfg.get('n_heads', 16),
         'max_seq_len': model_cfg.get('max_seq_len', 2048),
         'mlp_ratio': model_cfg.get('mlp_ratio', 4),
-        'causal': model_cfg.get('causal', True)
+        'causal': model_cfg.get('causal', True),
+        'bidirectional_prefix_len': model_cfg.get('bidirectional_prefix_len', 1)
     }
     
     # Initialize model
@@ -290,7 +291,12 @@ def start_actual_training(cli_args):
     # Create data builder
     print("\n=== Loading and Processing Data ===")
     task_configs = config.get('tasks', {})
-    data_builder = create_data_builder(**data_config, task_configs=task_configs)
+    data_builder = create_data_builder(
+        **data_config,
+        task_configs=task_configs,
+        vocab_size=model_config['vocab_size'],
+        bidirectional_prefix_len=model_config['bidirectional_prefix_len']
+    )
     
     # Create dataloaders
     try:
@@ -300,13 +306,13 @@ def start_actual_training(cli_args):
             shuffle_train=data_cfg.get('shuffle_train', True)
         )
         
-        # Update vocab size based on actual tokenizer
-        actual_vocab_size = data_builder.get_vocab_size()
-        model_config['vocab_size'] = actual_vocab_size
-        print(f"Confirmed vocab_size: {actual_vocab_size} (UTF-8 bytes)")
+        # Vocab size is now taken directly from config, so no need to update model
+        print(f"Using vocab_size: {data_builder.get_vocab_size()}")
         
     except Exception as e:
         print(f"Error creating dataloaders: {e}")
+        import traceback
+        traceback.print_exc()
         print("This might be due to missing datasets library or network issues.")
         print("Please install with: pip install datasets")
         return
@@ -320,10 +326,12 @@ def start_actual_training(cli_args):
     # Test a batch
     if 'train' in dataloaders and 'teacher_forcing' in dataloaders['train']:
         print("\n=== Data Sample (Teacher Forcing) ===")
-        for x, y in dataloaders['train']['teacher_forcing']:
+        for x, y, roles in dataloaders['train']['teacher_forcing']:
             print(f"Batch shape: {x.shape}")
             print(f"Sample tokens: {x[0][:20].tolist()}")
             print(f"Sample targets: {y[0][:20].tolist()}")
+            print(f"Roles keys: {roles.keys()}")
+            print(f"Sample is_prefix: {roles['is_prefix'][0][:20].long().tolist()}")
 
             # Decode sample text
             sample_text = data_builder.decode_tokens(x[0][:50])
@@ -333,11 +341,12 @@ def start_actual_training(cli_args):
     if 'train' in dataloaders and 'cocktail_party' in dataloaders['train']:
         print("\n=== Data Sample (Cocktail Party) ===")
         for batch in dataloaders['train']['cocktail_party']:
-            inputs, spans, correct_idx = batch
+            inputs, correct_idx, roles = batch
             print(f"Batch shape: {inputs.shape}")
-            print(f"Spans shape: {spans.shape}")
-            print(f"Sample tokens: {inputs[0][:20].tolist()}")
+            print(f"Correct_idx shape: {correct_idx.shape}")
             print(f"Sample correct_idx: {correct_idx[0].tolist()}")
+            print(f"Roles keys: {roles.keys()}")
+            print(f"Sample span_id: {roles['span_id'][0].long().tolist()}")
             
             # Decode sample text
             sample_text = data_builder.decode_tokens(inputs[0][:50])
