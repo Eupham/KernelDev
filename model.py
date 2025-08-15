@@ -231,10 +231,11 @@ class GPTModel(nn.Module):
             maskq_positions = (x == maskq_token_id).nonzero(as_tuple=True)
             h_q = x_embed.new_zeros(B, D)
 
-            # Find the first [MASKQ] for each item in the batch
-            unique_batch_idx, first_occurrence_indices = torch.unique(maskq_positions[0], return_first=True)
-            if unique_batch_idx.numel() > 0:
-                h_q[unique_batch_idx] = x_embed[unique_batch_idx, maskq_positions[1][first_occurrence_indices]]
+            # Find the first [MASKQ] for each item in the batch (compatible with older PyTorch)
+            if maskq_positions[0].numel() > 0:
+                unique_batch_idx, counts = torch.unique(maskq_positions[0], return_counts=True)
+                first_maskq_indices = torch.cat((maskq_positions[0].new_zeros(1), torch.cumsum(counts, 0)[:-1]))
+                h_q[unique_batch_idx] = x_embed[unique_batch_idx, maskq_positions[1][first_maskq_indices]]
 
             # 2) Vectorized span processing
             span_starts = (x == span_start_id).nonzero()
