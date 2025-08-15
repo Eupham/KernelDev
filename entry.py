@@ -333,9 +333,12 @@ def start_actual_training(cli_args):
     if 'train' in dataloaders and 'cocktail_party' in dataloaders['train']:
         print("\n=== Data Sample (Cocktail Party) ===")
         for batch in dataloaders['train']['cocktail_party']:
-            inputs, spans, correct_idx = batch
+            # Corrected unpacking based on the new collate function output
+            inputs, correct_idx, roles, attn_mask = batch
+            if inputs is None: continue # Handle empty batches
             print(f"Batch shape: {inputs.shape}")
-            print(f"Spans shape: {spans.shape}")
+            print(f"Roles keys: {roles.keys()}")
+            print(f"Attention mask shape: {attn_mask.shape}")
             print(f"Sample tokens: {inputs[0][:20].tolist()}")
             print(f"Sample correct_idx: {correct_idx[0].tolist()}")
             

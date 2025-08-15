@@ -89,6 +89,9 @@ model:
   # Length of the bidirectional prefix
   bidirectional_prefix_len: 1
 
+  # Allow MASKQ token to see context tokens
+  maskq_sees_context: false
+
 # GPU/Memory Configuration
 hardware:
   # Available GPU memory in GB (used for batch size estimation)
