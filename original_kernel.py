@@ -472,12 +472,14 @@ def _flash_attn_fwd(
     l_i = tl.zeros([TILE_Q_SIZE], dtype=tl.float32)
     acc = tl.zeros([TILE_Q_SIZE, HEAD_DIM], dtype=tl.float32)
 
+    q_mask = q_tile_indices < T
+
     if USE_ROLE_MASK:
-        q_is_prefix = tl.load(IS_PREFIX + batch * stride_prefix_b + q_tile_indices, boundary_check=(0,), other=0)
-        q_in_span = tl.load(IN_SPAN + batch * stride_span_b + q_tile_indices, boundary_check=(0,), other=0)
-        q_span_id = tl.load(SPAN_ID + batch * stride_spanid_b + q_tile_indices, boundary_check=(0,), other=-1)
-        q_is_maskq = tl.load(IS_MASKQ + batch * stride_maskq_b + q_tile_indices, boundary_check=(0,), other=0)
-        q_is_mask_marker = tl.load(IS_MASK_MARKER + batch * stride_maskm_b + q_tile_indices, boundary_check=(0,), other=0)
+        q_is_prefix = tl.load(IS_PREFIX + batch * stride_prefix_b + q_tile_indices, mask=q_mask, other=0)
+        q_in_span = tl.load(IN_SPAN + batch * stride_span_b + q_tile_indices, mask=q_mask, other=0)
+        q_span_id = tl.load(SPAN_ID + batch * stride_spanid_b + q_tile_indices, mask=q_mask, other=-1)
+        q_is_maskq = tl.load(IS_MASKQ + batch * stride_maskq_b + q_tile_indices, mask=q_mask, other=0)
+        q_is_mask_marker = tl.load(IS_MASK_MARKER + batch * stride_maskm_b + q_tile_indices, mask=q_mask, other=0)
 
     kv_end_tile_idx = tl.cdiv(T, TILE_K_SIZE)
     for kv_tile_idx in range(0, kv_end_tile_idx):
@@ -499,11 +501,12 @@ def _flash_attn_fwd(
         qk_scores = tl.dot(q_tile, tl.trans(k_tile)) * SM_SCALE
 
         current_kv_indices = kv_token_idx + kv_tile_indices
+        k_mask = current_kv_indices < T
         
         if USE_ROLE_MASK:
-            k_is_prefix = tl.load(IS_PREFIX + batch * stride_prefix_b + current_kv_indices, boundary_check=(0,), other=0)
-            k_in_span = tl.load(IN_SPAN + batch * stride_span_b + current_kv_indices, boundary_check=(0,), other=0)
-            k_span_id = tl.load(SPAN_ID + batch * stride_spanid_b + current_kv_indices, boundary_check=(0,), other=-1)
+            k_is_prefix = tl.load(IS_PREFIX + batch * stride_prefix_b + current_kv_indices, mask=k_mask, other=0)
+            k_in_span = tl.load(IN_SPAN + batch * stride_span_b + current_kv_indices, mask=k_mask, other=0)
+            k_span_id = tl.load(SPAN_ID + batch * stride_spanid_b + current_kv_indices, mask=k_mask, other=-1)
 
             q_is_prefix_b, k_is_prefix_b = q_is_prefix[:, None], k_is_prefix[None, :]
             q_in_span_b, k_in_span_b = q_in_span[:, None], k_in_span[None, :]
