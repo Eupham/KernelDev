@@ -216,7 +216,8 @@ def start_actual_training(cli_args):
         'n_heads': model_cfg.get('n_heads', 16),
         'max_seq_len': model_cfg.get('max_seq_len', 2048),
         'mlp_ratio': model_cfg.get('mlp_ratio', 4),
-        'causal': model_cfg.get('causal', True)
+        'causal': model_cfg.get('causal', True),
+        'bidirectional_prefix_len': model_cfg.get('bidirectional_prefix_len', 0)
     }
     
     # Initialize model
@@ -320,22 +321,22 @@ def start_actual_training(cli_args):
     # Test a batch
     if 'train' in dataloaders and 'teacher_forcing' in dataloaders['train']:
         print("\n=== Data Sample (Teacher Forcing) ===")
-        for x, y in dataloaders['train']['teacher_forcing']:
-            print(f"Batch shape: {x.shape}")
-            print(f"Sample tokens: {x[0][:20].tolist()}")
-            print(f"Sample targets: {y[0][:20].tolist()}")
-
+        for inputs, targets, roles in dataloaders['train']['teacher_forcing']:
+            print(f"Batch shape: {inputs.shape}")
+            print(f"Sample tokens: {inputs[0][:20].tolist()}")
+            print(f"Sample targets: {targets[0][:20].tolist()}")
+            print(f"Roles keys: {list(roles.keys())}")
             # Decode sample text
-            sample_text = data_builder.decode_tokens(x[0][:50])
+            sample_text = data_builder.decode_tokens(inputs[0][:50])
             print(f"Sample text: '{sample_text[:100]}...'")
             break
 
     if 'train' in dataloaders and 'cocktail_party' in dataloaders['train']:
         print("\n=== Data Sample (Cocktail Party) ===")
         for batch in dataloaders['train']['cocktail_party']:
-            inputs, spans, correct_idx = batch
+            inputs, correct_idx, roles = batch
             print(f"Batch shape: {inputs.shape}")
-            print(f"Spans shape: {spans.shape}")
+            print(f"Roles keys: {list(roles.keys())}")
             print(f"Sample tokens: {inputs[0][:20].tolist()}")
             print(f"Sample correct_idx: {correct_idx[0].tolist()}")
             
