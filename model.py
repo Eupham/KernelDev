@@ -146,7 +146,7 @@ class GPTModel(nn.Module):
         if task_name == 'cocktail_party' or task_name == 'soft_jigsaw':
             # Sanity checks for span-based tasks
             assert roles is not None, "Roles must be provided for span-based tasks."
-            assert roles['is_maskq'].sum(dim=1).allclose(torch.ones(B, device=x.device)), "Exactly one [MASKQ] per sequence required."
+            assert (roles['is_maskq'].sum(dim=1) == 1).all(), "Exactly one [MASKQ] per sequence required."
             assert roles['span_id'].max() >= 1, "At least one span must be present."
 
             # Strict span pooling using span_id
