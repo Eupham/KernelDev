@@ -426,14 +426,6 @@ def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
 
 
 # fmt: off
-@triton.heuristics(
-    dict(
-        Q_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_Q_SIZE'] == 0,
-        K_BLOCK_DIVISIBLE=lambda args : args['T'] % args['TILE_K_SIZE'] == 0,
-        PERFECT_MATCHING=lambda args : args['TILE_K_SIZE'] == args['TILE_Q_SIZE'],
-        RCP_LN2=lambda _: math.log2(math.e),
-    )
-)
 @triton.jit
 def _flash_attn_fwd(
     Q, K, V, L, LSE, O, # Tensors
