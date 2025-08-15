@@ -564,28 +564,27 @@ class DataBuilder:
         self, batch_size: int = 8, num_workers: int = 0, shuffle_train: bool = True
     ) -> Dict[str, Dict[str, DataLoader]]:
 
-        # Simplified create_datasets for on-the-fly tokenization from raw text
         raw_datasets = self.create_datasets()
         dataloaders = {}
         if not raw_datasets:
             print("Warning: No datasets were created.")
             return dataloaders
 
-        # We need a dummy dataset that just returns indices to raw text
         class RawTextDataset(Dataset):
-            def __init__(self, data):
+            def __init__(self, data, seq_len, tokenizer_fn):
                 self.data = data
+                self.seq_len = seq_len
+                self._tokenize_text = tokenizer_fn
+
             def __len__(self):
                 return len(self.data)
+
             def __getitem__(self, idx):
-                # Collate functions now expect (tokens, target_tokens)
-                # Let's provide dummy token tensors that will be re-processed
-                # This is inefficient but fits the required refactoring
                 text = self.data[idx]['text']
                 tokens = self._tokenize_text(text)
-                tokens = tokens[:self.seq_len+1]
-                pad = [SPECIAL_TOKENS['[PAD]']] * (self.seq_len + 1 - len(tokens))
-                tokens.extend(pad)
+                tokens = tokens[:self.seq_len + 1]
+                pad_len = (self.seq_len + 1) - len(tokens)
+                tokens.extend([SPECIAL_TOKENS['[PAD]']] * pad_len)
                 x = torch.tensor(tokens[:-1], dtype=torch.long)
                 y = torch.tensor(tokens[1:], dtype=torch.long)
                 return x, y
@@ -593,12 +592,7 @@ class DataBuilder:
         for split_name, data in raw_datasets.items():
             if not data: continue
 
-            # The collate functions are now complex and handle tokenization from text.
-            # So, we need a dataset that provides text samples.
-            # The base dataset returns (x,y) token tensors. We need to adapt.
-            # For now, let's wrap it for compatibility.
-            dataset_obj = RawTextDataset(data)
-            setattr(dataset_obj, '_tokenize_text', self._tokenize_text) # monkey-patch for jigsaw
+            dataset_obj = RawTextDataset(data, self.seq_len, self._tokenize_text)
 
             dataloaders[split_name] = {}
             shuffle = shuffle_train if split_name == 'train' else False
