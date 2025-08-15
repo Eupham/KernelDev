@@ -191,8 +191,14 @@ class GPTModel(nn.Module):
         # When roles are not needed, don't allocate anything — kernels skip role logic.
 
         # Apply transformer blocks
-        for block in self.blocks:
-            x_embed = block(x_embed, roles=roles)
+        # For soft_jigsaw, we want plain attention, but the head needs roles for pooling.
+        # So, we pass roles=None to the blocks but use the original roles dict in the head.
+        if task_name == 'soft_jigsaw':
+            for block in self.blocks:
+                x_embed = block(x_embed, roles=None)
+        else:
+            for block in self.blocks:
+                x_embed = block(x_embed, roles=roles)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)

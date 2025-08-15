@@ -303,8 +303,7 @@ class Trainer:
             inputs, p_star, roles = batch
             if inputs is None: return 0.0
             inputs, p_star = inputs.to(device), p_star.to(device)
-            # Let attention be plain (no role masks) for this task
-            roles = None
+            roles = {k: v.to(device) for k, v in roles.items()}
             # Warm → sharp anneal: start higher, cosine down
             base_tau = task_configs.get('soft_jigsaw', {}).get('tau', 1.5)
             steps = max(1, getattr(self, "steps_per_epoch", 1000) * self.config.num_epochs)
