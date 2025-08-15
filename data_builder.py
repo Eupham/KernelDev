@@ -5,6 +5,15 @@ import numpy as np
 from typing import Optional, Dict, Any, List
 import random
 
+# Define special tokens
+BIO_TAGS = {
+    'O': 0,
+    'B-ORIG': 1,
+    'I-ORIG': 2,
+    'PAD': -100,
+}
+NUM_BIO_TAGS = 3
+
 # Define special tokens according to the new spec
 SPECIAL_TOKENS = {
     '[PAD]': 0,
