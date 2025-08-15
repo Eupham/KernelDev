@@ -320,7 +320,7 @@ def start_actual_training(cli_args):
     # Test a batch
     if 'train' in dataloaders and 'teacher_forcing' in dataloaders['train']:
         print("\n=== Data Sample (Teacher Forcing) ===")
-        for x, y in dataloaders['train']['teacher_forcing']:
+        for x, y, _, _ in dataloaders['train']['teacher_forcing']:
             print(f"Batch shape: {x.shape}")
             print(f"Sample tokens: {x[0][:20].tolist()}")
             print(f"Sample targets: {y[0][:20].tolist()}")
