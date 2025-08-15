@@ -288,55 +288,47 @@ class Trainer:
     def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step."""
         if task_name == 'cocktail_party':
-            inputs, correct_idx, attn_mask = batch
-            if inputs.numel() == 0:
-                return 0.0
-            inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
+            inputs, correct_idx, roles = batch
+            if inputs.numel() == 0: return 0.0
+            inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
+            roles = {k: v.to(self.config.device) for k, v in roles.items()}
 
-            if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
-            else:
-                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+            with torch.amp.autocast('cuda', enabled=self.config.use_amp):
+                scores, loss = self.model(inputs, correct_idx=correct_idx, roles=roles, task_name=task_name)
 
         elif task_name == 'soft_jigsaw':
-            inputs, p_star, attn_mask = batch
-            if inputs is None: return 0.0 # Handle empty batches
-            inputs, p_star, attn_mask = inputs.to(self.config.device), p_star.to(self.config.device), attn_mask.to(self.config.device)
+            inputs, p_star, roles = batch
+            if inputs is None: return 0.0
+            inputs, p_star = inputs.to(self.config.device), p_star.to(self.config.device)
+            roles = {k: v.to(self.config.device) for k, v in roles.items()}
 
             task_cfg = task_configs.get('soft_jigsaw', {})
             tau = task_cfg.get('tau', 0.1)
 
-            if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    P_hat, loss = self.model(inputs, p_star=p_star, attention_mask=attn_mask, task_name=task_name, tau=tau)
-            else:
-                P_hat, loss = self.model(inputs, p_star=p_star, attention_mask=attn_mask, task_name=task_name, tau=tau)
-        elif task_name == 'distractor_loc':
-            x_prime, m_star, c_true, l_true = batch
-            if x_prime is None: return 0.0
+            with torch.amp.autocast('cuda', enabled=self.config.use_amp):
+                P_hat, loss = self.model(inputs, p_star=p_star, roles=roles, task_name=task_name, tau=tau)
 
+        elif task_name == 'distractor_loc':
+            x_prime, m_star, c_true, l_true, roles = batch
+            if x_prime is None: return 0.0
             x_prime, m_star, c_true, l_true = (
                 x_prime.to(self.config.device),
                 m_star.to(self.config.device),
                 c_true.to(self.config.device),
                 l_true.to(self.config.device),
             )
+            roles = {k: v.to(self.config.device) for k, v in roles.items()}
 
-            if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    predictions, loss = self.model(x_prime, task_name=task_name, m_star=m_star, c_true=c_true, l_true=l_true)
-            else:
-                predictions, loss = self.model(x_prime, task_name=task_name, m_star=m_star, c_true=c_true, l_true=l_true)
-        else:
-            x, y = batch
+            with torch.amp.autocast('cuda', enabled=self.config.use_amp):
+                predictions, loss = self.model(x_prime, task_name=task_name, roles=roles, m_star=m_star, c_true=c_true, l_true=l_true)
+
+        else: # teacher_forcing
+            x, y, roles = batch
             x, y = x.to(self.config.device), y.to(self.config.device)
+            roles = {k: v.to(self.config.device) for k, v in roles.items()}
 
-            if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    logits, loss = self.model(x, targets=y, task_name=task_name)
-            else:
-                logits, loss = self.model(x, targets=y, task_name=task_name)
+            with torch.amp.autocast('cuda', enabled=self.config.use_amp):
+                logits, loss = self.model(x, targets=y, roles=roles, task_name=task_name)
 
         if loss is None:
             return 0.0
@@ -369,16 +361,13 @@ class Trainer:
 
                     loss = None
                     if task_name == 'cocktail_party':
-                        inputs, correct_idx, attn_mask = batch
-                        if inputs.numel() == 0:
-                            continue
-                        inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
+                        inputs, correct_idx, roles = batch
+                        if inputs.numel() == 0: continue
+                        inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
+                        roles = {k: v.to(self.config.device) for k, v in roles.items()}
 
-                        if self.config.use_amp:
-                            with torch.amp.autocast('cuda'):
-                                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
-                        else:
-                            scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                        with torch.amp.autocast('cuda', enabled=self.config.use_amp):
+                            scores, loss = self.model(inputs, correct_idx=correct_idx, roles=roles, task_name=task_name)
 
                         if loss is not None and scores.numel() > 0:
                             metrics = self._calculate_accuracy(scores, correct_idx)
@@ -386,30 +375,27 @@ class Trainer:
                                 if k not in cocktail_party_metrics:
                                     cocktail_party_metrics[k] = []
                                 cocktail_party_metrics[k].append(v)
+
                     elif task_name == 'soft_jigsaw':
-                        inputs, p_star, attn_mask = batch
-                        if inputs is None or inputs.size(0) == 0:
-                            continue
-                        inputs, p_star, attn_mask = inputs.to(self.config.device), p_star.to(self.config.device), attn_mask.to(self.config.device)
+                        inputs, p_star, roles = batch
+                        if inputs is None or inputs.size(0) == 0: continue
+                        inputs, p_star = inputs.to(self.config.device), p_star.to(self.config.device)
+                        roles = {k: v.to(self.config.device) for k, v in roles.items()}
 
                         task_cfg = task_configs.get('soft_jigsaw', {})
                         tau = task_cfg.get('tau', 0.1)
 
-                        if self.config.use_amp:
-                            with torch.amp.autocast('cuda'):
-                                P_hat, loss = self.model(inputs, p_star=p_star, attention_mask=attn_mask, task_name=task_name, tau=tau)
-                        else:
-                            P_hat, loss = self.model(inputs, p_star=p_star, attention_mask=attn_mask, task_name=task_name, tau=tau)
+                        with torch.amp.autocast('cuda', enabled=self.config.use_amp):
+                            P_hat, loss = self.model(inputs, p_star=p_star, roles=roles, task_name=task_name, tau=tau)
+
                     elif task_name == 'distractor_loc':
-                        x_prime, m_star, c_true, l_true = batch
+                        x_prime, m_star, c_true, l_true, roles = batch
                         if x_prime is None: continue
                         x_prime, m_star, c_true, l_true = x_prime.to(self.config.device), m_star.to(self.config.device), c_true.to(self.config.device), l_true.to(self.config.device)
+                        roles = {k: v.to(self.config.device) for k, v in roles.items()}
 
-                        if self.config.use_amp:
-                            with torch.amp.autocast('cuda'):
-                                predictions, loss = self.model(x_prime, task_name=task_name, m_star=m_star, c_true=c_true, l_true=l_true)
-                        else:
-                            predictions, loss = self.model(x_prime, task_name=task_name, m_star=m_star, c_true=c_true, l_true=l_true)
+                        with torch.amp.autocast('cuda', enabled=self.config.use_amp):
+                            predictions, loss = self.model(x_prime, task_name=task_name, roles=roles, m_star=m_star, c_true=c_true, l_true=l_true)
 
                         if loss is not None:
                             m_hat, (c_hat, l_hat) = predictions
@@ -418,21 +404,19 @@ class Trainer:
                             iou = (intersection / (union + 1e-6)).mean().item()
                             c_mae = F.l1_loss(c_hat, c_true).item()
                             l_mae = F.l1_loss(l_hat, l_true).item()
-
                             metrics = {'mask_iou': iou, 'center_mae': c_mae, 'length_mae': l_mae, 'total_loss': loss.item()}
                             for k, v in metrics.items():
                                 if k not in distractor_loc_metrics:
                                     distractor_loc_metrics[k] = []
                                 distractor_loc_metrics[k].append(v)
-                    else:
-                        x, y = batch
-                        x, y = x.to(self.config.device), y.to(self.config.device)
 
-                        if self.config.use_amp:
-                            with torch.amp.autocast('cuda'):
-                                logits, loss = self.model(x, targets=y, task_name=task_name)
-                        else:
-                            logits, loss = self.model(x, targets=y, task_name=task_name)
+                    else: # teacher_forcing
+                        x, y, roles = batch
+                        x, y = x.to(self.config.device), y.to(self.config.device)
+                        roles = {k: v.to(self.config.device) for k, v in roles.items()}
+
+                        with torch.amp.autocast('cuda', enabled=self.config.use_amp):
+                            logits, loss = self.model(x, targets=y, roles=roles, task_name=task_name)
 
                     if loss is not None:
                         if isinstance(loss, dict):

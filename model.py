@@ -43,7 +43,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, roles: Dict[str, torch.Tensor] = None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -57,12 +57,13 @@ class MultiHeadAttention(nn.Module):
             q=q,
             k=k,
             v=v,
-            lens=None,
             causal=is_causal,
-            attention_mask=attention_mask,
-            in_span=in_span,
-            span_id=span_id,
-            is_prefix=is_prefix
+            attention_mask=None, # unused
+            in_span=roles.get('in_span') if roles else None,
+            span_id=roles.get('span_id') if roles else None,
+            is_prefix=roles.get('is_prefix') if roles else None,
+            is_maskq=roles.get('is_maskq') if roles else None,
+            is_maskmarker=roles.get('is_mask_marker') if roles else None,
         )
         
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -79,9 +80,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, roles: Dict[str, torch.Tensor] = None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+        x = x + self.attn(self.norm1(x), roles=roles)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -178,7 +179,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
+    def forward(self, x, targets=None, roles: Dict[str, torch.Tensor] = None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
         batch_size, seq_len = x.shape
         
         # Create position indices
@@ -186,26 +187,10 @@ class GPTModel(nn.Module):
         
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
-        
-        # Create metadata tensors
-        if attention_mask is not None:
-            span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id = SPECIAL_TOKENS['[ES]']
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
-
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
-            span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
-        else:
-            # Create dummy tensors when no attention mask is provided
-            in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
-            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(x_embed, roles=roles)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
@@ -213,44 +198,32 @@ class GPTModel(nn.Module):
         if task_name == 'cocktail_party':
             B, T = x.shape
             D = x_embed.size(-1)
-            mask_token_id = SPECIAL_TOKENS['[MASK]']
+
+            # Query vector from [MASKQ]
+            maskq_pos = (x == SPECIAL_TOKENS['[MASKQ]']).nonzero(as_tuple=False)
+            h_q = x_embed[torch.arange(B, device=x.device), maskq_pos[:,1]]
+
+            # Span processing
             span_start_id = SPECIAL_TOKENS['[SPAN]']
             span_end_id   = SPECIAL_TOKENS['[ES]']
-
-            # 1) Vectorized context extraction
-            mask_positions = (x == mask_token_id).nonzero(as_tuple=True)
-            h_context = x_embed.new_zeros(B, D)
-            # Get the first mask for each batch item, if it exists
-            unique_batch_idx, counts = torch.unique(mask_positions[0], return_counts=True)
-            first_mask_indices = torch.cat((x.new_zeros(1, dtype=torch.long), torch.cumsum(counts, 0)[:-1]))
-            if unique_batch_idx.numel() > 0:
-                 h_context[unique_batch_idx] = x_embed[unique_batch_idx, mask_positions[1][first_mask_indices]]
-
-            # 2) Vectorized span processing
             span_starts = (x == span_start_id).nonzero()
             span_ends = (x == span_end_id).nonzero()
 
             if span_starts.numel() == 0:
                 return torch.empty(0), torch.tensor(0.0, device=x.device)
 
-            # Create a tensor to map each span to its batch index
             batch_indices = span_starts[:, 0]
-
-            # Calculate max number of spans for padding
             max_spans = (x == span_start_id).sum(dim=1).max()
-
             h_spans = x_embed.new_zeros(B, max_spans, D)
 
             for i in range(B):
                 st_indices = span_starts[batch_indices == i, 1]
                 ed_indices = span_ends[batch_indices == i, 1]
-
                 for j, (st, ed) in enumerate(zip(st_indices, ed_indices)):
                     if st + 1 < ed:
                         h_spans[i, j] = x_embed[i, st + 1:ed].mean(dim=0)
 
-            # 4) Compute scores via einsum
-            scores = torch.einsum('bd,bnd->bn', h_context, h_spans)
+            scores = torch.einsum('bd,bnd->bn', h_q, h_spans)
 
             loss = None
             if correct_idx is not None:
