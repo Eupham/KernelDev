@@ -121,10 +121,9 @@ class DataBuilder:
 
         for t in tokens:
             if t in special_token_map:
-                # If we have buffered bytes, decode them first
                 if byte_buffer:
                     try:
-                        result_parts.append(byte_buffer.decode('utf-8', errors='replace'))
+                        result_parts.append(bytes(byte_buffer).decode('utf-8', errors='replace'))
                     except UnicodeDecodeError:
                         result_parts.append("<<DECODE_ERROR>>")
                     byte_buffer = []
@@ -132,10 +131,8 @@ class DataBuilder:
                 if not skip_special_tokens:
                     result_parts.append(special_token_map[t])
             else:
-                # It's a byte token, add to buffer
                 byte_buffer.append(t - NUM_SPECIAL_TOKENS)
 
-        # Decode any remaining bytes in the buffer
         if byte_buffer:
             try:
                 result_parts.append(bytes(byte_buffer).decode('utf-8', errors='replace'))
