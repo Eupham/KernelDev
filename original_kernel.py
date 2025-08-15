@@ -548,8 +548,12 @@ def _flash_attn_fwd(
     )
     tl.store(o_tile_ptr, acc.to(o_ptr.type.element_ty), boundary_check=(0,))
 
-    lse_ptr = LSE + batch * stride_lseb + head * stride_lseh + q_token_idx
-    tl.store(lse_ptr, m_i + tl.log(l_i), boundary_check=(0,))
+    lse_ptr_base = LSE + batch * stride_lseb + head * stride_lseh
+    lse_tile_ptr = tl.make_block_ptr(
+        base=lse_ptr_base, shape=(T,), strides=(stride_lset,),
+        offsets=(q_token_idx,), block_shape=(TILE_Q_SIZE,), order=(0,)
+    )
+    tl.store(lse_tile_ptr, m_i + tl.log(l_i))
 
 # Backward pass implementation is complex and omitted for brevity.
 # The key change is to replicate the masking logic from the forward pass.
