@@ -317,32 +317,51 @@ def start_actual_training(cli_args):
         for task_name, dataloader in task_dataloaders.items():
             print(f"  {task_name}: {len(dataloader)} batches of size {batch_size}")
 
-    # Test a batch
-    if 'train' in dataloaders and 'teacher_forcing' in dataloaders['train']:
-        print("\n=== Data Sample (Teacher Forcing) ===")
-        for x, y in dataloaders['train']['teacher_forcing']:
-            print(f"Batch shape: {x.shape}")
-            print(f"Sample tokens: {x[0][:20].tolist()}")
-            print(f"Sample targets: {y[0][:20].tolist()}")
+    # Test a batch from each task
+    for task_name in task_configs.keys():
+        if 'train' in dataloaders and task_name in dataloaders['train']:
+            print(f"\n=== Data Sample ({task_name}) ===")
+            try:
+                batch = next(iter(dataloaders['train'][task_name]))
+                if batch is None or batch[0] is None:
+                    print("Empty batch, skipping sample.")
+                    continue
 
-            # Decode sample text
-            sample_text = data_builder.decode_tokens(x[0][:50])
-            print(f"Sample text: '{sample_text[:100]}...'")
-            break
+                if task_name == 'teacher_forcing':
+                    x, y, roles = batch
+                    print(f"Batch shape: {x.shape}")
+                    print(f"Sample tokens: {x[0][:20].tolist()}")
+                    sample_text = data_builder.decode_tokens(x[0][:50])
+                    print(f"Sample text: '{sample_text[:100]}...'")
 
-    if 'train' in dataloaders and 'cocktail_party' in dataloaders['train']:
-        print("\n=== Data Sample (Cocktail Party) ===")
-        for batch in dataloaders['train']['cocktail_party']:
-            inputs, spans, correct_idx = batch
-            print(f"Batch shape: {inputs.shape}")
-            print(f"Spans shape: {spans.shape}")
-            print(f"Sample tokens: {inputs[0][:20].tolist()}")
-            print(f"Sample correct_idx: {correct_idx[0].tolist()}")
-            
-            # Decode sample text
-            sample_text = data_builder.decode_tokens(inputs[0][:50])
-            print(f"Sample text: '{sample_text[:100]}...'")
-            break
+                elif task_name == 'cocktail_party':
+                    inputs, correct_idx, roles = batch
+                    print(f"Batch shape: {inputs.shape}")
+                    print(f"Correct_idx shape: {correct_idx.shape}")
+                    print(f"Roles shapes: {{k: v.shape for k, v in roles.items()}}")
+                    sample_text = data_builder.decode_tokens(inputs[0][:50])
+                    print(f"Sample text: '{sample_text[:100]}...'")
+
+                elif task_name == 'soft_jigsaw':
+                    inputs, p_star, roles = batch
+                    print(f"Batch shape: {inputs.shape}")
+                    print(f"p_star shape: {p_star.shape}")
+                    print(f"Roles shapes: {{k: v.shape for k, v in roles.items()}}")
+                    sample_text = data_builder.decode_tokens(inputs[0][:50])
+                    print(f"Sample text: '{sample_text[:100]}...'")
+
+                elif task_name == 'distractor_loc':
+                    x_prime, m_star, c, l, roles = batch
+                    print(f"Batch shape: {x_prime.shape}")
+                    print(f"m_star shape: {m_star.shape}")
+                    print(f"Roles: {roles}") # Can be None
+                    sample_text = data_builder.decode_tokens(x_prime[0][:50])
+                    print(f"Sample text: '{sample_text[:100]}...'")
+
+            except StopIteration:
+                print(f"Could not get a sample batch for {task_name}.")
+            except Exception as e:
+                print(f"Error getting sample for {task_name}: {e}")
     
     # Create trainer
     print(f"\n=== Setting up Trainer ===")

@@ -435,36 +435,39 @@ def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
 )
 @triton.jit
 def _flash_attn_fwd(
-    Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, #
-    LSE: tl.tensor, O: tl.tensor,  #
-    ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
-    stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
-    stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,  #
-    stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
-    stride_mb: int, stride_mh: int, stride_mt: int,  #
-    stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
+    Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor,
+    LSE: tl.tensor, O: tl.tensor,
+    # Role tensors
+    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor, IS_MASKQ: tl.tensor, IS_MASKMARKER: tl.tensor,
+    stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
+    stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,
+    stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,
+    stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int,
+    stride_mb: int, stride_mh: int, stride_mt: int,
     lens_stride: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
+    # Role strides
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
-    T: int,  #
-    TIME_BUCKET:  int,  #
-    HEAD_DIM: tl.constexpr,  #
-    CAUSAL: tl.constexpr,  #
-    INPUT_PRECISION: tl.constexpr,  #
-    SM_SCALE: tl.constexpr,  #
-    DTYPE:  tl.constexpr,  #
-    PRESCALE_QK: tl.constexpr,  #
-    OUTPUT_LOGSUMEXP: tl.constexpr,  #
-    TILE_Q_SIZE: tl.constexpr,  #
-    TILE_K_SIZE: tl.constexpr,  #
-    PIPELINING: tl.constexpr,  #
-    Q_BLOCK_DIVISIBLE: tl.constexpr,  #
-    K_BLOCK_DIVISIBLE: tl.constexpr,  #
-    PERFECT_MATCHING: tl.constexpr,  #
-    RCP_LN2: tl.constexpr,  #
+    is_maskq_stride_b: int, is_maskq_stride_t: int,
+    is_maskmarker_stride_b: int, is_maskmarker_stride_t: int,
+    T: int,
+    TIME_BUCKET:  int,
+    HEAD_DIM: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    USE_ROLE_MASK: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+    SM_SCALE: tl.constexpr,
+    DTYPE:  tl.constexpr,
+    PRESCALE_QK: tl.constexpr,
+    OUTPUT_LOGSUMEXP: tl.constexpr,
+    TILE_Q_SIZE: tl.constexpr,
+    TILE_K_SIZE: tl.constexpr,
+    PIPELINING: tl.constexpr,
+    Q_BLOCK_DIVISIBLE: tl.constexpr,
+    K_BLOCK_DIVISIBLE: tl.constexpr,
+    PERFECT_MATCHING: tl.constexpr,
+    RCP_LN2: tl.constexpr,
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
