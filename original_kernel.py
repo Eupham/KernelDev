@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from typing import Dict, Optional
 
 MAX_TILE_SIZE = 512  # Reduced for T4 compatibility
 MIN_TILE_SIZE = 16  # Reduced for T4 compatibility
