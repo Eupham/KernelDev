@@ -283,10 +283,12 @@ class Trainer:
     def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step."""
         if task_name == 'cocktail_party':
-            inputs, correct_idx, attn_mask = batch
+            inputs, correct_idx = batch
             if inputs.numel() == 0:
                 return 0.0
-            inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
+            inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
+            # Create a dummy attention mask to trigger kernel-side logic
+            attn_mask = torch.ones(inputs.shape[0], 1, 1, device=self.config.device)
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
@@ -334,10 +336,12 @@ class Trainer:
 
                     loss = None
                     if task_name == 'cocktail_party':
-                        inputs, correct_idx, attn_mask = batch
+                        inputs, correct_idx = batch
                         if inputs.numel() == 0:
                             continue
-                        inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
+                        inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
+                        # Create a dummy attention mask to trigger kernel-side logic
+                        attn_mask = torch.ones(inputs.shape[0], 1, 1, device=self.config.device)
 
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):

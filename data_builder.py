@@ -20,6 +20,7 @@ SPECIAL_TOKENS = {
     '[MASK]': 2,
     '[SPAN]': 3,
     '[ES]': 4,
+    '[MASKQ]': 5,
 }
 NUM_SPECIAL_TOKENS = len(SPECIAL_TOKENS)
 
@@ -385,7 +386,6 @@ class DataBuilder:
 
         batch_inputs = []
         batch_correct_indices = []
-        batch_attn_masks = []
 
         for i in range(len(batch)):
             original_tokens_padded, _ = batch[i]
@@ -393,6 +393,7 @@ class DataBuilder:
 
             # 1. Strip padding to get the true sequence
             pad_id = SPECIAL_TOKENS['[PAD]']
+            maskq_id = SPECIAL_TOKENS['[MASKQ]']
             try:
                 first_pad_idx = original_tokens_padded.index(pad_id)
                 original_tokens = original_tokens_padded[:first_pad_idx]
@@ -433,6 +434,9 @@ class DataBuilder:
             wrapper_tokens = []
             for span_toks, _ in all_spans_with_labels:
                 wrapper_tokens.extend([SPECIAL_TOKENS['[SPAN]']] + span_toks + [SPECIAL_TOKENS['[ES]']])
+
+            # Add [MASKQ] at the end of all spans
+            wrapper_tokens.append(maskq_id)
             wrapper_len = len(wrapper_tokens)
 
             # 3. Truncate context to fit wrappers
@@ -446,57 +450,23 @@ class DataBuilder:
             final_sequence = truncated_masked_context + wrapper_tokens
 
             # 5. Final guard-rail truncation and padding
-            final_sequence = final_sequence[:self.seq_len]
+            if len(final_sequence) > self.seq_len:
+                 # Ensure MASKQ is the last token if truncation happens
+                final_sequence = final_sequence[:self.seq_len-1] + [maskq_id]
+
             if len(final_sequence) < self.seq_len:
                 final_sequence.extend([pad_id] * (self.seq_len - len(final_sequence)))
 
-            # 6. Build span IDs and attention mask from the final sequence
-            span_ids = torch.zeros(self.seq_len, dtype=torch.long)
-            current_pos = 0
-            in_span = False
-            span_idx = 0
-
-            # This is a simplified scan. A more robust impl would use the known structure.
-            # For now, we scan to find the spans we just placed.
-            temp_final_sequence = list(final_sequence)
-            try:
-                start_of_wrappers = len(truncated_masked_context)
-
-                current_pos_in_final = start_of_wrappers
-                for span_toks, _ in all_spans_with_labels:
-                    span_len_with_wrappers = len(span_toks) + 2
-
-                    start_idx = current_pos_in_final
-                    end_idx = start_idx + span_len_with_wrappers
-
-                    if start_idx < self.seq_len:
-                       span_ids[start_idx:min(end_idx, self.seq_len)] = span_idx + 1
-
-                    current_pos_in_final = end_idx
-                    span_idx += 1
-
-            except Exception as e:
-                # Fallback in case logic fails
-                pass
-
-
-            span_ids_i = span_ids.unsqueeze(1).expand(-1, self.seq_len)
-            span_ids_j = span_ids.unsqueeze(0).expand(self.seq_len, -1)
-            attn_mask = (span_ids_i == span_ids_j) | (span_ids_i == 0) | (span_ids_j == 0)
-            attn_mask = attn_mask.to(torch.bool)
-
             batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
             batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
-            batch_attn_masks.append(attn_mask)
 
         if not batch_inputs:
-            return torch.empty(0), torch.empty(0), torch.empty(0)
+            return torch.empty(0), torch.empty(0)
 
         inputs = torch.stack(batch_inputs)
         correct_indices = torch.stack(batch_correct_indices)
-        attention_masks = torch.stack(batch_attn_masks)
 
-        return inputs, correct_indices, attention_masks
+        return inputs, correct_indices
 
 
     def create_dataloaders(
