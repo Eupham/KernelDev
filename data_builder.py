@@ -112,32 +112,79 @@ class DataBuilder:
             print("Will attempt to load all available samples from the dataset.")
 
     def _tokenize_text(self, text: str) -> list:
-        # This is a simplified tokenizer. A real implementation would use a pre-trained tokenizer.
+        """
+        Tokenize text using UTF-8 byte-level tokenization with proper multibyte support.
+        
+        This function properly handles multibyte UTF-8 characters by encoding the entire
+        character and including all bytes in the token sequence.
+        """
         tokens = []
         i = 0
         while i < len(text):
             found = False
+            # First check for special tokens
             for token_str, token_id in SPECIAL_TOKENS.items():
                 if text[i:].startswith(token_str):
                     tokens.append(token_id)
                     i += len(token_str)
                     found = True
                     break
+            
             if not found:
-                tokens.append(text[i].encode('utf-8')[0] + NUM_SPECIAL_TOKENS)
+                # Handle UTF-8 characters properly by encoding the entire character
+                char = text[i]
+                utf8_bytes = char.encode('utf-8')
+                
+                # Add all bytes of the UTF-8 character to tokens
+                for byte_val in utf8_bytes:
+                    tokens.append(byte_val + NUM_SPECIAL_TOKENS)
+                
                 i += 1
         return tokens
 
     def _detokenize_bytes(self, tokens: list, skip_special_tokens=False) -> str:
+        """
+        Detokenize UTF-8 byte tokens back to text with proper multibyte reconstruction.
+        
+        This function reconstructs multibyte UTF-8 characters by collecting bytes
+        and decoding them properly.
+        """
         special_token_map = {v: k for k, v in SPECIAL_TOKENS.items()}
-        decoded_tokens = []
+        byte_sequence = []
+        text_parts = []
+        
         for t in tokens:
             if t in special_token_map:
+                # Process any pending byte sequence first
+                if byte_sequence:
+                    try:
+                        decoded_text = bytes(byte_sequence).decode('utf-8', errors='replace')
+                        text_parts.append(decoded_text)
+                        byte_sequence = []
+                    except UnicodeDecodeError:
+                        # Handle corrupted sequences gracefully
+                        text_parts.append('�' * len(byte_sequence))
+                        byte_sequence = []
+                
+                # Add special token if not skipping
                 if not skip_special_tokens:
-                    decoded_tokens.append(special_token_map[t])
+                    text_parts.append(special_token_map[t])
             else:
-                decoded_tokens.append(chr(t - NUM_SPECIAL_TOKENS))
-        return "".join(decoded_tokens)
+                # Collect bytes for UTF-8 reconstruction
+                byte_val = t - NUM_SPECIAL_TOKENS
+                if 0 <= byte_val <= 255:  # Valid byte range
+                    byte_sequence.append(byte_val)
+        
+        # Process any remaining byte sequence
+        if byte_sequence:
+            try:
+                decoded_text = bytes(byte_sequence).decode('utf-8', errors='replace')
+                text_parts.append(decoded_text)
+            except UnicodeDecodeError:
+                # Handle corrupted sequences gracefully
+                text_parts.append('�' * len(byte_sequence))
+        
+        return "".join(text_parts)
 
     def _process_iterable_dataset(self, dataset_iterable, dataset_name_logging: str) -> list:
         samples = []
@@ -422,7 +469,10 @@ class DataBuilder:
         batch_inputs = []
         batch_correct_indices = []
         batch_attn_masks = []
-
+        
+        # Pre-process all items to ensure consistent batch structure
+        valid_items = []
+        
         for i in range(len(batch)):
             original_tokens_padded, _ = batch[i]
             original_tokens_padded = original_tokens_padded.tolist()
@@ -435,85 +485,139 @@ class DataBuilder:
             except ValueError:
                 original_tokens = original_tokens_padded
 
-            span_size = random.randint(min_span_size, max_span_size)
-            if len(original_tokens) <= span_size:
-                continue
-            span_start = random.randint(0, len(original_tokens) - span_size)
-            true_span = original_tokens[span_start : span_start + span_size]
+            # 2. Find [CLS] to separate task instructions from context
+            cls_token = SPECIAL_TOKENS['[CLS]']
+            try:
+                cls_idx = original_tokens.index(cls_token)
+                task_prefix = original_tokens[:cls_idx + 1]  # Include [CLS]
+                context_tokens = original_tokens[cls_idx + 1:]  # Context after [CLS]
+            except ValueError:
+                # No [CLS] found, treat everything as context (fallback)
+                task_prefix = []
+                context_tokens = original_tokens
 
+            # 3. Sample span only from context (not from task instructions)
+            span_size = random.randint(min_span_size, max_span_size)
+            if len(context_tokens) <= span_size:
+                continue  # Skip if context too short
+                
+            span_start_in_context = random.randint(0, len(context_tokens) - span_size)
+            true_span = context_tokens[span_start_in_context : span_start_in_context + span_size]
+
+            # 4. Create distractors from other batch items (also from context only)
             distractors = []
             for _ in range(num_distractors):
-                distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
-                distractor_tokens_padded, _ = batch[distractor_idx]
-                distractor_tokens_padded = distractor_tokens_padded.tolist()
-                try:
-                    first_pad_idx_dist = distractor_tokens_padded.index(pad_id)
-                    distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
-                except ValueError:
-                    distractor_tokens = distractor_tokens_padded
+                attempts = 0
+                while len(distractors) < (_ + 1) and attempts < len(batch) * 2:  # Ensure we get enough distractors
+                    distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
+                    distractor_tokens_padded, _ = batch[distractor_idx]
+                    distractor_tokens_padded = distractor_tokens_padded.tolist()
+                    
+                    try:
+                        first_pad_idx_dist = distractor_tokens_padded.index(pad_id)
+                        distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
+                    except ValueError:
+                        distractor_tokens = distractor_tokens_padded
 
-                if len(distractor_tokens) <= span_size:
-                    continue
-                distractor_start = random.randint(0, len(distractor_tokens) - span_size)
-                distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
-                distractors.append(distractor_span)
+                    # Find [CLS] in distractor to get context only
+                    try:
+                        cls_idx_dist = distractor_tokens.index(cls_token)
+                        distractor_context = distractor_tokens[cls_idx_dist + 1:]
+                    except ValueError:
+                        distractor_context = distractor_tokens
 
-            if not distractors:
-                continue
+                    if len(distractor_context) > span_size:
+                        distractor_start = random.randint(0, len(distractor_context) - span_size)
+                        distractor_span = distractor_context[distractor_start : distractor_start + span_size]
+                        distractors.append(distractor_span)
+                    attempts += 1
 
-            all_spans_with_labels = [(true_span, 1)] + [(d, 0) for d in distractors]
+            # If we couldn't get enough distractors, pad with copies/variations
+            while len(distractors) < num_distractors:
+                if distractors:
+                    distractors.append(distractors[0])  # Reuse first distractor as fallback
+                else:
+                    # Fallback: create a distractor from a different part of the same context
+                    if len(context_tokens) > span_size * 2:
+                        alt_start = random.randint(0, len(context_tokens) - span_size)
+                        if alt_start != span_start_in_context:
+                            alt_span = context_tokens[alt_start : alt_start + span_size]
+                            distractors.append(alt_span)
+                        else:
+                            distractors.append(true_span)  # Last resort
+                    else:
+                        distractors.append(true_span)  # Last resort
+
+            valid_items.append({
+                'task_prefix': task_prefix,
+                'context_tokens': context_tokens,
+                'span_start_in_context': span_start_in_context,
+                'span_size': span_size,
+                'true_span': true_span,
+                'distractors': distractors[:num_distractors]  # Ensure exact count
+            })
+
+        # Now process all valid items with consistent structure
+        for item in valid_items:
+            all_spans_with_labels = [(item['true_span'], 1)] + [(d, 0) for d in item['distractors']]
             random.shuffle(all_spans_with_labels)
             correct_idx = [label for _, label in all_spans_with_labels].index(1)
 
-            # 2. Calculate wrapper length to reserve space (including [MASKQ])
+            # Calculate wrapper length to reserve space (including [MASKQ])
             wrapper_tokens = []
             for span_toks, _ in all_spans_with_labels:
                 wrapper_tokens.extend([SPECIAL_TOKENS['[SPAN]']] + span_toks + [SPECIAL_TOKENS['[ES]']])
             wrapper_len = len(wrapper_tokens) + 1  # +1 for [MASKQ]
 
-            # 3. Truncate context to fit wrappers
-            available_context_len = self.seq_len - wrapper_len
-            available_context_len = max(0, available_context_len)
-
-            masked_context = (original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:])
+            # Extend max tokens for cocktail party task to accommodate special tokens and distractors
+            required_space = len(item['task_prefix']) + wrapper_len
+            if required_space >= self.seq_len:
+                # Instead of skipping, extend the sequence length for this batch
+                extended_seq_len = required_space + min(50, len(item['context_tokens']))  # Add some context
+                available_context_len = extended_seq_len - required_space
+            else:
+                extended_seq_len = self.seq_len
+                available_context_len = self.seq_len - required_space
+            
+            # Create masked context (mask the span we sampled)
+            masked_context = (item['context_tokens'][:item['span_start_in_context']] + 
+                            [SPECIAL_TOKENS['[MASK]']] + 
+                            item['context_tokens'][item['span_start_in_context'] + item['span_size']:])
+            
+            # Truncate context if needed, but preserve all islands and [MASKQ]
             truncated_masked_context = masked_context[:available_context_len]
 
-            # 4. Stitch final sequence together (add [MASKQ] at the end)
-            final_sequence = truncated_masked_context + wrapper_tokens + [SPECIAL_TOKENS['[MASKQ]']]
+            # Stitch final sequence together: {prefix}[CLS]{context}[SPAN]...[ES][SPAN]...[ES][MASKQ]
+            final_sequence = item['task_prefix'] + truncated_masked_context + wrapper_tokens + [SPECIAL_TOKENS['[MASKQ]']]
 
-            # 5. Final guard-rail truncation and padding
-            final_sequence = final_sequence[:self.seq_len]
-            if len(final_sequence) < self.seq_len:
-                final_sequence.extend([pad_id] * (self.seq_len - len(final_sequence)))
+            # Pad to the extended length to accommodate all special tokens
+            if len(final_sequence) < extended_seq_len:
+                final_sequence.extend([pad_id] * (extended_seq_len - len(final_sequence)))
 
-            # 6. Build metadata tensors: in_span, span_id, is_prefix
-            in_span = torch.zeros(self.seq_len, dtype=torch.bool)
-            span_ids = torch.zeros(self.seq_len, dtype=torch.long)
-            is_prefix = torch.zeros(self.seq_len, dtype=torch.bool)
+            # Build metadata tensors: in_span, span_id, is_prefix (use extended length)
+            in_span = torch.zeros(extended_seq_len, dtype=torch.bool)
+            span_ids = torch.zeros(extended_seq_len, dtype=torch.long)
+            is_prefix = torch.zeros(extended_seq_len, dtype=torch.bool)
             
-            # Mark prefix tokens (everything before first [CLS] and including [CLS])
-            cls_token = SPECIAL_TOKENS['[CLS]']
-            try:
-                cls_idx = final_sequence.index(cls_token)
-                is_prefix[:cls_idx + 1] = True  # Include [CLS] itself as prefix
-            except ValueError:
-                # No [CLS] found, treat beginning as prefix
-                pass
+            # Mark prefix tokens (task instructions + [CLS])
+            prefix_len = len(item['task_prefix'])
+            if prefix_len > 0:
+                is_prefix[:prefix_len] = True
             
             # Mark span tokens and assign span IDs
-            start_of_spans = len(truncated_masked_context)
+            start_of_spans = prefix_len + len(truncated_masked_context)
             current_pos = start_of_spans
             span_token = SPECIAL_TOKENS['[SPAN]']
             es_token = SPECIAL_TOKENS['[ES]']
             
             for span_idx, (span_toks, _) in enumerate(all_spans_with_labels):
-                if current_pos >= self.seq_len:
+                if current_pos >= extended_seq_len:
                     break
                     
                 # Find [SPAN] token
-                if current_pos < self.seq_len and final_sequence[current_pos] == span_token:
+                if current_pos < extended_seq_len and final_sequence[current_pos] == span_token:
                     span_start = current_pos
-                    span_end = min(current_pos + len(span_toks) + 2, self.seq_len)  # +2 for [SPAN] and [ES]
+                    span_end = min(current_pos + len(span_toks) + 2, extended_seq_len)  # +2 for [SPAN] and [ES]
                     
                     # Mark all tokens in this span (including [SPAN] and [ES])
                     in_span[span_start:span_end] = True

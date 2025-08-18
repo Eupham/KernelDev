@@ -2397,6 +2397,53 @@ def is_hopper_gpu() -> bool:
     return major >= 9
 
 
+def verify_flash_attention_usage(model_forward_fn, sample_input, task_name="unknown"):
+    """
+    Verify that the model is using flash attention kernels by checking for triton kernel calls.
+    
+    Args:
+        model_forward_fn: The model's forward function
+        sample_input: Sample input to test with
+        task_name: Name of the task being verified
+    
+    Returns:
+        bool: True if flash attention is being used, False otherwise
+    """
+    import inspect
+    
+    # Check if flash_attention function is being called in the call stack
+    original_flash_attention = flash_attention
+    flash_attention_called = False
+    
+    def traced_flash_attention(*args, **kwargs):
+        nonlocal flash_attention_called
+        flash_attention_called = True
+        logger.info(f"Flash attention kernel called for task: {task_name}")
+        return original_flash_attention(*args, **kwargs)
+    
+    # Temporarily replace flash_attention with our traced version
+    import original_kernel
+    original_kernel.flash_attention = traced_flash_attention
+    
+    try:
+        # Run the model forward pass
+        with torch.no_grad():
+            _ = model_forward_fn(sample_input)
+        
+        if flash_attention_called:
+            logger.info(f"✓ Flash attention verified for {task_name} task")
+            return True
+        else:
+            logger.warning(f"✗ Flash attention NOT detected for {task_name} task")
+            return False
+            
+    finally:
+        # Restore original function
+        original_kernel.flash_attention = original_flash_attention
+    
+    return flash_attention_called
+
+
 # =============================================================================
 # Utility Functions
 # =============================================================================

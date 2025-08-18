@@ -154,11 +154,3 @@ tasks:
     num_distractors: 3
     min_span_size: 100
     max_span_size: 200
-  soft_jigsaw:
-    weight: 0.5
-    M: 5
-    tau: 0.5
-  distractor_loc:
-    weight: 0.7
-    L_min: 10
-    L_max: 50
