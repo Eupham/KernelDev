@@ -333,11 +333,9 @@ def start_actual_training(cli_args):
     if 'train' in dataloaders and 'cocktail_party' in dataloaders['train']:
         print("\n=== Data Sample (Cocktail Party) ===")
         for batch in dataloaders['train']['cocktail_party']:
-            inputs, spans, correct_idx = batch
+            inputs, correct_idx, _ = batch
             print(f"Batch shape: {inputs.shape}")
-            print(f"Spans shape: {spans.shape}")
             print(f"Sample tokens: {inputs[0][:20].tolist()}")
-            print(f"Sample correct_idx: {correct_idx[0].tolist()}")
             
             # Decode sample text
             sample_text = data_builder.decode_tokens(inputs[0][:50])
@@ -356,18 +354,13 @@ def start_actual_training(cli_args):
     print(f"\n=== Initial Evaluation ===")
     if 'train' in dataloaders and 'validation' in dataloaders:
         max_eval_batches = eval_cfg.get('max_eval_batches', 10)
-        initial_train_loss, _, _ = trainer.evaluate(dataloaders['train'], task_configs, max_batches=max_eval_batches)
-        initial_val_loss, initial_val_metrics, initial_distractor_metrics = trainer.evaluate(dataloaders['validation'], task_configs, max_batches=max_eval_batches)
+        initial_train_loss, _ = trainer.evaluate(dataloaders['train'], task_configs, max_batches=max_eval_batches)
+        initial_val_loss, initial_val_metrics = trainer.evaluate(dataloaders['validation'], task_configs, max_batches=max_eval_batches)
         print(f"Initial training loss: {initial_train_loss:.4f}")
         print(f"Initial validation loss: {initial_val_loss:.4f}")
         if initial_val_metrics:
             log_str = "Initial cocktail party metrics: "
             for k, v in initial_val_metrics.items():
-                log_str += f"{k}: {v:.4f}, "
-            print(log_str)
-        if initial_distractor_metrics:
-            log_str = "Initial distractor loc metrics: "
-            for k, v in initial_distractor_metrics.items():
                 log_str += f"{k}: {v:.4f}, "
             print(log_str)
     
