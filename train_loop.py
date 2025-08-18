@@ -243,7 +243,6 @@ class TrainingMetrics:
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'cocktail_party_metrics': self.cocktail_party_metrics,
-            'distractor_loc_metrics': self.distractor_loc_metrics,
             'learning_rates': self.learning_rates,
             'step_times': self.step_times,
             'total_steps': self.total_steps,

@@ -422,7 +422,10 @@ class DataBuilder:
         batch_inputs = []
         batch_correct_indices = []
         batch_attn_masks = []
-
+        
+        # Pre-process all items to ensure consistent batch structure
+        valid_items = []
+        
         for i in range(len(batch)):
             original_tokens_padded, _ = batch[i]
             original_tokens_padded = original_tokens_padded.tolist()
@@ -435,73 +438,126 @@ class DataBuilder:
             except ValueError:
                 original_tokens = original_tokens_padded
 
-            span_size = random.randint(min_span_size, max_span_size)
-            if len(original_tokens) <= span_size:
-                continue
-            span_start = random.randint(0, len(original_tokens) - span_size)
-            true_span = original_tokens[span_start : span_start + span_size]
+            # 2. Find [CLS] to separate task instructions from context
+            cls_token = SPECIAL_TOKENS['[CLS]']
+            try:
+                cls_idx = original_tokens.index(cls_token)
+                task_prefix = original_tokens[:cls_idx + 1]  # Include [CLS]
+                context_tokens = original_tokens[cls_idx + 1:]  # Context after [CLS]
+            except ValueError:
+                # No [CLS] found, treat everything as context (fallback)
+                task_prefix = []
+                context_tokens = original_tokens
 
+            # 3. Sample span only from context (not from task instructions)
+            span_size = random.randint(min_span_size, max_span_size)
+            if len(context_tokens) <= span_size:
+                continue  # Skip if context too short
+                
+            span_start_in_context = random.randint(0, len(context_tokens) - span_size)
+            true_span = context_tokens[span_start_in_context : span_start_in_context + span_size]
+
+            # 4. Create distractors from other batch items (also from context only)
             distractors = []
             for _ in range(num_distractors):
-                distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
-                distractor_tokens_padded, _ = batch[distractor_idx]
-                distractor_tokens_padded = distractor_tokens_padded.tolist()
-                try:
-                    first_pad_idx_dist = distractor_tokens_padded.index(pad_id)
-                    distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
-                except ValueError:
-                    distractor_tokens = distractor_tokens_padded
+                attempts = 0
+                while len(distractors) < (_ + 1) and attempts < len(batch) * 2:  # Ensure we get enough distractors
+                    distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
+                    distractor_tokens_padded, _ = batch[distractor_idx]
+                    distractor_tokens_padded = distractor_tokens_padded.tolist()
+                    
+                    try:
+                        first_pad_idx_dist = distractor_tokens_padded.index(pad_id)
+                        distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
+                    except ValueError:
+                        distractor_tokens = distractor_tokens_padded
 
-                if len(distractor_tokens) <= span_size:
-                    continue
-                distractor_start = random.randint(0, len(distractor_tokens) - span_size)
-                distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
-                distractors.append(distractor_span)
+                    # Find [CLS] in distractor to get context only
+                    try:
+                        cls_idx_dist = distractor_tokens.index(cls_token)
+                        distractor_context = distractor_tokens[cls_idx_dist + 1:]
+                    except ValueError:
+                        distractor_context = distractor_tokens
 
-            if not distractors:
-                continue
+                    if len(distractor_context) > span_size:
+                        distractor_start = random.randint(0, len(distractor_context) - span_size)
+                        distractor_span = distractor_context[distractor_start : distractor_start + span_size]
+                        distractors.append(distractor_span)
+                    attempts += 1
 
-            all_spans_with_labels = [(true_span, 1)] + [(d, 0) for d in distractors]
+            # If we couldn't get enough distractors, pad with copies/variations
+            while len(distractors) < num_distractors:
+                if distractors:
+                    distractors.append(distractors[0])  # Reuse first distractor as fallback
+                else:
+                    # Fallback: create a distractor from a different part of the same context
+                    if len(context_tokens) > span_size * 2:
+                        alt_start = random.randint(0, len(context_tokens) - span_size)
+                        if alt_start != span_start_in_context:
+                            alt_span = context_tokens[alt_start : alt_start + span_size]
+                            distractors.append(alt_span)
+                        else:
+                            distractors.append(true_span)  # Last resort
+                    else:
+                        distractors.append(true_span)  # Last resort
+
+            valid_items.append({
+                'task_prefix': task_prefix,
+                'context_tokens': context_tokens,
+                'span_start_in_context': span_start_in_context,
+                'span_size': span_size,
+                'true_span': true_span,
+                'distractors': distractors[:num_distractors]  # Ensure exact count
+            })
+
+        # Now process all valid items with consistent structure
+        for item in valid_items:
+            all_spans_with_labels = [(item['true_span'], 1)] + [(d, 0) for d in item['distractors']]
             random.shuffle(all_spans_with_labels)
             correct_idx = [label for _, label in all_spans_with_labels].index(1)
 
-            # 2. Calculate wrapper length to reserve space (including [MASKQ])
+            # Calculate wrapper length to reserve space (including [MASKQ])
             wrapper_tokens = []
             for span_toks, _ in all_spans_with_labels:
                 wrapper_tokens.extend([SPECIAL_TOKENS['[SPAN]']] + span_toks + [SPECIAL_TOKENS['[ES]']])
             wrapper_len = len(wrapper_tokens) + 1  # +1 for [MASKQ]
 
-            # 3. Truncate context to fit wrappers
-            available_context_len = self.seq_len - wrapper_len
-            available_context_len = max(0, available_context_len)
+            # Ensure we never truncate islands or [MASKQ] by checking space requirements
+            required_space = len(item['task_prefix']) + wrapper_len
+            if required_space >= self.seq_len:
+                # If wrapper + prefix is too big, skip this item
+                continue
 
-            masked_context = (original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:])
+            # Calculate how much context we can include
+            available_context_len = self.seq_len - required_space
+            
+            # Create masked context (mask the span we sampled)
+            masked_context = (item['context_tokens'][:item['span_start_in_context']] + 
+                            [SPECIAL_TOKENS['[MASK]']] + 
+                            item['context_tokens'][item['span_start_in_context'] + item['span_size']:])
+            
+            # Truncate context if needed, but preserve all islands and [MASKQ]
             truncated_masked_context = masked_context[:available_context_len]
 
-            # 4. Stitch final sequence together (add [MASKQ] at the end)
-            final_sequence = truncated_masked_context + wrapper_tokens + [SPECIAL_TOKENS['[MASKQ]']]
+            # Stitch final sequence together: {prefix}[CLS]{context}[SPAN]...[ES][SPAN]...[ES][MASKQ]
+            final_sequence = item['task_prefix'] + truncated_masked_context + wrapper_tokens + [SPECIAL_TOKENS['[MASKQ]']]
 
-            # 5. Final guard-rail truncation and padding
-            final_sequence = final_sequence[:self.seq_len]
+            # Pad to exact length (no truncation since we pre-calculated space)
             if len(final_sequence) < self.seq_len:
                 final_sequence.extend([pad_id] * (self.seq_len - len(final_sequence)))
 
-            # 6. Build metadata tensors: in_span, span_id, is_prefix
+            # Build metadata tensors: in_span, span_id, is_prefix
             in_span = torch.zeros(self.seq_len, dtype=torch.bool)
             span_ids = torch.zeros(self.seq_len, dtype=torch.long)
             is_prefix = torch.zeros(self.seq_len, dtype=torch.bool)
             
-            # Mark prefix tokens (everything before first [CLS] and including [CLS])
-            cls_token = SPECIAL_TOKENS['[CLS]']
-            try:
-                cls_idx = final_sequence.index(cls_token)
-                is_prefix[:cls_idx + 1] = True  # Include [CLS] itself as prefix
-            except ValueError:
-                # No [CLS] found, treat beginning as prefix
-                pass
+            # Mark prefix tokens (task instructions + [CLS])
+            prefix_len = len(item['task_prefix'])
+            if prefix_len > 0:
+                is_prefix[:prefix_len] = True
             
             # Mark span tokens and assign span IDs
-            start_of_spans = len(truncated_masked_context)
+            start_of_spans = prefix_len + len(truncated_masked_context)
             current_pos = start_of_spans
             span_token = SPECIAL_TOKENS['[SPAN]']
             es_token = SPECIAL_TOKENS['[ES]']
