@@ -322,6 +322,9 @@ class Trainer:
         self.initial_lr = self.config.learning_rate
         self.scheduler = None # Will be initialized in train()
         
+        # Track optimizer step count to prevent scheduler warning
+        self._optimizer_step_count = 0
+        
         print(f"Trainer initialized on device: {self.config.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
     
@@ -461,7 +464,8 @@ class Trainer:
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'scheduler_state_dict': self.scheduler.state_dict(),
                 'metrics': self.metrics.__dict__, # Note: metrics are rank-local
-                'config': self.config.__dict__
+                'config': self.config.__dict__,
+                '_optimizer_step_count': self._optimizer_step_count  # Save optimizer step count
             }
 
             checkpoint_path = os.path.join(
@@ -515,6 +519,9 @@ class Trainer:
         model_to_load.load_state_dict(state_dict)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        # Restore optimizer step count (for scheduler warning prevention)
+        self._optimizer_step_count = checkpoint.get('_optimizer_step_count', 0)
 
         # Restore metrics (rank-local)
         for key, value in checkpoint['metrics'].items():
@@ -575,16 +582,21 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.config.scaler.step(self.optimizer)
                 self.config.scaler.update()
+                # Track optimizer step for scheduler warning prevention
+                self._optimizer_step_count += 1
             else:
                 total_loss.backward()
                 if self.config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
+                # Track optimizer step for scheduler warning prevention
+                self._optimizer_step_count += 1
 
             # Get current LR *before* scheduler steps to log the correct value for the current step
             current_lr = self.optimizer.param_groups[0]['lr']
 
-            if self.scheduler is not None:
+            # Only step scheduler after optimizer has been stepped at least once
+            if self.scheduler is not None and self._optimizer_step_count > 0:
                 self.scheduler.step()
             
             # Update metrics

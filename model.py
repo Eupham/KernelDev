@@ -230,11 +230,10 @@ class GPTModel(nn.Module):
         # Apply transformer blocks
         for block in self.blocks:
             if task_name == 'cocktail_party':
-                # For cocktail party, don't pass the old attention_mask, use metadata tensors
-                x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+                # For cocktail party, pass attention_mask=True to trigger cocktail party patterns in triton kernel
+                x_embed = block(x_embed, attention_mask=True, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
             else:
-                # For teacher forcing, use cocktail party attention but with proper prefix setup
-                # This ensures prefix is bidirectional and context is causal
+                # For teacher forcing, use simple causal attention
                 x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         
         # Final normalization
