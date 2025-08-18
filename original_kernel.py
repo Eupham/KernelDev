@@ -620,12 +620,11 @@ def _flash_attn_fwd(
             context_causal = q_is_context & k_is_context & (q_tile_indices[:, None] >= kv_indices[None, :])
             context_to_prefix = q_is_context & k_is_cls_or_prefix
             
-            # Pattern 3: Span tokens bidirectional within same span + can see [CLS] and [MASKQ]
+            # Pattern 3: Span tokens bidirectional within same span + can see [CLS] only (NO MASKQ)
             same_span = (q_in_span[:, None] & k_in_span[None, :] & 
                         (q_span_id[:, None] == k_span_id[None, :]) & 
                         (q_span_id[:, None] > 0))  # Exclude span_id=0 and span_id=-1
             span_to_cls = q_in_span[:, None] & k_is_cls_or_prefix
-            span_to_maskq = q_in_span[:, None] & k_is_maskq
             
             # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
             maskq_to_spans = q_is_maskq & k_in_span[None, :]
@@ -634,7 +633,7 @@ def _flash_attn_fwd(
             # Combine all allowed patterns
             mask = (prefix_to_prefix | 
                    context_causal | context_to_prefix |
-                   same_span | span_to_cls | span_to_maskq |
+                   same_span | span_to_cls |
                    maskq_to_spans | maskq_to_cls)
             # --- End of Cocktail Party Attention Pattern ---
 
@@ -1385,12 +1384,11 @@ def _flash_attn_bwd_dq(
             context_causal = q_is_context & k_is_context & (q_tile_indices[:, None] >= kv_indices[None, :])
             context_to_prefix = q_is_context & k_is_cls_or_prefix
             
-            # Pattern 3: Span tokens bidirectional within same span + can see [CLS] and [MASKQ]
+            # Pattern 3: Span tokens bidirectional within same span + can see [CLS] only (NO MASKQ)
             same_span = (q_in_span[:, None] & k_in_span[None, :] & 
                         (q_span_id[:, None] == k_span_id[None, :]) & 
                         (q_span_id[:, None] > 0))  # Exclude span_id=0 and span_id=-1
             span_to_cls = q_in_span[:, None] & k_is_cls_or_prefix
-            span_to_maskq = q_in_span[:, None] & k_is_maskq
             
             # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
             maskq_to_spans = q_is_maskq & k_in_span[None, :]
@@ -1399,7 +1397,7 @@ def _flash_attn_bwd_dq(
             # Combine all allowed patterns
             mask = (prefix_to_prefix | 
                    context_causal | context_to_prefix |
-                   same_span | span_to_cls | span_to_maskq |
+                   same_span | span_to_cls |
                    maskq_to_spans | maskq_to_cls)
             # --- End of Cocktail Party Attention Pattern ---
         elif CAUSAL:
@@ -1546,12 +1544,11 @@ def _flash_attn_bwd_dkdv(
             context_causal = q_is_context & k_is_context & (q_tile_indices[None, :] >= kv_indices[:, None])
             context_to_prefix = q_is_context & k_is_cls_or_prefix
             
-            # Pattern 3: Span tokens bidirectional within same span + can see [CLS] and [MASKQ]
+            # Pattern 3: Span tokens bidirectional within same span + can see [CLS] only (NO MASKQ)
             same_span = (q_in_span[None, :] & k_in_span[:, None] & 
                         (q_span_id[None, :] == k_span_id[:, None]) & 
                         (q_span_id[None, :] > 0))  # Exclude span_id=0 and span_id=-1
             span_to_cls = q_in_span[None, :] & k_is_cls_or_prefix
-            span_to_maskq = q_in_span[None, :] & k_is_maskq
             
             # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
             maskq_to_spans = q_is_maskq & k_in_span[:, None]
@@ -1560,7 +1557,7 @@ def _flash_attn_bwd_dkdv(
             # Combine all allowed patterns
             mask = (prefix_to_prefix | 
                    context_causal | context_to_prefix |
-                   same_span | span_to_cls | span_to_maskq |
+                   same_span | span_to_cls |
                    maskq_to_spans | maskq_to_cls)
             # --- End of Cocktail Party Attention Pattern ---
         elif CAUSAL:
