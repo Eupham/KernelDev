@@ -76,14 +76,14 @@ class MultiHeadAttention(nn.Module):
         
         is_causal = self.causal
 
-        # Use flash attention kernel
+        # Use flash attention kernel with metadata only (no attention_mask)
         out = flash_attention(
             q=q,
             k=k,
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=attention_mask,
+            attention_mask=None,
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix
@@ -191,61 +191,76 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Create metadata tensors
+        # Generate metadata tensors based on input parameters or tokens
         if in_span is not None and span_id is not None and is_prefix is not None:
             # Use directly provided metadata tensors
             pass  # in_span, span_id, is_prefix are already set
-        elif attention_mask is not None and isinstance(attention_mask, dict) and task_name == 'cocktail_party':
-            # Use metadata from cocktail party data builder
+        elif attention_mask is not None and isinstance(attention_mask, dict):
+            # Use metadata from data builder (remove task_name dependency)
             in_span = attention_mask['in_span']
-            span_id = attention_mask['span_id']
+            span_id = attention_mask['span_id'] 
             is_prefix = attention_mask['is_prefix']
-        elif attention_mask is not None:
-            # Legacy behavior: generate metadata from tokens
+        else:
+            # Generate metadata from tokens (auto-detect sequence type)
             span_start_id = SPECIAL_TOKENS['[SPAN]']
             span_end_id = SPECIAL_TOKENS['[ES]']
             cls_token_id = SPECIAL_TOKENS['[CLS]']
+            maskq_token_id = SPECIAL_TOKENS['[MASKQ]']
 
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
-            span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
-        else:
-            # Create metadata tensors for teacher forcing
+            # Initialize metadata tensors
             in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.zeros((batch_size, seq_len), dtype=torch.long, device=x.device)  # Use 0 for non-span tokens
-            
-            # For teacher forcing, mark prefix tokens (task instructions + [CLS])
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
+            span_id = torch.zeros((batch_size, seq_len), dtype=torch.long, device=x.device)
             is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
             
-            # Find [CLS] positions and mark everything up to and including [CLS] as prefix
-            for batch_idx in range(batch_size):
-                cls_positions = (x[batch_idx] == cls_token_id).nonzero(as_tuple=True)[0]
-                if len(cls_positions) > 0:
-                    # Mark everything up to and including the first [CLS] as prefix
-                    cls_pos = cls_positions[0].item()
-                    is_prefix[batch_idx, :cls_pos + 1] = True
-
-        # Apply transformer blocks
-        for block in self.blocks:
-            if task_name == 'cocktail_party':
-                # For cocktail party, don't pass the old attention_mask, use metadata tensors
-                x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            # Check if this looks like a cocktail party sequence (has span tokens)
+            has_spans = (x == span_start_id).any() or (x == span_end_id).any() or (x == maskq_token_id).any()
+            
+            if has_spans:
+                # Process cocktail party style sequence
+                in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
+                span_id = torch.cumsum((x == span_start_id).int(), dim=1)
+                span_id[~in_span] = 0  # Non-span tokens get span_id=0
+                
+                # Mark MASKQ tokens with special span_id=-1 (last token behavior)
+                maskq_positions = (x == maskq_token_id)
+                span_id[maskq_positions] = -1
+                
+                # Mark prefix tokens (everything up to and including [CLS])
+                for batch_idx in range(batch_size):
+                    cls_positions = (x[batch_idx] == cls_token_id).nonzero(as_tuple=True)[0]
+                    if len(cls_positions) > 0:
+                        cls_pos = cls_positions[0].item()
+                        is_prefix[batch_idx, :cls_pos + 1] = True
             else:
-                # For teacher forcing, use cocktail party attention but with proper prefix setup
-                # This ensures prefix is bidirectional and context is causal
-                x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+                # Process teacher forcing style sequence (only [CLS] special token behavior)
+                for batch_idx in range(batch_size):
+                    cls_positions = (x[batch_idx] == cls_token_id).nonzero(as_tuple=True)[0]
+                    if len(cls_positions) > 0:
+                        # Mark everything up to and including the first [CLS] as prefix
+                        cls_pos = cls_positions[0].item()
+                        is_prefix[batch_idx, :cls_pos + 1] = True
+
+        # Apply transformer blocks (using metadata-only routing)
+        for block in self.blocks:
+            # Always use metadata tensors for attention control (no task-based routing)
+            x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
         
-        if task_name == 'cocktail_party':
+        # Auto-detect output mode based on tokens present (no task-based routing)
+        mask_token_id = SPECIAL_TOKENS['[MASK]']
+        span_start_id = SPECIAL_TOKENS['[SPAN]']
+        span_end_id = SPECIAL_TOKENS['[ES]']
+        
+        # If sequence contains span tokens and mask, process as cocktail party
+        has_mask = (x == mask_token_id).any()
+        has_spans = (x == span_start_id).any() and (x == span_end_id).any()
+        
+        if has_mask and has_spans:
+            # Cocktail party processing (span-based reasoning)
             B, T = x.shape
             D = x_embed.size(-1)
-            mask_token_id = SPECIAL_TOKENS['[MASK]']
-            span_start_id = SPECIAL_TOKENS['[SPAN]']
-            span_end_id   = SPECIAL_TOKENS['[ES]']
 
             # 1) Vectorized context extraction
             mask_positions = (x == mask_token_id).nonzero(as_tuple=True)
@@ -288,7 +303,7 @@ class GPTModel(nn.Module):
 
             return scores, loss
         else:
-            # Teacher forcing task (generative)
+            # Teacher forcing processing (generative language modeling)
             logits = self.head(x_embed)
             loss = None
             if targets is not None:
