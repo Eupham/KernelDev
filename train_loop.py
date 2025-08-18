@@ -277,6 +277,28 @@ class Trainer:
 
         # Initialize distributed training
         init_distributed(self)
+        
+        # Apply speed optimizations
+        self._apply_pytorch_optimizations()
+
+    def _apply_pytorch_optimizations(self):
+        """Apply PyTorch optimization flags for speed"""
+        try:
+            # Enable cuDNN benchmark for consistent input sizes
+            if torch.cuda.is_available():
+                torch.backends.cudnn.benchmark = True
+                
+                # Allow TF32 for speed on modern GPUs
+                if hasattr(torch.backends.cudnn, 'allow_tf32'):
+                    torch.backends.cudnn.allow_tf32 = True
+                if hasattr(torch.backends.cuda, 'matmul'):
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                    
+            if not self.is_distributed or dist.get_rank() == 0:
+                print("✓ PyTorch optimization flags enabled for speed")
+        except Exception as e:
+            if not self.is_distributed or dist.get_rank() == 0:
+                print(f"⚠ Could not apply all PyTorch optimizations: {e}")
 
         if self.is_distributed and dist.get_world_size() > 1:
             # self.config.device is set in init_distributed
@@ -310,18 +332,23 @@ class Trainer:
         return self.config.learning_rate
     
     def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
-        """Perform a single training step."""
+        """Perform a single training step with speed optimizations."""
         if task_name == 'cocktail_party':
             inputs, correct_idx, metadata = batch
             if inputs.numel() == 0:
                 return 0.0
-            inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
             
-            # Move metadata tensors to device
+            # Use non_blocking=True for faster GPU transfers
+            inputs = inputs.to(self.config.device, non_blocking=True)
+            correct_idx = correct_idx.to(self.config.device, non_blocking=True)
+            
+            # Move metadata tensors to device efficiently
             if isinstance(metadata, dict):
-                metadata = {k: v.to(self.config.device) for k, v in metadata.items()}
+                metadata = {k: v.to(self.config.device, non_blocking=True) if isinstance(v, torch.Tensor) else v 
+                          for k, v in metadata.items()}
             else:
-                metadata = metadata.to(self.config.device)
+                if metadata is not None:
+                    metadata = metadata.to(self.config.device, non_blocking=True)
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
@@ -331,7 +358,9 @@ class Trainer:
 
         else:
             x, y = batch
-            x, y = x.to(self.config.device), y.to(self.config.device)
+            # Use non_blocking=True for faster GPU transfers
+            x = x.to(self.config.device, non_blocking=True)
+            y = y.to(self.config.device, non_blocking=True)
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):

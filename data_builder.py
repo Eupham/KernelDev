@@ -507,8 +507,15 @@ class DataBuilder:
             # 4. Create distractors from other batch items (also from context only)
             distractors = []
             attempts = 0
+            available_indices = [j for j in range(len(batch)) if i != j]
+            
+            # If no other batch items available, skip this item or create synthetic distractors
+            if not available_indices:
+                print(f"Warning: Batch size too small for cocktail party task (need at least 2 items)")
+                continue
+                
             while len(distractors) < num_distractors and attempts < len(batch) * num_distractors * 2:
-                distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
+                distractor_idx = random.choice(available_indices)
                 distractor_tokens_padded, _ = batch[distractor_idx]
                 distractor_tokens_padded = distractor_tokens_padded.tolist()
                 
@@ -675,6 +682,17 @@ class DataBuilder:
             print("Warning: No datasets were created. Returning empty dataloaders dict.")
             return dataloaders
 
+        # Optimize DataLoader settings for speed
+        optimized_kwargs = {
+            'num_workers': num_workers,
+            'pin_memory': torch.cuda.is_available(),
+            'persistent_workers': num_workers > 0,  # Keep workers alive between epochs
+            'prefetch_factor': 4 if num_workers > 0 else None,  # Increase prefetch for speed
+        }
+        
+        # Remove None values
+        optimized_kwargs = {k: v for k, v in optimized_kwargs.items() if v is not None}
+
         for split_name, dataset_obj in datasets.items():
             if not dataset_obj:
                 print(f"Skipping DataLoader for {split_name} as dataset is empty or invalid.")
@@ -686,16 +704,16 @@ class DataBuilder:
             # Teacher forcing dataloader
             dataloaders[split_name]['teacher_forcing'] = DataLoader(
                 dataset_obj, batch_size=16, shuffle=shuffle,
-                num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-                collate_fn=self._collate_fn_teacher_forcing
+                collate_fn=self._collate_fn_teacher_forcing,
+                **optimized_kwargs
             )
 
             # Cocktail party dataloader
             if 'cocktail_party' in self.task_configs:
                 dataloaders[split_name]['cocktail_party'] = DataLoader(
                     dataset_obj, batch_size=8, shuffle=shuffle,
-                    num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-                    collate_fn=self._collate_fn_cocktail_party
+                    collate_fn=self._collate_fn_cocktail_party,
+                    **optimized_kwargs
                 )
 
         return dataloaders
