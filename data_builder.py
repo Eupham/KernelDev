@@ -506,31 +506,30 @@ class DataBuilder:
 
             # 4. Create distractors from other batch items (also from context only)
             distractors = []
-            for _ in range(num_distractors):
-                attempts = 0
-                while len(distractors) < (_ + 1) and attempts < len(batch) * 2:  # Ensure we get enough distractors
-                    distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
-                    distractor_tokens_padded, _ = batch[distractor_idx]
-                    distractor_tokens_padded = distractor_tokens_padded.tolist()
-                    
-                    try:
-                        first_pad_idx_dist = distractor_tokens_padded.index(pad_id)
-                        distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
-                    except ValueError:
-                        distractor_tokens = distractor_tokens_padded
+            attempts = 0
+            while len(distractors) < num_distractors and attempts < len(batch) * num_distractors * 2:
+                distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
+                distractor_tokens_padded, _ = batch[distractor_idx]
+                distractor_tokens_padded = distractor_tokens_padded.tolist()
+                
+                try:
+                    first_pad_idx_dist = distractor_tokens_padded.index(pad_id)
+                    distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
+                except ValueError:
+                    distractor_tokens = distractor_tokens_padded
 
-                    # Find [CLS] in distractor to get context only
-                    try:
-                        cls_idx_dist = distractor_tokens.index(cls_token)
-                        distractor_context = distractor_tokens[cls_idx_dist + 1:]
-                    except ValueError:
-                        distractor_context = distractor_tokens
+                # Find [CLS] in distractor to get context only
+                try:
+                    cls_idx_dist = distractor_tokens.index(cls_token)
+                    distractor_context = distractor_tokens[cls_idx_dist + 1:]
+                except ValueError:
+                    distractor_context = distractor_tokens
 
-                    if len(distractor_context) > span_size:
-                        distractor_start = random.randint(0, len(distractor_context) - span_size)
-                        distractor_span = distractor_context[distractor_start : distractor_start + span_size]
-                        distractors.append(distractor_span)
-                    attempts += 1
+                if len(distractor_context) > span_size:
+                    distractor_start = random.randint(0, len(distractor_context) - span_size)
+                    distractor_span = distractor_context[distractor_start : distractor_start + span_size]
+                    distractors.append(distractor_span)
+                attempts += 1
 
             # If we couldn't get enough distractors, pad with copies/variations
             while len(distractors) < num_distractors:
