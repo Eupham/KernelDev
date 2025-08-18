@@ -204,10 +204,21 @@ class GPTModel(nn.Module):
             span_id[~in_span] = -1
             is_prefix = (x == cls_token_id)
         else:
-            # Create dummy tensors when no attention mask is provided
+            # Create metadata tensors for teacher forcing
             in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.full((batch_size, seq_len), -1, dtype=torch.int32, device=x.device)
+            span_id = torch.zeros((batch_size, seq_len), dtype=torch.long, device=x.device)  # Use 0 for non-span tokens
+            
+            # For teacher forcing, mark prefix tokens (task instructions + [CLS])
+            cls_token_id = SPECIAL_TOKENS['[CLS]']
             is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+            
+            # Find [CLS] positions and mark everything up to and including [CLS] as prefix
+            for batch_idx in range(batch_size):
+                cls_positions = (x[batch_idx] == cls_token_id).nonzero(as_tuple=True)[0]
+                if len(cls_positions) > 0:
+                    # Mark everything up to and including the first [CLS] as prefix
+                    cls_pos = cls_positions[0].item()
+                    is_prefix[batch_idx, :cls_pos + 1] = True
 
         # Apply transformer blocks
         for block in self.blocks:
@@ -215,7 +226,9 @@ class GPTModel(nn.Module):
                 # For cocktail party, don't pass the old attention_mask, use metadata tensors
                 x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
             else:
-                x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+                # For teacher forcing, use cocktail party attention but with proper prefix setup
+                # This ensures prefix is bidirectional and context is causal
+                x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
