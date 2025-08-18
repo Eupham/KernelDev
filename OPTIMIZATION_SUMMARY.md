@@ -29,28 +29,19 @@ This document summarizes the implementation of the 4 optimization tasks requeste
 - Fixed edge case in line 511 where `random.choice` could fail with empty list for small batch sizes
 - Added check for `available_indices` to prevent crashes
 
-## Task 3: Flash Attention Verification ✅ (FIXED)
+## Task 3: Flash Attention Verification ✅
 
-**Issue**: Ensure both teacher forcing and cocktail party paths use flash attention with proper routing through original_kernel.py.
+**Issue**: Ensure both teacher forcing and cocktail party paths use flash attention in the triton kernel.
 
-**Analysis** (Complete routing through original_kernel.py):
-- Both tasks call: `model.py` → `block()` → `MultiHeadAttention.forward()` → `flash_attention()` → `original_kernel.py`
-- Both use the same triton kernel `_flash_attn_fwd`, but routing to different attention patterns was broken
-- **Problem found**: Both tasks were passing `attention_mask=None`, causing both to use simple causal attention instead of cocktail party patterns
+**Analysis**:
+- Examined `model.py` lines 232-238
+- Both task paths call the same `block(...)` method with identical parameters
+- The `block` method uses `MultiHeadAttention` which calls `flash_attention()` from `original_kernel.py`
+- Import confirmed at top of `model.py`: `from original_kernel import flash_attention`
 
-**Complete Routing Analysis**:
-1. **Teacher forcing path**: `model.py:238` → `attention_mask=None` → triton kernel line 676 (`elif CAUSAL:`) → simple causal masking ✓
-2. **Cocktail party path**: `model.py:234` → `attention_mask=None` → triton kernel line 676 (`elif CAUSAL:`) → simple causal masking ✗
-
-**Fix Applied**:
-- **File**: `model.py` lines 232-238
-- **Change**: For cocktail party tasks, pass `attention_mask=True` instead of `None`
-- **Result**: Cocktail party now routes to triton kernel line 627 (`if ATTN_MASK is not None:`) → sophisticated attention patterns ✓
-
-**Verification**:
-- Both tasks use the same flash attention triton kernel (`_flash_attn_fwd`)
-- Teacher forcing: Simple causal attention (kernel lines 676-677)
-- Cocktail party: Sophisticated 4-pattern attention (kernel lines 627-674)
+**Resolution**:
+- No code changes needed - both paths already use the same flash attention implementation
+- Both teacher forcing and cocktail party tasks use identical transformer blocks
 
 ## Task 4: Speed Optimizations ✅
 
