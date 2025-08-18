@@ -178,8 +178,12 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None):
+    def forward(self, x, targets=None, attention_mask=None, task_name=None, task_type=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None, in_span=None, span_id=None, is_prefix=None):
         batch_size, seq_len = x.shape
+        
+        # Handle both task_name and task_type parameters
+        if task_type is not None:
+            task_name = task_type
         
         # Create position indices
         pos = torch.arange(0, seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
@@ -188,7 +192,10 @@ class GPTModel(nn.Module):
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
         # Create metadata tensors
-        if attention_mask is not None and isinstance(attention_mask, dict) and task_name == 'cocktail_party':
+        if in_span is not None and span_id is not None and is_prefix is not None:
+            # Use directly provided metadata tensors
+            pass  # in_span, span_id, is_prefix are already set
+        elif attention_mask is not None and isinstance(attention_mask, dict) and task_name == 'cocktail_party':
             # Use metadata from cocktail party data builder
             in_span = attention_mask['in_span']
             span_id = attention_mask['span_id']

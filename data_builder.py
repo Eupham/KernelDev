@@ -112,32 +112,79 @@ class DataBuilder:
             print("Will attempt to load all available samples from the dataset.")
 
     def _tokenize_text(self, text: str) -> list:
-        # This is a simplified tokenizer. A real implementation would use a pre-trained tokenizer.
+        """
+        Tokenize text using UTF-8 byte-level tokenization with proper multibyte support.
+        
+        This function properly handles multibyte UTF-8 characters by encoding the entire
+        character and including all bytes in the token sequence.
+        """
         tokens = []
         i = 0
         while i < len(text):
             found = False
+            # First check for special tokens
             for token_str, token_id in SPECIAL_TOKENS.items():
                 if text[i:].startswith(token_str):
                     tokens.append(token_id)
                     i += len(token_str)
                     found = True
                     break
+            
             if not found:
-                tokens.append(text[i].encode('utf-8')[0] + NUM_SPECIAL_TOKENS)
+                # Handle UTF-8 characters properly by encoding the entire character
+                char = text[i]
+                utf8_bytes = char.encode('utf-8')
+                
+                # Add all bytes of the UTF-8 character to tokens
+                for byte_val in utf8_bytes:
+                    tokens.append(byte_val + NUM_SPECIAL_TOKENS)
+                
                 i += 1
         return tokens
 
     def _detokenize_bytes(self, tokens: list, skip_special_tokens=False) -> str:
+        """
+        Detokenize UTF-8 byte tokens back to text with proper multibyte reconstruction.
+        
+        This function reconstructs multibyte UTF-8 characters by collecting bytes
+        and decoding them properly.
+        """
         special_token_map = {v: k for k, v in SPECIAL_TOKENS.items()}
-        decoded_tokens = []
+        byte_sequence = []
+        text_parts = []
+        
         for t in tokens:
             if t in special_token_map:
+                # Process any pending byte sequence first
+                if byte_sequence:
+                    try:
+                        decoded_text = bytes(byte_sequence).decode('utf-8', errors='replace')
+                        text_parts.append(decoded_text)
+                        byte_sequence = []
+                    except UnicodeDecodeError:
+                        # Handle corrupted sequences gracefully
+                        text_parts.append('�' * len(byte_sequence))
+                        byte_sequence = []
+                
+                # Add special token if not skipping
                 if not skip_special_tokens:
-                    decoded_tokens.append(special_token_map[t])
+                    text_parts.append(special_token_map[t])
             else:
-                decoded_tokens.append(chr(t - NUM_SPECIAL_TOKENS))
-        return "".join(decoded_tokens)
+                # Collect bytes for UTF-8 reconstruction
+                byte_val = t - NUM_SPECIAL_TOKENS
+                if 0 <= byte_val <= 255:  # Valid byte range
+                    byte_sequence.append(byte_val)
+        
+        # Process any remaining byte sequence
+        if byte_sequence:
+            try:
+                decoded_text = bytes(byte_sequence).decode('utf-8', errors='replace')
+                text_parts.append(decoded_text)
+            except UnicodeDecodeError:
+                # Handle corrupted sequences gracefully
+                text_parts.append('�' * len(byte_sequence))
+        
+        return "".join(text_parts)
 
     def _process_iterable_dataset(self, dataset_iterable, dataset_name_logging: str) -> list:
         samples = []
@@ -522,14 +569,15 @@ class DataBuilder:
                 wrapper_tokens.extend([SPECIAL_TOKENS['[SPAN]']] + span_toks + [SPECIAL_TOKENS['[ES]']])
             wrapper_len = len(wrapper_tokens) + 1  # +1 for [MASKQ]
 
-            # Ensure we never truncate islands or [MASKQ] by checking space requirements
+            # Extend max tokens for cocktail party task to accommodate special tokens and distractors
             required_space = len(item['task_prefix']) + wrapper_len
             if required_space >= self.seq_len:
-                # If wrapper + prefix is too big, skip this item
-                continue
-
-            # Calculate how much context we can include
-            available_context_len = self.seq_len - required_space
+                # Instead of skipping, extend the sequence length for this batch
+                extended_seq_len = required_space + min(50, len(item['context_tokens']))  # Add some context
+                available_context_len = extended_seq_len - required_space
+            else:
+                extended_seq_len = self.seq_len
+                available_context_len = self.seq_len - required_space
             
             # Create masked context (mask the span we sampled)
             masked_context = (item['context_tokens'][:item['span_start_in_context']] + 
@@ -542,14 +590,14 @@ class DataBuilder:
             # Stitch final sequence together: {prefix}[CLS]{context}[SPAN]...[ES][SPAN]...[ES][MASKQ]
             final_sequence = item['task_prefix'] + truncated_masked_context + wrapper_tokens + [SPECIAL_TOKENS['[MASKQ]']]
 
-            # Pad to exact length (no truncation since we pre-calculated space)
-            if len(final_sequence) < self.seq_len:
-                final_sequence.extend([pad_id] * (self.seq_len - len(final_sequence)))
+            # Pad to the extended length to accommodate all special tokens
+            if len(final_sequence) < extended_seq_len:
+                final_sequence.extend([pad_id] * (extended_seq_len - len(final_sequence)))
 
-            # Build metadata tensors: in_span, span_id, is_prefix
-            in_span = torch.zeros(self.seq_len, dtype=torch.bool)
-            span_ids = torch.zeros(self.seq_len, dtype=torch.long)
-            is_prefix = torch.zeros(self.seq_len, dtype=torch.bool)
+            # Build metadata tensors: in_span, span_id, is_prefix (use extended length)
+            in_span = torch.zeros(extended_seq_len, dtype=torch.bool)
+            span_ids = torch.zeros(extended_seq_len, dtype=torch.long)
+            is_prefix = torch.zeros(extended_seq_len, dtype=torch.bool)
             
             # Mark prefix tokens (task instructions + [CLS])
             prefix_len = len(item['task_prefix'])
@@ -563,13 +611,13 @@ class DataBuilder:
             es_token = SPECIAL_TOKENS['[ES]']
             
             for span_idx, (span_toks, _) in enumerate(all_spans_with_labels):
-                if current_pos >= self.seq_len:
+                if current_pos >= extended_seq_len:
                     break
                     
                 # Find [SPAN] token
-                if current_pos < self.seq_len and final_sequence[current_pos] == span_token:
+                if current_pos < extended_seq_len and final_sequence[current_pos] == span_token:
                     span_start = current_pos
-                    span_end = min(current_pos + len(span_toks) + 2, self.seq_len)  # +2 for [SPAN] and [ES]
+                    span_end = min(current_pos + len(span_toks) + 2, extended_seq_len)  # +2 for [SPAN] and [ES]
                     
                     # Mark all tokens in this span (including [SPAN] and [ES])
                     in_span[span_start:span_end] = True
