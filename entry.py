@@ -333,7 +333,7 @@ def start_actual_training(cli_args):
     if 'train' in dataloaders and 'cocktail_party' in dataloaders['train']:
         print("\n=== Data Sample (Cocktail Party) ===")
         for batch in dataloaders['train']['cocktail_party']:
-            inputs, correct_idx, _ = batch
+            inputs, correct_idx = batch
             print(f"Batch shape: {inputs.shape}")
             print(f"Sample tokens: {inputs[0][:20].tolist()}")
             
