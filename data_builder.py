@@ -230,7 +230,7 @@ class DataBuilder:
         try:
             print("Attempting Method 1: Load C4 'en' (streaming)...")
             dataset_stream = load_dataset(
-                self.dataset_name, name=self.dataset_config, streaming=True, split='train', trust_remote_code=True
+                self.dataset_name, name=self.dataset_config, streaming=True, split='train'
             )
             print("C4 'en' (streaming) load_dataset call succeeded. Processing samples...")
             loaded_samples = self._process_iterable_dataset(dataset_stream, "C4 'en' streaming")
@@ -255,7 +255,7 @@ class DataBuilder:
                     fetch_n = max(fetch_n, 100) # Ensure a minimum fetch
                     print(f"Will try to fetch up to {fetch_n} records for non-streaming C4 'en'.")
                     dataset_non_stream = load_dataset(
-                        self.dataset_name, name=self.dataset_config, split=f'train[:{fetch_n}]', trust_remote_code=True
+                        self.dataset_name, name=self.dataset_config, split=f'train[:{fetch_n}]'
                     )
                     print("C4 'en' (non-streaming) load_dataset call succeeded. Processing samples...")
                     loaded_samples = self._process_iterable_dataset(dataset_non_stream, "C4 'en' non-streaming")
@@ -279,7 +279,7 @@ class DataBuilder:
             # Attempt 2: C4 without 'en' config (streaming)
             try:
                 print("Attempting Method 2: Load C4 (no config) (streaming)...")
-                dataset_m2 = load_dataset(self.dataset_name, streaming=True, split='train', trust_remote_code=True)
+                dataset_m2 = load_dataset(self.dataset_name, streaming=True, split='train')
                 print("C4 (no config, streaming) load_dataset call succeeded. Processing samples...")
                 loaded_samples = self._process_iterable_dataset(dataset_m2, "C4 (no config) streaming")
                 if not loaded_samples and self.max_samples > 0:
