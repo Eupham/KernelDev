@@ -202,7 +202,15 @@ class GPTModel(nn.Module):
             in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
             span_id = torch.cumsum((x == span_start_id).int(), dim=1)
             span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
+            
+            # For teacher forcing: prefix includes everything before and including [CLS]
+            # Find [CLS] positions and mark everything up to and including [CLS] as prefix
+            is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
+            for batch_idx in range(batch_size):
+                cls_positions = (x[batch_idx] == cls_token_id).nonzero(as_tuple=True)[0]
+                if len(cls_positions) > 0:
+                    cls_idx = cls_positions[0].item()  # Take first [CLS] 
+                    is_prefix[batch_idx, :cls_idx + 1] = True  # Include everything up to and including [CLS]
         else:
             # Create dummy tensors when no attention mask is provided
             in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
@@ -215,7 +223,8 @@ class GPTModel(nn.Module):
                 # For cocktail party, don't pass the old attention_mask, use metadata tensors
                 x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
             else:
-                x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+                # For teacher forcing, also use metadata tensors to ensure proper prefix/context behavior
+                x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)

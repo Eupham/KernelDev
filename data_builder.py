@@ -435,64 +435,115 @@ class DataBuilder:
             except ValueError:
                 original_tokens = original_tokens_padded
 
-            span_size = random.randint(min_span_size, max_span_size)
-            if len(original_tokens) <= span_size:
-                continue
-            span_start = random.randint(0, len(original_tokens) - span_size)
-            true_span = original_tokens[span_start : span_start + span_size]
+            # 2. Find the context section (after [CLS] token) to avoid sampling from task instructions
+            cls_token = SPECIAL_TOKENS['[CLS]']
+            try:
+                cls_idx = original_tokens.index(cls_token)
+                context_start = cls_idx + 1  # Start after [CLS]
+                context_tokens = original_tokens[context_start:]
+                prefix_tokens = original_tokens[:cls_idx + 1]  # Include [CLS] in prefix
+            except ValueError:
+                # No [CLS] found, treat all as context (fallback)
+                context_tokens = original_tokens
+                prefix_tokens = []
+                context_start = 0
 
+            # 3. Sample span from context only (prevents sampling from task instructions)
+            span_size = random.randint(min_span_size, max_span_size)
+            if len(context_tokens) <= span_size:
+                continue
+            
+            # Sample relative to context, then adjust for absolute position
+            context_span_start = random.randint(0, len(context_tokens) - span_size)
+            absolute_span_start = context_start + context_span_start
+            true_span = original_tokens[absolute_span_start : absolute_span_start + span_size]
+
+            # 4. Collect exactly num_distractors distractors to ensure batch consistency
             distractors = []
-            for _ in range(num_distractors):
+            max_attempts = len(batch) * 3  # Prevent infinite loop
+            attempts = 0
+            
+            while len(distractors) < num_distractors and attempts < max_attempts:
+                attempts += 1
                 distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
                 distractor_tokens_padded, _ = batch[distractor_idx]
                 distractor_tokens_padded = distractor_tokens_padded.tolist()
+                
                 try:
                     first_pad_idx_dist = distractor_tokens_padded.index(pad_id)
                     distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
                 except ValueError:
                     distractor_tokens = distractor_tokens_padded
 
-                if len(distractor_tokens) <= span_size:
+                # Find context section in distractor too
+                try:
+                    distractor_cls_idx = distractor_tokens.index(cls_token)
+                    distractor_context_start = distractor_cls_idx + 1
+                    distractor_context = distractor_tokens[distractor_context_start:]
+                except ValueError:
+                    distractor_context = distractor_tokens
+                    distractor_context_start = 0
+
+                if len(distractor_context) <= span_size:
                     continue
-                distractor_start = random.randint(0, len(distractor_tokens) - span_size)
-                distractor_span = distractor_tokens[distractor_start : distractor_start + span_size]
+                    
+                # Sample from distractor context only
+                distractor_span_start = random.randint(0, len(distractor_context) - span_size)
+                distractor_span = distractor_context[distractor_span_start : distractor_span_start + span_size]
                 distractors.append(distractor_span)
 
-            if not distractors:
-                continue
+            # 5. Pad distractors if we couldn't get enough (batch consistency)
+            while len(distractors) < num_distractors:
+                # Use the true span as a fallback distractor (marked as distractor)
+                distractors.append(true_span[:])
 
-            all_spans_with_labels = [(true_span, 1)] + [(d, 0) for d in distractors]
+            # Ensure we have exactly num_distractors + 1 gold = total spans
+            all_spans_with_labels = [(true_span, 1)] + [(d, 0) for d in distractors[:num_distractors]]
             random.shuffle(all_spans_with_labels)
             correct_idx = [label for _, label in all_spans_with_labels].index(1)
 
-            # 2. Calculate wrapper length to reserve space (including [MASKQ])
+            # 6. Calculate wrapper length to reserve space (including [MASKQ])
             wrapper_tokens = []
             for span_toks, _ in all_spans_with_labels:
                 wrapper_tokens.extend([SPECIAL_TOKENS['[SPAN]']] + span_toks + [SPECIAL_TOKENS['[ES]']])
             wrapper_len = len(wrapper_tokens) + 1  # +1 for [MASKQ]
 
-            # 3. Truncate context to fit wrappers
+            # 7. Ensure we don't truncate islands or MASKQ by planning sequence length
+            if wrapper_len >= self.seq_len:
+                # If wrapper alone exceeds seq_len, we need to truncate spans themselves
+                # This is a fallback - ideally spans should be sized to fit
+                continue
+
+            # 8. Truncate context to fit wrappers, ensuring MASKQ fits
             available_context_len = self.seq_len - wrapper_len
             available_context_len = max(0, available_context_len)
 
-            masked_context = (original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:])
+            # Create masked context preserving prefix structure
+            if prefix_tokens:
+                masked_context = prefix_tokens + original_tokens[context_start:absolute_span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[absolute_span_start + span_size:]
+            else:
+                masked_context = original_tokens[:absolute_span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[absolute_span_start + span_size:]
+            
             truncated_masked_context = masked_context[:available_context_len]
 
-            # 4. Stitch final sequence together (add [MASKQ] at the end)
+            # 9. Stitch final sequence together (add [MASKQ] at the end)
             final_sequence = truncated_masked_context + wrapper_tokens + [SPECIAL_TOKENS['[MASKQ]']]
 
-            # 5. Final guard-rail truncation and padding
-            final_sequence = final_sequence[:self.seq_len]
+            # 10. Verify no truncation of islands or MASKQ
+            if len(final_sequence) > self.seq_len:
+                # This shouldn't happen with our planning, but safety check
+                continue
+
+            # 11. Add padding if needed
             if len(final_sequence) < self.seq_len:
                 final_sequence.extend([pad_id] * (self.seq_len - len(final_sequence)))
 
-            # 6. Build metadata tensors: in_span, span_id, is_prefix
+            # 12. Build metadata tensors: in_span, span_id, is_prefix
             in_span = torch.zeros(self.seq_len, dtype=torch.bool)
             span_ids = torch.zeros(self.seq_len, dtype=torch.long)
             is_prefix = torch.zeros(self.seq_len, dtype=torch.bool)
             
             # Mark prefix tokens (everything before first [CLS] and including [CLS])
-            cls_token = SPECIAL_TOKENS['[CLS]']
             try:
                 cls_idx = final_sequence.index(cls_token)
                 is_prefix[:cls_idx + 1] = True  # Include [CLS] itself as prefix
@@ -512,12 +563,12 @@ class DataBuilder:
                     
                 # Find [SPAN] token
                 if current_pos < self.seq_len and final_sequence[current_pos] == span_token:
-                    span_start = current_pos
-                    span_end = min(current_pos + len(span_toks) + 2, self.seq_len)  # +2 for [SPAN] and [ES]
+                    span_start_pos = current_pos
+                    span_end_pos = min(current_pos + len(span_toks) + 2, self.seq_len)  # +2 for [SPAN] and [ES]
                     
                     # Mark all tokens in this span (including [SPAN] and [ES])
-                    in_span[span_start:span_end] = True
-                    span_ids[span_start:span_end] = span_idx + 1  # Use 1-based span IDs
+                    in_span[span_start_pos:span_end_pos] = True
+                    span_ids[span_start_pos:span_end_pos] = span_idx + 1  # Use 1-based span IDs
                     
                     current_pos += len(span_toks) + 2
                 else:
@@ -530,7 +581,8 @@ class DataBuilder:
                 # [MASKQ] is not in_span but has special access patterns
                 span_ids[maskq_idx] = -1  # Special marker for [MASKQ]
             except ValueError:
-                pass
+                # This shouldn't happen since we added [MASKQ], but safety check
+                continue
             
             # Return metadata instead of old attention mask
             batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
