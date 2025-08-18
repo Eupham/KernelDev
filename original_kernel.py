@@ -1,3 +1,28 @@
+"""
+Specialized Flash Attention Implementation with Hierarchical Attention Patterns
+
+This module implements memory-efficient flash attention with support for sophisticated
+attention patterns required for cocktail party tasks. The implementation maintains
+mathematical equivalence to standard attention while reducing memory complexity from
+O(n²) to O(n) through block-wise computation.
+
+Key Components:
+- Flash Attention Forward/Backward Kernels: Triton-based GPU kernels for efficient computation
+- Hierarchical Attention Patterns: 4-section attention structure for cocktail party tasks
+- Incoherent Processing: Hadamard transforms to reduce quantization error
+- GPU Optimization: Auto-tuning and hardware-specific configurations
+- Mixed Precision Support: fp16, bf16, and fp32 computation modes
+
+Attention Hierarchy:
+1. Prefix Section: Bidirectional within prefix (tokens before/including [CLS])
+2. Context Section: Causal within context + access to prefix  
+3. Span Islands: Bidirectional within spans + access to context (isolated from other spans)
+4. Bridge Section: [MASKQ] token with access to all spans + prefix (aggregator hub)
+
+This implementation maintains flash attention benefits while enabling complex attention
+patterns necessary for span-based reasoning tasks.
+"""
+
 import logging
 import math
 import torch._dynamo
@@ -8,11 +33,18 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+# =============================================================================
+# Configuration Constants
+# =============================================================================
+
 MAX_TILE_SIZE = 512  # Reduced for T4 compatibility
 MIN_TILE_SIZE = 16  # Reduced for T4 compatibility
 
 
-# Incoherent processing utilities for reducing quantization error
+# =============================================================================
+# Incoherent Processing Utilities
+# =============================================================================
+
 def generate_hadamard_signs(head_dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """Generate random signs for Hadamard transform."""
     return torch.randint(0, 2, (head_dim,), device=device, dtype=dtype) * 2 - 1
@@ -424,6 +456,10 @@ def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
     return configs
 
 
+# =============================================================================
+# Flash Attention Triton Kernels
+# =============================================================================
+
 # fmt: off
 @triton.heuristics(
     dict(
@@ -603,20 +639,39 @@ def _flash_attn_fwd(
             q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
             q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
 
-            # --- Start of new mask computation ---
+            # --- Cocktail Party Attention Pattern ---
             # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
-            same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
-            span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
-            causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
-
-            prefix_keys = k_is_prefix[None, :]
-            prefix_q = q_is_prefix[:, None]
-
-            # Rows that are prefix queries get everything
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
+            
+            # Check if query/key tokens are special types
+            q_is_maskq = (q_span_id[:, None] == -1)  # [MASKQ] marked with span_id = -1
+            k_is_maskq = (k_span_id[None, :] == -1)
+            k_is_cls_or_prefix = k_is_prefix[None, :]
+            
+            # Pattern 1: [CLS]/prefix tokens can only see within prefix (bidirectional within prefix)
+            prefix_to_prefix = q_is_prefix[:, None] & k_is_prefix[None, :]
+            
+            # Pattern 2: Context tokens (non-span, non-prefix) causal within context + can see prefix
+            q_is_context = ~q_in_span[:, None] & ~q_is_prefix[:, None] & ~q_is_maskq
+            k_is_context = ~k_in_span[None, :] & ~k_is_prefix[None, :] & ~k_is_maskq
+            context_causal = q_is_context & k_is_context & (q_tile_indices[:, None] >= kv_indices[None, :])
+            context_to_prefix = q_is_context & k_is_cls_or_prefix
+            
+            # Pattern 3: Span tokens bidirectional within same span + can see context (NO MASKQ)
+            same_span = (q_in_span[:, None] & k_in_span[None, :] & 
+                        (q_span_id[:, None] == k_span_id[None, :]) & 
+                        (q_span_id[:, None] > 0))  # Exclude span_id=0 and span_id=-1
+            span_to_context = q_in_span[:, None] & k_is_context
+            
+            # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
+            maskq_to_spans = q_is_maskq & k_in_span[None, :]
+            maskq_to_cls = q_is_maskq & k_is_cls_or_prefix
+            
+            # Combine all allowed patterns
+            mask = (prefix_to_prefix | 
+                   context_causal | context_to_prefix |
+                   same_span | span_to_context |
+                   maskq_to_spans | maskq_to_cls)
+            # --- End of Cocktail Party Attention Pattern ---
 
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
@@ -1348,18 +1403,39 @@ def _flash_attn_bwd_dq(
             q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
             q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
-            # --- Start of new mask computation ---
-            same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
-            span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
-            causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
-
-            prefix_keys = k_is_prefix[None, :]
-            prefix_q = q_is_prefix[:, None]
-
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
+            # --- Cocktail Party Attention Pattern ---
+            # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
+            
+            # Check if query/key tokens are special types
+            q_is_maskq = (q_span_id[:, None] == -1)  # [MASKQ] marked with span_id = -1
+            k_is_maskq = (k_span_id[None, :] == -1)
+            k_is_cls_or_prefix = k_is_prefix[None, :]
+            
+            # Pattern 1: [CLS]/prefix tokens can only see within prefix (bidirectional within prefix)
+            prefix_to_prefix = q_is_prefix[:, None] & k_is_prefix[None, :]
+            
+            # Pattern 2: Context tokens (non-span, non-prefix) causal within context + can see prefix
+            q_is_context = ~q_in_span[:, None] & ~q_is_prefix[:, None] & ~q_is_maskq
+            k_is_context = ~k_in_span[None, :] & ~k_is_prefix[None, :] & ~k_is_maskq
+            context_causal = q_is_context & k_is_context & (q_tile_indices[:, None] >= kv_indices[None, :])
+            context_to_prefix = q_is_context & k_is_cls_or_prefix
+            
+            # Pattern 3: Span tokens bidirectional within same span + can see context (NO MASKQ)
+            same_span = (q_in_span[:, None] & k_in_span[None, :] & 
+                        (q_span_id[:, None] == k_span_id[None, :]) & 
+                        (q_span_id[:, None] > 0))  # Exclude span_id=0 and span_id=-1
+            span_to_context = q_in_span[:, None] & k_is_context
+            
+            # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
+            maskq_to_spans = q_is_maskq & k_in_span[None, :]
+            maskq_to_cls = q_is_maskq & k_is_cls_or_prefix
+            
+            # Combine all allowed patterns
+            mask = (prefix_to_prefix | 
+                   context_causal | context_to_prefix |
+                   same_span | span_to_context |
+                   maskq_to_spans | maskq_to_cls)
+            # --- End of Cocktail Party Attention Pattern ---
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
         else:
@@ -1487,18 +1563,39 @@ def _flash_attn_bwd_dkdv(
             q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
             q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
-            # --- Start of new mask computation ---
-            same_span = (q_in_span[None, :] & k_in_span[:, None] & (q_span_id[None, :] == k_span_id[:, None]))
-            span_to_ns = q_in_span[None, :] & ~k_in_span[:, None]
-            causal_ns = ~q_in_span[None, :] & ~k_in_span[:, None] & (q_tile_indices[None, :] >= kv_indices[:, None])
-
-            prefix_keys = k_is_prefix[:, None]
-            prefix_q = q_is_prefix[None, :]
-
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
+            # --- Cocktail Party Attention Pattern ---
+            # Note: indices are transposed for backward pass [TILE_K_SIZE, TILE_Q_SIZE]
+            
+            # Check if query/key tokens are special types
+            q_is_maskq = (q_span_id[None, :] == -1)  # [MASKQ] marked with span_id = -1
+            k_is_maskq = (k_span_id[:, None] == -1)
+            k_is_cls_or_prefix = k_is_prefix[:, None]
+            
+            # Pattern 1: [CLS]/prefix tokens can only see within prefix (bidirectional within prefix)
+            prefix_to_prefix = q_is_prefix[None, :] & k_is_prefix[:, None]
+            
+            # Pattern 2: Context tokens (non-span, non-prefix) causal within context + can see prefix
+            q_is_context = ~q_in_span[None, :] & ~q_is_prefix[None, :] & ~q_is_maskq
+            k_is_context = ~k_in_span[:, None] & ~k_is_prefix[:, None] & ~k_is_maskq
+            context_causal = q_is_context & k_is_context & (q_tile_indices[None, :] >= kv_indices[:, None])
+            context_to_prefix = q_is_context & k_is_cls_or_prefix
+            
+            # Pattern 3: Span tokens bidirectional within same span + can see context (NO MASKQ)
+            same_span = (q_in_span[None, :] & k_in_span[:, None] & 
+                        (q_span_id[None, :] == k_span_id[:, None]) & 
+                        (q_span_id[None, :] > 0))  # Exclude span_id=0 and span_id=-1
+            span_to_context = q_in_span[None, :] & k_is_context
+            
+            # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
+            maskq_to_spans = q_is_maskq & k_in_span[:, None]
+            maskq_to_cls = q_is_maskq & k_is_cls_or_prefix
+            
+            # Combine all allowed patterns
+            mask = (prefix_to_prefix | 
+                   context_causal | context_to_prefix |
+                   same_span | span_to_context |
+                   maskq_to_spans | maskq_to_cls)
+            # --- End of Cocktail Party Attention Pattern ---
         elif CAUSAL:
             mask = q_tile_indices[None, :] >= kv_indices[:, None]
         else:
@@ -2195,6 +2292,10 @@ class IncoherentFlashAttention(torch.autograd.Function):
         return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
+# =============================================================================
+# Main Flash Attention Interface
+# =============================================================================
+
 def flash_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2295,6 +2396,10 @@ def is_hopper_gpu() -> bool:
     major, minor = torch.cuda.get_device_capability()
     return major >= 9
 
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
 def should_use_incoherent_processing(incoherent_processing: bool | None = None) -> bool:
     """

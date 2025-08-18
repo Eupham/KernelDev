@@ -1,3 +1,19 @@
+"""
+Training Infrastructure for Hierarchical Attention Models
+
+This module provides comprehensive training and evaluation framework for GPT models
+with support for both teacher forcing and cocktail party tasks. Includes distributed
+training, mixed precision, and task-specific evaluation metrics.
+
+Key Components:
+- TrainingConfig: Configuration management for training parameters
+- TrainingMetrics: Performance tracking and logging
+- Trainer: Main training loop with multi-task support
+- Evaluation utilities for both task types
+- Text generation with advanced sampling controls
+- Distributed training coordination
+"""
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -15,6 +31,14 @@ import json
 import math
 from pathlib import Path
 
+# =============================================================================
+# Configuration Classes
+# =============================================================================
+
+
+# =============================================================================
+# Configuration Classes
+# =============================================================================
 
 class TrainingConfig:
     """Configuration class for training parameters."""
@@ -145,6 +169,9 @@ def init_distributed(trainer_instance: 'Trainer'):
         trainer_instance.config.local_rank = 0 # Default for non-distributed
         print(f"Running in non-distributed mode on device: {trainer_instance.config.device}")
 
+# =============================================================================
+# Metrics Tracking
+# =============================================================================
 
 class TrainingMetrics:
     """Class to track and manage training metrics."""
@@ -225,6 +252,9 @@ class TrainingMetrics:
         }
         torch.save(metrics_dict, filepath)
 
+# =============================================================================
+# Main Trainer Class
+# =============================================================================
 
 class Trainer:
     """Main training class that handles the training loop."""
@@ -283,16 +313,22 @@ class Trainer:
     def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step."""
         if task_name == 'cocktail_party':
-            inputs, correct_idx, attn_mask = batch
+            inputs, correct_idx, metadata = batch
             if inputs.numel() == 0:
                 return 0.0
-            inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
+            inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
+            
+            # Move metadata tensors to device
+            if isinstance(metadata, dict):
+                metadata = {k: v.to(self.config.device) for k, v in metadata.items()}
+            else:
+                metadata = metadata.to(self.config.device)
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                    scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
             else:
-                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
 
         else:
             x, y = batch
@@ -334,16 +370,22 @@ class Trainer:
 
                     loss = None
                     if task_name == 'cocktail_party':
-                        inputs, correct_idx, attn_mask = batch
+                        inputs, correct_idx, metadata = batch
                         if inputs.numel() == 0:
                             continue
-                        inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
+                        inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
+                        
+                        # Move metadata tensors to device
+                        if isinstance(metadata, dict):
+                            metadata = {k: v.to(self.config.device) for k, v in metadata.items()}
+                        else:
+                            metadata = metadata.to(self.config.device)
 
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
-                                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
                         else:
-                            scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                            scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
 
                         if loss is not None and scores.numel() > 0:
                             metrics = self._calculate_accuracy(scores, correct_idx)

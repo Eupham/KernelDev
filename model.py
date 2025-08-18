@@ -1,8 +1,29 @@
+"""
+GPT Model Implementation with Hierarchical Attention Support
+
+This module implements a GPT transformer architecture with support for both standard
+causal attention and specialized hierarchical attention patterns for cocktail party tasks.
+
+Key Components:
+- GPTModel: Main transformer with configurable attention modes
+- MultiHeadAttention: Attention mechanism with flash attention integration
+- TransformerLayer: Standard transformer blocks with attention and feed-forward
+- SwiGLU: Efficient activation function for improved performance  
+- RMSNorm: RMS normalization for numerical stability
+
+The model supports two distinct operating modes:
+1. Teacher Forcing: Standard causal language modeling
+2. Cocktail Party: Hierarchical attention for span-based reasoning
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from original_kernel import flash_attention
 
+# =============================================================================
+# Normalization and Activation Functions
+# =============================================================================
 
 class RMSNorm(nn.Module):
     """RMS normalization without learnable weight parameters."""
@@ -27,6 +48,9 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+# =============================================================================
+# Attention Mechanism
+# =============================================================================
 
 class MultiHeadAttention(nn.Module):
     """Multi-head attention using flash attention kernel."""
@@ -68,6 +92,9 @@ class MultiHeadAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(out)
 
+# =============================================================================
+# Transformer Components
+# =============================================================================
 
 class TransformerBlock(nn.Module):
     """Transformer block with pre-normalization."""
@@ -89,6 +116,10 @@ class TransformerBlock(nn.Module):
 
 from data_builder import NUM_BIO_TAGS, SPECIAL_TOKENS, BIO_TAGS
 from torch.distributions import Bernoulli
+
+# =============================================================================
+# Main GPT Model
+# =============================================================================
 
 class GPTModel(nn.Module):
     """GPT-styled model using flash attention kernel."""
@@ -157,7 +188,13 @@ class GPTModel(nn.Module):
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
         # Create metadata tensors
-        if attention_mask is not None:
+        if attention_mask is not None and isinstance(attention_mask, dict) and task_name == 'cocktail_party':
+            # Use metadata from cocktail party data builder
+            in_span = attention_mask['in_span']
+            span_id = attention_mask['span_id']
+            is_prefix = attention_mask['is_prefix']
+        elif attention_mask is not None:
+            # Legacy behavior: generate metadata from tokens
             span_start_id = SPECIAL_TOKENS['[SPAN]']
             span_end_id = SPECIAL_TOKENS['[ES]']
             cls_token_id = SPECIAL_TOKENS['[CLS]']
@@ -174,7 +211,11 @@ class GPTModel(nn.Module):
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            if task_name == 'cocktail_party':
+                # For cocktail party, don't pass the old attention_mask, use metadata tensors
+                x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            else:
+                x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)

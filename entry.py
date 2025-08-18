@@ -1,3 +1,25 @@
+"""
+GPT Model Training Entry Point with Hierarchical Attention Support
+
+This is the main entry script for training GPT models with support for both standard
+teacher forcing and specialized cocktail party tasks. Handles configuration management,
+distributed training setup, precision optimization, and comprehensive training coordination.
+
+Key Features:
+- Multi-GPU distributed training with automatic process spawning
+- Mixed precision training (fp16, bf16, fp32) with automatic GPU detection
+- Memory-aware batch size estimation for optimal resource utilization
+- YAML-based configuration with command-line override support
+- Comprehensive GPU profiling and performance monitoring
+- Task-specific training and evaluation for teacher forcing and cocktail party
+
+Usage:
+    python entry.py                                    # Default configuration
+    python entry.py --config config_fast.yaml         # Custom config file
+    python entry.py --precision bf16 --batch-size 8   # Override specific settings
+    python entry.py --nproc_per_node 4                # 4-GPU distributed training
+"""
+
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -14,11 +36,14 @@ import os
 # Ensure ArgumentParser and REMAINDER are available if argparse is re-imported or used directly
 from argparse import ArgumentParser, REMAINDER
 
-
 # Import our custom modules
 from model import GPTModel
 from data_builder import DataBuilder, create_data_builder
 from train_loop import Trainer, TrainingConfig, create_trainer
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
 
 def find_free_port():
