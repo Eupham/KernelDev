@@ -76,14 +76,14 @@ class MultiHeadAttention(nn.Module):
         
         is_causal = self.causal
 
-        # Use flash attention kernel
+        # Use flash attention kernel - only pass metadata tensors, never attention_mask
         out = flash_attention(
             q=q,
             k=k,
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=attention_mask,
+            attention_mask=None,  # Never pass attention_mask to kernel
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix
@@ -191,51 +191,74 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Create metadata tensors
+        # Create metadata tensors based on provided data or infer from tokens
         if in_span is not None and span_id is not None and is_prefix is not None:
             # Use directly provided metadata tensors
             pass  # in_span, span_id, is_prefix are already set
-        elif attention_mask is not None and isinstance(attention_mask, dict) and task_name == 'cocktail_party':
-            # Use metadata from cocktail party data builder
+        elif attention_mask is not None and isinstance(attention_mask, dict):
+            # Use metadata from data builder (cocktail party)
             in_span = attention_mask['in_span']
             span_id = attention_mask['span_id']
             is_prefix = attention_mask['is_prefix']
-        elif attention_mask is not None:
-            # Legacy behavior: generate metadata from tokens
+        else:
+            # Generate metadata from tokens based on special token positions
             span_start_id = SPECIAL_TOKENS['[SPAN]']
             span_end_id = SPECIAL_TOKENS['[ES]']
             cls_token_id = SPECIAL_TOKENS['[CLS]']
+            maskq_token_id = SPECIAL_TOKENS['[MASKQ]']
+            pad_token_id = SPECIAL_TOKENS['[PAD]']
 
-            in_span = (torch.cumsum((x == span_start_id).int(), dim=1) - torch.cumsum((x == span_end_id).int(), dim=1)) > 0
-            span_id = torch.cumsum((x == span_start_id).int(), dim=1)
-            span_id[~in_span] = -1
-            is_prefix = (x == cls_token_id)
-        else:
-            # Create metadata tensors for teacher forcing
+            # Initialize metadata tensors
             in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            span_id = torch.zeros((batch_size, seq_len), dtype=torch.long, device=x.device)  # Use 0 for non-span tokens
-            
-            # For teacher forcing, mark prefix tokens (task instructions + [CLS])
-            cls_token_id = SPECIAL_TOKENS['[CLS]']
+            span_id = torch.zeros((batch_size, seq_len), dtype=torch.long, device=x.device)
             is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
             
-            # Find [CLS] positions and mark everything up to and including [CLS] as prefix
             for batch_idx in range(batch_size):
-                cls_positions = (x[batch_idx] == cls_token_id).nonzero(as_tuple=True)[0]
+                tokens = x[batch_idx]
+                
+                # Mark prefix tokens (everything up to and including [CLS])
+                cls_positions = (tokens == cls_token_id).nonzero(as_tuple=True)[0]
                 if len(cls_positions) > 0:
-                    # Mark everything up to and including the first [CLS] as prefix
                     cls_pos = cls_positions[0].item()
                     is_prefix[batch_idx, :cls_pos + 1] = True
+                
+                # Track span boundaries for in_span and span_id
+                span_stack = []
+                current_span_id = 0
+                
+                for pos in range(seq_len):
+                    token = tokens[pos].item()
+                    
+                    if token == span_start_id:
+                        # Start of new span
+                        current_span_id += 1
+                        span_stack.append(current_span_id)
+                        in_span[batch_idx, pos] = True
+                        span_id[batch_idx, pos] = current_span_id
+                        
+                    elif token == span_end_id:
+                        # End of current span
+                        if span_stack:
+                            current_span = span_stack.pop()
+                            in_span[batch_idx, pos] = True
+                            span_id[batch_idx, pos] = current_span
+                        
+                    elif token == maskq_token_id:
+                        # [MASKQ] token - mark with special span_id = -1
+                        span_id[batch_idx, pos] = -1
+                        
+                    elif token == pad_token_id:
+                        # PAD tokens - mark with span_id = -2 for kernel to ignore
+                        span_id[batch_idx, pos] = -2
+                        
+                    elif span_stack:
+                        # Inside a span
+                        in_span[batch_idx, pos] = True
+                        span_id[batch_idx, pos] = span_stack[-1]
 
-        # Apply transformer blocks
+        # Apply transformer blocks - always pass metadata tensors, never attention_mask
         for block in self.blocks:
-            if task_name == 'cocktail_party':
-                # For cocktail party, don't pass the old attention_mask, use metadata tensors
-                x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
-            else:
-                # For teacher forcing, use cocktail party attention but with proper prefix setup
-                # This ensures prefix is bidirectional and context is causal
-                x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
