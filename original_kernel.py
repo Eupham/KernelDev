@@ -603,20 +603,40 @@ def _flash_attn_fwd(
             q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
             q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
 
-            # --- Start of new mask computation ---
+            # --- Cocktail Party Attention Pattern ---
             # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
-            same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
-            span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
-            causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
-
-            prefix_keys = k_is_prefix[None, :]
-            prefix_q = q_is_prefix[:, None]
-
-            # Rows that are prefix queries get everything
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
+            
+            # Check if query/key tokens are special types
+            q_is_maskq = (q_span_id[:, None] == -1)  # [MASKQ] marked with span_id = -1
+            k_is_maskq = (k_span_id[None, :] == -1)
+            k_is_cls_or_prefix = k_is_prefix[None, :]
+            
+            # Pattern 1: [CLS]/prefix tokens can only see within prefix (bidirectional within prefix)
+            prefix_to_prefix = q_is_prefix[:, None] & k_is_prefix[None, :]
+            
+            # Pattern 2: Context tokens (non-span, non-prefix) causal within context + can see prefix
+            q_is_context = ~q_in_span[:, None] & ~q_is_prefix[:, None] & ~q_is_maskq
+            k_is_context = ~k_in_span[None, :] & ~k_is_prefix[None, :] & ~k_is_maskq
+            context_causal = q_is_context & k_is_context & (q_tile_indices[:, None] >= kv_indices[None, :])
+            context_to_prefix = q_is_context & k_is_cls_or_prefix
+            
+            # Pattern 3: Span tokens bidirectional within same span + can see [CLS] and [MASKQ]
+            same_span = (q_in_span[:, None] & k_in_span[None, :] & 
+                        (q_span_id[:, None] == k_span_id[None, :]) & 
+                        (q_span_id[:, None] > 0))  # Exclude span_id=0 and span_id=-1
+            span_to_cls = q_in_span[:, None] & k_is_cls_or_prefix
+            span_to_maskq = q_in_span[:, None] & k_is_maskq
+            
+            # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
+            maskq_to_spans = q_is_maskq & k_in_span[None, :]
+            maskq_to_cls = q_is_maskq & k_is_cls_or_prefix
+            
+            # Combine all allowed patterns
+            mask = (prefix_to_prefix | 
+                   context_causal | context_to_prefix |
+                   same_span | span_to_cls | span_to_maskq |
+                   maskq_to_spans | maskq_to_cls)
+            # --- End of Cocktail Party Attention Pattern ---
 
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
@@ -1348,18 +1368,40 @@ def _flash_attn_bwd_dq(
             q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
             q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
-            # --- Start of new mask computation ---
-            same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
-            span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
-            causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
-
-            prefix_keys = k_is_prefix[None, :]
-            prefix_q = q_is_prefix[:, None]
-
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
+            # --- Cocktail Party Attention Pattern ---
+            # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
+            
+            # Check if query/key tokens are special types
+            q_is_maskq = (q_span_id[:, None] == -1)  # [MASKQ] marked with span_id = -1
+            k_is_maskq = (k_span_id[None, :] == -1)
+            k_is_cls_or_prefix = k_is_prefix[None, :]
+            
+            # Pattern 1: [CLS]/prefix tokens can only see within prefix (bidirectional within prefix)
+            prefix_to_prefix = q_is_prefix[:, None] & k_is_prefix[None, :]
+            
+            # Pattern 2: Context tokens (non-span, non-prefix) causal within context + can see prefix
+            q_is_context = ~q_in_span[:, None] & ~q_is_prefix[:, None] & ~q_is_maskq
+            k_is_context = ~k_in_span[None, :] & ~k_is_prefix[None, :] & ~k_is_maskq
+            context_causal = q_is_context & k_is_context & (q_tile_indices[:, None] >= kv_indices[None, :])
+            context_to_prefix = q_is_context & k_is_cls_or_prefix
+            
+            # Pattern 3: Span tokens bidirectional within same span + can see [CLS] and [MASKQ]
+            same_span = (q_in_span[:, None] & k_in_span[None, :] & 
+                        (q_span_id[:, None] == k_span_id[None, :]) & 
+                        (q_span_id[:, None] > 0))  # Exclude span_id=0 and span_id=-1
+            span_to_cls = q_in_span[:, None] & k_is_cls_or_prefix
+            span_to_maskq = q_in_span[:, None] & k_is_maskq
+            
+            # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
+            maskq_to_spans = q_is_maskq & k_in_span[None, :]
+            maskq_to_cls = q_is_maskq & k_is_cls_or_prefix
+            
+            # Combine all allowed patterns
+            mask = (prefix_to_prefix | 
+                   context_causal | context_to_prefix |
+                   same_span | span_to_cls | span_to_maskq |
+                   maskq_to_spans | maskq_to_cls)
+            # --- End of Cocktail Party Attention Pattern ---
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
         else:
@@ -1487,18 +1529,40 @@ def _flash_attn_bwd_dkdv(
             q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
             q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
-            # --- Start of new mask computation ---
-            same_span = (q_in_span[None, :] & k_in_span[:, None] & (q_span_id[None, :] == k_span_id[:, None]))
-            span_to_ns = q_in_span[None, :] & ~k_in_span[:, None]
-            causal_ns = ~q_in_span[None, :] & ~k_in_span[:, None] & (q_tile_indices[None, :] >= kv_indices[:, None])
-
-            prefix_keys = k_is_prefix[:, None]
-            prefix_q = q_is_prefix[None, :]
-
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
-            # --- End of new mask computation ---
+            # --- Cocktail Party Attention Pattern ---
+            # Note: indices are transposed for backward pass [TILE_K_SIZE, TILE_Q_SIZE]
+            
+            # Check if query/key tokens are special types
+            q_is_maskq = (q_span_id[None, :] == -1)  # [MASKQ] marked with span_id = -1
+            k_is_maskq = (k_span_id[:, None] == -1)
+            k_is_cls_or_prefix = k_is_prefix[:, None]
+            
+            # Pattern 1: [CLS]/prefix tokens can only see within prefix (bidirectional within prefix)
+            prefix_to_prefix = q_is_prefix[None, :] & k_is_prefix[:, None]
+            
+            # Pattern 2: Context tokens (non-span, non-prefix) causal within context + can see prefix
+            q_is_context = ~q_in_span[None, :] & ~q_is_prefix[None, :] & ~q_is_maskq
+            k_is_context = ~k_in_span[:, None] & ~k_is_prefix[:, None] & ~k_is_maskq
+            context_causal = q_is_context & k_is_context & (q_tile_indices[None, :] >= kv_indices[:, None])
+            context_to_prefix = q_is_context & k_is_cls_or_prefix
+            
+            # Pattern 3: Span tokens bidirectional within same span + can see [CLS] and [MASKQ]
+            same_span = (q_in_span[None, :] & k_in_span[:, None] & 
+                        (q_span_id[None, :] == k_span_id[:, None]) & 
+                        (q_span_id[None, :] > 0))  # Exclude span_id=0 and span_id=-1
+            span_to_cls = q_in_span[None, :] & k_is_cls_or_prefix
+            span_to_maskq = q_in_span[None, :] & k_is_maskq
+            
+            # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
+            maskq_to_spans = q_is_maskq & k_in_span[:, None]
+            maskq_to_cls = q_is_maskq & k_is_cls_or_prefix
+            
+            # Combine all allowed patterns
+            mask = (prefix_to_prefix | 
+                   context_causal | context_to_prefix |
+                   same_span | span_to_cls | span_to_maskq |
+                   maskq_to_spans | maskq_to_cls)
+            # --- End of Cocktail Party Attention Pattern ---
         elif CAUSAL:
             mask = q_tile_indices[None, :] >= kv_indices[:, None]
         else:

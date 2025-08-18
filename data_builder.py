@@ -20,6 +20,7 @@ SPECIAL_TOKENS = {
     '[MASK]': 2,
     '[SPAN]': 3,
     '[ES]': 4,
+    '[MASKQ]': 5,
 }
 NUM_SPECIAL_TOKENS = len(SPECIAL_TOKENS)
 
@@ -429,11 +430,11 @@ class DataBuilder:
             random.shuffle(all_spans_with_labels)
             correct_idx = [label for _, label in all_spans_with_labels].index(1)
 
-            # 2. Calculate wrapper length to reserve space
+            # 2. Calculate wrapper length to reserve space (including [MASKQ])
             wrapper_tokens = []
             for span_toks, _ in all_spans_with_labels:
                 wrapper_tokens.extend([SPECIAL_TOKENS['[SPAN]']] + span_toks + [SPECIAL_TOKENS['[ES]']])
-            wrapper_len = len(wrapper_tokens)
+            wrapper_len = len(wrapper_tokens) + 1  # +1 for [MASKQ]
 
             # 3. Truncate context to fit wrappers
             available_context_len = self.seq_len - wrapper_len
@@ -442,61 +443,89 @@ class DataBuilder:
             masked_context = (original_tokens[:span_start] + [SPECIAL_TOKENS['[MASK]']] + original_tokens[span_start + span_size:])
             truncated_masked_context = masked_context[:available_context_len]
 
-            # 4. Stitch final sequence together
-            final_sequence = truncated_masked_context + wrapper_tokens
+            # 4. Stitch final sequence together (add [MASKQ] at the end)
+            final_sequence = truncated_masked_context + wrapper_tokens + [SPECIAL_TOKENS['[MASKQ]']]
 
             # 5. Final guard-rail truncation and padding
             final_sequence = final_sequence[:self.seq_len]
             if len(final_sequence) < self.seq_len:
                 final_sequence.extend([pad_id] * (self.seq_len - len(final_sequence)))
 
-            # 6. Build span IDs and attention mask from the final sequence
+            # 6. Build metadata tensors: in_span, span_id, is_prefix
+            in_span = torch.zeros(self.seq_len, dtype=torch.bool)
             span_ids = torch.zeros(self.seq_len, dtype=torch.long)
-            current_pos = 0
-            in_span = False
-            span_idx = 0
-
-            # This is a simplified scan. A more robust impl would use the known structure.
-            # For now, we scan to find the spans we just placed.
-            temp_final_sequence = list(final_sequence)
+            is_prefix = torch.zeros(self.seq_len, dtype=torch.bool)
+            
+            # Mark prefix tokens (everything before first [CLS] and including [CLS])
+            cls_token = SPECIAL_TOKENS['[CLS]']
             try:
-                start_of_wrappers = len(truncated_masked_context)
-
-                current_pos_in_final = start_of_wrappers
-                for span_toks, _ in all_spans_with_labels:
-                    span_len_with_wrappers = len(span_toks) + 2
-
-                    start_idx = current_pos_in_final
-                    end_idx = start_idx + span_len_with_wrappers
-
-                    if start_idx < self.seq_len:
-                       span_ids[start_idx:min(end_idx, self.seq_len)] = span_idx + 1
-
-                    current_pos_in_final = end_idx
-                    span_idx += 1
-
-            except Exception as e:
-                # Fallback in case logic fails
+                cls_idx = final_sequence.index(cls_token)
+                is_prefix[:cls_idx + 1] = True  # Include [CLS] itself as prefix
+            except ValueError:
+                # No [CLS] found, treat beginning as prefix
                 pass
-
-
-            span_ids_i = span_ids.unsqueeze(1).expand(-1, self.seq_len)
-            span_ids_j = span_ids.unsqueeze(0).expand(self.seq_len, -1)
-            attn_mask = (span_ids_i == span_ids_j) | (span_ids_i == 0) | (span_ids_j == 0)
-            attn_mask = attn_mask.to(torch.bool)
-
+            
+            # Mark span tokens and assign span IDs
+            start_of_spans = len(truncated_masked_context)
+            current_pos = start_of_spans
+            span_token = SPECIAL_TOKENS['[SPAN]']
+            es_token = SPECIAL_TOKENS['[ES]']
+            
+            for span_idx, (span_toks, _) in enumerate(all_spans_with_labels):
+                if current_pos >= self.seq_len:
+                    break
+                    
+                # Find [SPAN] token
+                if current_pos < self.seq_len and final_sequence[current_pos] == span_token:
+                    span_start = current_pos
+                    span_end = min(current_pos + len(span_toks) + 2, self.seq_len)  # +2 for [SPAN] and [ES]
+                    
+                    # Mark all tokens in this span (including [SPAN] and [ES])
+                    in_span[span_start:span_end] = True
+                    span_ids[span_start:span_end] = span_idx + 1  # Use 1-based span IDs
+                    
+                    current_pos += len(span_toks) + 2
+                else:
+                    current_pos += len(span_toks) + 2
+            
+            # Mark [MASKQ] specially (it should see all spans but not be in a span itself)
+            maskq_token = SPECIAL_TOKENS['[MASKQ]']
+            try:
+                maskq_idx = final_sequence.index(maskq_token)
+                # [MASKQ] is not in_span but has special access patterns
+                span_ids[maskq_idx] = -1  # Special marker for [MASKQ]
+            except ValueError:
+                pass
+            
+            # Return metadata instead of old attention mask
             batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
             batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
-            batch_attn_masks.append(attn_mask)
+            # Return metadata tensors for attention calculation
+            batch_attn_masks.append({
+                'in_span': in_span,
+                'span_id': span_ids,
+                'is_prefix': is_prefix
+            })
 
         if not batch_inputs:
-            return torch.empty(0), torch.empty(0), torch.empty(0)
+            return torch.empty(0), torch.empty(0), {}
 
         inputs = torch.stack(batch_inputs)
         correct_indices = torch.stack(batch_correct_indices)
-        attention_masks = torch.stack(batch_attn_masks)
+        
+        # Stack the metadata tensors
+        batch_size = len(batch_attn_masks)
+        in_span_batch = torch.stack([mask_dict['in_span'] for mask_dict in batch_attn_masks])
+        span_id_batch = torch.stack([mask_dict['span_id'] for mask_dict in batch_attn_masks])
+        is_prefix_batch = torch.stack([mask_dict['is_prefix'] for mask_dict in batch_attn_masks])
+        
+        metadata = {
+            'in_span': in_span_batch,
+            'span_id': span_id_batch, 
+            'is_prefix': is_prefix_batch
+        }
 
-        return inputs, correct_indices, attention_masks
+        return inputs, correct_indices, metadata
 
 
     def create_dataloaders(

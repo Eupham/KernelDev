@@ -283,16 +283,22 @@ class Trainer:
     def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step."""
         if task_name == 'cocktail_party':
-            inputs, correct_idx, attn_mask = batch
+            inputs, correct_idx, metadata = batch
             if inputs.numel() == 0:
                 return 0.0
-            inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
+            inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
+            
+            # Move metadata tensors to device
+            if isinstance(metadata, dict):
+                metadata = {k: v.to(self.config.device) for k, v in metadata.items()}
+            else:
+                metadata = metadata.to(self.config.device)
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                    scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
             else:
-                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
 
         else:
             x, y = batch
@@ -334,16 +340,22 @@ class Trainer:
 
                     loss = None
                     if task_name == 'cocktail_party':
-                        inputs, correct_idx, attn_mask = batch
+                        inputs, correct_idx, metadata = batch
                         if inputs.numel() == 0:
                             continue
-                        inputs, correct_idx, attn_mask = inputs.to(self.config.device), correct_idx.to(self.config.device), attn_mask.to(self.config.device)
+                        inputs, correct_idx = inputs.to(self.config.device), correct_idx.to(self.config.device)
+                        
+                        # Move metadata tensors to device
+                        if isinstance(metadata, dict):
+                            metadata = {k: v.to(self.config.device) for k, v in metadata.items()}
+                        else:
+                            metadata = metadata.to(self.config.device)
 
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
-                                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
                         else:
-                            scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=attn_mask, task_name=task_name)
+                            scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
 
                         if loss is not None and scores.numel() > 0:
                             metrics = self._calculate_accuracy(scores, correct_idx)

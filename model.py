@@ -157,7 +157,13 @@ class GPTModel(nn.Module):
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
         # Create metadata tensors
-        if attention_mask is not None:
+        if attention_mask is not None and isinstance(attention_mask, dict) and task_name == 'cocktail_party':
+            # Use metadata from cocktail party data builder
+            in_span = attention_mask['in_span']
+            span_id = attention_mask['span_id']
+            is_prefix = attention_mask['is_prefix']
+        elif attention_mask is not None:
+            # Legacy behavior: generate metadata from tokens
             span_start_id = SPECIAL_TOKENS['[SPAN]']
             span_end_id = SPECIAL_TOKENS['[ES]']
             cls_token_id = SPECIAL_TOKENS['[CLS]']
@@ -174,7 +180,11 @@ class GPTModel(nn.Module):
 
         # Apply transformer blocks
         for block in self.blocks:
-            x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            if task_name == 'cocktail_party':
+                # For cocktail party, don't pass the old attention_mask, use metadata tensors
+                x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            else:
+                x_embed = block(x_embed, attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
