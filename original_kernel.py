@@ -473,7 +473,6 @@ def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
 def _flash_attn_fwd(
     Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, #
     LSE: tl.tensor, O: tl.tensor,  #
-    ATTN_MASK: tl.tensor,
     IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,  #
@@ -481,7 +480,6 @@ def _flash_attn_fwd(
     stride_mb: int, stride_mh: int, stride_mt: int,  #
     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
     lens_stride: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
@@ -624,7 +622,7 @@ def _flash_attn_fwd(
         )
 
         kv_indices = kv_token_idx + tile_k_arange
-        if ATTN_MASK is not None:
+        if IN_SPAN is not None and SPAN_ID is not None and IS_PREFIX is not None:
             # Load metadata for the key tile
             k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
             k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
@@ -636,8 +634,12 @@ def _flash_attn_fwd(
             k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
 
             # Load metadata for the query tile
+            q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
+            q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
             q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
             q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
+            q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
+            q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
             # --- Cocktail Party Attention Pattern ---
             # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
@@ -863,7 +865,6 @@ def _flash_attn_bwd(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, L: tl.tensor, #
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor, DK: tl.tensor, DV: tl.tensor,
-    ATTN_MASK: tl.tensor,
     IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,  #
@@ -875,7 +876,6 @@ def _flash_attn_bwd(
     stride_dkb: int, stride_dkh: int, stride_dkt: int, stride_dkk: int,  #
     stride_dvb: int, stride_dvh: int, stride_dvt: int, stride_dvk: int,  #
     lens_stride: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
@@ -988,7 +988,6 @@ def _flash_attn_bwd(
 def _flash_attn_bwd_dq_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor,
-    ATTN_MASK: tl.tensor,
     IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,
@@ -997,7 +996,6 @@ def _flash_attn_bwd_dq_inner(
     stride_mb: int, stride_mh: int, stride_mt: int,
     stride_dob: int, stride_doh: int, stride_dot: int, stride_dok: int,
     stride_dqb: int, stride_dqh: int, stride_dqt: int, stride_dqk: int,
-    mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
@@ -1384,7 +1382,7 @@ def _flash_attn_bwd_dq(
         p = tl.math.exp2(qk - m)
 
         kv_indices = kv_token_idx + tile_k_arange
-        if ATTN_MASK is not None:
+        if IN_SPAN is not None and SPAN_ID is not None and IS_PREFIX is not None:
             # Load metadata for the key tile
             k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
             k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
@@ -1798,7 +1796,6 @@ def attention_forward_adapter(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    attention_mask: torch.Tensor = None,
     in_span: torch.Tensor = None,
     span_id: torch.Tensor = None,
     is_prefix: torch.Tensor = None,
@@ -1833,7 +1830,6 @@ def attention_forward_adapter(
         lens,
         LSE,
         O,
-        attention_mask,
         in_span,
         span_id,
         is_prefix,
@@ -1843,7 +1839,6 @@ def attention_forward_adapter(
         *(strides(LSE, 3) if LSE is not None else [0] * 3),
         *strides(O, 4),
         *(strides(lens, 1) if lens is not None else [0]),
-        *(strides(attention_mask, 3) if attention_mask is not None else [0]*3),
         *(strides(in_span, 2) if in_span is not None else [0]*2),
         *(strides(span_id, 2) if span_id is not None else [0]*2),
         *(strides(is_prefix, 2) if is_prefix is not None else [0]*2),
@@ -2126,7 +2121,6 @@ def _flash_attention(
     return_lse: bool,
     prescale_qk: bool,
     precision: str,
-    attention_mask: torch.Tensor | None,
     in_span: torch.Tensor | None,
     span_id: torch.Tensor | None,
     is_prefix: torch.Tensor | None,
@@ -2143,7 +2137,6 @@ def _flash_attention(
         prescale_qk=prescale_qk,
         return_lse=return_lse or requires_grad,
         precision=precision,
-        attention_mask=attention_mask,
         in_span=in_span,
         span_id=span_id,
         is_prefix=is_prefix,
@@ -2162,7 +2155,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
-        incoherent_processing, hadamard_signs_q, hadamard_signs_k, attention_mask,
+        incoherent_processing, hadamard_signs_q, hadamard_signs_k,
         in_span, span_id, is_prefix
     ):
         # Store context for backward pass
@@ -2173,7 +2166,6 @@ class IncoherentFlashAttention(torch.autograd.Function):
         ctx.prescale_qk = prescale_qk
         ctx.precision = precision
         ctx.return_lse = return_lse
-        ctx.attention_mask = attention_mask
         ctx.in_span = in_span
         ctx.span_id = span_id
         ctx.is_prefix = is_prefix
@@ -2220,7 +2212,6 @@ class IncoherentFlashAttention(torch.autograd.Function):
             prescale_qk=prescale_qk,
             return_lse=return_lse or requires_grad,
             precision=precision,
-            attention_mask=attention_mask,
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix,
@@ -2258,7 +2249,6 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 autotune=ctx.autotune,
                 prescale_qk=ctx.prescale_qk,
                 precision=ctx.precision,
-                attention_mask=ctx.attention_mask,
                 in_span=ctx.in_span,
                 span_id=ctx.span_id,
                 is_prefix=ctx.is_prefix,
@@ -2283,13 +2273,12 @@ class IncoherentFlashAttention(torch.autograd.Function):
                 autotune=ctx.autotune,
                 prescale_qk=ctx.prescale_qk,
                 precision=ctx.precision,
-                attention_mask=ctx.attention_mask,
                 in_span=ctx.in_span,
                 span_id=ctx.span_id,
                 is_prefix=ctx.is_prefix,
             )
         
-        return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 # =============================================================================
@@ -2310,7 +2299,6 @@ def flash_attention(
     incoherent_processing: bool | None = None,
     hadamard_signs_q: torch.Tensor | None = None,
     hadamard_signs_k: torch.Tensor | None = None,
-    attention_mask: torch.Tensor | None = None,
     in_span: torch.Tensor | None = None,
     span_id: torch.Tensor | None = None,
     is_prefix: torch.Tensor | None = None,
@@ -2364,7 +2352,7 @@ def flash_attention(
     if use_incoherent:
         return IncoherentFlashAttention.apply(
             q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
-            use_incoherent, hadamard_signs_q, hadamard_signs_k, attention_mask,
+            use_incoherent, hadamard_signs_q, hadamard_signs_k,
             in_span, span_id, is_prefix
         )
     else:
@@ -2380,7 +2368,6 @@ def flash_attention(
             return_lse=return_lse,
             prescale_qk=prescale_qk,
             precision=precision,
-            attention_mask=attention_mask,
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix,
