@@ -642,6 +642,11 @@ class DataBuilder:
             except ValueError:
                 pass
             
+            # Mark PAD tokens with special span_id = -2 so kernel can ignore them
+            pad_token = SPECIAL_TOKENS['[PAD]']
+            pad_mask = torch.tensor(final_sequence) == pad_token
+            span_ids[pad_mask] = -2
+            
             # Return metadata instead of old attention mask
             batch_inputs.append(torch.tensor(final_sequence, dtype=torch.long))
             batch_correct_indices.append(torch.tensor(correct_idx, dtype=torch.long))
