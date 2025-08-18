@@ -230,7 +230,7 @@ class DataBuilder:
         try:
             print("Attempting Method 1: Load C4 'en' (streaming)...")
             dataset_stream = load_dataset(
-                self.dataset_name, name=self.dataset_config, streaming=True, split='train', trust_remote_code=True
+                self.dataset_name, name=self.dataset_config, streaming=True, split='train'
             )
             print("C4 'en' (streaming) load_dataset call succeeded. Processing samples...")
             loaded_samples = self._process_iterable_dataset(dataset_stream, "C4 'en' streaming")
@@ -255,7 +255,7 @@ class DataBuilder:
                     fetch_n = max(fetch_n, 100) # Ensure a minimum fetch
                     print(f"Will try to fetch up to {fetch_n} records for non-streaming C4 'en'.")
                     dataset_non_stream = load_dataset(
-                        self.dataset_name, name=self.dataset_config, split=f'train[:{fetch_n}]', trust_remote_code=True
+                        self.dataset_name, name=self.dataset_config, split=f'train[:{fetch_n}]'
                     )
                     print("C4 'en' (non-streaming) load_dataset call succeeded. Processing samples...")
                     loaded_samples = self._process_iterable_dataset(dataset_non_stream, "C4 'en' non-streaming")
@@ -279,7 +279,7 @@ class DataBuilder:
             # Attempt 2: C4 without 'en' config (streaming)
             try:
                 print("Attempting Method 2: Load C4 (no config) (streaming)...")
-                dataset_m2 = load_dataset(self.dataset_name, streaming=True, split='train', trust_remote_code=True)
+                dataset_m2 = load_dataset(self.dataset_name, streaming=True, split='train')
                 print("C4 (no config, streaming) load_dataset call succeeded. Processing samples...")
                 loaded_samples = self._process_iterable_dataset(dataset_m2, "C4 (no config) streaming")
                 if not loaded_samples and self.max_samples > 0:
@@ -506,31 +506,30 @@ class DataBuilder:
 
             # 4. Create distractors from other batch items (also from context only)
             distractors = []
-            for _ in range(num_distractors):
-                attempts = 0
-                while len(distractors) < (_ + 1) and attempts < len(batch) * 2:  # Ensure we get enough distractors
-                    distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
-                    distractor_tokens_padded, _ = batch[distractor_idx]
-                    distractor_tokens_padded = distractor_tokens_padded.tolist()
-                    
-                    try:
-                        first_pad_idx_dist = distractor_tokens_padded.index(pad_id)
-                        distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
-                    except ValueError:
-                        distractor_tokens = distractor_tokens_padded
+            attempts = 0
+            while len(distractors) < num_distractors and attempts < len(batch) * num_distractors * 2:
+                distractor_idx = random.choice([j for j in range(len(batch)) if i != j])
+                distractor_tokens_padded, _ = batch[distractor_idx]
+                distractor_tokens_padded = distractor_tokens_padded.tolist()
+                
+                try:
+                    first_pad_idx_dist = distractor_tokens_padded.index(pad_id)
+                    distractor_tokens = distractor_tokens_padded[:first_pad_idx_dist]
+                except ValueError:
+                    distractor_tokens = distractor_tokens_padded
 
-                    # Find [CLS] in distractor to get context only
-                    try:
-                        cls_idx_dist = distractor_tokens.index(cls_token)
-                        distractor_context = distractor_tokens[cls_idx_dist + 1:]
-                    except ValueError:
-                        distractor_context = distractor_tokens
+                # Find [CLS] in distractor to get context only
+                try:
+                    cls_idx_dist = distractor_tokens.index(cls_token)
+                    distractor_context = distractor_tokens[cls_idx_dist + 1:]
+                except ValueError:
+                    distractor_context = distractor_tokens
 
-                    if len(distractor_context) > span_size:
-                        distractor_start = random.randint(0, len(distractor_context) - span_size)
-                        distractor_span = distractor_context[distractor_start : distractor_start + span_size]
-                        distractors.append(distractor_span)
-                    attempts += 1
+                if len(distractor_context) > span_size:
+                    distractor_start = random.randint(0, len(distractor_context) - span_size)
+                    distractor_span = distractor_context[distractor_start : distractor_start + span_size]
+                    distractors.append(distractor_span)
+                attempts += 1
 
             # If we couldn't get enough distractors, pad with copies/variations
             while len(distractors) < num_distractors:
