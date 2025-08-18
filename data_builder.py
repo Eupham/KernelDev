@@ -1,9 +1,36 @@
+"""
+Data Processing and Task Management for Hierarchical Attention Models
+
+This module handles dataset loading, tokenization, and task-specific data preparation
+for both teacher forcing and cocktail party tasks. It supports multiple dataset sources
+and generates the metadata required for hierarchical attention patterns.
+
+Key Components:
+- DataBuilder: Main class for dataset management and tokenization
+- Task-specific collation functions for teacher forcing and cocktail party
+- Metadata generation for attention pattern control (in_span, span_id, is_prefix)
+- UTF-8 byte-level tokenization with special token support
+- Streaming dataset support for large corpora
+
+Special Tokens:
+- [PAD]: Padding token (ID: 0)
+- [CLS]: Classification/prefix separator (ID: 1)
+- [MASK]: Masked token in context (ID: 2)  
+- [SPAN]: Span start marker (ID: 3)
+- [ES]: Span end marker (ID: 4)
+- [MASKQ]: Query aggregator token (ID: 5)
+"""
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 import numpy as np
 from typing import Optional, Dict, Any, List
 import random
+
+# =============================================================================
+# Configuration Constants
+# =============================================================================
 
 # Define special tokens
 BIO_TAGS = {
@@ -23,6 +50,10 @@ SPECIAL_TOKENS = {
     '[MASKQ]': 5,
 }
 NUM_SPECIAL_TOKENS = len(SPECIAL_TOKENS)
+
+# =============================================================================
+# Dataset Classes
+# =============================================================================
 
 class OnTheFlyTokenizedDataset(Dataset):
     def __init__(self, raw_data, seq_len=512, tokenizer_fn=None):
@@ -47,6 +78,10 @@ class OnTheFlyTokenizedDataset(Dataset):
         x = torch.tensor(tokens[:-1], dtype=torch.long)
         y = torch.tensor(tokens[1:], dtype=torch.long)
         return x, y
+
+# =============================================================================
+# Main Data Builder
+# =============================================================================
 
 class DataBuilder:
     def __init__(

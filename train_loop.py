@@ -1,3 +1,19 @@
+"""
+Training Infrastructure for Hierarchical Attention Models
+
+This module provides comprehensive training and evaluation framework for GPT models
+with support for both teacher forcing and cocktail party tasks. Includes distributed
+training, mixed precision, and task-specific evaluation metrics.
+
+Key Components:
+- TrainingConfig: Configuration management for training parameters
+- TrainingMetrics: Performance tracking and logging
+- Trainer: Main training loop with multi-task support
+- Evaluation utilities for both task types
+- Text generation with advanced sampling controls
+- Distributed training coordination
+"""
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -15,6 +31,14 @@ import json
 import math
 from pathlib import Path
 
+# =============================================================================
+# Configuration Classes
+# =============================================================================
+
+
+# =============================================================================
+# Configuration Classes
+# =============================================================================
 
 class TrainingConfig:
     """Configuration class for training parameters."""
@@ -145,6 +169,9 @@ def init_distributed(trainer_instance: 'Trainer'):
         trainer_instance.config.local_rank = 0 # Default for non-distributed
         print(f"Running in non-distributed mode on device: {trainer_instance.config.device}")
 
+# =============================================================================
+# Metrics Tracking
+# =============================================================================
 
 class TrainingMetrics:
     """Class to track and manage training metrics."""
@@ -225,6 +252,9 @@ class TrainingMetrics:
         }
         torch.save(metrics_dict, filepath)
 
+# =============================================================================
+# Main Trainer Class
+# =============================================================================
 
 class Trainer:
     """Main training class that handles the training loop."""

@@ -1,3 +1,28 @@
+"""
+Specialized Flash Attention Implementation with Hierarchical Attention Patterns
+
+This module implements memory-efficient flash attention with support for sophisticated
+attention patterns required for cocktail party tasks. The implementation maintains
+mathematical equivalence to standard attention while reducing memory complexity from
+O(n²) to O(n) through block-wise computation.
+
+Key Components:
+- Flash Attention Forward/Backward Kernels: Triton-based GPU kernels for efficient computation
+- Hierarchical Attention Patterns: 4-section attention structure for cocktail party tasks
+- Incoherent Processing: Hadamard transforms to reduce quantization error
+- GPU Optimization: Auto-tuning and hardware-specific configurations
+- Mixed Precision Support: fp16, bf16, and fp32 computation modes
+
+Attention Hierarchy:
+1. Prefix Section: Bidirectional within prefix (tokens before/including [CLS])
+2. Context Section: Causal within context + access to prefix  
+3. Span Islands: Bidirectional within spans + access to context (isolated from other spans)
+4. Bridge Section: [MASKQ] token with access to all spans + prefix (aggregator hub)
+
+This implementation maintains flash attention benefits while enabling complex attention
+patterns necessary for span-based reasoning tasks.
+"""
+
 import logging
 import math
 import torch._dynamo
@@ -8,11 +33,18 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+# =============================================================================
+# Configuration Constants
+# =============================================================================
+
 MAX_TILE_SIZE = 512  # Reduced for T4 compatibility
 MIN_TILE_SIZE = 16  # Reduced for T4 compatibility
 
 
-# Incoherent processing utilities for reducing quantization error
+# =============================================================================
+# Incoherent Processing Utilities
+# =============================================================================
+
 def generate_hadamard_signs(head_dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """Generate random signs for Hadamard transform."""
     return torch.randint(0, 2, (head_dim,), device=device, dtype=dtype) * 2 - 1
@@ -423,6 +455,10 @@ def bwd_configs_pruner(configs, nargs, HEAD_DIM, DTYPE, **kwargs):
     logger.warning(f"Start benchmarking backward flash_attention {len(configs) = }")
     return configs
 
+
+# =============================================================================
+# Flash Attention Triton Kernels
+# =============================================================================
 
 # fmt: off
 @triton.heuristics(
@@ -2256,6 +2292,10 @@ class IncoherentFlashAttention(torch.autograd.Function):
         return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
+# =============================================================================
+# Main Flash Attention Interface
+# =============================================================================
+
 def flash_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2356,6 +2396,10 @@ def is_hopper_gpu() -> bool:
     major, minor = torch.cuda.get_device_capability()
     return major >= 9
 
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
 def should_use_incoherent_processing(incoherent_processing: bool | None = None) -> bool:
     """
