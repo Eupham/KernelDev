@@ -438,7 +438,7 @@ def _flash_attn_fwd(
     Q: tl.tensor, Kt: tl.tensor, V: tl.tensor, L: tl.tensor, #
     LSE: tl.tensor, O: tl.tensor,  #
     ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor, IS_MASKQ: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,  #
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
@@ -449,6 +449,7 @@ def _flash_attn_fwd(
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
+    is_maskq_stride_b: int, is_maskq_stride_t: int,
     T: int,  #
     TIME_BUCKET:  int,  #
     HEAD_DIM: tl.constexpr,  #
@@ -603,19 +604,33 @@ def _flash_attn_fwd(
             q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
             q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
 
+            q_is_maskq_ptr = IS_MASKQ + batch * is_maskq_stride_b + q_tile_indices
+            q_is_maskq = tl.load(q_is_maskq_ptr, mask=q_tile_indices < seq_len, other=0)
+
+            k_is_maskq_ptr = IS_MASKQ + batch * is_maskq_stride_b + kv_indices
+            k_is_maskq = tl.load(k_is_maskq_ptr, mask=kv_indices < seq_len, other=0)
+
             # --- Start of new mask computation ---
-            # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
-            same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
-            span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
-            causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
+            q_is_prefix = q_is_prefix[:, None]
+            q_in_span = q_in_span[:, None]
+            q_is_maskq = q_is_maskq[:, None]
+            q_is_context = ~q_is_prefix & ~q_in_span & ~q_is_maskq
 
-            prefix_keys = k_is_prefix[None, :]
-            prefix_q = q_is_prefix[:, None]
+            k_is_prefix = k_is_prefix[None, :]
+            k_in_span = k_in_span[None, :]
+            k_is_maskq = k_is_maskq[None, :]
+            k_is_context = ~k_is_prefix & ~k_in_span & ~k_is_maskq
 
-            # Rows that are prefix queries get everything
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
+            causal_mask = q_tile_indices[:, None] >= kv_indices[None, :]
+            same_span_mask = q_in_span & k_in_span & (q_span_id[:, None] == k_span_id[None, :])
+
+            # Define attention rules
+            prefix_rule = q_is_prefix & k_is_prefix
+            context_rule = q_is_context & ( (k_is_context & causal_mask) | k_is_prefix )
+            span_rule = q_in_span & (same_span_mask | k_is_context)
+            maskq_rule = q_is_maskq & k_in_span
+
+            mask = prefix_rule | context_rule | span_rule | maskq_rule
             # --- End of new mask computation ---
 
         elif CAUSAL:
@@ -809,7 +824,7 @@ def _flash_attn_bwd(
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor, DK: tl.tensor, DV: tl.tensor,
     ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor, IS_MASKQ: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,  #
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
@@ -824,6 +839,7 @@ def _flash_attn_bwd(
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
+    is_maskq_stride_b: int, is_maskq_stride_t: int,
     T: int,  #
     TIME_BUCKET: int,  #
     DQ_TILES_NUM: int,  #
@@ -859,7 +875,7 @@ def _flash_attn_bwd(
         _flash_attn_bwd_dkdv_inner(
             Q, K, V, DELTA, LSE, DO, DK, DV,
             ATTN_MASK,
-            IN_SPAN, SPAN_ID, IS_PREFIX,
+            IN_SPAN, SPAN_ID, IS_PREFIX, IS_MASKQ,
             stride_qb, stride_qh, stride_qt, stride_qk,
             stride_kb, stride_kh, stride_kt, stride_kk,
             stride_vb, stride_vh, stride_vt, stride_vk,
@@ -872,6 +888,7 @@ def _flash_attn_bwd(
             in_span_stride_b, in_span_stride_t,
             span_id_stride_b, span_id_stride_t,
             is_prefix_stride_b, is_prefix_stride_t,
+            is_maskq_stride_b, is_maskq_stride_t,
             batch=batch,
             head=head,
             tile_id=tile_id,
@@ -895,7 +912,7 @@ def _flash_attn_bwd(
             Q, K, V, DELTA, LSE,
             DO, DQ,
             ATTN_MASK,
-            IN_SPAN, SPAN_ID, IS_PREFIX,
+            IN_SPAN, SPAN_ID, IS_PREFIX, IS_MASKQ,
             stride_qb, stride_qh, stride_qt, stride_qk,
             stride_kb, stride_kh, stride_kt, stride_kk,
             stride_vb, stride_vh, stride_vt, stride_vk,
@@ -907,6 +924,7 @@ def _flash_attn_bwd(
             in_span_stride_b, in_span_stride_t,
             span_id_stride_b, span_id_stride_t,
             is_prefix_stride_b, is_prefix_stride_t,
+            is_maskq_stride_b, is_maskq_stride_t,
             batch=batch,
             head=head,
             tile_id=tile_id,
@@ -934,7 +952,7 @@ def _flash_attn_bwd_dq_inner(
     Q: tl.tensor, K: tl.tensor, V: tl.tensor, DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DQ: tl.tensor,
     ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor, IS_MASKQ: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,
@@ -946,6 +964,7 @@ def _flash_attn_bwd_dq_inner(
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
+    is_maskq_stride_b: int, is_maskq_stride_t: int,
     batch: int,
     head: int,
     tile_id: int,
@@ -1045,11 +1064,12 @@ def _flash_attn_bwd_dq_inner(
         dq, q, m, di, do,
         kt_tile_ptr, vt_tile_ptr,
         ATTN_MASK,
-        IN_SPAN, SPAN_ID, IS_PREFIX,
+        IN_SPAN, SPAN_ID, IS_PREFIX, IS_MASKQ,
         mask_stride_b, mask_stride_h, mask_stride_t,
         in_span_stride_b, in_span_stride_t,
         span_id_stride_b, span_id_stride_t,
         is_prefix_stride_b, is_prefix_stride_t,
+        is_maskq_stride_b, is_maskq_stride_t,
         batch, head,
         seq_len=seq_len,
         T=T,
@@ -1087,7 +1107,7 @@ def _flash_attn_bwd_dkdv_inner(
     DELTA: tl.tensor, LSE: tl.tensor,
     DO: tl.tensor, DK: tl.tensor, DV: tl.tensor,
     ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor, IS_MASKQ: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,
     stride_kb: int, stride_kh: int, stride_kt: int, stride_kk: int,
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,
@@ -1101,6 +1121,7 @@ def _flash_attn_bwd_dkdv_inner(
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
+    is_maskq_stride_b: int, is_maskq_stride_t: int,
     batch: int,
     head: int,
     tile_id: int,
@@ -1207,11 +1228,12 @@ def _flash_attn_bwd_dkdv_inner(
         qt_tile_ptr, do_tile_ptr, lse_tile_ptr, delta_tile_ptr,
         k, v,
         ATTN_MASK,
-        IN_SPAN, SPAN_ID, IS_PREFIX,
+        IN_SPAN, SPAN_ID, IS_PREFIX, IS_MASKQ,
         mask_stride_b, mask_stride_h, mask_stride_t,
         in_span_stride_b, in_span_stride_t,
         span_id_stride_b, span_id_stride_t,
         is_prefix_stride_b, is_prefix_stride_t,
+        is_maskq_stride_b, is_maskq_stride_t,
         batch, head,
         seq_len=seq_len,
         T=T,
@@ -1263,11 +1285,12 @@ def _flash_attn_bwd_dq(
     di: tl.tensor, do: tl.tensor,
     kt_tile_ptr: tl.tensor, vt_tile_ptr: tl.tensor,
     ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor, IS_MASKQ: tl.tensor,
     mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
+    is_maskq_stride_b: int, is_maskq_stride_t: int,
     batch: int, head: int,
     seq_len: tl.tensor,
     T: tl.constexpr,
@@ -1348,17 +1371,32 @@ def _flash_attn_bwd_dq(
             q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
             q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
+            q_is_maskq_ptr = IS_MASKQ + batch * is_maskq_stride_b + q_tile_indices
+            q_is_maskq = tl.load(q_is_maskq_ptr, mask=q_tile_indices < seq_len, other=0)
+            k_is_maskq_ptr = IS_MASKQ + batch * is_maskq_stride_b + kv_indices
+            k_is_maskq = tl.load(k_is_maskq_ptr, mask=kv_indices < seq_len, other=0)
+
             # --- Start of new mask computation ---
-            same_span = (q_in_span[:, None] & k_in_span[None, :] & (q_span_id[:, None] == k_span_id[None, :]))
-            span_to_ns = q_in_span[:, None] & ~k_in_span[None, :]
-            causal_ns = ~q_in_span[:, None] & ~k_in_span[None, :] & (q_tile_indices[:, None] >= kv_indices[None, :])
+            q_is_prefix = q_is_prefix[:, None]
+            q_in_span = q_in_span[:, None]
+            q_is_maskq = q_is_maskq[:, None]
+            q_is_context = ~q_is_prefix & ~q_in_span & ~q_is_maskq
 
-            prefix_keys = k_is_prefix[None, :]
-            prefix_q = q_is_prefix[:, None]
+            k_is_prefix = k_is_prefix[None, :]
+            k_in_span = k_in_span[None, :]
+            k_is_maskq = k_is_maskq[None, :]
+            k_is_context = ~k_is_prefix & ~k_in_span & ~k_is_maskq
 
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
+            causal_mask = q_tile_indices[:, None] >= kv_indices[None, :]
+            same_span_mask = q_in_span & k_in_span & (q_span_id[:, None] == k_span_id[None, :])
+
+            # Define attention rules
+            prefix_rule = q_is_prefix & k_is_prefix
+            context_rule = q_is_context & ( (k_is_context & causal_mask) | k_is_prefix )
+            span_rule = q_in_span & (same_span_mask | k_is_context)
+            maskq_rule = q_is_maskq & k_in_span
+
+            mask = prefix_rule | context_rule | span_rule | maskq_rule
             # --- End of new mask computation ---
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
@@ -1383,11 +1421,12 @@ def _flash_attn_bwd_dkdv(
     lse_tile_ptr: tl.tensor, delta_tile_ptr: tl.tensor,
     k: tl.tensor, v: tl.tensor,
     ATTN_MASK: tl.tensor,
-    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor, IS_MASKQ: tl.tensor,
     mask_stride_b: int, mask_stride_h: int, mask_stride_t: int,
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
+    is_maskq_stride_b: int, is_maskq_stride_t: int,
     batch: int, head: int,
     seq_len: tl.tensor,
     T: tl.constexpr,
@@ -1487,17 +1526,33 @@ def _flash_attn_bwd_dkdv(
             q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
             q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
 
+            q_is_maskq_ptr = IS_MASKQ + batch * is_maskq_stride_b + q_tile_indices
+            q_is_maskq = tl.load(q_is_maskq_ptr, mask=q_tile_indices < seq_len, other=0)
+            k_is_maskq_ptr = IS_MASKQ + batch * is_maskq_stride_b + kv_indices
+            k_is_maskq = tl.load(k_is_maskq_ptr, mask=kv_indices < seq_len, other=0)
+
             # --- Start of new mask computation ---
-            same_span = (q_in_span[None, :] & k_in_span[:, None] & (q_span_id[None, :] == k_span_id[:, None]))
-            span_to_ns = q_in_span[None, :] & ~k_in_span[:, None]
-            causal_ns = ~q_in_span[None, :] & ~k_in_span[:, None] & (q_tile_indices[None, :] >= kv_indices[:, None])
+            # Note: query and key dimensions are swapped here for the backward pass (dk, dv)
+            q_is_prefix = q_is_prefix[None, :]
+            q_in_span = q_in_span[None, :]
+            q_is_maskq = q_is_maskq[None, :]
+            q_is_context = ~q_is_prefix & ~q_in_span & ~q_is_maskq
 
-            prefix_keys = k_is_prefix[:, None]
-            prefix_q = q_is_prefix[None, :]
+            k_is_prefix = k_is_prefix[:, None]
+            k_in_span = k_in_span[:, None]
+            k_is_maskq = k_is_maskq[:, None]
+            k_is_context = ~k_is_prefix & ~k_in_span & ~k_is_maskq
 
-            row_allow_all = prefix_q
-            row_mask_core = prefix_keys | same_span | span_to_ns | causal_ns
-            mask = tl.where(row_allow_all, True, row_mask_core)
+            causal_mask = q_tile_indices[None, :] >= kv_indices[:, None]
+            same_span_mask = q_in_span & k_in_span & (q_span_id[None, :] == k_span_id[:, None])
+
+            # Define attention rules
+            prefix_rule = q_is_prefix & k_is_prefix
+            context_rule = q_is_context & ( (k_is_context & causal_mask) | k_is_prefix )
+            span_rule = q_in_span & (same_span_mask | k_is_context)
+            maskq_rule = q_is_maskq & k_in_span
+
+            mask = prefix_rule | context_rule | span_rule | maskq_rule
             # --- End of new mask computation ---
         elif CAUSAL:
             mask = q_tile_indices[None, :] >= kv_indices[:, None]
@@ -1705,6 +1760,7 @@ def attention_forward_adapter(
     in_span: torch.Tensor = None,
     span_id: torch.Tensor = None,
     is_prefix: torch.Tensor = None,
+    is_maskq: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1740,6 +1796,7 @@ def attention_forward_adapter(
         in_span,
         span_id,
         is_prefix,
+        is_maskq,
         *strides(q, 4),
         *strides(kt, 4),
         *strides(v, 4),
@@ -1750,6 +1807,7 @@ def attention_forward_adapter(
         *(strides(in_span, 2) if in_span is not None else [0]*2),
         *(strides(span_id, 2) if span_id is not None else [0]*2),
         *(strides(is_prefix, 2) if is_prefix is not None else [0]*2),
+        *(strides(is_maskq, 2) if is_maskq is not None else [0]*2),
         T=T,
         HEAD_DIM=HEAD_DIM,
         CAUSAL=causal,
@@ -1782,6 +1840,7 @@ def attention_forward_adapter_abstract(
     in_span: torch.Tensor | None,
     span_id: torch.Tensor | None,
     is_prefix: torch.Tensor | None,
+    is_maskq: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
@@ -1809,6 +1868,7 @@ def attention_backward_adapter(
     in_span: torch.Tensor,
     span_id: torch.Tensor,
     is_prefix: torch.Tensor,
+    is_maskq: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1857,6 +1917,7 @@ def attention_backward_adapter(
         in_span,
         span_id,
         is_prefix,
+        is_maskq,
         *strides(q, 4),
         *strides(k, 4),
         *strides(v, 4),
@@ -1871,6 +1932,7 @@ def attention_backward_adapter(
         *(strides(in_span, 2) if in_span is not None else [0]*2),
         *(strides(span_id, 2) if span_id is not None else [0]*2),
         *(strides(is_prefix, 2) if is_prefix is not None else [0]*2),
+        *(strides(is_maskq, 2) if is_maskq is not None else [0]*2),
         T=T,
         HEAD_DIM=HEAD_DIM,
         CAUSAL=causal,
@@ -1902,6 +1964,7 @@ def attention_backward_adapter_abstract(
     in_span: torch.Tensor,
     span_id: torch.Tensor,
     is_prefix: torch.Tensor,
+    is_maskq: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     DQ = torch.empty_like(q, memory_format=torch.contiguous_format)
     DK = torch.empty_like(k, memory_format=torch.contiguous_format)
@@ -1926,6 +1989,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         in_span,
         span_id,
         is_prefix,
+        is_maskq,
     ) = inputs
     ctx.save_for_backward(
         q,
@@ -1938,6 +2002,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         in_span,
         span_id,
         is_prefix,
+        is_maskq,
     )
     ctx.causal = causal
     ctx.autotune = autotune
@@ -1947,7 +2012,7 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
 
 
 def attention_backward_adapter_op(ctx, do, dlse):
-    q, k, v, o, lse, lens, attention_mask, in_span, span_id, is_prefix = ctx.saved_tensors
+    q, k, v, o, lse, lens, attention_mask, in_span, span_id, is_prefix, is_maskq = ctx.saved_tensors
     causal = ctx.causal
     autotune = ctx.autotune
     sm_scale = ctx.sm_scale
@@ -1971,9 +2036,10 @@ def attention_backward_adapter_op(ctx, do, dlse):
         in_span=in_span,
         span_id=span_id,
         is_prefix=is_prefix,
+        is_maskq=is_maskq,
     )
 
-    return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None
+    return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 torch.library.register_autograd(
