@@ -21,9 +21,7 @@ Usage:
 """
 
 import torch
-import torch.nn.functional as F
 import numpy as np
-import matplotlib.pyplot as plt
 import argparse # Keep this, but ArgumentParser might be used from new imports
 import yaml
 from pathlib import Path
@@ -33,13 +31,13 @@ import sys
 import subprocess
 import socket
 import os
-# Ensure ArgumentParser and REMAINDER are available if argparse is re-imported or used directly
-from argparse import ArgumentParser, REMAINDER
+# Ensure ArgumentParser is available if argparse is re-imported or used directly
+from argparse import ArgumentParser
 
 # Import our custom modules
 from model import GPTModel
-from data_builder import DataBuilder, create_data_builder
-from train_loop import Trainer, TrainingConfig, create_trainer
+from data_builder import create_data_builder
+from train_loop import TrainingConfig, create_trainer
 
 # =============================================================================
 # Utility Functions
@@ -575,7 +573,6 @@ if __name__ == "__main__":
         help='Learning rate (overrides config)'
     )
     # Use parse_args() which will capture all defined args.
-    # REMAINDER is not needed here as we explicitly define training args.
     args = parser.parse_args()
 
     if "IS_WORKER_PROCESS" in os.environ:
