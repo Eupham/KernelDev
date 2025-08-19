@@ -21,6 +21,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from original_kernel import flash_attention
 
+# Mock SPECIAL_TOKENS for testing without data_builder dependency
+SPECIAL_TOKENS = {
+    '[PAD]': 0,
+    '[CLS]': 1,
+    '[MASK]': 2,
+    '[SPAN]': 3,
+    '[ES]': 4,
+    '[MASKQ]': 5
+}
+
 # =============================================================================
 # Normalization and Activation Functions
 # =============================================================================
@@ -96,14 +106,22 @@ class MultiHeadAttention(nn.Module):
 # =============================================================================
 
 class TransformerBlock(nn.Module):
-    """Transformer block with pre-normalization."""
+    """Transformer block with pre-normalization and optional layer uncertainty."""
     
-    def __init__(self, dim, n_heads, mlp_ratio=4, causal=True):
+    def __init__(self, dim, n_heads, mlp_ratio=4, causal=True, vocab_size=None, has_layer_supervision=False):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.attn = MultiHeadAttention(dim, n_heads, causal=causal)
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
+        
+        # Layer uncertainty and supervision components
+        self.has_layer_supervision = has_layer_supervision
+        if has_layer_supervision and vocab_size is not None:
+            # Learnable log-precision parameter for this layer (start at 0)
+            self.log_sigma = nn.Parameter(torch.zeros(1))
+            # Small readout head for deep supervision
+            self.layer_head = nn.Linear(dim, vocab_size, bias=False)
     
     def forward(self, x, in_span=None, span_id=None, is_prefix=None):
         # Pre-norm for attention
@@ -112,8 +130,6 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-
-from data_builder import SPECIAL_TOKENS
 
 # =============================================================================
 # Main GPT Model
@@ -132,13 +148,16 @@ class GPTModel(nn.Module):
         mlp_ratio=4,
         causal=True,
         bidirectional_prefix_len=0,
-        task_names: list = None
+        task_names: list = None,
+        layer_supervision_frequency: int = 4  # Apply layer supervision every N layers
     ):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
         self.max_seq_len = max_seq_len
         self.bidirectional_prefix_len = bidirectional_prefix_len
+        self.vocab_size = vocab_size
+        self.layer_supervision_frequency = layer_supervision_frequency
         
         # Learnable uncertainty parameters for each task
         if task_names:
@@ -150,16 +169,22 @@ class GPTModel(nn.Module):
         self.token_emb = nn.Embedding(vocab_size, dim)
         self.pos_emb = nn.Embedding(max_seq_len, dim)
         
-        # Transformer blocks
+        # Transformer blocks with selective layer supervision
         self.blocks = nn.ModuleList([
             TransformerBlock(
                 dim=dim,
                 n_heads=n_heads,
                 mlp_ratio=mlp_ratio,
-                causal=causal
+                causal=causal,
+                vocab_size=vocab_size,
+                has_layer_supervision=(i % layer_supervision_frequency == 0 and i > 0)  # Start from layer 1
             )
-            for _ in range(n_layers)
+            for i in range(n_layers)
         ])
+        
+        # Track which layers have supervision for easier access
+        self.supervised_layer_indices = [i for i in range(n_layers) 
+                                       if i % layer_supervision_frequency == 0 and i > 0]
         
         # Final norm and output projection
         self.norm_out = RMSNorm(dim)
@@ -238,10 +263,29 @@ class GPTModel(nn.Module):
                         cls_pos = cls_positions[0].item()
                         is_prefix[batch_idx, :cls_pos + 1] = True
 
-        # Apply transformer blocks (using metadata-only routing)
-        for block in self.blocks:
+        # Apply transformer blocks with layer supervision
+        layer_losses = {}
+        intermediate_outputs = {}
+        
+        for i, block in enumerate(self.blocks):
             # Always use metadata tensors for attention control (no task-based routing)
             x_embed = block(x_embed, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            
+            # Collect intermediate outputs for layer supervision
+            if block.has_layer_supervision and targets is not None:
+                # Apply normalization and compute layer logits
+                normalized_x = self.norm_out(x_embed)  # Use same normalization as final layer
+                layer_logits = block.layer_head(normalized_x)
+                
+                # Compute layer-wise cross-entropy loss
+                layer_loss = F.cross_entropy(
+                    layer_logits.view(-1, layer_logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=SPECIAL_TOKENS['[PAD]']
+                )
+                
+                layer_losses[f'layer_{i}'] = layer_loss
+                intermediate_outputs[f'layer_{i}'] = layer_logits
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
@@ -304,13 +348,24 @@ class GPTModel(nn.Module):
             # Teacher forcing processing (generative language modeling)
             logits = self.head(x_embed)
             loss = None
+            
             if targets is not None:
-                # Compute cross-entropy loss
-                loss = F.cross_entropy(
+                # Compute final layer cross-entropy loss
+                final_loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     targets.view(-1),
                     ignore_index=SPECIAL_TOKENS['[PAD]']
                 )
+                
+                # If we have layer supervision, return structured loss
+                if layer_losses:
+                    loss = {
+                        'final_loss': final_loss,
+                        'layer_losses': layer_losses
+                    }
+                else:
+                    loss = final_loss
+                    
             return logits, loss
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
