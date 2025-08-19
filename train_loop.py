@@ -17,8 +17,7 @@ Key Components:
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from data_builder import BIO_TAGS
-from torch.distributions import Bernoulli
+
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -496,7 +495,6 @@ class Trainer:
         model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
 
         # Handle 'module.' prefix differences
-        current_keys_have_module = all(k.startswith('module.') for k in model_to_load.state_dict().keys())
         checkpoint_keys_have_module = all(k.startswith('module.') for k in state_dict.keys())
 
         if isinstance(self.model, DDP): # Current model is DDP
