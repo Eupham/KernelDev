@@ -967,9 +967,7 @@ class Trainer:
                         logits, loss = self.model(x, targets=y, task_name=task_name)
 
                     if loss is not None:
-                        # Apply uncertainty weighting to handle structured losses
-                        weighted_loss = self.apply_layer_uncertainty_weighting(loss, task_name)
-                        total_loss += weighted_loss.item()
+                        total_loss += loss.item()
                         num_batches += 1
         
         self.model.train()
