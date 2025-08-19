@@ -26,11 +26,15 @@ def test_layer_uncertainty_symmetry_breaking():
     # Check layer uncertainty parameters
     layer_uncertainties = {}
     for layer_idx in model.supervised_layer_indices:
-        if hasattr(model.blocks[layer_idx], 'log_sigma'):
-            log_sigma = model.blocks[layer_idx].log_sigma.item()
-            sigma = torch.exp(model.blocks[layer_idx].log_sigma).item()
-            layer_uncertainties[f'layer_{layer_idx}'] = {'log_sigma': log_sigma, 'sigma': sigma}
-            print(f"   Layer {layer_idx}: log_sigma = {log_sigma:.6f}, sigma = {sigma:.6f}")
+        if hasattr(model.blocks[layer_idx], 'log_sigmas'):
+            # New structure: task-specific uncertainties per layer
+            for task_name in ['teacher_forcing', 'cocktail_party']:
+                if task_name in model.blocks[layer_idx].log_sigmas:
+                    log_sigma = model.blocks[layer_idx].log_sigmas[task_name].item()
+                    sigma = torch.exp(model.blocks[layer_idx].log_sigmas[task_name]).item()
+                    key = f'layer_{layer_idx}_{task_name}'
+                    layer_uncertainties[key] = {'log_sigma': log_sigma, 'sigma': sigma}
+                    print(f"   Layer {layer_idx} {task_name}: log_sigma = {log_sigma:.6f}, sigma = {sigma:.6f}")
     
     # Check if they are different (symmetry broken)
     log_sigma_values = [params['log_sigma'] for params in layer_uncertainties.values()]
@@ -57,13 +61,17 @@ def test_task_level_uncertainties():
     )
     
     print("Task-level uncertainties:")
-    for task_name, log_sigma_param in model.log_sigmas.items():
-        log_sigma = log_sigma_param.item()
-        sigma = torch.exp(log_sigma_param).item()
-        print(f"   {task_name}: log_sigma = {log_sigma:.6f}, sigma = {sigma:.6f}")
-    
-    # These should still be identical (zeros) since task-level doesn't need symmetry breaking
-    return True
+    if hasattr(model, 'log_sigmas'):
+        for task_name, log_sigma_param in model.log_sigmas.items():
+            log_sigma = log_sigma_param.item()
+            sigma = torch.exp(log_sigma_param).item()
+            print(f"   {task_name}: log_sigma = {log_sigma:.6f}, sigma = {sigma:.6f}")
+        print("   ⚠ Task-level uncertainties still exist (should be eliminated)")
+        return False
+    else:
+        print("   ✓ Task-level uncertainties successfully eliminated")
+        print("   ✓ Uncertainty is now handled at the layer level per task")
+        return True
 
 if __name__ == "__main__":
     print("Testing Model Initialization Improvements")
