@@ -330,6 +330,62 @@ class Trainer:
             return self.config.learning_rate * step / self.config.warmup_steps
         return self.config.learning_rate
     
+    def apply_layer_uncertainty_weighting(self, loss, task_name: str, lambda_pred: float = 1.0, lambda_kl: float = 1e-3) -> torch.Tensor:
+        """Apply layer-wise uncertainty weighting to structured losses."""
+        model = self.model.module if isinstance(self.model, DDP) else self.model
+        
+        if isinstance(loss, dict) and 'layer_losses' in loss:
+            # Handle structured loss with layer supervision
+            total_weighted_loss = torch.tensor(0.0, device=loss['final_loss'].device)
+            
+            # 1. Final layer loss with task-level uncertainty (if available)
+            final_loss = loss['final_loss']
+            if hasattr(model, 'log_sigmas') and task_name in model.log_sigmas:
+                task_log_sigma = model.log_sigmas[task_name]
+                weighted_final = lambda_pred * (0.5 * torch.exp(-2 * task_log_sigma) * final_loss + task_log_sigma)
+            else:
+                weighted_final = lambda_pred * final_loss
+            total_weighted_loss += weighted_final
+            
+            # 2. Layer-wise losses with layer uncertainty
+            layer_losses = loss['layer_losses']
+            kl_penalty = torch.tensor(0.0, device=final_loss.device)
+            
+            for layer_name, layer_loss in layer_losses.items():
+                # Extract layer index
+                layer_idx = int(layer_name.split('_')[1])
+                layer_block = model.blocks[layer_idx]
+                
+                if hasattr(layer_block, 'log_sigma'):
+                    # Apply uncertainty weighting: L_ℓ(unc) = 1/2 * exp(-2*s_ℓ) * L_ℓ + s_ℓ
+                    s_l = layer_block.log_sigma
+                    
+                    # Clamp s_ℓ to [-5, 5] to avoid degenerate blow-ups
+                    s_l_clamped = torch.clamp(s_l, -5.0, 5.0)
+                    
+                    uncertainty_weighted_loss = 0.5 * torch.exp(-2 * s_l_clamped) * layer_loss + s_l_clamped
+                    total_weighted_loss = total_weighted_loss + uncertainty_weighted_loss
+                    
+                    # Add KL penalty: KL(q(s_ℓ)||p(s)) for Gaussian prior with mean 0
+                    # For Gaussian prior N(0, 1), KL = 0.5 * (s_ℓ² + exp(2*s_ℓ) - 2*s_ℓ - 1)
+                    # Simplified to L2 penalty as mentioned in the issue: s_ℓ²
+                    kl_penalty = kl_penalty + 0.5 * s_l_clamped ** 2
+                else:
+                    # No uncertainty for this layer, just add the loss
+                    total_weighted_loss = total_weighted_loss + layer_loss
+            
+            # Add KL regularization
+            total_weighted_loss = total_weighted_loss + lambda_kl * kl_penalty
+            
+            return total_weighted_loss
+        else:
+            # Handle simple loss (no layer supervision)
+            if hasattr(model, 'log_sigmas') and task_name in model.log_sigmas:
+                task_log_sigma = model.log_sigmas[task_name]
+                return 0.5 * torch.exp(-2 * task_log_sigma) * loss + task_log_sigma
+            else:
+                return loss
+    
     def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step with speed optimizations."""
         if task_name == 'cocktail_party':
@@ -432,11 +488,21 @@ class Trainer:
 
                     if loss is not None:
                         if isinstance(loss, dict):
-                            batch_loss = 0
-                            for loss_name, loss_value in loss.items():
-                                weight = task_configs.get(task_name, {}).get(f"{loss_name}_weight", 1.0)
-                                batch_loss += weight * loss_value
-                            total_loss += batch_loss.item()
+                            # Handle structured loss from layer supervision
+                            if 'final_loss' in loss:
+                                batch_loss = loss['final_loss'].item()
+                                # Add layer losses if present
+                                if 'layer_losses' in loss:
+                                    layer_sum = sum(l.item() for l in loss['layer_losses'].values())
+                                    batch_loss += layer_sum
+                                total_loss += batch_loss
+                            else:
+                                # Handle other dict losses
+                                batch_loss = 0
+                                for loss_name, loss_value in loss.items():
+                                    weight = task_configs.get(task_name, {}).get(f"{loss_name}_weight", 1.0)
+                                    batch_loss += weight * loss_value
+                                total_loss += batch_loss.item()
                         else:
                             total_loss += loss.item()
                         num_batches += 1
@@ -554,11 +620,20 @@ class Trainer:
                 if loss is None or (isinstance(loss, float) and loss == 0.0):
                     continue
 
-                individual_losses[task_name] = loss.item()
+                # Extract scalar loss for logging
+                if isinstance(loss, dict):
+                    scalar_loss = loss['final_loss'].item()
+                    if 'layer_losses' in loss:
+                        # Add average layer loss for logging
+                        avg_layer_loss = sum(l.item() for l in loss['layer_losses'].values()) / len(loss['layer_losses'])
+                        scalar_loss += avg_layer_loss
+                else:
+                    scalar_loss = loss.item()
+                
+                individual_losses[task_name] = scalar_loss
 
-                # Uncertainty-based weighting
-                log_sigma = self.model.module.log_sigmas[task_name] if isinstance(self.model, DDP) else self.model.log_sigmas[task_name]
-                weighted_loss = 0.5 * torch.exp(-2 * log_sigma) * loss + log_sigma
+                # Apply layer-wise uncertainty weighting
+                weighted_loss = self.apply_layer_uncertainty_weighting(loss, task_name)
 
                 total_loss += weighted_loss.squeeze()
 
@@ -602,13 +677,29 @@ class Trainer:
                 loss_var = self.metrics.get_loss_variance()
                 log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
                 log_str += f"Total Loss: {total_loss.item():.4f} (MA: {loss_ma:.4f}, Var: {loss_var:.4f}), "
+                
+                # Log task-level losses and uncertainties
+                model = self.model.module if isinstance(self.model, DDP) else self.model
                 for task_name, loss_value in individual_losses.items():
-                    log_sigma = self.model.module.log_sigmas[task_name].item() if isinstance(self.model, DDP) else self.model.log_sigmas[task_name].item()
-                    sigma = math.exp(log_sigma)
-                    log_str += f"{task_name}: {loss_value:.4f} (σ: {sigma:.4f}), "
+                    if hasattr(model, 'log_sigmas') and task_name in model.log_sigmas:
+                        log_sigma = model.log_sigmas[task_name].item()
+                        sigma = math.exp(log_sigma)
+                        log_str += f"{task_name}: {loss_value:.4f} (σ: {sigma:.4f}), "
+                    else:
+                        log_str += f"{task_name}: {loss_value:.4f}, "
 
                 log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
+                
+                # Log layer-level uncertainties
+                if hasattr(model, 'supervised_layer_indices') and model.supervised_layer_indices:
+                    layer_log_str = "Layer uncertainties: "
+                    for layer_idx in model.supervised_layer_indices:
+                        if hasattr(model.blocks[layer_idx], 'log_sigma'):
+                            s_l = model.blocks[layer_idx].log_sigma.item()
+                            sigma_l = math.exp(s_l)
+                            layer_log_str += f"L{layer_idx}(σ:{sigma_l:.3f}), "
+                    print(layer_log_str)
 
             # Evaluation, saving, and inference block (runs on rank 0)
             if (not self.is_distributed or dist.get_rank() == 0):
