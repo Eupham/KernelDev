@@ -488,24 +488,9 @@ class Trainer:
                             logits, loss = self.model(x, targets=y, task_name=task_name)
 
                     if loss is not None:
-                        if isinstance(loss, dict):
-                            # Handle structured loss from layer supervision
-                            if 'final_loss' in loss:
-                                batch_loss = loss['final_loss'].item()
-                                # Add layer losses if present
-                                if 'layer_losses' in loss:
-                                    layer_sum = sum(l.item() for l in loss['layer_losses'].values())
-                                    batch_loss += layer_sum
-                                total_loss += batch_loss
-                            else:
-                                # Handle other dict losses
-                                batch_loss = 0
-                                for loss_name, loss_value in loss.items():
-                                    weight = task_configs.get(task_name, {}).get(f"{loss_name}_weight", 1.0)
-                                    batch_loss += weight * loss_value
-                                total_loss += batch_loss.item()
-                        else:
-                            total_loss += loss.item()
+                        # Apply uncertainty weighting consistently in evaluation too
+                        weighted_loss = self.apply_layer_uncertainty_weighting(loss, task_name)
+                        total_loss += weighted_loss.item()
                         num_batches += 1
 
         self.model.train()

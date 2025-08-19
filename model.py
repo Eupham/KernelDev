@@ -118,8 +118,10 @@ class TransformerBlock(nn.Module):
         # Layer uncertainty and supervision components
         self.has_layer_supervision = has_layer_supervision
         if has_layer_supervision and vocab_size is not None:
-            # Learnable log-precision parameter for this layer (start at 0)
-            self.log_sigma = nn.Parameter(torch.zeros(1))
+            # Learnable log-precision parameter for this layer 
+            # Add small random perturbation to break symmetry between layers
+            init_value = torch.normal(0.0, 0.05, (1,))
+            self.log_sigma = nn.Parameter(init_value)
             # Small readout head for deep supervision
             self.layer_head = nn.Linear(dim, vocab_size, bias=False)
     
