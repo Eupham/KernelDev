@@ -113,8 +113,7 @@ class TransformerBlock(nn.Module):
         return x
 
 
-from data_builder import NUM_BIO_TAGS, SPECIAL_TOKENS, BIO_TAGS
-from torch.distributions import Bernoulli
+from data_builder import SPECIAL_TOKENS
 
 # =============================================================================
 # Main GPT Model
