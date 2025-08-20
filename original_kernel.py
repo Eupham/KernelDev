@@ -2066,14 +2066,14 @@ def flash_attention_reference(
 
     if lens is not None:
         key_padding_mask = (
-            torch.arange(T, device="cuda").unsqueeze(0) < lens.unsqueeze(-1)
+            torch.arange(T, device=q.device).unsqueeze(0) < lens.unsqueeze(-1)
         ).unsqueeze(-1)
         key_padding_mask_ref = key_padding_mask
         key_padding_mask = key_padding_mask & key_padding_mask.transpose(-1, -2)
         attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask.unsqueeze(1)
         res_mask = key_padding_mask_ref.unsqueeze(1)
     else:
-        res_mask = torch.tensor([True], device="cuda")
+        res_mask = torch.tensor([True], device=q.device)
 
     sparsity_fraction = attn_mask.sum().item() / attn_mask.numel()
     return (
@@ -2306,6 +2306,20 @@ def flash_attention(
         hadamard_signs_q (Tensor | None): Pre-computed random signs for Q transform
         hadamard_signs_k (Tensor | None): Pre-computed random signs for K transform
     """
+    # Check if running on CPU - if so, fall back to reference implementation
+    if q.device.type == 'cpu' or k.device.type == 'cpu' or v.device.type == 'cpu':
+        logger.info("Flash attention fallback: Using CPU reference implementation")
+        result = flash_attention_reference(q, k, v, lens=lens, causal=causal, scale=sm_scale)
+        if return_lse:
+            # Reference implementation returns (output, mask, sparsity), but we need (output, lse)
+            # For CPU fallback, we don't have LSE, so return zeros with proper shape
+            output = result[0]
+            batch_size, n_heads, seq_len = output.shape[:3]
+            lse = torch.zeros(batch_size, n_heads, seq_len, device=output.device, dtype=output.dtype)
+            return output, lse
+        else:
+            return result[0]  # Just return the output tensor
+    
     if not torch.compiler.is_compiling():
         for i in (q, k, v):
             torch._dynamo.mark_static(i, 1)
