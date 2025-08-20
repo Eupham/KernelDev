@@ -511,7 +511,7 @@ class Trainer:
 
                     if loss is not None:
                         # Apply uncertainty weighting consistently in evaluation too
-                        weighted_loss = self.apply_layer_uncertainty_weighting(loss, task_name)
+                        weighted_loss, _ = self.apply_layer_uncertainty_weighting({task_name: loss})
                         total_loss += weighted_loss.item()
                         num_batches += 1
 
@@ -1000,7 +1000,7 @@ class Trainer:
 
                     if loss is not None:
                         # Apply uncertainty weighting to handle structured losses
-                        weighted_loss = self.apply_layer_uncertainty_weighting(loss, task_name)
+                        weighted_loss, _ = self.apply_layer_uncertainty_weighting({task_name: loss})
                         total_loss += weighted_loss.item()
                         num_batches += 1
         
