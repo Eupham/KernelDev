@@ -154,3 +154,22 @@ tasks:
     num_distractors: 3
     min_span_size: 100
     max_span_size: 200
+
+# Layer Uncertainty Configuration
+layer_uncertainty:
+  # Supervise all layers ("all") or every N layers (integer)
+  supervise_layers: "all"
+  
+  # Use shared heads across layers
+  share_heads: true
+  
+  # Conditioning method: "film" or "concat2"
+  conditioning: "film"
+  
+  # Per-task layer supervision weights
+  lambda_layers:
+    tf: 1.0  # teacher_forcing
+    cp: 1.0  # cocktail_party
+  
+  # KL regularization weight for uncertainty parameters
+  lambda_kl: 1e-3

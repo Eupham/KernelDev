@@ -157,20 +157,33 @@ class GPTModel(nn.Module):
         causal=True,
         bidirectional_prefix_len=0,
         task_names: list = None,
-        layer_supervision_frequency: int = 4  # Apply layer supervision every N layers
+        layer_supervision_frequency: int = 4,  # Apply layer supervision every N layers
+        supervise_layers: str = "frequency",  # "all" or "frequency"
+        share_heads: bool = False,  # Use shared head across layers
+        conditioning: str = "film"  # "film" or "concat2"
     ):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
+        self.n_layers = n_layers
         self.max_seq_len = max_seq_len
         self.bidirectional_prefix_len = bidirectional_prefix_len
         self.vocab_size = vocab_size
         self.layer_supervision_frequency = layer_supervision_frequency
         self.task_names = task_names or []
+        self.supervise_layers = supervise_layers
+        self.share_heads = share_heads
+        self.conditioning = conditioning
 
         # Token and position embeddings (no bias)
         self.token_emb = nn.Embedding(vocab_size, dim)
         self.pos_emb = nn.Embedding(max_seq_len, dim)
+        
+        # Determine layer supervision logic
+        if supervise_layers == "all":
+            layer_has_supervision = lambda i: True  # All layers have supervision
+        else:
+            layer_has_supervision = lambda i: (i % layer_supervision_frequency == 0 and i > 0)
         
         # Transformer blocks with per-task layer uncertainty for ALL layers
         self.blocks = nn.ModuleList([
@@ -179,16 +192,35 @@ class GPTModel(nn.Module):
                 n_heads=n_heads,
                 mlp_ratio=mlp_ratio,
                 causal=causal,
-                vocab_size=vocab_size,
-                has_layer_supervision=(i % layer_supervision_frequency == 0 and i > 0),  # Keep supervision for specific layers
+                vocab_size=vocab_size if not share_heads else None,  # No individual heads if sharing
+                has_layer_supervision=layer_has_supervision(i),
                 task_names=task_names  # All layers get per-task uncertainty
             )
             for i in range(n_layers)
         ])
         
         # Track which layers have supervision for easier access
-        self.supervised_layer_indices = [i for i in range(n_layers) 
-                                       if i % layer_supervision_frequency == 0 and i > 0]
+        if supervise_layers == "all":
+            self.supervised_layer_indices = list(range(n_layers))
+        else:
+            self.supervised_layer_indices = [i for i in range(n_layers) 
+                                           if i % layer_supervision_frequency == 0 and i > 0]
+        
+        # Shared head configuration
+        if share_heads:
+            # Shared teacher forcing head for all layers
+            conditioning_dim = 2 if conditioning == "concat2" else 0
+            self.shared_tf_head = nn.Linear(dim + conditioning_dim, vocab_size, bias=False)
+            
+            # FiLM conditioning parameters
+            if conditioning == "film":
+                self.layer_alpha = nn.Parameter(torch.zeros(n_layers))
+                self.layer_beta = nn.Parameter(torch.zeros(n_layers))
+                self.task_alpha = nn.ParameterDict({t: nn.Parameter(torch.zeros(1)) for t in self.task_names})
+                self.task_beta = nn.ParameterDict({t: nn.Parameter(torch.zeros(1)) for t in self.task_names})
+            elif conditioning == "concat2":
+                self.layer_id = nn.Parameter(torch.zeros(n_layers, 1))  # scalar per layer
+                self.task_id = nn.ParameterDict({t: nn.Parameter(torch.zeros(1)) for t in self.task_names})
         
         # Final norm and output projection
         self.norm_out = RMSNorm(dim)
@@ -196,8 +228,86 @@ class GPTModel(nn.Module):
         
         # Weight tying: share weights between token embedding and output head
         self.head.weight = self.token_emb.weight
+        if share_heads:
+            # Also tie shared head weights
+            self.shared_tf_head.weight = self.token_emb.weight
         
         self.apply(self._init_weights)
+    
+    def condition_hidden(self, h, layer_idx, task):
+        """Apply FiLM-style conditioning: h' = (1 + α_ℓ + α_t) * h + (β_ℓ + β_t)"""
+        if self.conditioning != "film":
+            raise ValueError("condition_hidden only works with FiLM conditioning")
+        
+        a = 1.0 + self.layer_alpha[layer_idx] + self.task_alpha[task]
+        b = self.layer_beta[layer_idx] + self.task_beta[task]
+        return h * a + b
+    
+    def augment_hidden(self, h, layer_idx, task):
+        """Concatenate [s_layerID, s_taskID] to each token hidden before the shared LM head"""
+        if self.conditioning != "concat2":
+            raise ValueError("augment_hidden only works with concat2 conditioning")
+        
+        B, T, D = h.shape
+        lid = self.layer_id[layer_idx].expand(B, T, 1)
+        tid = self.task_id[task].expand(B, T, 1)
+        return torch.cat([h, lid, tid], dim=-1)  # -> (B,T,D+2)
+    
+    def extract_mask_query(self, h, tokens):
+        """Extract context vector from mask query tokens for cocktail party task"""
+        mask_token_id = SPECIAL_TOKENS['[MASK]']
+        B, T, D = h.shape
+        
+        # Vectorized context extraction
+        mask_positions = (tokens == mask_token_id).nonzero(as_tuple=True)
+        h_context = h.new_zeros(B, D)
+        
+        # Get the first mask for each batch item, if it exists
+        if mask_positions[0].numel() > 0:
+            unique_batch_idx, counts = torch.unique(mask_positions[0], return_counts=True)
+            first_mask_indices = torch.cat((tokens.new_zeros(1, dtype=torch.long), torch.cumsum(counts, 0)[:-1]))
+            if unique_batch_idx.numel() > 0:
+                h_context[unique_batch_idx] = h[unique_batch_idx, mask_positions[1][first_mask_indices]]
+        
+        return h_context
+    
+    def pool_spans(self, h, tokens):
+        """Pool span embeddings for cocktail party task"""
+        span_start_id = SPECIAL_TOKENS['[SPAN]']
+        span_end_id = SPECIAL_TOKENS['[ES]']
+        B, T, D = h.shape
+        
+        # Vectorized span processing
+        span_starts = (tokens == span_start_id).nonzero()
+        span_ends = (tokens == span_end_id).nonzero()
+        
+        if span_starts.numel() == 0:
+            return h.new_zeros(B, 1, D)  # Return at least one span dimension
+        
+        # Create a tensor to map each span to its batch index
+        batch_indices = span_starts[:, 0]
+        
+        # Calculate max number of spans for padding
+        max_spans = (tokens == span_start_id).sum(dim=1).max()
+        
+        h_spans = h.new_zeros(B, max_spans, D)
+        
+        for i in range(B):
+            st_indices = span_starts[batch_indices == i, 1]
+            ed_indices = span_ends[batch_indices == i, 1]
+            
+            for j, (st, ed) in enumerate(zip(st_indices, ed_indices)):
+                if st + 1 < ed:
+                    h_spans[i, j] = h[i, st + 1:ed].mean(dim=0)
+        
+        return h_spans
+    
+    def final_span_scores(self, h, tokens):
+        """Compute final span scores for cocktail party task (reuses existing logic)"""
+        ctx_vec = self.extract_mask_query(h, tokens)  # (B, D)
+        span_vecs = self.pool_spans(h, tokens)  # (B, Nspans, D)
+        scores = torch.einsum('bd,bnd->bn', ctx_vec, span_vecs)
+        return scores
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -267,110 +377,125 @@ class GPTModel(nn.Module):
                         cls_pos = cls_positions[0].item()
                         is_prefix[batch_idx, :cls_pos + 1] = True
 
-        # Apply transformer blocks with layer supervision
-        layer_losses = {}
-        intermediate_outputs = {}
+        # Apply transformer blocks with layer supervision for BOTH tasks
+        layer_losses_tf = {}  # Teacher forcing layer losses
+        layer_losses_cp = {}  # Cocktail party layer losses
         
         for i, block in enumerate(self.blocks):
-            # Always use metadata tensors for attention control (no task-based routing)
+            # Always use metadata tensors for attention control
             x_embed = block(x_embed, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
             
-            # Collect intermediate outputs for layer supervision
-            if block.has_layer_supervision and targets is not None:
-                # Apply normalization and compute layer logits
-                normalized_x = self.norm_out(x_embed)  # Use same normalization as final layer
-                layer_logits = block.layer_head(normalized_x)
+            # Apply normalization for layer-wise supervision
+            if block.has_layer_supervision:
+                h = self.norm_out(x_embed)  # Use same normalization as final layer
                 
-                # Compute layer-wise cross-entropy loss
-                layer_loss = F.cross_entropy(
-                    layer_logits.view(-1, layer_logits.size(-1)),
-                    targets.view(-1),
-                    ignore_index=SPECIAL_TOKENS['[PAD]']
-                )
+                # --- Teacher Forcing per-layer logits (shared head) ---
+                if targets is not None:
+                    if self.share_heads:
+                        # Use shared head with conditioning
+                        if self.conditioning == "film":
+                            h_conditioned = self.condition_hidden(h, i, "teacher_forcing")
+                            layer_logits = self.shared_tf_head(h_conditioned)
+                        else:  # "concat2"
+                            h_aug = self.augment_hidden(h, i, "teacher_forcing")
+                            layer_logits = self.shared_tf_head(h_aug)
+                    else:
+                        # Use per-layer head (existing logic)
+                        layer_logits = block.layer_head(h)
+                    
+                    # CE over tokens (mask/pad as usual)
+                    ce_tf = F.cross_entropy(
+                        layer_logits.view(-1, layer_logits.size(-1)),
+                        targets.view(-1),
+                        ignore_index=SPECIAL_TOKENS['[PAD]']
+                    )
+                    layer_losses_tf[f'layer_{i}'] = ce_tf
                 
-                layer_losses[f'layer_{i}'] = layer_loss
-                intermediate_outputs[f'layer_{i}'] = layer_logits
+                # --- Cocktail Party per-layer scores (contrastive span selection) ---
+                if correct_idx is not None:
+                    # Check if this is actually a cocktail party sequence
+                    mask_token_id = SPECIAL_TOKENS['[MASK]']
+                    span_start_id = SPECIAL_TOKENS['[SPAN]']
+                    span_end_id = SPECIAL_TOKENS['[ES]']
+                    has_mask = (x == mask_token_id).any()
+                    has_spans = (x == span_start_id).any() and (x == span_end_id).any()
+                    
+                    if has_mask and has_spans:
+                        # Compute context and span embeddings from h for this layer
+                        ctx_vec = self.extract_mask_query(h, x)  # (B, D)
+                        span_vecs = self.pool_spans(h, x)  # (B, Nspans, D)
+                        
+                        # Scores: dot(ctx, span) per candidate
+                        scores_i = torch.einsum('bd,bnd->bn', ctx_vec, span_vecs)
+                        ce_cp = F.cross_entropy(scores_i, correct_idx)  # (B,)
+                        layer_losses_cp[f'layer_{i}'] = ce_cp
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
         
-        # Auto-detect output mode based on tokens present (no task-based routing)
+        # Auto-detect output mode based on tokens present
         mask_token_id = SPECIAL_TOKENS['[MASK]']
         span_start_id = SPECIAL_TOKENS['[SPAN]']
         span_end_id = SPECIAL_TOKENS['[ES]']
         
-        # If sequence contains span tokens and mask, process as cocktail party
+        # Check what type of processing we need
         has_mask = (x == mask_token_id).any()
         has_spans = (x == span_start_id).any() and (x == span_end_id).any()
         
-        if has_mask and has_spans:
-            # Cocktail party processing (span-based reasoning)
-            B, T = x.shape
-            D = x_embed.size(-1)
-
-            # 1) Vectorized context extraction
-            mask_positions = (x == mask_token_id).nonzero(as_tuple=True)
-            h_context = x_embed.new_zeros(B, D)
-            # Get the first mask for each batch item, if it exists
-            unique_batch_idx, counts = torch.unique(mask_positions[0], return_counts=True)
-            first_mask_indices = torch.cat((x.new_zeros(1, dtype=torch.long), torch.cumsum(counts, 0)[:-1]))
-            if unique_batch_idx.numel() > 0:
-                 h_context[unique_batch_idx] = x_embed[unique_batch_idx, mask_positions[1][first_mask_indices]]
-
-            # 2) Vectorized span processing
-            span_starts = (x == span_start_id).nonzero()
-            span_ends = (x == span_end_id).nonzero()
-
-            if span_starts.numel() == 0:
-                return torch.empty(0), torch.tensor(0.0, device=x.device)
-
-            # Create a tensor to map each span to its batch index
-            batch_indices = span_starts[:, 0]
-
-            # Calculate max number of spans for padding
-            max_spans = (x == span_start_id).sum(dim=1).max()
-
-            h_spans = x_embed.new_zeros(B, max_spans, D)
-
-            for i in range(B):
-                st_indices = span_starts[batch_indices == i, 1]
-                ed_indices = span_ends[batch_indices == i, 1]
-
-                for j, (st, ed) in enumerate(zip(st_indices, ed_indices)):
-                    if st + 1 < ed:
-                        h_spans[i, j] = x_embed[i, st + 1:ed].mean(dim=0)
-
-            # 4) Compute scores via einsum
-            scores = torch.einsum('bd,bnd->bn', h_context, h_spans)
-
-            loss = None
-            if correct_idx is not None:
-                loss = F.cross_entropy(scores, correct_idx)
-
-            return scores, loss
-        else:
-            # Teacher forcing processing (generative language modeling)
-            logits = self.head(x_embed)
-            loss = None
+        # Prepare final outputs
+        logits_final = None
+        scores_final = None
+        loss_tf = None
+        loss_cp = None
+        
+        # Teacher forcing final head
+        if targets is not None:
+            logits_final = self.head(x_embed)
+            final_ce_tf = F.cross_entropy(
+                logits_final.view(-1, logits_final.size(-1)),
+                targets.view(-1),
+                ignore_index=SPECIAL_TOKENS['[PAD]']
+            )
             
-            if targets is not None:
-                # Compute final layer cross-entropy loss
-                final_loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
-                    ignore_index=SPECIAL_TOKENS['[PAD]']
-                )
-                
-                # If we have layer supervision, return structured loss
-                if layer_losses:
-                    loss = {
-                        'final_loss': final_loss,
-                        'layer_losses': layer_losses
-                    }
-                else:
-                    loss = final_loss
-                    
-            return logits, loss
+            # Structure teacher forcing loss
+            if layer_losses_tf:
+                loss_tf = {
+                    'final_ce': final_ce_tf,
+                    'layer_ce': layer_losses_tf
+                }
+            else:
+                loss_tf = final_ce_tf
+        
+        # Cocktail party final scores
+        if correct_idx is not None and has_mask and has_spans:
+            scores_final = self.final_span_scores(x_embed, x)
+            final_ce_cp = F.cross_entropy(scores_final, correct_idx)
+            
+            # Structure cocktail party loss
+            if layer_losses_cp:
+                loss_cp = {
+                    'final_ce': final_ce_cp,
+                    'layer_ce': layer_losses_cp
+                }
+            else:
+                loss_cp = final_ce_cp
+        
+        # Return based on what was requested
+        if has_mask and has_spans:
+            # Cocktail party mode - return structured loss for both tasks if available
+            if loss_tf is not None and loss_cp is not None:
+                # Both tasks available
+                combined_loss = {"teacher_forcing": loss_tf, "cocktail_party": loss_cp}
+            elif loss_cp is not None:
+                # Only cocktail party
+                combined_loss = loss_cp
+            else:
+                combined_loss = None
+            
+            return scores_final, combined_loss
+        else:
+            # Teacher forcing mode
+            return logits_final, loss_tf
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """Generate new tokens using the model with top-k and top-p sampling."""
