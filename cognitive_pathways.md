@@ -4,20 +4,20 @@
 
 This document outlines potential mathematical and computational pathways toward implementing cognitive architectures within the KernelDev framework. Drawing from established cognitive theories, neuroscience principles, and modern machine learning approaches, we explore several promising directions that could extend the current hierarchical attention system into a more comprehensive cognitive model.
 
-## Current Foundation: Hierarchical Attention with Uncertainty
+## Current Foundation: Hierarchical Attention Framework
 
 The existing KernelDev implementation provides a solid foundation with:
 
 - **Hierarchical Attention Patterns**: 4-section attention structure supporting complex reasoning
-- **Uncertainty-Based Multi-Task Learning**: Learnable uncertainty parameters σ_τ for task weighting
+- **Multi-Task Learning**: Simple weighted loss combination for teacher forcing and cocktail party tasks
 - **Memory-Efficient Computation**: Flash attention with O(n) memory complexity
 - **Span-Based Reasoning**: Cocktail party task enabling selective attention mechanisms
 
 **Mathematical Foundation:**
 ```
-L_total = Σ_τ [1/(2σ_τ²) L_τ + log(σ_τ)]
+L_total = Σ_τ [w_τ × L_τ]
 ```
-where τ indexes tasks, L_τ is task-specific loss, and σ_τ represents learned uncertainty.
+where τ indexes tasks, L_τ is task-specific loss, and w_τ represents configurable task weights.
 
 ## Pathway 1: ACT-R Integration (Adaptive Control of Thought-Rational)
 
@@ -365,9 +365,9 @@ Attention_cognitive = Softmax(
 
 ## Conclusion
 
-The KernelDev framework provides an excellent foundation for implementing sophisticated cognitive architectures. The hierarchical attention mechanism, uncertainty-based learning, and memory-efficient computation create a strong base for extending toward human-like cognitive capabilities.
+The KernelDev framework provides an excellent foundation for implementing sophisticated cognitive architectures. The hierarchical attention mechanism, multi-task learning, and memory-efficient computation create a strong base for extending toward human-like cognitive capabilities.
 
-The most promising near-term pathway appears to be integrating working memory mechanisms with predictive coding, as these build naturally on the existing uncertainty framework while providing clear cognitive benefits. The attention sink mechanism from the cocktail party implementation offers a natural bridge toward implementing persistent cognitive states.
+The most promising near-term pathway appears to be integrating working memory mechanisms with predictive coding, as these build naturally on the existing multi-task framework while providing clear cognitive benefits. The attention sink mechanism from the cocktail party implementation offers a natural bridge toward implementing persistent cognitive states.
 
 Future research should focus on:
 1. Empirical validation of cognitive plausibility
