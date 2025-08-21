@@ -330,84 +330,101 @@ class Trainer:
             return self.config.learning_rate * step / self.config.warmup_steps
         return self.config.learning_rate
     
-    def apply_layer_uncertainty_weighting(self, loss_dict, lambda_layers=None, lambda_kl=1e-3):
-        """Apply per-layer, per-task uncertainty weighting to losses according to issue #129."""
+    def apply_layer_uncertainty_weighting(self, loss, task_name: str, lambda_pred: float = 1.0, lambda_kl: float = 1e-3) -> torch.Tensor:
+        """Apply per-layer, per-task uncertainty weighting to losses."""
         model = self.model.module if isinstance(self.model, DDP) else self.model
         
-        if lambda_layers is None:
-            lambda_layers = {"teacher_forcing": 1.0, "cocktail_party": 1.0}
-        
-        total_loss = torch.tensor(0.0, device=next(model.parameters()).device)
-        unc_deltas = {}  # for logging
-        
-        # Handle both single task and multi-task loss structures
-        if isinstance(loss_dict, dict) and any(task in loss_dict for task in ["teacher_forcing", "cocktail_party"]):
-            # Multi-task structure: {"teacher_forcing": loss_tf, "cocktail_party": loss_cp}
-            tasks_to_process = [(task, loss) for task, loss in loss_dict.items() if loss is not None]
-        else:
-            # Single task - need to infer task name from context or use default
-            # For backward compatibility, assume this is teacher_forcing if not specified
-            tasks_to_process = [("teacher_forcing", loss_dict)]
-        
-        for task_name, task_loss in tasks_to_process:
-            if task_loss is None:
-                continue
+        if isinstance(loss, dict) and 'layer_losses' in loss:
+            # Handle structured loss with layer supervision
+            final_loss = loss['final_loss']
+            layer_losses = loss['layer_losses']
             
-            # Get task weight
-            lambda_t = lambda_layers.get(task_name, 1.0)
+            # Apply per-layer, per-task uncertainty weighting
+            total_weighted_loss = torch.tensor(0.0, device=final_loss.device)
+            kl_penalty = torch.tensor(0.0, device=final_loss.device)
             
-            if isinstance(task_loss, dict) and 'final_ce' in task_loss:
-                # Structured loss: {'final_ce': final_loss, 'layer_ce': layer_losses}
-                final_loss = task_loss['final_ce']      # raw final CE (scalar)
-                layer_losses = task_loss['layer_ce']    # {"layer_i": CE_i, ...}
+            # 1. Final layer uncertainty (from the last layer)
+            final_layer_idx = len(model.blocks) - 1
+            final_layer_block = model.blocks[final_layer_idx]
+            
+            if hasattr(final_layer_block, 'log_sigmas') and task_name in final_layer_block.log_sigmas:
+                s_final = final_layer_block.log_sigmas[task_name].squeeze()
+                s_final_clamped = torch.clamp(s_final, -5.0, 5.0)
                 
-                # Add raw final loss to headline metric
-                total_loss = total_loss + final_loss
+                uncertainty_weighted_final = 0.5 * torch.exp(-2 * s_final_clamped) * final_loss + s_final_clamped
+                total_weighted_loss = total_weighted_loss + lambda_pred * uncertainty_weighted_final
                 
-                # Apply uncertainty weighting to layer losses
-                delta = torch.tensor(0.0, device=final_loss.device)
-                
-                for layer_name, ce_layer in layer_losses.items():
-                    i = int(layer_name.split('_')[-1])  # layer index
-                    layer_block = model.blocks[i]
-                    
-                    if hasattr(layer_block, 'log_sigmas') and task_name in layer_block.log_sigmas:
-                        s = layer_block.log_sigmas[task_name].clamp(-5, 5)  # s_{ℓ,t}
-                        weighted = 0.5 * torch.exp(-2*s) * ce_layer + s
-                        total_loss = total_loss + lambda_t * weighted
-                        delta = delta + (0.5*torch.exp(-2*s) - 1.0) * ce_layer + s
-                    else:
-                        # No uncertainty for this layer, just add weighted raw loss
-                        total_loss = total_loss + lambda_t * ce_layer
-                
-                # KL/L2 prior on s_{ℓ,t} for ALL layers (not just supervised ones)
-                kl = torch.tensor(0.0, device=final_loss.device)
-                for i in range(len(model.blocks)):
-                    layer_block = model.blocks[i]
-                    if hasattr(layer_block, 'log_sigmas') and task_name in layer_block.log_sigmas:
-                        s = layer_block.log_sigmas[task_name]
-                        kl = kl + 0.5 * (s ** 2)
-                
-                total_loss = total_loss + lambda_kl * kl
-                
-                unc_deltas[task_name] = {"delta": delta.detach(), "kl": (lambda_kl*kl).detach()}
-                
+                # Add KL penalty for final layer
+                kl_penalty = kl_penalty + 0.5 * s_final_clamped ** 2
             else:
-                # Simple scalar loss - treat as final loss only
-                total_loss = total_loss + task_loss
+                # Fallback if no uncertainty for final layer
+                total_weighted_loss = total_weighted_loss + lambda_pred * final_loss
+            
+            # 2. Layer-wise losses with per-task uncertainty (only for supervised layers)
+            for layer_name, layer_loss in layer_losses.items():
+                # Extract layer index
+                layer_idx = int(layer_name.split('_')[1])
+                layer_block = model.blocks[layer_idx]
                 
-                # Still add KL penalty for this task across all layers
-                kl = torch.tensor(0.0, device=task_loss.device)
-                for i in range(len(model.blocks)):
-                    layer_block = model.blocks[i]
-                    if hasattr(layer_block, 'log_sigmas') and task_name in layer_block.log_sigmas:
-                        s = layer_block.log_sigmas[task_name]
-                        kl = kl + 0.5 * (s ** 2)
+                if hasattr(layer_block, 'log_sigmas') and task_name in layer_block.log_sigmas:
+                    # Apply per-task uncertainty weighting: L_ℓ(unc) = 1/2 * exp(-2*s_ℓ) * L_ℓ + s_ℓ
+                    s_l = layer_block.log_sigmas[task_name].squeeze()
+                    
+                    # Clamp s_ℓ to [-5, 5] to avoid degenerate blow-ups
+                    s_l_clamped = torch.clamp(s_l, -5.0, 5.0)
+                    
+                    uncertainty_weighted_loss = 0.5 * torch.exp(-2 * s_l_clamped) * layer_loss + s_l_clamped
+                    total_weighted_loss = total_weighted_loss + uncertainty_weighted_loss
+                    
+                    # Add KL penalty for this layer
+                    kl_penalty = kl_penalty + 0.5 * s_l_clamped ** 2
+                else:
+                    # No per-task uncertainty for this layer, just add the loss
+                    total_weighted_loss = total_weighted_loss + layer_loss
+            
+            # 3. Add KL regularization for ALL layers (not just supervised ones)
+            #    This ensures all uncertainty parameters receive gradients
+            for i, layer_block in enumerate(model.blocks):
+                if hasattr(layer_block, 'log_sigmas') and task_name in layer_block.log_sigmas:
+                    s_l = layer_block.log_sigmas[task_name].squeeze()
+                    s_l_clamped = torch.clamp(s_l, -5.0, 5.0)
+                    # Add KL penalty for this layer (prevents degenerate uncertainty values)
+                    kl_penalty = kl_penalty + 0.5 * s_l_clamped ** 2
+            
+            # Add KL regularization
+            total_weighted_loss = total_weighted_loss + lambda_kl * kl_penalty
+            
+            return total_weighted_loss
+        else:
+            # Handle simple loss (no layer supervision) - apply final layer uncertainty
+            final_layer_idx = len(model.blocks) - 1
+            final_layer_block = model.blocks[final_layer_idx]
+            
+            # Apply final layer uncertainty
+            total_weighted_loss = torch.tensor(0.0, device=loss.device)
+            kl_penalty = torch.tensor(0.0, device=loss.device)
+            
+            if hasattr(final_layer_block, 'log_sigmas') and task_name in final_layer_block.log_sigmas:
+                s_final = final_layer_block.log_sigmas[task_name].squeeze()
+                s_final_clamped = torch.clamp(s_final, -5.0, 5.0)
                 
-                total_loss = total_loss + lambda_kl * kl
-                unc_deltas[task_name] = {"delta": torch.tensor(0.0), "kl": (lambda_kl*kl).detach()}
-        
-        return total_loss, unc_deltas
+                uncertainty_weighted_loss = 0.5 * torch.exp(-2 * s_final_clamped) * loss + s_final_clamped
+                total_weighted_loss = total_weighted_loss + uncertainty_weighted_loss
+                
+                # Add KL penalty for final layer
+                kl_penalty = kl_penalty + 0.5 * s_final_clamped ** 2
+            else:
+                total_weighted_loss = total_weighted_loss + loss
+            
+            # Add KL regularization for ALL layers to ensure all uncertainty parameters get gradients
+            for i, layer_block in enumerate(model.blocks):
+                if hasattr(layer_block, 'log_sigmas') and task_name in layer_block.log_sigmas:
+                    s_l = layer_block.log_sigmas[task_name].squeeze()
+                    s_l_clamped = torch.clamp(s_l, -5.0, 5.0)
+                    # Add KL penalty for this layer
+                    kl_penalty = kl_penalty + 0.5 * s_l_clamped ** 2
+            
+            return total_weighted_loss + lambda_kl * kl_penalty
     
     def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step with speed optimizations."""
@@ -643,12 +660,8 @@ class Trainer:
                 # Store raw loss for reporting
                 individual_losses[task_name] = raw_total_loss
 
-                # Apply layer-wise uncertainty weighting with new signature
-                lambda_layers = getattr(task_configs, 'lambda_layers', {"teacher_forcing": 1.0, "cocktail_party": 1.0})
-                lambda_kl = getattr(task_configs, 'lambda_kl', 1e-3)
-                weighted_loss, unc_deltas = self.apply_layer_uncertainty_weighting(
-                    {task_name: loss}, lambda_layers, lambda_kl
-                )
+                # Apply layer-wise uncertainty weighting
+                weighted_loss = self.apply_layer_uncertainty_weighting(loss, task_name)
                 
                 # Store weighted loss for reporting
                 if task_name not in weighted_losses:
