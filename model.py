@@ -106,26 +106,17 @@ class MultiHeadAttention(nn.Module):
 # =============================================================================
 
 class TransformerBlock(nn.Module):
-    """Transformer block with pre-normalization and per-task layer uncertainty."""
+    """Transformer block with pre-normalization."""
     
-    def __init__(self, dim, n_heads, mlp_ratio=4, causal=True, vocab_size=None, has_layer_supervision=False, task_names=None):
+    def __init__(self, dim, n_heads, mlp_ratio=4, causal=True, vocab_size=None, has_layer_supervision=False):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.attn = MultiHeadAttention(dim, n_heads, causal=causal)
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
         
-        # Layer uncertainty and supervision components
+        # Layer supervision components
         self.has_layer_supervision = has_layer_supervision
-        self.task_names = task_names or []
-        
-        # Per-task layer uncertainty parameters - ALL layers get these now
-        if task_names:
-            self.log_sigmas = nn.ParameterDict()
-            for task in task_names:
-                # Add small random perturbation to break symmetry between layers and tasks
-                init_value = torch.normal(0.0, 0.05, (1,))
-                self.log_sigmas[task] = nn.Parameter(init_value)
         
         # Readout head for deep supervision (if enabled)
         if has_layer_supervision and vocab_size is not None:
@@ -156,7 +147,6 @@ class GPTModel(nn.Module):
         mlp_ratio=4,
         causal=True,
         bidirectional_prefix_len=0,
-        task_names: list = None,
         layer_supervision_frequency: int = 4,  # Apply layer supervision every N layers
         supervise_layers: str = "frequency",  # "all" or "frequency"
         share_heads: bool = False,  # Use shared head across layers
@@ -170,7 +160,6 @@ class GPTModel(nn.Module):
         self.bidirectional_prefix_len = bidirectional_prefix_len
         self.vocab_size = vocab_size
         self.layer_supervision_frequency = layer_supervision_frequency
-        self.task_names = task_names or []
         self.supervise_layers = supervise_layers
         self.share_heads = share_heads
         self.conditioning = conditioning
@@ -185,7 +174,7 @@ class GPTModel(nn.Module):
         else:
             layer_has_supervision = lambda i: (i % layer_supervision_frequency == 0 and i > 0)
         
-        # Transformer blocks with per-task layer uncertainty for ALL layers
+        # Transformer blocks
         self.blocks = nn.ModuleList([
             TransformerBlock(
                 dim=dim,
@@ -193,8 +182,7 @@ class GPTModel(nn.Module):
                 mlp_ratio=mlp_ratio,
                 causal=causal,
                 vocab_size=vocab_size if not share_heads else None,  # No individual heads if sharing
-                has_layer_supervision=layer_has_supervision(i),
-                task_names=task_names  # All layers get per-task uncertainty
+                has_layer_supervision=layer_has_supervision(i)
             )
             for i in range(n_layers)
         ])
@@ -216,11 +204,8 @@ class GPTModel(nn.Module):
             if conditioning == "film":
                 self.layer_alpha = nn.Parameter(torch.zeros(n_layers))
                 self.layer_beta = nn.Parameter(torch.zeros(n_layers))
-                self.task_alpha = nn.ParameterDict({t: nn.Parameter(torch.zeros(1)) for t in self.task_names})
-                self.task_beta = nn.ParameterDict({t: nn.Parameter(torch.zeros(1)) for t in self.task_names})
             elif conditioning == "concat2":
                 self.layer_id = nn.Parameter(torch.zeros(n_layers, 1))  # scalar per layer
-                self.task_id = nn.ParameterDict({t: nn.Parameter(torch.zeros(1)) for t in self.task_names})
         
         # Final norm and output projection
         self.norm_out = RMSNorm(dim)
@@ -234,24 +219,23 @@ class GPTModel(nn.Module):
         
         self.apply(self._init_weights)
     
-    def condition_hidden(self, h, layer_idx, task):
-        """Apply FiLM-style conditioning: h' = (1 + α_ℓ + α_t) * h + (β_ℓ + β_t)"""
+    def condition_hidden(self, h, layer_idx):
+        """Apply FiLM-style conditioning: h' = (1 + α_ℓ) * h + β_ℓ"""
         if self.conditioning != "film":
             raise ValueError("condition_hidden only works with FiLM conditioning")
         
-        a = 1.0 + self.layer_alpha[layer_idx] + self.task_alpha[task]
-        b = self.layer_beta[layer_idx] + self.task_beta[task]
+        a = 1.0 + self.layer_alpha[layer_idx]
+        b = self.layer_beta[layer_idx]
         return h * a + b
     
-    def augment_hidden(self, h, layer_idx, task):
-        """Concatenate [s_layerID, s_taskID] to each token hidden before the shared LM head"""
+    def augment_hidden(self, h, layer_idx):
+        """Concatenate [s_layerID] to each token hidden before the shared LM head"""
         if self.conditioning != "concat2":
             raise ValueError("augment_hidden only works with concat2 conditioning")
         
         B, T, D = h.shape
         lid = self.layer_id[layer_idx].expand(B, T, 1)
-        tid = self.task_id[task].expand(B, T, 1)
-        return torch.cat([h, lid, tid], dim=-1)  # -> (B,T,D+2)
+        return torch.cat([h, lid], dim=-1)  # -> (B,T,D+1)
     
     def extract_mask_query(self, h, tokens):
         """Extract context vector from mask query tokens for cocktail party task"""
@@ -394,10 +378,10 @@ class GPTModel(nn.Module):
                     if self.share_heads:
                         # Use shared head with conditioning
                         if self.conditioning == "film":
-                            h_conditioned = self.condition_hidden(h, i, "teacher_forcing")
+                            h_conditioned = self.condition_hidden(h, i)
                             layer_logits = self.shared_tf_head(h_conditioned)
                         else:  # "concat2"
-                            h_aug = self.augment_hidden(h, i, "teacher_forcing")
+                            h_aug = self.augment_hidden(h, i)
                             layer_logits = self.shared_tf_head(h_aug)
                     else:
                         # Use per-layer head (existing logic)
