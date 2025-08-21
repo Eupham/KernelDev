@@ -336,17 +336,16 @@ class Trainer:
         
         if isinstance(loss, dict) and 'layer_losses' in loss:
             # Handle structured loss with layer supervision
-            final_loss = loss['final_loss']
+            total_weighted_loss = torch.tensor(0.0, device=loss['final_loss'].device)
             
             # 1. Final layer loss with task-level uncertainty (if available)
+            final_loss = loss['final_loss']
             if hasattr(model, 'log_sigmas') and task_name in model.log_sigmas:
-                task_log_sigma = model.log_sigmas[task_name].squeeze()  # Ensure scalar
+                task_log_sigma = model.log_sigmas[task_name]
                 weighted_final = lambda_pred * (0.5 * torch.exp(-2 * task_log_sigma) * final_loss + task_log_sigma)
             else:
                 weighted_final = lambda_pred * final_loss
-            
-            # Initialize total_weighted_loss with the same shape as weighted_final
-            total_weighted_loss = weighted_final
+            total_weighted_loss += weighted_final
             
             # 2. Layer-wise losses with layer uncertainty
             layer_losses = loss['layer_losses']
@@ -359,7 +358,7 @@ class Trainer:
                 
                 if hasattr(layer_block, 'log_sigma'):
                     # Apply uncertainty weighting: L_ℓ(unc) = 1/2 * exp(-2*s_ℓ) * L_ℓ + s_ℓ
-                    s_l = layer_block.log_sigma.squeeze()  # Ensure scalar
+                    s_l = layer_block.log_sigma
                     
                     # Clamp s_ℓ to [-5, 5] to avoid degenerate blow-ups
                     s_l_clamped = torch.clamp(s_l, -5.0, 5.0)
@@ -382,7 +381,7 @@ class Trainer:
         else:
             # Handle simple loss (no layer supervision)
             if hasattr(model, 'log_sigmas') and task_name in model.log_sigmas:
-                task_log_sigma = model.log_sigmas[task_name].squeeze()  # Ensure scalar
+                task_log_sigma = model.log_sigmas[task_name]
                 return 0.5 * torch.exp(-2 * task_log_sigma) * loss + task_log_sigma
             else:
                 return loss
