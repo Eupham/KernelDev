@@ -106,9 +106,9 @@ class MultiHeadAttention(nn.Module):
 # =============================================================================
 
 class TransformerBlock(nn.Module):
-    """Transformer block with pre-normalization and per-task layer uncertainty."""
+    """Transformer block with pre-normalization and optional layer uncertainty."""
     
-    def __init__(self, dim, n_heads, mlp_ratio=4, causal=True, vocab_size=None, has_layer_supervision=False, task_names=None):
+    def __init__(self, dim, n_heads, mlp_ratio=4, causal=True, vocab_size=None, has_layer_supervision=False):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.attn = MultiHeadAttention(dim, n_heads, causal=causal)
@@ -117,18 +117,12 @@ class TransformerBlock(nn.Module):
         
         # Layer uncertainty and supervision components
         self.has_layer_supervision = has_layer_supervision
-        self.task_names = task_names or []
-        
-        # Per-task layer uncertainty parameters - ALL layers get these now
-        if task_names:
-            self.log_sigmas = nn.ParameterDict()
-            for task in task_names:
-                # Add small random perturbation to break symmetry between layers and tasks
-                init_value = torch.normal(0.0, 0.05, (1,))
-                self.log_sigmas[task] = nn.Parameter(init_value)
-        
-        # Readout head for deep supervision (if enabled)
         if has_layer_supervision and vocab_size is not None:
+            # Learnable log-precision parameter for this layer 
+            # Add small random perturbation to break symmetry between layers
+            init_value = torch.normal(0.0, 0.05, (1,))
+            self.log_sigma = nn.Parameter(init_value)
+            # Small readout head for deep supervision
             self.layer_head = nn.Linear(dim, vocab_size, bias=False)
     
     def forward(self, x, in_span=None, span_id=None, is_prefix=None):
@@ -166,13 +160,18 @@ class GPTModel(nn.Module):
         self.bidirectional_prefix_len = bidirectional_prefix_len
         self.vocab_size = vocab_size
         self.layer_supervision_frequency = layer_supervision_frequency
-        self.task_names = task_names or []
+        
+        # Learnable uncertainty parameters for each task
+        if task_names:
+            self.log_sigmas = nn.ParameterDict({
+                task: nn.Parameter(torch.zeros(1)) for task in task_names
+            })
 
         # Token and position embeddings (no bias)
         self.token_emb = nn.Embedding(vocab_size, dim)
         self.pos_emb = nn.Embedding(max_seq_len, dim)
         
-        # Transformer blocks with per-task layer uncertainty for ALL layers
+        # Transformer blocks with selective layer supervision
         self.blocks = nn.ModuleList([
             TransformerBlock(
                 dim=dim,
@@ -180,8 +179,7 @@ class GPTModel(nn.Module):
                 mlp_ratio=mlp_ratio,
                 causal=causal,
                 vocab_size=vocab_size,
-                has_layer_supervision=(i % layer_supervision_frequency == 0 and i > 0),  # Keep supervision for specific layers
-                task_names=task_names  # All layers get per-task uncertainty
+                has_layer_supervision=(i % layer_supervision_frequency == 0 and i > 0)  # Start from layer 1
             )
             for i in range(n_layers)
         ])
