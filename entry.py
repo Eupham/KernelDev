@@ -244,6 +244,8 @@ def start_actual_training(cli_args):
     
     # Initialize model
     print(f"\n=== Initializing Model ===")
+    task_configs = config.get('tasks', {})
+    model_config['task_names'] = list(task_configs.keys())
     model = GPTModel(**model_config)
     
     # Setup precision and mixed precision training
