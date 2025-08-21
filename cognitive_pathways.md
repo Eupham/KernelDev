@@ -9,15 +9,8 @@ This document outlines potential mathematical and computational pathways toward 
 The existing KernelDev implementation provides a solid foundation with:
 
 - **Hierarchical Attention Patterns**: 4-section attention structure supporting complex reasoning
-- **Uncertainty-Based Multi-Task Learning**: Learnable uncertainty parameters σ_τ for task weighting
 - **Memory-Efficient Computation**: Flash attention with O(n) memory complexity
 - **Span-Based Reasoning**: Cocktail party task enabling selective attention mechanisms
-
-**Mathematical Foundation:**
-```
-L_total = Σ_τ [1/(2σ_τ²) L_τ + log(σ_τ)]
-```
-where τ indexes tasks, L_τ is task-specific loss, and σ_τ represents learned uncertainty.
 
 ## Pathway 1: ACT-R Integration (Adaptive Control of Thought-Rational)
 
@@ -204,7 +197,7 @@ where ε_l is prediction error, μ_l is prediction, and K_l is gain.
 
 2. **Uncertainty Estimation**
    ```
-   Precision_l = 1/σ_l² 
+   Precision_l = 1/variance_l 
    Weighted_error = Precision_l × ε_l²
    ```
 
@@ -216,9 +209,9 @@ where ε_l is prediction error, μ_l is prediction, and K_l is gain.
 
 ### Integration with Current System
 
-Extend uncertainty learning to predictive framework:
+Extend precision learning to predictive framework:
 ```
-L_predictive = Σ_l [Precision_l × ||ε_l||² + DKL(q(σ_l)||p(σ_l))]
+L_predictive = Σ_l [Precision_l × ||ε_l||² + DKL(q(precision_l)||p(precision_l))]
 ```
 
 ## Pathway 6: Memory Consolidation and Episodic Learning
@@ -321,14 +314,14 @@ Cognition(t) = Φ(
 
 **Loss Function Extension:**
 ```
-L_cognitive = L_uncertainty + λ_pred L_prediction + λ_mem L_memory + λ_control L_control + λ_emotion L_emotion
+L_cognitive = L_base + λ_pred L_prediction + λ_mem L_memory + λ_control L_control + λ_emotion L_emotion
 ```
 
 **Attention Mechanism Generalization:**
 ```
 Attention_cognitive = Softmax(
     (Q_working + Q_ltm + Q_prediction)(K_input + K_context + K_goal)^T / √d + 
-    Bias_emotional + Bias_motivational + Bias_uncertainty
+    Bias_emotional + Bias_motivational
 )
 ```
 
@@ -337,7 +330,7 @@ Attention_cognitive = Softmax(
 ### Near-term (3-6 months)
 1. Working memory buffer implementation
 2. Predictive coding integration
-3. Enhanced uncertainty mechanisms
+3. Enhanced precision mechanisms
 
 ### Medium-term (6-12 months)
 1. ACT-R memory integration
@@ -365,9 +358,9 @@ Attention_cognitive = Softmax(
 
 ## Conclusion
 
-The KernelDev framework provides an excellent foundation for implementing sophisticated cognitive architectures. The hierarchical attention mechanism, uncertainty-based learning, and memory-efficient computation create a strong base for extending toward human-like cognitive capabilities.
+The KernelDev framework provides an excellent foundation for implementing sophisticated cognitive architectures. The hierarchical attention mechanism and memory-efficient computation create a strong base for extending toward human-like cognitive capabilities.
 
-The most promising near-term pathway appears to be integrating working memory mechanisms with predictive coding, as these build naturally on the existing uncertainty framework while providing clear cognitive benefits. The attention sink mechanism from the cocktail party implementation offers a natural bridge toward implementing persistent cognitive states.
+The most promising near-term pathway appears to be integrating working memory mechanisms with predictive coding, as these build naturally on the existing architecture while providing clear cognitive benefits. The attention sink mechanism from the cocktail party implementation offers a natural bridge toward implementing persistent cognitive states.
 
 Future research should focus on:
 1. Empirical validation of cognitive plausibility
