@@ -330,20 +330,23 @@ class Trainer:
             return self.config.learning_rate * step / self.config.warmup_steps
         return self.config.learning_rate
     
-    def combine_losses(self, loss_dict, lambda_layers=None):
-        """Combine losses from different tasks and layers without uncertainty weighting."""
+    def apply_layer_uncertainty_weighting(self, loss_dict, lambda_layers=None, lambda_kl=1e-3):
+        """Apply per-layer, per-task uncertainty weighting to losses according to issue #129."""
+        model = self.model.module if isinstance(self.model, DDP) else self.model
+        
         if lambda_layers is None:
             lambda_layers = {"teacher_forcing": 1.0, "cocktail_party": 1.0}
         
-        total_loss = torch.tensor(0.0)
-        device = None
+        total_loss = torch.tensor(0.0, device=next(model.parameters()).device)
+        unc_deltas = {}  # for logging
         
         # Handle both single task and multi-task loss structures
         if isinstance(loss_dict, dict) and any(task in loss_dict for task in ["teacher_forcing", "cocktail_party"]):
             # Multi-task structure: {"teacher_forcing": loss_tf, "cocktail_party": loss_cp}
             tasks_to_process = [(task, loss) for task, loss in loss_dict.items() if loss is not None]
         else:
-            # Single task - assume teacher_forcing for backward compatibility
+            # Single task - need to infer task name from context or use default
+            # For backward compatibility, assume this is teacher_forcing if not specified
             tasks_to_process = [("teacher_forcing", loss_dict)]
         
         for task_name, task_loss in tasks_to_process:
@@ -355,30 +358,56 @@ class Trainer:
             
             if isinstance(task_loss, dict) and 'final_ce' in task_loss:
                 # Structured loss: {'final_ce': final_loss, 'layer_ce': layer_losses}
-                final_loss = task_loss['final_ce']
-                layer_losses = task_loss['layer_ce']
+                final_loss = task_loss['final_ce']      # raw final CE (scalar)
+                layer_losses = task_loss['layer_ce']    # {"layer_i": CE_i, ...}
                 
-                # Set device from first loss tensor
-                if device is None:
-                    device = final_loss.device
-                    total_loss = total_loss.to(device)
+                # Add raw final loss to headline metric
+                total_loss = total_loss + final_loss
                 
-                # Add final loss
-                total_loss = total_loss + lambda_t * final_loss
+                # Apply uncertainty weighting to layer losses
+                delta = torch.tensor(0.0, device=final_loss.device)
                 
-                # Add layer losses
                 for layer_name, ce_layer in layer_losses.items():
-                    total_loss = total_loss + lambda_t * ce_layer
+                    i = int(layer_name.split('_')[-1])  # layer index
+                    layer_block = model.blocks[i]
+                    
+                    if hasattr(layer_block, 'log_sigmas') and task_name in layer_block.log_sigmas:
+                        s = layer_block.log_sigmas[task_name].clamp(-5, 5)  # s_{ℓ,t}
+                        weighted = 0.5 * torch.exp(-2*s) * ce_layer + s
+                        total_loss = total_loss + lambda_t * weighted
+                        delta = delta + (0.5*torch.exp(-2*s) - 1.0) * ce_layer + s
+                    else:
+                        # No uncertainty for this layer, just add weighted raw loss
+                        total_loss = total_loss + lambda_t * ce_layer
+                
+                # KL/L2 prior on s_{ℓ,t} for ALL layers (not just supervised ones)
+                kl = torch.tensor(0.0, device=final_loss.device)
+                for i in range(len(model.blocks)):
+                    layer_block = model.blocks[i]
+                    if hasattr(layer_block, 'log_sigmas') and task_name in layer_block.log_sigmas:
+                        s = layer_block.log_sigmas[task_name]
+                        kl = kl + 0.5 * (s ** 2)
+                
+                total_loss = total_loss + lambda_kl * kl
+                
+                unc_deltas[task_name] = {"delta": delta.detach(), "kl": (lambda_kl*kl).detach()}
                 
             else:
-                # Simple scalar loss
-                if device is None:
-                    device = task_loss.device
-                    total_loss = total_loss.to(device)
+                # Simple scalar loss - treat as final loss only
+                total_loss = total_loss + task_loss
                 
-                total_loss = total_loss + lambda_t * task_loss
+                # Still add KL penalty for this task across all layers
+                kl = torch.tensor(0.0, device=task_loss.device)
+                for i in range(len(model.blocks)):
+                    layer_block = model.blocks[i]
+                    if hasattr(layer_block, 'log_sigmas') and task_name in layer_block.log_sigmas:
+                        s = layer_block.log_sigmas[task_name]
+                        kl = kl + 0.5 * (s ** 2)
+                
+                total_loss = total_loss + lambda_kl * kl
+                unc_deltas[task_name] = {"delta": torch.tensor(0.0), "kl": (lambda_kl*kl).detach()}
         
-        return total_loss
+        return total_loss, unc_deltas
     
     def train_step(self, batch: Tuple, task_name: str, task_configs: Dict[str, Any]) -> float:
         """Perform a single training step with speed optimizations."""
@@ -481,9 +510,9 @@ class Trainer:
                             logits, loss = self.model(x, targets=y, task_name=task_name)
 
                     if loss is not None:
-                        # Combine losses without uncertainty weighting
-                        combined_loss = self.combine_losses({task_name: loss})
-                        total_loss += combined_loss.item()
+                        # Apply uncertainty weighting consistently in evaluation too
+                        weighted_loss, _ = self.apply_layer_uncertainty_weighting({task_name: loss})
+                        total_loss += weighted_loss.item()
                         num_batches += 1
 
         self.model.train()
@@ -614,16 +643,19 @@ class Trainer:
                 # Store raw loss for reporting
                 individual_losses[task_name] = raw_total_loss
 
-                # Combine losses without uncertainty weighting
+                # Apply layer-wise uncertainty weighting with new signature
                 lambda_layers = getattr(task_configs, 'lambda_layers', {"teacher_forcing": 1.0, "cocktail_party": 1.0})
-                combined_loss = self.combine_losses({task_name: loss}, lambda_layers)
+                lambda_kl = getattr(task_configs, 'lambda_kl', 1e-3)
+                weighted_loss, unc_deltas = self.apply_layer_uncertainty_weighting(
+                    {task_name: loss}, lambda_layers, lambda_kl
+                )
                 
-                # Store combined loss for reporting
+                # Store weighted loss for reporting
                 if task_name not in weighted_losses:
                     weighted_losses[task_name] = 0.0
-                weighted_losses[task_name] = combined_loss.item()
+                weighted_losses[task_name] = weighted_loss.item()
 
-                total_loss += combined_loss.squeeze()
+                total_loss += weighted_loss.squeeze()
 
             epoch_losses.append(total_loss.item())
 
@@ -666,15 +698,26 @@ class Trainer:
                 log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
                 log_str += f"Total Loss: {total_loss.item():.4f} (MA: {loss_ma:.4f}, Var: {loss_var:.4f}), "
                 
-                # Log task-level losses
+                # Log task-level losses (raw and uncertainty-weighted separately)
                 model = self.model.module if isinstance(self.model, DDP) else self.model
                 for task_name in individual_losses.keys():
                     raw_loss = individual_losses[task_name]
-                    combined_loss = weighted_losses.get(task_name, raw_loss)
-                    log_str += f"{task_name}: {combined_loss:.4f}, "
+                    weighted_loss = weighted_losses.get(task_name, raw_loss)
+                    log_str += f"{task_name}: raw={raw_loss:.4f}, weighted={weighted_loss:.4f}, "
 
                 log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
+                
+                # Log layer-level per-task uncertainties
+                if hasattr(model, 'supervised_layer_indices') and model.supervised_layer_indices:
+                    for task_name in self.task_names if hasattr(self, 'task_names') else model.task_names:
+                        layer_log_str = f"{task_name} layer uncertainties: "
+                        for layer_idx in model.supervised_layer_indices:
+                            if hasattr(model.blocks[layer_idx], 'log_sigmas') and task_name in model.blocks[layer_idx].log_sigmas:
+                                s_l = model.blocks[layer_idx].log_sigmas[task_name].item()
+                                sigma_l = math.exp(s_l)
+                                layer_log_str += f"L{layer_idx}(σ:{sigma_l:.3f}), "
+                        print(layer_log_str)
 
             # Evaluation, saving, and inference block (runs on rank 0)
             if (not self.is_distributed or dist.get_rank() == 0):
@@ -956,9 +999,9 @@ class Trainer:
                         logits, loss = self.model(x, targets=y, task_name=task_name)
 
                     if loss is not None:
-                        # Combine losses without uncertainty weighting
-                        combined_loss = self.combine_losses({task_name: loss})
-                        total_loss += combined_loss.item()
+                        # Apply uncertainty weighting to handle structured losses
+                        weighted_loss, _ = self.apply_layer_uncertainty_weighting({task_name: loss})
+                        total_loss += weighted_loss.item()
                         num_batches += 1
         
         self.model.train()
