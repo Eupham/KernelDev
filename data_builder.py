@@ -24,8 +24,8 @@ Special Tokens:
 import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
-
-from typing import Optional, Dict
+import numpy as np
+from typing import Optional, Dict, Any, List
 import random
 
 # =============================================================================
@@ -33,6 +33,14 @@ import random
 # =============================================================================
 
 # Define special tokens
+BIO_TAGS = {
+    'O': 0,
+    'B-ORIG': 1,
+    'I-ORIG': 2,
+    'PAD': -100,
+}
+NUM_BIO_TAGS = 3
+
 SPECIAL_TOKENS = {
     '[PAD]': 0,
     '[CLS]': 1,
@@ -606,6 +614,7 @@ class DataBuilder:
             start_of_spans = prefix_len + len(truncated_masked_context)
             current_pos = start_of_spans
             span_token = SPECIAL_TOKENS['[SPAN]']
+            es_token = SPECIAL_TOKENS['[ES]']
             
             for span_idx, (span_toks, _) in enumerate(all_spans_with_labels):
                 if current_pos >= extended_seq_len:

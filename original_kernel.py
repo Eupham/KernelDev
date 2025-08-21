@@ -1464,6 +1464,7 @@ def _flash_attn_bwd_dkdv(
     PRESCALE_QK: tl.constexpr,
 ):
     # Conditional logic for backward pass based on CAUSAL parameter
+    kv_tile_max_token = min(kv_token_idx + TILE_K_SIZE, seq_len)
     if CAUSAL:
         # For causal attention: find which Q tiles can attend to this KV tile
         q_start_tile_idx = kv_token_idx // TILE_Q_SIZE  # First Q tile that might attend to this KV
