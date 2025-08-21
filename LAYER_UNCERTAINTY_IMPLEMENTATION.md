@@ -13,15 +13,13 @@ The implementation adds per-layer uncertainty parameters with deep supervision t
 **Location**: `model.py` - `TransformerBlock` class
 
 - Added learnable log-precision parameters `s_ℓ` per supervised layer
-- **UPDATED**: Parameters initialized with small random perturbations (N(0, 0.05²)) to break symmetry
+- Parameters initialized to 0 (corresponding to σ_ℓ = 1)
 - Clamped to [-5, 5] during loss computation to prevent degenerate blow-ups
 
 ```python
 # In TransformerBlock.__init__()
 if has_layer_supervision and vocab_size is not None:
-    # Add small random perturbation to break symmetry between layers
-    init_value = torch.normal(0.0, 0.05, (1,))
-    self.log_sigma = nn.Parameter(init_value)
+    self.log_sigma = nn.Parameter(torch.zeros(1))
     self.layer_head = nn.Linear(dim, vocab_size, bias=False)
 ```
 
@@ -183,32 +181,7 @@ trainer.train(train_loaders, val_loaders)
 - Use default `λ_KL=1e-3` for KL regularization
 - Monitor layer uncertainty values - earlier layers typically have larger σ_ℓ
 
-## Fixes and Improvements
-
-### Issue Resolution
-
-The implementation now addresses the key concerns raised in issue #118:
-
-1. **Loss Imbalance Fixed**: The jump from loss ~2-3 to ~6+ was caused by evaluation summing raw layer losses without uncertainty weighting. Now evaluation applies uncertainty weighting consistently.
-
-2. **Symmetry Breaking**: Layer uncertainties now initialize with small random perturbations (N(0, 0.05²)) instead of identical zeros, encouraging divergence during training.
-
-3. **Consistent Treatment**: Both teacher forcing and cocktail party tasks receive identical uncertainty treatment in all code paths.
-
-### Before and After
-
-**Before (problematic)**:
-- All layer uncertainties: σ = 1.000 (identical)
-- Evaluation loss: raw_final + raw_layer_4 + raw_layer_8 + raw_layer_12 ≈ 2.5 + 3.2 + 2.8 + 2.6 = 11.1
-- Training loss: uncertainty_weighted ≈ 4.6
-- Large discrepancy between training and evaluation
-
-**After (fixed)**:
-- Layer uncertainties: σ ∈ [0.96, 1.05] (different) 
-- Evaluation loss: uncertainty_weighted ≈ 4.6
-- Training loss: uncertainty_weighted ≈ 4.6
-- Consistent behavior between training and evaluation
-
+## Expected Behavior
 
 ### Sanity Checks
 
