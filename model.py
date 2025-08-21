@@ -448,10 +448,9 @@ class GPTModel(nn.Module):
         loss_tf = None
         loss_cp = None
         
-        # Teacher forcing final head - always compute for generation, only compute loss if targets provided
-        logits_final = self.head(x_embed)
-        
+        # Teacher forcing final head
         if targets is not None:
+            logits_final = self.head(x_embed)
             final_ce_tf = F.cross_entropy(
                 logits_final.view(-1, logits_final.size(-1)),
                 targets.view(-1),
