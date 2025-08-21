@@ -631,11 +631,11 @@ class Trainer:
 
                 # Extract raw loss for logging (before uncertainty weighting)
                 if isinstance(loss, dict):
-                    raw_final_loss = loss['final_ce'].item()
+                    raw_final_loss = loss['final_loss'].item()
                     raw_total_loss = raw_final_loss
-                    if 'layer_ce' in loss:
+                    if 'layer_losses' in loss:
                         # Add all layer losses to get total raw loss
-                        raw_layer_losses = sum(l.item() for l in loss['layer_ce'].values())
+                        raw_layer_losses = sum(l.item() for l in loss['layer_losses'].values())
                         raw_total_loss += raw_layer_losses
                 else:
                     raw_total_loss = loss.item()
