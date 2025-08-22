@@ -558,11 +558,8 @@ class Trainer:
 
                 individual_losses[task_name] = loss.item()
 
-                # Uncertainty-based weighting
-                log_sigma = self.model.module.log_sigmas[task_name] if isinstance(self.model, DDP) else self.model.log_sigmas[task_name]
-                weighted_loss = 0.5 * torch.exp(-2 * log_sigma) * loss + log_sigma
-
-                total_loss += weighted_loss.squeeze()
+                # Direct loss accumulation without uncertainty weighting
+                total_loss += loss
 
             epoch_losses.append(total_loss.item())
 
@@ -605,9 +602,7 @@ class Trainer:
                 log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
                 log_str += f"Total Loss: {total_loss.item():.4f} (MA: {loss_ma:.4f}, Var: {loss_var:.4f}), "
                 for task_name, loss_value in individual_losses.items():
-                    log_sigma = self.model.module.log_sigmas[task_name].item() if isinstance(self.model, DDP) else self.model.log_sigmas[task_name].item()
-                    sigma = math.exp(log_sigma)
-                    log_str += f"{task_name}: {loss_value:.4f} (σ: {sigma:.4f}), "
+                    log_str += f"{task_name}: {loss_value:.4f}, "
 
                 log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
@@ -892,9 +887,8 @@ class Trainer:
                         logits, loss = self.model(x, targets=y, task_name=task_name)
 
                     if loss is not None:
-                        # Apply uncertainty weighting to handle structured losses
-                        weighted_loss = self.apply_layer_uncertainty_weighting(loss, task_name)
-                        total_loss += weighted_loss.item()
+                        # Direct loss accumulation without uncertainty weighting
+                        total_loss += loss.item()
                         num_batches += 1
         
         self.model.train()

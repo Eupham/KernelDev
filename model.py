@@ -142,11 +142,7 @@ class GPTModel(nn.Module):
         self.max_seq_len = max_seq_len
         self.bidirectional_prefix_len = bidirectional_prefix_len
         
-        # Learnable uncertainty parameters for each task
-        if task_names:
-            self.log_sigmas = nn.ParameterDict({
-                task: nn.Parameter(torch.zeros(1)) for task in task_names
-            })
+        # Note: task_names parameter is no longer used (uncertainty removed)
 
         # Token and position embeddings (no bias)
         self.token_emb = nn.Embedding(vocab_size, dim)
