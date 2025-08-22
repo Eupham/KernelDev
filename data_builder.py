@@ -694,15 +694,17 @@ class DataBuilder:
 
             # Teacher forcing dataloader
             dataloaders[split_name]['teacher_forcing'] = DataLoader(
-                dataset_obj, batch_size=16, shuffle=shuffle,
+                dataset_obj, batch_size=batch_size, shuffle=shuffle,
                 collate_fn=self._collate_fn_teacher_forcing,
                 **optimized_kwargs
             )
 
             # Cocktail party dataloader
             if 'cocktail_party' in self.task_configs:
+                # Use half batch size for cocktail party due to memory requirements
+                cocktail_batch_size = max(1, batch_size // 2)
                 dataloaders[split_name]['cocktail_party'] = DataLoader(
-                    dataset_obj, batch_size=8, shuffle=shuffle,
+                    dataset_obj, batch_size=cocktail_batch_size, shuffle=shuffle,
                     collate_fn=self._collate_fn_cocktail_party,
                     **optimized_kwargs
                 )

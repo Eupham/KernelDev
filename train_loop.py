@@ -346,6 +346,23 @@ class Trainer:
         print(f"Trainer initialized on device: {self.config.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
     
+    def _get_autocast_device_type(self) -> str:
+        """Get the appropriate device type for autocast based on current device."""
+        if isinstance(self.config.device, torch.device):
+            device_type = self.config.device.type
+        else:
+            device_type = str(self.config.device)
+        
+        # Extract device type (e.g., 'cuda:0' -> 'cuda', 'cpu' -> 'cpu')
+        if ':' in device_type:
+            device_type = device_type.split(':')[0]
+            
+        # Ensure we use valid autocast device types
+        if device_type == 'cuda':
+            return 'cuda'
+        else:
+            return 'cpu'
+    
     def warmup_lr(self, step: int) -> float:
         """Calculate learning rate with warmup."""
         if step < self.config.warmup_steps:
@@ -372,7 +389,7 @@ class Trainer:
                     metadata = metadata.to(self.config.device, non_blocking=True)
 
             if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast(self._get_autocast_device_type()):
                     # Pass metadata tensors directly instead of as task_name
                     scores, loss = self.model(inputs, correct_idx=correct_idx, 
                                             in_span=metadata.get('in_span'),
@@ -393,7 +410,7 @@ class Trainer:
             y = y.to(self.config.device, non_blocking=True)
 
             if self.config.use_amp and self.config.scaler is not None:
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast(self._get_autocast_device_type()):
                     logits, loss = self.model(x, targets=y, task_name=task_name)
             else:
                 logits, loss = self.model(x, targets=y, task_name=task_name)
@@ -440,7 +457,7 @@ class Trainer:
                             metadata = metadata.to(self.config.device)
 
                         if self.config.use_amp:
-                            with torch.amp.autocast('cuda'):
+                            with torch.amp.autocast(self._get_autocast_device_type()):
                                 scores, loss = self.model(inputs, correct_idx=correct_idx,
                                                         in_span=metadata.get('in_span'),
                                                         span_id=metadata.get('span_id'),
@@ -464,7 +481,7 @@ class Trainer:
                         x, y = x.to(self.config.device), y.to(self.config.device)
 
                         if self.config.use_amp:
-                            with torch.amp.autocast('cuda'):
+                            with torch.amp.autocast(self._get_autocast_device_type()):
                                 logits, loss = self.model(x, targets=y, task_name=task_name)
                         else:
                             logits, loss = self.model(x, targets=y, task_name=task_name)
@@ -875,7 +892,7 @@ class Trainer:
             
             if self.config.use_amp:
                 # Use mixed precision for generation
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast(self._get_autocast_device_type()):
                     generated = model_to_generate_from.generate(
                         x,
                         max_new_tokens=max_length,
@@ -918,7 +935,7 @@ class Trainer:
                     x, y = x.to(self.config.device), y.to(self.config.device)
                     
                     if self.config.use_amp and self.config.scaler is not None:
-                        with torch.amp.autocast('cuda'):
+                        with torch.amp.autocast(self._get_autocast_device_type()):
                             logits, loss = self.model(x, targets=y, task_name=task_name)
                     else:
                         logits, loss = self.model(x, targets=y, task_name=task_name)
