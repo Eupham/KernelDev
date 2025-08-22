@@ -67,7 +67,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, in_span=None, span_id=None, is_prefix=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -76,14 +76,13 @@ class MultiHeadAttention(nn.Module):
         
         is_causal = self.causal
 
-        # Use flash attention kernel with metadata only (no attention_mask)
+        # Use flash attention kernel with metadata only (no external attention_mask)
         out = flash_attention(
             q=q,
             k=k,
             v=v,
             lens=None,
             causal=is_causal,
-            attention_mask=None,
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix
@@ -106,15 +105,15 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, in_span=None, span_id=None, is_prefix=None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+        x = x + self.attn(self.norm1(x), in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
 
 
-from data_builder import NUM_BIO_TAGS, SPECIAL_TOKENS, BIO_TAGS
+from data_builder import SPECIAL_TOKENS
 from torch.distributions import Bernoulli
 
 # =============================================================================
@@ -142,12 +141,6 @@ class GPTModel(nn.Module):
         self.max_seq_len = max_seq_len
         self.bidirectional_prefix_len = bidirectional_prefix_len
         
-        # Learnable uncertainty parameters for each task
-        if task_names:
-            self.log_sigmas = nn.ParameterDict({
-                task: nn.Parameter(torch.zeros(1)) for task in task_names
-            })
-
         # Token and position embeddings (no bias)
         self.token_emb = nn.Embedding(vocab_size, dim)
         self.pos_emb = nn.Embedding(max_seq_len, dim)
@@ -178,7 +171,7 @@ class GPTModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, x, targets=None, attention_mask=None, task_name=None, task_type=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, targets=None, task_name=None, task_type=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None, in_span=None, span_id=None, is_prefix=None):
         batch_size, seq_len = x.shape
         
         # Handle both task_name and task_type parameters
@@ -195,11 +188,11 @@ class GPTModel(nn.Module):
         if in_span is not None and span_id is not None and is_prefix is not None:
             # Use directly provided metadata tensors
             pass  # in_span, span_id, is_prefix are already set
-        elif attention_mask is not None and isinstance(attention_mask, dict):
-            # Use metadata from data builder (remove task_name dependency)
-            in_span = attention_mask['in_span']
-            span_id = attention_mask['span_id'] 
-            is_prefix = attention_mask['is_prefix']
+        elif isinstance(task_name, dict) and 'in_span' in task_name:
+            # Use metadata from data builder (remove attention_mask dependency)
+            in_span = task_name['in_span']
+            span_id = task_name['span_id'] 
+            is_prefix = task_name['is_prefix']
         else:
             # Generate metadata from tokens (auto-detect sequence type)
             span_start_id = SPECIAL_TOKENS['[SPAN]']
@@ -242,8 +235,8 @@ class GPTModel(nn.Module):
 
         # Apply transformer blocks (using metadata-only routing)
         for block in self.blocks:
-            # Always use metadata tensors for attention control (no task-based routing)
-            x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            # Always use metadata tensors for attention control (no external attention_mask)
+            x_embed = block(x_embed, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
