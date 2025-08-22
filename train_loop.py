@@ -116,6 +116,22 @@ class TrainingConfig:
         self.local_rank = -1 # For DDP
         self.is_distributed = False # Will be set by init_distributed
 
+# Helper function for safe environment variable parsing
+def _safe_parse_env_int(env_var_name: str, env_var_value: str) -> int:
+    """Safely parse an environment variable to an integer with detailed error reporting."""
+    if not env_var_value:
+        raise ValueError(f"{env_var_name} is empty")
+    
+    # Strip whitespace
+    cleaned_value = env_var_value.strip()
+    if not cleaned_value:
+        raise ValueError(f"{env_var_name} contains only whitespace")
+    
+    try:
+        return int(cleaned_value)
+    except ValueError as e:
+        raise ValueError(f"{env_var_name}='{env_var_value}' is not a valid integer") from e
+
 # Note: This function is called in Trainer.__init__ and sets Trainer's attributes.
 def init_distributed(trainer_instance: 'Trainer'):
     """Initializes the distributed training environment."""
@@ -123,7 +139,12 @@ def init_distributed(trainer_instance: 'Trainer'):
         trainer_instance.is_distributed = True
         # Ensure local_rank is set if already initialized
         if hasattr(trainer_instance.config, 'local_rank') and trainer_instance.config.local_rank == -1:
-             trainer_instance.config.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            local_rank_env = os.environ.get('LOCAL_RANK', '0')
+            try:
+                trainer_instance.config.local_rank = _safe_parse_env_int('LOCAL_RANK', local_rank_env)
+            except ValueError:
+                # Fall back to 0 if LOCAL_RANK is invalid
+                trainer_instance.config.local_rank = 0
         return
 
     rank_env = os.environ.get('RANK')
@@ -132,11 +153,11 @@ def init_distributed(trainer_instance: 'Trainer'):
 
     if rank_env is not None and world_size_env is not None:
         try:
-            rank = int(rank_env)
-            world_size = int(world_size_env)
+            rank = _safe_parse_env_int('RANK', rank_env)
+            world_size = _safe_parse_env_int('WORLD_SIZE', world_size_env)
 
             if local_rank_env is not None:
-                local_rank = int(local_rank_env)
+                local_rank = _safe_parse_env_int('LOCAL_RANK', local_rank_env)
             else: # Fallback if LOCAL_RANK is not set (e.g. older torch versions or different launcher)
                 local_rank = rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
 
@@ -152,8 +173,9 @@ def init_distributed(trainer_instance: 'Trainer'):
             else:
                 print("CUDA not available. Distributed training with NCCL backend not possible.")
                 trainer_instance.is_distributed = False
-        except ValueError:
-            print("RANK, WORLD_SIZE, or LOCAL_RANK environment variables are not valid integers.")
+        except ValueError as e:
+            print(f"Environment variable parsing error: {e}")
+            print("Running in non-distributed mode.")
             trainer_instance.is_distributed = False
         except Exception as e:
             print(f"Error initializing distributed group: {e}")
