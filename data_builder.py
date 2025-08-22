@@ -108,29 +108,34 @@ class DataBuilder:
         
         This function properly handles multibyte UTF-8 characters by encoding the entire
         character and including all bytes in the token sequence.
+        
+        Optimized to handle large texts efficiently by using string replacements
+        for special tokens first, then processing the resulting text.
         """
+        # Step 1: Pre-process text to replace special tokens with unique markers
+        # Use characters that don't appear in normal text
+        special_markers = {}
+        processed_text = text
+        
+        # Replace special tokens with unique single-byte markers
+        # Use control characters (0x01-0x06) that won't appear in normal UTF-8 text
+        for i, (token_str, token_id) in enumerate(SPECIAL_TOKENS.items(), 1):
+            marker_char = chr(i)  # chr(1), chr(2), etc.
+            special_markers[marker_char] = token_id
+            processed_text = processed_text.replace(token_str, marker_char)
+        
+        # Step 2: Tokenize the processed text
         tokens = []
-        i = 0
-        while i < len(text):
-            found = False
-            # First check for special tokens
-            for token_str, token_id in SPECIAL_TOKENS.items():
-                if text[i:].startswith(token_str):
-                    tokens.append(token_id)
-                    i += len(token_str)
-                    found = True
-                    break
-            
-            if not found:
-                # Handle UTF-8 characters properly by encoding the entire character
-                char = text[i]
+        for char in processed_text:
+            if char in special_markers:
+                # This is a special token marker
+                tokens.append(special_markers[char])
+            else:
+                # Regular character - encode as UTF-8 bytes
                 utf8_bytes = char.encode('utf-8')
-                
-                # Add all bytes of the UTF-8 character to tokens
                 for byte_val in utf8_bytes:
                     tokens.append(byte_val + NUM_SPECIAL_TOKENS)
-                
-                i += 1
+        
         return tokens
 
     def _detokenize_bytes(self, tokens: list, skip_special_tokens=False) -> str:
@@ -344,12 +349,15 @@ class DataBuilder:
             "CUDA enables parallel computing on NVIDIA GPUs for accelerated machine learning workloads.",
             "Tokenization is the process of converting text into numerical tokens that models can process.",
         ]
-        num_repetitions = (self.max_samples // 10 if self.max_samples != float('inf') and self.max_samples > 10 else 100)
-        num_repetitions = max(num_repetitions, 1) # Ensure at least one repetition
+        
+        # Limit the number of repetitions to prevent excessive text size
+        # Cap at reasonable number to avoid tokenization performance issues
+        max_reasonable_repetitions = min(1000, self.max_samples // 10 if self.max_samples != float('inf') else 100)
+        num_repetitions = max(1, max_reasonable_repetitions)
         full_sample_texts = sample_texts * num_repetitions
         
-        # Ensure fallback provides a reasonable number of texts for splitting
-        num_fallback_texts = max(20, len(full_sample_texts))
+        # Ensure fallback provides a reasonable number of texts for splitting, but cap it
+        num_fallback_texts = min(max(20, len(full_sample_texts)), 10000)  # Cap at 10,000 texts
         text_block = '\n'.join(full_sample_texts[:num_fallback_texts])
 
         # Ensure splits are somewhat reasonable even for small text_block
@@ -694,15 +702,17 @@ class DataBuilder:
 
             # Teacher forcing dataloader
             dataloaders[split_name]['teacher_forcing'] = DataLoader(
-                dataset_obj, batch_size=16, shuffle=shuffle,
+                dataset_obj, batch_size=batch_size, shuffle=shuffle,
                 collate_fn=self._collate_fn_teacher_forcing,
                 **optimized_kwargs
             )
 
             # Cocktail party dataloader
             if 'cocktail_party' in self.task_configs:
+                # Use half batch size for cocktail party due to memory requirements
+                cocktail_batch_size = max(1, batch_size // 2)
                 dataloaders[split_name]['cocktail_party'] = DataLoader(
-                    dataset_obj, batch_size=8, shuffle=shuffle,
+                    dataset_obj, batch_size=cocktail_batch_size, shuffle=shuffle,
                     collate_fn=self._collate_fn_cocktail_party,
                     **optimized_kwargs
                 )
