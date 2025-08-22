@@ -360,6 +360,12 @@ def start_actual_training(cli_args):
         for batch in dataloaders['train']['cocktail_party']:
             inputs, correct_idx, _ = batch
             print(f"Batch shape: {inputs.shape}")
+            
+            # Check if batch is empty
+            if inputs.numel() == 0:
+                print("Empty batch - skipping cocktail party sample")
+                break
+            
             print(f"Sample tokens: {inputs[0][:20].tolist()}")
             
             # Decode sample text
