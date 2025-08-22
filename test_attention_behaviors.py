@@ -259,6 +259,8 @@ class AttentionBehaviorTests(unittest.TestCase):
                 span_id[batch_idx, pos] = -1  # MASKQ marked with span_id = -1
                 pos += 1
                 
+        return tokens, is_prefix, in_span, span_id
+                
     def _try_run_actual_kernel(self, q, k, v, **kwargs):
         """
         Try to run the actual flash attention kernel if CUDA is available.
