@@ -67,7 +67,7 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
     
-    def forward(self, x, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -83,6 +83,7 @@ class MultiHeadAttention(nn.Module):
             v=v,
             lens=None,
             causal=is_causal,
+            attention_mask=None,
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix
@@ -105,9 +106,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
     
-    def forward(self, x, in_span=None, span_id=None, is_prefix=None):
+    def forward(self, x, attention_mask=None, in_span=None, span_id=None, is_prefix=None):
         # Pre-norm for attention
-        x = x + self.attn(self.norm1(x), in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+        x = x + self.attn(self.norm1(x), attention_mask=attention_mask, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         # Pre-norm for MLP
         x = x + self.mlp(self.norm2(x))
         return x
@@ -242,7 +243,7 @@ class GPTModel(nn.Module):
         # Apply transformer blocks (using metadata-only routing)
         for block in self.blocks:
             # Always use metadata tensors for attention control (no task-based routing)
-            x_embed = block(x_embed, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
+            x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         
         # Final normalization
         x_embed = self.norm_out(x_embed)
