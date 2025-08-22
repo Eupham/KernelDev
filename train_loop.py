@@ -17,7 +17,6 @@ Key Components:
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from data_builder import BIO_TAGS
 from torch.distributions import Bernoulli
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -352,9 +351,18 @@ class Trainer:
 
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
+                    # Pass metadata tensors directly instead of as task_name
+                    scores, loss = self.model(inputs, correct_idx=correct_idx, 
+                                            in_span=metadata.get('in_span'),
+                                            span_id=metadata.get('span_id'), 
+                                            is_prefix=metadata.get('is_prefix'),
+                                            task_name=task_name)
             else:
-                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
+                scores, loss = self.model(inputs, correct_idx=correct_idx,
+                                        in_span=metadata.get('in_span'),
+                                        span_id=metadata.get('span_id'),
+                                        is_prefix=metadata.get('is_prefix'), 
+                                        task_name=task_name)
 
         else:
             x, y = batch
@@ -411,9 +419,17 @@ class Trainer:
 
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
-                                scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
+                                scores, loss = self.model(inputs, correct_idx=correct_idx,
+                                                        in_span=metadata.get('in_span'),
+                                                        span_id=metadata.get('span_id'),
+                                                        is_prefix=metadata.get('is_prefix'),
+                                                        task_name=task_name)
                         else:
-                            scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
+                            scores, loss = self.model(inputs, correct_idx=correct_idx,
+                                                    in_span=metadata.get('in_span'),
+                                                    span_id=metadata.get('span_id'),
+                                                    is_prefix=metadata.get('is_prefix'),
+                                                    task_name=task_name)
 
                         if loss is not None and scores.numel() > 0:
                             metrics = self._calculate_accuracy(scores, correct_idx)
