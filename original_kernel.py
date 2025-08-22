@@ -475,6 +475,7 @@ def _flash_attn_fwd(
     LSE: tl.tensor, O: tl.tensor,  #
     ATTN_MASK: tl.tensor,
     IN_SPAN: tl.tensor, SPAN_ID: tl.tensor, IS_PREFIX: tl.tensor,
+    OUTPUT_ATTN_MASK: tl.tensor,
     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
     stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,  #
     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
@@ -485,6 +486,8 @@ def _flash_attn_fwd(
     in_span_stride_b: int, in_span_stride_t: int,
     span_id_stride_b: int, span_id_stride_t: int,
     is_prefix_stride_b: int, is_prefix_stride_t: int,
+    output_attn_mask_stride_b: int, output_attn_mask_stride_h: int, 
+    output_attn_mask_stride_q: int, output_attn_mask_stride_k: int,
     T: int,  #
     TIME_BUCKET:  int,  #
     HEAD_DIM: tl.constexpr,  #
@@ -501,6 +504,7 @@ def _flash_attn_fwd(
     K_BLOCK_DIVISIBLE: tl.constexpr,  #
     PERFECT_MATCHING: tl.constexpr,  #
     RCP_LN2: tl.constexpr,  #
+    RETURN_ATTENTION_MASK: tl.constexpr,  #
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
@@ -679,6 +683,34 @@ def _flash_attn_fwd(
             mask = True
 
         mask = mask & (q_lens_mask & (kv_indices[None, :] < seq_len))
+        
+        # If we need to return the attention mask, write it to the output tensor
+        if RETURN_ATTENTION_MASK and OUTPUT_ATTN_MASK is not None:
+            output_attn_mask_batch_head_offset = (batch * output_attn_mask_stride_b + 
+                                                 head * output_attn_mask_stride_h)
+            output_attn_mask_tile_ptr = tl.make_block_ptr(
+                base=OUTPUT_ATTN_MASK + output_attn_mask_batch_head_offset,
+                shape=(T, T),
+                strides=(output_attn_mask_stride_q, output_attn_mask_stride_k),
+                offsets=(q_token_idx, kv_token_idx),
+                block_shape=(TILE_Q_SIZE, TILE_K_SIZE),
+                order=(1, 0),
+            )
+            
+            # Write the mask to the output tensor
+            if Q_BLOCK_DIVISIBLE and K_BLOCK_DIVISIBLE:
+                tl.store(
+                    output_attn_mask_tile_ptr,
+                    mask.to(tl.int8),  # Convert bool to int8 for storage
+                )
+            else:
+                boundary_mask = (q_tile_indices[:, None] < seq_len) & (kv_indices[None, :] < seq_len)
+                tl.store(
+                    output_attn_mask_tile_ptr,
+                    mask.to(tl.int8),
+                    boundary_check=(0, 1),
+                    mask=boundary_mask,
+                )
         
         if not PERFECT_MATCHING:
             q_attended |= tl.max(mask, 1) > 0
@@ -1802,6 +1834,8 @@ def attention_forward_adapter(
     in_span: torch.Tensor = None,
     span_id: torch.Tensor = None,
     is_prefix: torch.Tensor = None,
+    output_attention_mask: torch.Tensor = None,
+    return_attention_mask: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, T, HEAD_DIM = q.shape
 
@@ -1837,6 +1871,7 @@ def attention_forward_adapter(
         in_span,
         span_id,
         is_prefix,
+        output_attention_mask,
         *strides(q, 4),
         *strides(kt, 4),
         *strides(v, 4),
@@ -1847,6 +1882,7 @@ def attention_forward_adapter(
         *(strides(in_span, 2) if in_span is not None else [0]*2),
         *(strides(span_id, 2) if span_id is not None else [0]*2),
         *(strides(is_prefix, 2) if is_prefix is not None else [0]*2),
+        *(strides(output_attention_mask, 4) if output_attention_mask is not None else [0]*4),
         T=T,
         HEAD_DIM=HEAD_DIM,
         CAUSAL=causal,
@@ -1856,6 +1892,7 @@ def attention_forward_adapter(
         TIME_BUCKET=triton.next_power_of_2(T),
         OUTPUT_LOGSUMEXP=return_lse,
         SM_SCALE=sm_scale,
+        RETURN_ATTENTION_MASK=return_attention_mask,
     )
 
     if LSE is None:
@@ -1879,6 +1916,8 @@ def attention_forward_adapter_abstract(
     in_span: torch.Tensor | None,
     span_id: torch.Tensor | None,
     is_prefix: torch.Tensor | None,
+    output_attention_mask: torch.Tensor | None,
+    return_attention_mask: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(q, memory_format=torch.contiguous_format),
@@ -2130,8 +2169,18 @@ def _flash_attention(
     in_span: torch.Tensor | None,
     span_id: torch.Tensor | None,
     is_prefix: torch.Tensor | None,
+    return_attention_mask: bool = False,
 ):
     requires_grad = any(i.requires_grad for i in (q, k, v))
+    
+    # If we need to return attention mask, create an output tensor for it
+    if return_attention_mask:
+        batch, heads, seq_len, _ = q.shape
+        output_attention_mask = torch.zeros((batch, heads, seq_len, seq_len), 
+                                          dtype=torch.bool, device=q.device)
+    else:
+        output_attention_mask = None
+    
     O, LSE = torch.ops.flash_attention.forward(
         q=q,
         k=k,
@@ -2147,8 +2196,15 @@ def _flash_attention(
         in_span=in_span,
         span_id=span_id,
         is_prefix=is_prefix,
+        output_attention_mask=output_attention_mask,
+        return_attention_mask=return_attention_mask,
     )
-    if return_lse:
+    
+    if return_attention_mask:
+        if return_lse:
+            return (O, LSE), output_attention_mask
+        return O, output_attention_mask
+    elif return_lse:
         return O, LSE
     return O
 
@@ -2163,7 +2219,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
     def forward(
         ctx, q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
         incoherent_processing, hadamard_signs_q, hadamard_signs_k, attention_mask,
-        in_span, span_id, is_prefix
+        in_span, span_id, is_prefix, return_attention_mask
     ):
         # Store context for backward pass
         ctx.incoherent_processing = incoherent_processing
@@ -2177,6 +2233,7 @@ class IncoherentFlashAttention(torch.autograd.Function):
         ctx.in_span = in_span
         ctx.span_id = span_id
         ctx.is_prefix = is_prefix
+        ctx.return_attention_mask = return_attention_mask
         
         # Apply Hadamard transform for incoherent processing
         q_transformed, k_transformed = q, k
@@ -2209,6 +2266,15 @@ class IncoherentFlashAttention(torch.autograd.Function):
         
         # Run flash attention on transformed tensors
         requires_grad = any(i.requires_grad for i in (q, k, v))
+        
+        # If we need to return attention mask, create an output tensor for it
+        if return_attention_mask:
+            batch, heads, seq_len, _ = q.shape
+            output_attention_mask = torch.zeros((batch, heads, seq_len, seq_len), 
+                                              dtype=torch.bool, device=q.device)
+        else:
+            output_attention_mask = None
+        
         O, LSE = torch.ops.flash_attention.forward(
             q=q_transformed,
             k=k_transformed,
@@ -2224,13 +2290,19 @@ class IncoherentFlashAttention(torch.autograd.Function):
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix,
+            output_attention_mask=output_attention_mask,
+            return_attention_mask=return_attention_mask,
         )
         
         # Save tensors for backward pass
         if requires_grad:
             ctx.save_for_backward(q, k, v, O, LSE, lens)
         
-        if return_lse:
+        if return_attention_mask:
+            if return_lse:
+                return (O, LSE), output_attention_mask
+            return O, output_attention_mask
+        elif return_lse:
             return O, LSE
         return O
     
@@ -2314,6 +2386,7 @@ def flash_attention(
     in_span: torch.Tensor | None = None,
     span_id: torch.Tensor | None = None,
     is_prefix: torch.Tensor | None = None,
+    return_attention_mask: bool = False,
 ):
     """
     Computes self-attention with optional causal masking and flash attention optimization.
@@ -2340,6 +2413,13 @@ def flash_attention(
                                            False: Force disable
         hadamard_signs_q (Tensor | None): Pre-computed random signs for Q transform
         hadamard_signs_k (Tensor | None): Pre-computed random signs for K transform
+        return_attention_mask (bool): If True, returns the computed attention mask along with the output
+    
+    Returns:
+        If return_attention_mask is False:
+            Tensor (or tuple[Tensor, Tensor] if return_lse is True): Attention output
+        If return_attention_mask is True:
+            tuple[Tensor, Tensor]: (output, attention_mask) where attention_mask is [batch, heads, seq_len, seq_len]
     """
     if not torch.compiler.is_compiling():
         for i in (q, k, v):
@@ -2362,14 +2442,14 @@ def flash_attention(
     
     # Use the custom autograd function if incoherent processing is enabled
     if use_incoherent:
-        return IncoherentFlashAttention.apply(
+        result = IncoherentFlashAttention.apply(
             q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
             use_incoherent, hadamard_signs_q, hadamard_signs_k, attention_mask,
-            in_span, span_id, is_prefix
+            in_span, span_id, is_prefix, return_attention_mask
         )
     else:
         # Use standard flash attention for normal case
-        return _flash_attention(
+        result = _flash_attention(
             q=q,
             k=k,
             v=v,
@@ -2384,7 +2464,10 @@ def flash_attention(
             in_span=in_span,
             span_id=span_id,
             is_prefix=is_prefix,
+            return_attention_mask=return_attention_mask,
         )
+    
+    return result
 
 
 def is_hopper_gpu() -> bool:
