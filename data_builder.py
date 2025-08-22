@@ -32,6 +32,15 @@ import random
 # Configuration Constants
 # =============================================================================
 
+# Define special tokens
+BIO_TAGS = {
+    'O': 0,
+    'B-ORIG': 1,
+    'I-ORIG': 2,
+    'PAD': -100,
+}
+NUM_BIO_TAGS = 3
+
 SPECIAL_TOKENS = {
     '[PAD]': 0,
     '[CLS]': 1,
