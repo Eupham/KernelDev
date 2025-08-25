@@ -58,7 +58,7 @@ try:
 except ImportError as e:
     print(f"⚠️  Data builder not available: {e}")
     DATA_BUILDER_AVAILABLE = False
-    # Fallback special tokens
+    # Special tokens for testing
     SPECIAL_TOKENS = {
         '[PAD]': 0,
         '[CLS]': 1,
@@ -120,7 +120,7 @@ class AttentionBehaviorTests(unittest.TestCase):
                 self.maskq_id = SPECIAL_TOKENS['[MASKQ]']
             except Exception as e:
                 print(f"⚠️  Could not initialize data builder: {e}")
-                # Use fallback values for special tokens
+                # Use default values for special tokens
                 self.pad_id = SPECIAL_TOKENS['[PAD]']
                 self.cls_id = SPECIAL_TOKENS['[CLS]']
                 self.mask_id = SPECIAL_TOKENS['[MASK]']
@@ -129,7 +129,7 @@ class AttentionBehaviorTests(unittest.TestCase):
                 self.maskq_id = SPECIAL_TOKENS['[MASKQ]']
                 self.data_builder = None
         else:
-            # Use fallback values for special tokens
+            # Use default values for special tokens
             self.pad_id = SPECIAL_TOKENS['[PAD]']
             self.cls_id = SPECIAL_TOKENS['[CLS]']
             self.mask_id = SPECIAL_TOKENS['[MASK]']
@@ -291,9 +291,9 @@ class AttentionBehaviorTests(unittest.TestCase):
         except Exception as e:
             return False, None, str(e)
 
-    def _run_kernel_or_fallback(self, q, k, v, test_name="test", **kwargs):
+    def _run_kernel_only(self, q, k, v, test_name="test", **kwargs):
         """
-        Try to run the actual kernel. No fallback behavior to avoid misleading results.
+        Try to run the actual kernel. No fallback behavior - fail gracefully if CUDA unavailable.
         Returns (used_cuda, result, attention_mask)
         """
         success, result, error = self._try_run_actual_kernel(q, k, v, **kwargs)
@@ -309,7 +309,7 @@ class AttentionBehaviorTests(unittest.TestCase):
                 return True, result, None
         else:
             print(f"❌ {test_name}: CUDA kernel failed ({error})")
-            print(f"   Skipping fallback behavior as requested - CPU results are misleading")
+            print(f"   Test requires CUDA execution - skipping to avoid misleading results")
             # Do not provide fallback behavior as it masks real kernel issues
             self._current_test_used_cuda = False
             return False, None, None
@@ -691,150 +691,11 @@ class AttentionBehaviorTests(unittest.TestCase):
             
         return results
 
-    def _create_mock_attention_scores_teacher_forcing(self, is_prefix: torch.Tensor, cls_pos: int) -> torch.Tensor:
-        """
-        Create mock attention scores that follow teacher forcing patterns.
-        This simulates what the attention should look like for validation.
-        """
-        batch_size, seq_len = is_prefix.shape
-        attention_scores = torch.zeros((batch_size, self.n_heads, seq_len, seq_len))
-        
-        for batch_idx in range(batch_size):
-            for head in range(self.n_heads):
-                # 1. Bidirectional within prefix
-                prefix_positions = torch.where(is_prefix[batch_idx])[0]
-                for i in prefix_positions:
-                    for j in prefix_positions:
-                        attention_scores[batch_idx, head, i, j] = 1.0
-                        
-                # 2. Causal after CLS
-                context_positions = torch.where(~is_prefix[batch_idx])[0]
-                context_positions = context_positions[context_positions < seq_len]
-                
-                for i in context_positions:
-                    # Can see CLS and previous context tokens
-                    attention_scores[batch_idx, head, i, cls_pos] = 1.0
-                    for j in context_positions:
-                        if j <= i:  # Causal: can see current and previous
-                            attention_scores[batch_idx, head, i, j] = 1.0
-                            
-        return attention_scores
 
-    def _create_mock_attention_scores_cocktail_party(self, is_prefix: torch.Tensor, 
-                                                   in_span: torch.Tensor, span_id: torch.Tensor) -> torch.Tensor:
-        """
-        Create mock attention scores that follow cocktail party patterns.
-        This simulates what the attention should look like for validation.
-        """
-        batch_size, seq_len = is_prefix.shape
-        attention_scores = torch.zeros((batch_size, self.n_heads, seq_len, seq_len))
-        
-        for batch_idx in range(batch_size):
-            for head in range(self.n_heads):
-                # 1. Bidirectional within prefix
-                prefix_positions = torch.where(is_prefix[batch_idx])[0]
-                for i in prefix_positions:
-                    for j in prefix_positions:
-                        attention_scores[batch_idx, head, i, j] = 1.0
-                        
-                # 2. Context causal behavior + can see prefix
-                context_mask = ~is_prefix[batch_idx] & ~in_span[batch_idx] & (span_id[batch_idx] != -1)
-                context_positions = torch.where(context_mask)[0]
-                
-                for i in context_positions:
-                    # Can see prefix
-                    for j in prefix_positions:
-                        attention_scores[batch_idx, head, i, j] = 1.0
-                    # Causal within context
-                    for j in context_positions:
-                        if j <= i:
-                            attention_scores[batch_idx, head, i, j] = 1.0
-                            
-                # 3. Span island behaviors
-                unique_spans = torch.unique(span_id[batch_idx])
-                unique_spans = unique_spans[unique_spans > 0]
-                
-                for span_id_val in unique_spans:
-                    span_positions = torch.where((span_id[batch_idx] == span_id_val) & in_span[batch_idx])[0]
-                    
-                    # Bidirectional within same span
-                    for i in span_positions:
-                        for j in span_positions:
-                            attention_scores[batch_idx, head, i, j] = 1.0
-                        # Can see context
-                        for j in context_positions:
-                            attention_scores[batch_idx, head, i, j] = 1.0
-                            
-                # 4. MASKQ behaviors
-                maskq_positions = torch.where(span_id[batch_idx] == -1)[0]
-                for maskq_pos in maskq_positions:
-                    # MASKQ can see all spans and prefix
-                    for j in prefix_positions:
-                        attention_scores[batch_idx, head, maskq_pos, j] = 1.0
-                    for span_id_val in unique_spans:
-                        span_positions = torch.where((span_id[batch_idx] == span_id_val) & in_span[batch_idx])[0]
-                        for j in span_positions:
-                            attention_scores[batch_idx, head, maskq_pos, j] = 1.0
-                            
-        return attention_scores
 
-    def test_teacher_forcing_attention_patterns(self):
-        """Test teacher forcing attention behaviors."""
-        print("\n=== Testing Teacher Forcing Attention Patterns ===")
-        
-        # Create test sequence
-        tokens, is_prefix, attention_mask = self._create_teacher_forcing_sequence()
-        cls_pos = 3  # Position of CLS token in our test sequence
-        
-        print(f"Test sequence shape: {tokens.shape}")
-        print(f"CLS position: {cls_pos}")
-        print(f"Prefix mask: {is_prefix[0]}")
-        
-        # Create mock attention scores that should follow teacher forcing patterns
-        attention_scores = self._create_mock_attention_scores_teacher_forcing(is_prefix, cls_pos)
-        
-        # Validate the patterns
-        results = self._validate_teacher_forcing_attention_pattern(attention_scores, is_prefix, cls_pos)
-        
-        print("Validation Results:")
-        for key, value in results.items():
-            status = "✓" if value else "✗"
-            print(f"  {status} {key}: {value}")
-            
-        # Assert all validations pass
-        for key, value in results.items():
-            self.assertTrue(value, f"Teacher forcing pattern validation failed: {key}")
-            
-        print("✓ All teacher forcing attention patterns validated successfully!")
 
-    def test_cocktail_party_attention_patterns(self):
-        """Test cocktail party attention behaviors."""
-        print("\n=== Testing Cocktail Party Attention Patterns ===")
-        
-        # Create test sequence
-        tokens, is_prefix, in_span, span_id = self._create_cocktail_party_sequence()
-        
-        print(f"Test sequence shape: {tokens.shape}")
-        print(f"Prefix mask: {is_prefix[0]}")
-        print(f"In span mask: {in_span[0]}")
-        print(f"Span IDs: {span_id[0]}")
-        
-        # Create mock attention scores that should follow cocktail party patterns
-        attention_scores = self._create_mock_attention_scores_cocktail_party(is_prefix, in_span, span_id)
-        
-        # Validate the patterns
-        results = self._validate_cocktail_party_attention_pattern(attention_scores, is_prefix, in_span, span_id)
-        
-        print("Validation Results:")
-        for key, value in results.items():
-            status = "✓" if value else "✗"
-            print(f"  {status} {key}: {value}")
-            
-        # Assert all validations pass
-        for key, value in results.items():
-            self.assertTrue(value, f"Cocktail party pattern validation failed: {key}")
-            
-        print("✓ All cocktail party attention patterns validated successfully!")
+
+
 
     def test_special_token_behaviors(self):
         """Test special token handling behaviors."""
@@ -935,12 +796,12 @@ class AttentionBehaviorTests(unittest.TestCase):
                         sample_text = test_builder.decode_tokens(sample_tokens[:32])
                         print(f"   Sample text (first 32 tokens): {sample_text}")
                     
-                    # Note: CLS might not be present in fallback data, but SPAN, ES should be
+                    # Note: CLS might not be present in test data, but SPAN, ES should be
                     # since those are added by the cocktail party collation function
                     if has_cls:
                         print("   ✅ CLS token found in cocktail party sequence")
                     else:
-                        print("   ⚠️  CLS token not found (may be using fallback data without task prefixes)")
+                        print("   ⚠️  CLS token not found (may be using test data without task prefixes)")
                     
                     if has_span and has_es:
                         print("   ✅ Span tokens found - cocktail party structure present")
@@ -1145,7 +1006,7 @@ class AttentionBehaviorTests(unittest.TestCase):
         print(f"Tensors created on device: {q.device}")
         
         # Try to run actual kernel with attention mask output
-        used_cuda, output, attention_mask_output = self._run_kernel_or_fallback(
+        used_cuda, output, attention_mask_output = self._run_kernel_only(
             q, k, v,
             test_name="Teacher Forcing",
             causal=True,
@@ -1205,7 +1066,7 @@ class AttentionBehaviorTests(unittest.TestCase):
         print(f"Tensors created on device: {q.device}")
         
         # Try to run actual kernel with cocktail party metadata
-        used_cuda, output, attention_mask_output = self._run_kernel_or_fallback(
+        used_cuda, output, attention_mask_output = self._run_kernel_only(
             q, k, v,
             test_name="Cocktail Party",
             causal=True,  # Cocktail party uses modified causal logic
@@ -1481,7 +1342,7 @@ class AttentionBehaviorTests(unittest.TestCase):
         print(f"  • span_id: {span_id[0]}")
         
         # Try to run the actual kernel
-        used_cuda, output, attention_mask = self._run_kernel_or_fallback(
+        used_cuda, output, attention_mask = self._run_kernel_only(
             q, k, v,
             test_name="Comprehensive Demo",
             causal=True,
@@ -1643,7 +1504,6 @@ def run_tests():
             self.cuda_successes = []
             self.cuda_failures = []
             self.cuda_skipped = []
-            self.cpu_fallbacks = []
             self.current_test_used_cuda = False
             
         def startTest(self, test):
@@ -1656,8 +1516,6 @@ def run_tests():
                 test_name = f"{test.__class__.__name__}.{test._testMethodName}"
                 if self.current_test_used_cuda:
                     self.cuda_successes.append(test_name)
-                else:
-                    self.cpu_fallbacks.append(test_name)
                     
         def addError(self, test, err):
             super().addError(test, err)
@@ -1677,8 +1535,6 @@ def run_tests():
                 test_name = f"{test.__class__.__name__}.{test._testMethodName}"
                 if "CUDA" in reason:
                     self.cuda_skipped.append((test_name, reason))
-                else:
-                    self.cpu_fallbacks.append(test_name)
     
     # Create custom test runner
     class CategorizedTestRunner(unittest.TextTestRunner):
@@ -1719,14 +1575,6 @@ def run_tests():
                 print(f"     Error: {error_str.split('\\n')[0]}")
         print()
     
-    # Report CPU fallbacks (but mark as not definitive)
-    if result.cpu_fallbacks:
-        print(f"⚠️  CPU FALLBACK RESULTS ({len(result.cpu_fallbacks)}) - NOT RELIABLE FOR KERNEL VALIDATION:")
-        for test_name in result.cpu_fallbacks:
-            print(f"   • {test_name} (used mock/fallback behavior)")
-        print("   Note: These results use simulated behavior and do not validate actual kernel correctness")
-        print()
-    
     # Summary based on actual CUDA results only
     print("=" * 60)
     cuda_total = len(result.cuda_successes) + len(result.cuda_failures)
@@ -1737,8 +1585,7 @@ def run_tests():
         print("To properly test attention kernels, run on a CUDA-enabled device.")
     elif cuda_total == 0:
         print("⚠️  NO CUDA KERNEL TESTS EXECUTED!")
-        print("All tests used CPU fallback behavior which does not validate kernel correctness.")
-        print("To properly test attention kernels, run on a CUDA-enabled device.")
+        print("No tests executed. To properly test attention kernels, run on a CUDA-enabled device.")
     elif len(result.cuda_failures) == 0:
         print(f"✅ ALL {len(result.cuda_successes)} CUDA KERNEL TESTS PASSED!")
         print("Attention kernel behaviors are correctly implemented.")
@@ -1749,7 +1596,7 @@ def run_tests():
     
     print("=" * 60)
     
-    # Return success only if CUDA tests passed (ignore CPU fallbacks)
+    # Return success only if CUDA tests passed
     return cuda_total > 0 and len(result.cuda_failures) == 0
 
 
