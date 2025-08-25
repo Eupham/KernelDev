@@ -187,17 +187,17 @@ class GPTModel(nn.Module):
         # Token and position embeddings
         x_embed = self.token_emb(x) + self.pos_emb(pos)
         
-        # Generate metadata tensors based on input parameters or tokens
+        # Generate metadata tensors based on input parameters
         if in_span is not None and span_id is not None and is_prefix is not None:
             # Use directly provided metadata tensors
             pass  # in_span, span_id, is_prefix are already set
         elif attention_mask is not None and isinstance(attention_mask, dict):
-            # Use metadata from data builder (remove task_name dependency)
+            # Use metadata from data builder (consistent approach for all tasks)
             in_span = attention_mask['in_span']
             span_id = attention_mask['span_id'] 
             is_prefix = attention_mask['is_prefix']
         else:
-            # Generate metadata from tokens (auto-detect sequence type)
+            # Fallback: Generate metadata from tokens (for standalone inference)
             span_start_id = SPECIAL_TOKENS['[SPAN]']
             span_end_id = SPECIAL_TOKENS['[ES]']
             cls_token_id = SPECIAL_TOKENS['[CLS]']
@@ -217,7 +217,7 @@ class GPTModel(nn.Module):
                 span_id = torch.cumsum((x == span_start_id).int(), dim=1)
                 span_id[~in_span] = 0  # Non-span tokens get span_id=0
                 
-                # Mark MASKQ tokens with special span_id=-1 (last token behavior)
+                # Mark MASKQ tokens with special span_id=-1
                 maskq_positions = (x == maskq_token_id)
                 span_id[maskq_positions] = -1
                 
@@ -228,7 +228,7 @@ class GPTModel(nn.Module):
                         cls_pos = cls_positions[0].item()
                         is_prefix[batch_idx, :cls_pos + 1] = True
             else:
-                # Process teacher forcing style sequence (only [CLS] special token behavior)
+                # Process teacher forcing style sequence
                 for batch_idx in range(batch_size):
                     cls_positions = (x[batch_idx] == cls_token_id).nonzero(as_tuple=True)[0]
                     if len(cls_positions) > 0:
@@ -236,9 +236,8 @@ class GPTModel(nn.Module):
                         cls_pos = cls_positions[0].item()
                         is_prefix[batch_idx, :cls_pos + 1] = True
 
-        # Apply transformer blocks (using metadata-only routing)
+        # Apply transformer blocks (consistently using metadata for attention control)
         for block in self.blocks:
-            # Always use metadata tensors for attention control (no task-based routing)
             x_embed = block(x_embed, attention_mask=None, in_span=in_span, span_id=span_id, is_prefix=is_prefix)
         
         # Final normalization

@@ -357,21 +357,56 @@ class Trainer:
                 scores, loss = self.model(inputs, correct_idx=correct_idx, attention_mask=metadata, task_name=task_name)
 
         else:
+            # Teacher forcing and other tasks
             x, y = batch
             # Use non_blocking=True for faster GPU transfers
             x = x.to(self.config.device, non_blocking=True)
             y = y.to(self.config.device, non_blocking=True)
 
+            # Generate metadata for teacher forcing to ensure consistent attention patterns
+            metadata = self._generate_teacher_forcing_metadata(x)
+
             if self.config.use_amp and self.config.scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    logits, loss = self.model(x, targets=y, task_name=task_name)
+                    logits, loss = self.model(x, targets=y, attention_mask=metadata, task_name=task_name)
             else:
-                logits, loss = self.model(x, targets=y, task_name=task_name)
+                logits, loss = self.model(x, targets=y, attention_mask=metadata, task_name=task_name)
 
         if loss is None:
             return 0.0
 
         return loss
+
+    def _generate_teacher_forcing_metadata(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Generate metadata tensors for teacher forcing tasks to ensure consistent attention patterns."""
+        from data_builder import SPECIAL_TOKENS
+        
+        batch_size, seq_len = x.shape
+        device = x.device
+        
+        # Initialize metadata tensors
+        in_span = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
+        span_id = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+        is_prefix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
+        
+        cls_token_id = SPECIAL_TOKENS['[CLS]']
+        
+        # For teacher forcing: Mark everything up to and including [CLS] as prefix
+        # This ensures bidirectional attention within prefix, causal after
+        for batch_idx in range(batch_size):
+            cls_positions = (x[batch_idx] == cls_token_id).nonzero(as_tuple=True)[0]
+            if len(cls_positions) > 0:
+                # Mark everything up to and including the first [CLS] as prefix
+                cls_pos = cls_positions[0].item()
+                is_prefix[batch_idx, :cls_pos + 1] = True
+        
+        # For teacher forcing: in_span and span_id remain zero (no spans)
+        
+        return {
+            'in_span': in_span,
+            'span_id': span_id,
+            'is_prefix': is_prefix
+        }
 
     def _calculate_accuracy(self, scores: torch.Tensor, correct_idx: torch.Tensor) -> Dict[str, float]:
         """Calculates accuracy for the contrastive task."""
@@ -422,14 +457,18 @@ class Trainer:
                                     cocktail_party_metrics[k] = []
                                 cocktail_party_metrics[k].append(v)
                     else:
+                        # Teacher forcing and other tasks
                         x, y = batch
                         x, y = x.to(self.config.device), y.to(self.config.device)
 
+                        # Generate metadata for teacher forcing to ensure consistent attention patterns
+                        metadata = self._generate_teacher_forcing_metadata(x)
+
                         if self.config.use_amp:
                             with torch.amp.autocast('cuda'):
-                                logits, loss = self.model(x, targets=y, task_name=task_name)
+                                logits, loss = self.model(x, targets=y, attention_mask=metadata, task_name=task_name)
                         else:
-                            logits, loss = self.model(x, targets=y, task_name=task_name)
+                            logits, loss = self.model(x, targets=y, attention_mask=metadata, task_name=task_name)
 
                     if loss is not None:
                         if isinstance(loss, dict):
