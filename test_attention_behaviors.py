@@ -1032,12 +1032,12 @@ class AttentionBehaviorTests(unittest.TestCase):
             
         else:
             # CUDA kernel failed - skip this test since it requires CUDA
-            print("⚠️  CUDA kernel execution required but not available!")
+            print("⚠️  CUDA kernel execution failed; cannot validate without a working kernel.")
             print("   Cannot validate teacher forcing attention patterns without actual kernel execution.")
             print("   Skipping test as it requires CUDA kernel execution.")
             
             # Skip the test rather than failing it when CUDA is simply not available
-            self.skipTest("CUDA kernel execution required for teacher forcing pattern validation but CUDA unavailable")
+            self.skipTest("CUDA kernel execution failed for teacher forcing pattern validation")
         
         print("🔧 API signature correctly accepts teacher forcing parameters")
 
@@ -1103,12 +1103,12 @@ class AttentionBehaviorTests(unittest.TestCase):
                 
         else:
             # CUDA kernel failed - skip this test since it requires CUDA  
-            print("⚠️  CUDA kernel execution required but not available!")
+            print("⚠️  CUDA kernel execution failed; cannot validate without a working kernel.")
             print("   Cannot validate cocktail party attention patterns without actual kernel execution.")
             print("   Skipping test as it requires CUDA kernel execution.")
             
             # Skip the test rather than failing it when CUDA is simply not available
-            self.skipTest("CUDA kernel execution required for cocktail party pattern validation but CUDA unavailable")
+            self.skipTest("CUDA kernel execution failed for cocktail party pattern validation")
         
         print("🔧 API signature correctly accepts cocktail party metadata parameters")
 
@@ -1399,12 +1399,12 @@ class AttentionBehaviorTests(unittest.TestCase):
                 
         else:
             # CUDA kernel failed - skip this test since it requires CUDA
-            print(f"\n⚠️  CUDA kernel execution required but not available!")
+            print(f"\n⚠️  CUDA kernel execution failed; cannot validate without a working kernel.")
             print("   Cannot demonstrate cocktail party behaviors without actual kernel execution.")
             print("   Skipping test as it requires CUDA kernel execution.")
             
             # Skip the test rather than failing it when CUDA is simply not available
-            self.skipTest("CUDA kernel execution required for attention pattern validation but CUDA unavailable")
+            self.skipTest("CUDA kernel execution failed for attention pattern validation")
             
         print(f"\n✅ Comprehensive demonstration completed!")
 
@@ -1558,7 +1558,10 @@ def run_tests():
     
     # Report CUDA skipped tests (tests that require CUDA but it's not available)
     if result.cuda_skipped:
-        print(f"⏭️  CUDA TESTS SKIPPED ({len(result.cuda_skipped)}) - CUDA NOT AVAILABLE:")
+        reasons = [reason for _, reason in result.cuda_skipped]
+        unavailable = any("unavailable" in reason.lower() or "not available" in reason.lower() for reason in reasons)
+        header = "CUDA NOT AVAILABLE" if unavailable else "KERNEL EXECUTION FAILED"
+        print(f"⏭️  CUDA TESTS SKIPPED ({len(result.cuda_skipped)}) - {header}:")
         for test_name, reason in result.cuda_skipped:
             print(f"   • {test_name}")
             print(f"     Reason: {reason}")
@@ -1581,7 +1584,12 @@ def run_tests():
     
     if cuda_total == 0 and len(result.cuda_skipped) > 0:
         print(f"⏭️  {len(result.cuda_skipped)} CUDA KERNEL TESTS SKIPPED!")
-        print("CUDA tests were skipped because CUDA is not available.")
+        reasons = [reason for _, reason in result.cuda_skipped]
+        unavailable = any("unavailable" in reason.lower() or "not available" in reason.lower() for reason in reasons)
+        if unavailable:
+            print("CUDA tests were skipped because CUDA is not available.")
+        else:
+            print("CUDA tests were skipped because kernel execution failed.")
         print("To properly test attention kernels, run on a CUDA-enabled device.")
     elif cuda_total == 0:
         print("⚠️  NO CUDA KERNEL TESTS EXECUTED!")
