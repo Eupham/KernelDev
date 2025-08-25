@@ -6,15 +6,16 @@ This test suite validates the attention behaviors across both teacher forcing an
 cocktail party tasks, testing the special token handling and attention patterns
 implemented in original_kernel.py.
 
-The tests focus on validating the attention logic without actually running
-the Triton kernels, making them suitable for environments where Triton
-is not available.
+The test suite includes:
+- Logic validation tests that validate the attention pattern logic without kernels
+- Kernel integration tests that require CUDA to test actual kernel execution
 
 Test Categories:
 1. Teacher Forcing Task Attention Behaviors
 2. Cocktail Party Task Attention Behaviors  
 3. Special Token Handling
 4. Attention Pattern Validation
+5. Kernel Integration Tests (require CUDA)
 
 Expected Behaviors Tested:
 
@@ -36,9 +37,8 @@ COCKTAIL PARTY TASK (4-part attention structure):
 Usage:
     python test_attention_behaviors.py
 
-The tests create synthetic data that matches the expected format and validates
-that the attention pattern logic correctly identifies and handles each type of
-token according to the specification.
+Logic validation tests work on any device. Kernel integration tests require CUDA 
+and will fail with clear error messages if CUDA is not available.
 """
 
 import torch
@@ -1542,7 +1542,7 @@ def run_tests():
     print("ATTENTION TOKEN BEHAVIOR TESTS")
     print("=" * 60)
     print("Testing attention patterns for teacher forcing and cocktail party tasks")
-    print("Note: These tests validate the attention logic without running Triton kernels")
+    print("Note: Some tests validate the attention logic, others require CUDA for kernel testing")
     print()
     
     # Create test suite
