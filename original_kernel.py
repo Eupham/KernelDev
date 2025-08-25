@@ -741,11 +741,11 @@ def _flash_attn_fwd(
                 )
             else:
                 boundary_mask = (q_tile_indices[:, None] < seq_len) & (kv_indices[None, :] < seq_len)
+                safe_mask_tile = (mask & boundary_mask).to(tl.int8)
                 tl.store(
                     output_attn_mask_tile_ptr,
-                    mask.to(tl.int8),
+                    safe_mask_tile,
                     boundary_check=(0, 1),
-                    mask=boundary_mask,
                 )
         
         if not PERFECT_MATCHING:
