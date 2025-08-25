@@ -522,12 +522,18 @@ def _flash_attn_fwd(
 
     q_tile_indices = q_token_idx + tl.arange(0, TILE_Q_SIZE)
 
-    # Load metadata for the current query tile
-    q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
-    q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
+    # Load metadata for the current query tile - use safe loading
+    if IN_SPAN is not None:
+        q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
+        q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
+    else:
+        q_in_span = tl.full([TILE_Q_SIZE], False, tl.int1)
 
-    q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
-    q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
+    if IS_PREFIX is not None:
+        q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
+        q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
+    else:
+        q_is_prefix = tl.full([TILE_Q_SIZE], False, tl.int1)
 
     # Decide loop bound per tile
     q_tile_has_noncausal = tl.sum((q_in_span | q_is_prefix).to(tl.int32)) > 0
@@ -628,27 +634,57 @@ def _flash_attn_fwd(
         )
 
         kv_indices = kv_token_idx + tile_k_arange
-        if ATTN_MASK is not None:
-            # Load metadata for the key tile
-            k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
-            k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
+        
+        # Decide if we should use token rules based on metadata presence
+        USE_TOKEN_RULES = (IN_SPAN is not None) or (SPAN_ID is not None) or (IS_PREFIX is not None)
+        
+        if USE_TOKEN_RULES:
+            # Safe loads for optional metadata
+            # Load k metadata
+            if IN_SPAN is not None:
+                k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
+                k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
+            else:
+                k_in_span = tl.full([TILE_K_SIZE], False, tl.int1)
 
-            k_span_id_ptr = SPAN_ID + batch * span_id_stride_b + kv_indices
-            k_span_id = tl.load(k_span_id_ptr, mask=kv_indices < seq_len, other=-1)
+            if SPAN_ID is not None:
+                k_span_id_ptr = SPAN_ID + batch * span_id_stride_b + kv_indices
+                k_span_id = tl.load(k_span_id_ptr, mask=kv_indices < seq_len, other=0)
+            else:
+                k_span_id = tl.full([TILE_K_SIZE], 0, tl.int32)
 
-            k_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + kv_indices
-            k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
+            if IS_PREFIX is not None:
+                k_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + kv_indices
+                k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
+            else:
+                k_is_prefix = tl.full([TILE_K_SIZE], False, tl.int1)
 
-            # Load metadata for the query tile
-            q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
-            q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
+            # Load q metadata
+            if IN_SPAN is not None:
+                q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
+                q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
+            else:
+                q_in_span = tl.full([TILE_Q_SIZE], False, tl.int1)
+
+            if SPAN_ID is not None:
+                q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
+                q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=0)
+            else:
+                q_span_id = tl.full([TILE_Q_SIZE], 0, tl.int32)
+
+            if IS_PREFIX is not None:
+                q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
+                q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
+            else:
+                q_is_prefix = tl.full([TILE_Q_SIZE], False, tl.int1)
 
             # --- Cocktail Party Attention Pattern ---
             # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
             
             # Check if query/key tokens are special types
-            q_is_maskq = (q_span_id[:, None] == -1)  # [MASKQ] marked with span_id = -1
-            k_is_maskq = (k_span_id[None, :] == -1)
+            # [MASKQ] only when SPAN_ID is known; otherwise treat as not MASKQ
+            q_is_maskq = (q_span_id[:, None] == -1) if (SPAN_ID is not None) else tl.full([TILE_Q_SIZE, 1], False, tl.int1)
+            k_is_maskq = (k_span_id[None, :] == -1) if (SPAN_ID is not None) else tl.full([1, TILE_K_SIZE], False, tl.int1)
             k_is_cls_or_prefix = k_is_prefix[None, :]
             
             # Pattern 1: [CLS]/prefix tokens can only see within prefix (bidirectional within prefix)
@@ -663,7 +699,7 @@ def _flash_attn_fwd(
             # Pattern 3: Span tokens bidirectional within same span + can see context (NO MASKQ)
             same_span = (q_in_span[:, None] & k_in_span[None, :] & 
                         (q_span_id[:, None] == k_span_id[None, :]) & 
-                        (q_span_id[:, None] > 0))  # Exclude span_id=0 and span_id=-1
+                        ((SPAN_ID is not None) & (q_span_id[:, None] > 0)))  # Only when SPAN_ID known & > 0
             span_to_context = q_in_span[:, None] & k_is_context
             
             # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
@@ -1416,31 +1452,57 @@ def _flash_attn_bwd_dq(
         p = tl.math.exp2(qk - m)
 
         kv_indices = kv_token_idx + tile_k_arange
-        if ATTN_MASK is not None:
-            # Load metadata for the key tile
-            k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
-            k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
+        
+        # Decide if we should use token rules based on metadata presence
+        USE_TOKEN_RULES = (IN_SPAN is not None) or (SPAN_ID is not None) or (IS_PREFIX is not None)
+        
+        if USE_TOKEN_RULES:
+            # Safe loads for optional metadata
+            # Load k metadata
+            if IN_SPAN is not None:
+                k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
+                k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
+            else:
+                k_in_span = tl.full([TILE_K_SIZE], False, tl.int1)
 
-            k_span_id_ptr = SPAN_ID + batch * span_id_stride_b + kv_indices
-            k_span_id = tl.load(k_span_id_ptr, mask=kv_indices < seq_len, other=-1)
+            if SPAN_ID is not None:
+                k_span_id_ptr = SPAN_ID + batch * span_id_stride_b + kv_indices
+                k_span_id = tl.load(k_span_id_ptr, mask=kv_indices < seq_len, other=0)
+            else:
+                k_span_id = tl.full([TILE_K_SIZE], 0, tl.int32)
 
-            k_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + kv_indices
-            k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
+            if IS_PREFIX is not None:
+                k_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + kv_indices
+                k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
+            else:
+                k_is_prefix = tl.full([TILE_K_SIZE], False, tl.int1)
 
-            # Load metadata for the query tile
-            q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
-            q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
-            q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
-            q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
-            q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
-            q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
+            # Load q metadata
+            if IN_SPAN is not None:
+                q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
+                q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
+            else:
+                q_in_span = tl.full([TILE_Q_SIZE], False, tl.int1)
+
+            if SPAN_ID is not None:
+                q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
+                q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=0)
+            else:
+                q_span_id = tl.full([TILE_Q_SIZE], 0, tl.int32)
+
+            if IS_PREFIX is not None:
+                q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
+                q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
+            else:
+                q_is_prefix = tl.full([TILE_Q_SIZE], False, tl.int1)
 
             # --- Cocktail Party Attention Pattern ---
             # All broadcasted to [TILE_Q_SIZE, TILE_K_SIZE]
             
             # Check if query/key tokens are special types
-            q_is_maskq = (q_span_id[:, None] == -1)  # [MASKQ] marked with span_id = -1
-            k_is_maskq = (k_span_id[None, :] == -1)
+            # [MASKQ] only when SPAN_ID is known; otherwise treat as not MASKQ
+            q_is_maskq = (q_span_id[:, None] == -1) if (SPAN_ID is not None) else tl.full([TILE_Q_SIZE, 1], False, tl.int1)
+            k_is_maskq = (k_span_id[None, :] == -1) if (SPAN_ID is not None) else tl.full([1, TILE_K_SIZE], False, tl.int1)
             k_is_cls_or_prefix = k_is_prefix[None, :]
             
             # Pattern 1: [CLS]/prefix tokens can only see within prefix (bidirectional within prefix)
@@ -1455,7 +1517,7 @@ def _flash_attn_bwd_dq(
             # Pattern 3: Span tokens bidirectional within same span + can see context (NO MASKQ)
             same_span = (q_in_span[:, None] & k_in_span[None, :] & 
                         (q_span_id[:, None] == k_span_id[None, :]) & 
-                        (q_span_id[:, None] > 0))  # Exclude span_id=0 and span_id=-1
+                        ((SPAN_ID is not None) & (q_span_id[:, None] > 0)))  # Only when SPAN_ID known & > 0
             span_to_context = q_in_span[:, None] & k_is_context
             
             # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
@@ -1576,31 +1638,57 @@ def _flash_attn_bwd_dkdv(
         pT = tl.math.exp2(qkT - m[None, :])
 
         q_tile_indices = q_token_idx + tile_q_arange
-        if ATTN_MASK is not None:
-            # Load metadata for the key tile
-            k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
-            k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
+        
+        # Decide if we should use token rules based on metadata presence
+        USE_TOKEN_RULES = (IN_SPAN is not None) or (SPAN_ID is not None) or (IS_PREFIX is not None)
+        
+        if USE_TOKEN_RULES:
+            # Safe loads for optional metadata
+            # Load k metadata
+            if IN_SPAN is not None:
+                k_in_span_ptr = IN_SPAN + batch * in_span_stride_b + kv_indices
+                k_in_span = tl.load(k_in_span_ptr, mask=kv_indices < seq_len, other=0)
+            else:
+                k_in_span = tl.full([TILE_K_SIZE], False, tl.int1)
 
-            k_span_id_ptr = SPAN_ID + batch * span_id_stride_b + kv_indices
-            k_span_id = tl.load(k_span_id_ptr, mask=kv_indices < seq_len, other=-1)
+            if SPAN_ID is not None:
+                k_span_id_ptr = SPAN_ID + batch * span_id_stride_b + kv_indices
+                k_span_id = tl.load(k_span_id_ptr, mask=kv_indices < seq_len, other=0)
+            else:
+                k_span_id = tl.full([TILE_K_SIZE], 0, tl.int32)
 
-            k_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + kv_indices
-            k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
+            if IS_PREFIX is not None:
+                k_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + kv_indices
+                k_is_prefix = tl.load(k_is_prefix_ptr, mask=kv_indices < seq_len, other=0)
+            else:
+                k_is_prefix = tl.full([TILE_K_SIZE], False, tl.int1)
 
-            # Load metadata for the query tile
-            q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
-            q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
-            q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
-            q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=-1)
-            q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
-            q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
+            # Load q metadata
+            if IN_SPAN is not None:
+                q_in_span_ptr = IN_SPAN + batch * in_span_stride_b + q_tile_indices
+                q_in_span = tl.load(q_in_span_ptr, mask=q_tile_indices < seq_len, other=0)
+            else:
+                q_in_span = tl.full([TILE_Q_SIZE], False, tl.int1)
+
+            if SPAN_ID is not None:
+                q_span_id_ptr = SPAN_ID + batch * span_id_stride_b + q_tile_indices
+                q_span_id = tl.load(q_span_id_ptr, mask=q_tile_indices < seq_len, other=0)
+            else:
+                q_span_id = tl.full([TILE_Q_SIZE], 0, tl.int32)
+
+            if IS_PREFIX is not None:
+                q_is_prefix_ptr = IS_PREFIX + batch * is_prefix_stride_b + q_tile_indices
+                q_is_prefix = tl.load(q_is_prefix_ptr, mask=q_tile_indices < seq_len, other=0)
+            else:
+                q_is_prefix = tl.full([TILE_Q_SIZE], False, tl.int1)
 
             # --- Cocktail Party Attention Pattern ---
             # Note: indices are transposed for backward pass [TILE_K_SIZE, TILE_Q_SIZE]
             
             # Check if query/key tokens are special types
-            q_is_maskq = (q_span_id[None, :] == -1)  # [MASKQ] marked with span_id = -1
-            k_is_maskq = (k_span_id[:, None] == -1)
+            # [MASKQ] only when SPAN_ID is known; otherwise treat as not MASKQ
+            q_is_maskq = (q_span_id[None, :] == -1) if (SPAN_ID is not None) else tl.full([1, TILE_Q_SIZE], False, tl.int1)
+            k_is_maskq = (k_span_id[:, None] == -1) if (SPAN_ID is not None) else tl.full([TILE_K_SIZE, 1], False, tl.int1)
             k_is_cls_or_prefix = k_is_prefix[:, None]
             
             # Pattern 1: [CLS]/prefix tokens can only see within prefix (bidirectional within prefix)
@@ -1615,7 +1703,7 @@ def _flash_attn_bwd_dkdv(
             # Pattern 3: Span tokens bidirectional within same span + can see context (NO MASKQ)
             same_span = (q_in_span[None, :] & k_in_span[:, None] & 
                         (q_span_id[None, :] == k_span_id[:, None]) & 
-                        (q_span_id[None, :] > 0))  # Exclude span_id=0 and span_id=-1
+                        ((SPAN_ID is not None) & (q_span_id[None, :] > 0)))  # Only when SPAN_ID known & > 0
             span_to_context = q_in_span[None, :] & k_is_context
             
             # Pattern 4: [MASKQ] can see all spans + [CLS] (simplified to only spans for easier calculation)
