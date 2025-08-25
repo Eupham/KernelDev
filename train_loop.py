@@ -315,7 +315,8 @@ class Trainer:
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay
+            weight_decay=self.config.weight_decay,
+            fused=True
         )
         
         # Initialize learning rate scheduler
