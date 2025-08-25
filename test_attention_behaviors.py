@@ -293,20 +293,25 @@ class AttentionBehaviorTests(unittest.TestCase):
 
     def _run_kernel_or_fallback(self, q, k, v, test_name="test", **kwargs):
         """
-        Run the actual kernel if possible, otherwise use fallback behavior.
+        Try to run the actual kernel. No fallback behavior to avoid misleading results.
         Returns (used_cuda, result, attention_mask)
         """
         success, result, error = self._try_run_actual_kernel(q, k, v, **kwargs)
         
         if success:
             print(f"✅ {test_name}: Successfully ran CUDA kernel")
+            # Mark that this test used CUDA for categorization
+            self._current_test_used_cuda = True
             if isinstance(result, tuple):
                 output, attention_mask = result
                 return True, output, attention_mask
             else:
                 return True, result, None
         else:
-            print(f"⚠️  {test_name}: CUDA kernel failed ({error}), using fallback")
+            print(f"❌ {test_name}: CUDA kernel failed ({error})")
+            print(f"   Skipping fallback behavior as requested - CPU results are misleading")
+            # Do not provide fallback behavior as it masks real kernel issues
+            self._current_test_used_cuda = False
             return False, None, None
     
     def _test_prefix_bidirectional_attention(self, attention_mask, is_prefix):
@@ -1165,25 +1170,13 @@ class AttentionBehaviorTests(unittest.TestCase):
             print("✅ All teacher forcing attention patterns validated from real kernel!")
             
         else:
-            # Fallback to testing the API signature and demonstrating expected behavior
-            print("📋 Testing expected teacher forcing behavior (mock demonstration):")
+            # CUDA kernel failed - skip this test since it requires CUDA
+            print("⚠️  CUDA kernel execution required but not available!")
+            print("   Cannot validate teacher forcing attention patterns without actual kernel execution.")
+            print("   Skipping test as it requires CUDA kernel execution.")
             
-            # Create mock attention scores that follow teacher forcing patterns
-            attention_scores = self._create_mock_attention_scores_teacher_forcing(is_prefix, cls_pos)
-            
-            # Validate the patterns
-            results = self._validate_teacher_forcing_attention_pattern(attention_scores, is_prefix, cls_pos)
-            
-            print("Expected behavior validation:")
-            for key, value in results.items():
-                status = "✓" if value else "✗"
-                print(f"  {status} {key}: {value}")
-                
-            # Assert all validations pass for expected behavior
-            for key, value in results.items():
-                self.assertTrue(value, f"Expected teacher forcing pattern failed: {key}")
-                
-            print("✅ Teacher forcing expected behavior validated!")
+            # Skip the test rather than failing it when CUDA is simply not available
+            self.skipTest("CUDA kernel execution required for teacher forcing pattern validation but CUDA unavailable")
         
         print("🔧 API signature correctly accepts teacher forcing parameters")
 
@@ -1248,25 +1241,13 @@ class AttentionBehaviorTests(unittest.TestCase):
                 # Don't fail the test - this helps us understand what's wrong
                 
         else:
-            # Fallback to demonstrating expected behavior
-            print("📋 Testing expected cocktail party behavior (mock demonstration):")
+            # CUDA kernel failed - skip this test since it requires CUDA  
+            print("⚠️  CUDA kernel execution required but not available!")
+            print("   Cannot validate cocktail party attention patterns without actual kernel execution.")
+            print("   Skipping test as it requires CUDA kernel execution.")
             
-            # Create mock attention scores that follow cocktail party patterns
-            attention_scores = self._create_mock_attention_scores_cocktail_party(is_prefix, in_span, span_id)
-            
-            # Validate the patterns
-            results = self._validate_cocktail_party_attention_pattern(attention_scores, is_prefix, in_span, span_id)
-            
-            print("Expected behavior validation:")
-            for key, value in results.items():
-                status = "✓" if value else "✗"
-                print(f"  {status} {key}: {value}")
-                
-            # Assert all validations pass for expected behavior
-            for key, value in results.items():
-                self.assertTrue(value, f"Expected cocktail party pattern failed: {key}")
-                
-            print("✅ Cocktail party expected behavior validated!")
+            # Skip the test rather than failing it when CUDA is simply not available
+            self.skipTest("CUDA kernel execution required for cocktail party pattern validation but CUDA unavailable")
         
         print("🔧 API signature correctly accepts cocktail party metadata parameters")
 
@@ -1556,12 +1537,13 @@ class AttentionBehaviorTests(unittest.TestCase):
                 print(f"   • MASKQ visibility: {'✅' if maskq_ok else '❌'}")
                 
         else:
-            print(f"\n📋 CUDA not available - demonstrating expected behaviors:")
-            print("   This would show the correct cocktail party attention patterns")
-            print("   when running on a CUDA-enabled device like H100.")
+            # CUDA kernel failed - skip this test since it requires CUDA
+            print(f"\n⚠️  CUDA kernel execution required but not available!")
+            print("   Cannot demonstrate cocktail party behaviors without actual kernel execution.")
+            print("   Skipping test as it requires CUDA kernel execution.")
             
-            # Show what the expected patterns should be
-            self._demonstrate_expected_patterns(is_prefix, in_span, span_id)
+            # Skip the test rather than failing it when CUDA is simply not available
+            self.skipTest("CUDA kernel execution required for attention pattern validation but CUDA unavailable")
             
         print(f"\n✅ Comprehensive demonstration completed!")
 
@@ -1643,7 +1625,7 @@ class AttentionBehaviorTests(unittest.TestCase):
 
 
 def run_tests():
-    """Run all attention behavior tests."""
+    """Run all attention behavior tests with proper categorization."""
     print("=" * 60)
     print("ATTENTION TOKEN BEHAVIOR TESTS")
     print("=" * 60)
@@ -1654,25 +1636,121 @@ def run_tests():
     # Create test suite
     suite = unittest.TestLoader().loadTestsFromTestCase(AttentionBehaviorTests)
     
-    # Run tests with verbose output
-    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout, buffer=False)
+    # Create custom test result class to track categories
+    class CategorizedTestResult(unittest.TextTestResult):
+        def __init__(self, stream, descriptions, verbosity):
+            super().__init__(stream, descriptions, verbosity)
+            self.cuda_successes = []
+            self.cuda_failures = []
+            self.cuda_skipped = []
+            self.cpu_fallbacks = []
+            self.current_test_used_cuda = False
+            
+        def startTest(self, test):
+            super().startTest(test)
+            self.current_test_used_cuda = False
+            
+        def addSuccess(self, test):
+            super().addSuccess(test)
+            if hasattr(test, '_testMethodName'):
+                test_name = f"{test.__class__.__name__}.{test._testMethodName}"
+                if self.current_test_used_cuda:
+                    self.cuda_successes.append(test_name)
+                else:
+                    self.cpu_fallbacks.append(test_name)
+                    
+        def addError(self, test, err):
+            super().addError(test, err)
+            if hasattr(test, '_testMethodName'):
+                test_name = f"{test.__class__.__name__}.{test._testMethodName}"
+                self.cuda_failures.append((test_name, err))
+                
+        def addFailure(self, test, err):
+            super().addFailure(test, err)
+            if hasattr(test, '_testMethodName'):
+                test_name = f"{test.__class__.__name__}.{test._testMethodName}"
+                self.cuda_failures.append((test_name, err))
+                
+        def addSkip(self, test, reason):
+            super().addSkip(test, reason)
+            if hasattr(test, '_testMethodName'):
+                test_name = f"{test.__class__.__name__}.{test._testMethodName}"
+                if "CUDA" in reason:
+                    self.cuda_skipped.append((test_name, reason))
+                else:
+                    self.cpu_fallbacks.append(test_name)
+    
+    # Create custom test runner
+    class CategorizedTestRunner(unittest.TextTestRunner):
+        def _makeResult(self):
+            return CategorizedTestResult(self.stream, self.descriptions, self.verbosity)
+    
+    # Run tests with custom runner
+    runner = CategorizedTestRunner(verbosity=2, stream=sys.stdout, buffer=False)
     result = runner.run(suite)
     
     print("\n" + "=" * 60)
-    if result.wasSuccessful():
-        print("✓ ALL TESTS PASSED!")
-        print("Attention token behaviors are correctly implemented.")
+    print("TEST RESULTS CATEGORIZATION")
+    print("=" * 60)
+    
+    # Report CUDA successes (if any)
+    if result.cuda_successes:
+        print(f"✅ CUDA KERNEL SUCCESSES ({len(result.cuda_successes)}):")
+        for test_name in result.cuda_successes:
+            print(f"   • {test_name}")
+        print()
+    
+    # Report CUDA skipped tests (tests that require CUDA but it's not available)
+    if result.cuda_skipped:
+        print(f"⏭️  CUDA TESTS SKIPPED ({len(result.cuda_skipped)}) - CUDA NOT AVAILABLE:")
+        for test_name, reason in result.cuda_skipped:
+            print(f"   • {test_name}")
+            print(f"     Reason: {reason}")
+        print()
+    
+    # Report CUDA failures (actual kernel failures)
+    if result.cuda_failures:
+        print(f"❌ CUDA KERNEL FAILURES ({len(result.cuda_failures)}):")
+        for test_name, error in result.cuda_failures:
+            print(f"   • {test_name}")
+            # Extract meaningful error info
+            error_str = str(error[1]) if len(error) > 1 else str(error)
+            if "CUDA" in error_str or "kernel" in error_str.lower():
+                print(f"     Error: {error_str.split('\\n')[0]}")
+        print()
+    
+    # Report CPU fallbacks (but mark as not definitive)
+    if result.cpu_fallbacks:
+        print(f"⚠️  CPU FALLBACK RESULTS ({len(result.cpu_fallbacks)}) - NOT RELIABLE FOR KERNEL VALIDATION:")
+        for test_name in result.cpu_fallbacks:
+            print(f"   • {test_name} (used mock/fallback behavior)")
+        print("   Note: These results use simulated behavior and do not validate actual kernel correctness")
+        print()
+    
+    # Summary based on actual CUDA results only
+    print("=" * 60)
+    cuda_total = len(result.cuda_successes) + len(result.cuda_failures)
+    
+    if cuda_total == 0 and len(result.cuda_skipped) > 0:
+        print(f"⏭️  {len(result.cuda_skipped)} CUDA KERNEL TESTS SKIPPED!")
+        print("CUDA tests were skipped because CUDA is not available.")
+        print("To properly test attention kernels, run on a CUDA-enabled device.")
+    elif cuda_total == 0:
+        print("⚠️  NO CUDA KERNEL TESTS EXECUTED!")
+        print("All tests used CPU fallback behavior which does not validate kernel correctness.")
+        print("To properly test attention kernels, run on a CUDA-enabled device.")
+    elif len(result.cuda_failures) == 0:
+        print(f"✅ ALL {len(result.cuda_successes)} CUDA KERNEL TESTS PASSED!")
+        print("Attention kernel behaviors are correctly implemented.")
     else:
-        print("✗ SOME TESTS FAILED!")
-        print(f"Failures: {len(result.failures)}")
-        print(f"Errors: {len(result.errors)}")
-        
-        for test, traceback in result.failures + result.errors:
-            print(f"\nFailed: {test}")
-            print(traceback)
+        print(f"❌ {len(result.cuda_failures)} CUDA KERNEL TESTS FAILED!")
+        print(f"CUDA Successes: {len(result.cuda_successes)}")
+        print(f"CUDA Failures: {len(result.cuda_failures)}")
     
     print("=" * 60)
-    return result.wasSuccessful()
+    
+    # Return success only if CUDA tests passed (ignore CPU fallbacks)
+    return cuda_total > 0 and len(result.cuda_failures) == 0
 
 
 if __name__ == "__main__":
