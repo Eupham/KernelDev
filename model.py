@@ -139,6 +139,7 @@ class GPTModel(nn.Module):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
+        self.n_layers = n_layers
         self.max_seq_len = max_seq_len
         self.bidirectional_prefix_len = bidirectional_prefix_len
         
@@ -169,10 +170,44 @@ class GPTModel(nn.Module):
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
+        """
+        GPT-style weight initialization with scaled residual init (DeepNorm/GPT-NeoX trick).
+        
+        - Embeddings: Normal init with std=0.02
+        - Attention projections (Q, K, V): Normal init with std=0.02  
+        - Residual connection layers (attention output, MLP output): Scaled by 1/sqrt(2*n_layers)
+        - Other linear layers: Normal init with std=0.02
+        """
+        if isinstance(module, nn.Embedding):
+            # Standard embedding initialization
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Linear):
+            # Determine if this is a residual connection layer that needs scaled init
+            is_residual_layer = False
+            
+            # Check if this is an attention output projection or MLP output layer
+            # We can identify these by walking up the module hierarchy
+            module_name = None
+            for name, m in self.named_modules():
+                if m is module:
+                    module_name = name
+                    break
+            
+            if module_name:
+                # Attention output projections: *.attn.o_proj
+                # MLP output projections: *.mlp.w2
+                if module_name.endswith('.attn.o_proj') or module_name.endswith('.mlp.w2'):
+                    is_residual_layer = True
+            
+            if is_residual_layer:
+                # Scaled residual initialization (DeepNorm/GPT-NeoX trick)
+                # Scale by 1/sqrt(2*n_layers) to maintain variance through residual connections
+                residual_scale = 1.0 / (2 * self.n_layers) ** 0.5
+                std = 0.02 * residual_scale
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            else:
+                # Standard initialization for Q, K, V projections and MLP input layers
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, x, targets=None, attention_mask=None, task_name=None, task_type=None, spans=None, correct_idx=None, p_star=None, tau=0.1, m_star=None, c_true=None, l_true=None, in_span=None, span_id=None, is_prefix=None):
         batch_size, seq_len = x.shape
