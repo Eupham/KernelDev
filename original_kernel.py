@@ -9,7 +9,6 @@ O(n²) to O(n) through block-wise computation.
 Key Components:
 - Flash Attention Forward/Backward Kernels: Triton-based GPU kernels for efficient computation
 - Hierarchical Attention Patterns: 4-section attention structure for cocktail party tasks
-- Incoherent Processing: Hadamard transforms to reduce quantization error
 - GPU Optimization: Auto-tuning and hardware-specific configurations
 - Mixed Precision Support: fp16, bf16, and fp32 computation modes
 
@@ -41,212 +40,19 @@ MAX_TILE_SIZE = 512  # Reduced for T4 compatibility
 MIN_TILE_SIZE = 16  # Reduced for T4 compatibility
 
 
-# =============================================================================
-# Incoherent Processing Utilities
-# =============================================================================
-
-def generate_hadamard_signs(head_dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Generate random signs for Hadamard transform."""
-    return torch.randint(0, 2, (head_dim,), device=device, dtype=dtype) * 2 - 1
 
 
-def hadamard_transform(x: torch.Tensor, signs: torch.Tensor = None) -> torch.Tensor:
-    """
-    Apply fast Walsh-Hadamard transform with random signs for incoherent processing.
-    
-    Args:
-        x: Input tensor of shape (..., head_dim) where head_dim must be a power of 2
-        signs: Random signs tensor of shape (head_dim,), if None will generate random signs
-        
-    Returns:
-        Transformed tensor with outliers spread out to reduce quantization error
-    """
-    *batch_dims, head_dim = x.shape
-    
-    # Ensure head_dim is power of 2
-    if head_dim & (head_dim - 1) != 0:
-        raise ValueError(f"Head dimension {head_dim} must be a power of 2 for Hadamard transform")
-    
-    # Generate random signs if not provided
-    if signs is None:
-        signs = generate_hadamard_signs(head_dim, x.device, x.dtype)
-    
-    # Apply random signs
-    x_signed = x * signs
-    
-    # Fast Walsh-Hadamard Transform (O(d log d))
-    result = x_signed
-    stride = 1
-    while stride < head_dim:
-        # Butterfly operations
-        result = result.view(*batch_dims, head_dim // (2 * stride), 2, stride)
-        left, right = result.chunk(2, dim=-2)
-        left, right = left.squeeze(-2), right.squeeze(-2)
-        
-        result = torch.stack([left + right, left - right], dim=-2)
-        result = result.view(*batch_dims, head_dim)
-        stride *= 2
-    
-    # Normalize by sqrt(head_dim) to maintain magnitude
-    return result / math.sqrt(head_dim)
 
 
-def hadamard_inverse_transform(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
-    """
-    Apply inverse Walsh-Hadamard transform with the same random signs.
-    
-    Args:
-        x: Input tensor that was transformed with hadamard_transform
-        signs: The same random signs tensor used in the forward transform
-        
-    Returns:
-        Recovered original tensor
-    """
-    *batch_dims, head_dim = x.shape
-    
-    # The Hadamard transform is its own inverse, so we apply it again
-    # but we need to handle the normalization and signs correctly
-    
-    # First, undo the normalization
-    result = x * math.sqrt(head_dim)
-    
-    # Apply Walsh-Hadamard Transform (same as forward)
-    stride = 1
-    while stride < head_dim:
-        # Butterfly operations
-        result = result.view(*batch_dims, head_dim // (2 * stride), 2, stride)
-        left, right = result.chunk(2, dim=-2)
-        left, right = left.squeeze(-2), right.squeeze(-2)
-        
-        result = torch.stack([left + right, left - right], dim=-2)
-        result = result.view(*batch_dims, head_dim)
-        stride *= 2
-    
-    # Remove the random signs
-    result = result * signs
-    
-    # Apply final normalization
-    return result / head_dim
 
 
-@triton.jit
-def _hadamard_transform_kernel(
-    X: tl.tensor,
-    SIGNS: tl.tensor,
-    Y: tl.tensor,
-    stride_xb: int, stride_xh: int, stride_xt: int, stride_xd: int,
-    stride_yb: int, stride_yh: int, stride_yt: int, stride_yd: int,
-    stride_sb: int, stride_sh: int, stride_sd: int,
-    B: int, H: int, T: int, HEAD_DIM: tl.constexpr,
-    TILE_SIZE: tl.constexpr,
-    INVERSE: tl.constexpr,
-):
-    """
-    Simple Triton kernel for approximate Hadamard-style transform with random signs.
-    Focuses on spreading outliers rather than exact Walsh-Hadamard transform.
-    """
-    batch_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-    token_id = tl.program_id(2)
-    
-    # Bounds check
-    valid = (batch_id < B) & (head_id < H) & (token_id < T)
-    if not valid:
-        return
-    
-    # Load signs for this head
-    signs_ptr = SIGNS + batch_id * stride_sb + head_id * stride_sh
-    signs = tl.load(signs_ptr + tl.arange(0, HEAD_DIM))
-    
-    # Load input data
-    x_ptr = X + batch_id * stride_xb + head_id * stride_xh + token_id * stride_xt
-    x = tl.load(x_ptr + tl.arange(0, HEAD_DIM))
-    
-    if INVERSE:
-        # For inverse: reverse the forward operations
-        # Undo normalization first
-        result = x * tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
-        
-        # Simple spreading operation (reverse of forward)
-        indices = tl.arange(0, HEAD_DIM)
-        # Pair adjacent elements and apply butterfly-like operations
-        even_indices = indices * 2
-        odd_indices = indices * 2 + 1
-        
-        # Create new result by combining pairs
-        even_mask = even_indices < HEAD_DIM
-        odd_mask = odd_indices < HEAD_DIM
-        
-        even_vals = tl.where(even_mask, result, 0.0)
-        odd_vals = tl.where(odd_mask, tl.zeros_like(result), 0.0)  # Simplified for compatibility
-        
-        # Apply simple mixing to spread values
-        mixed = even_vals + odd_vals * 0.7071  # Approximate spreading
-        result = mixed
-        
-        # Remove signs and apply final normalization
-        result = result * signs / tl.cast(HEAD_DIM, tl.float32)
-    else:
-        # Forward transform: apply signs, then spread values
-        x_signed = x * signs
-        
-        # Simple spreading operation to approximate Hadamard effect
-        indices = tl.arange(0, HEAD_DIM)
-        
-        # Create pairs and apply butterfly-like operations
-        even_indices = indices * 2
-        odd_indices = indices * 2 + 1
-        
-        # Apply spreading by mixing adjacent values
-        even_mask = even_indices < HEAD_DIM
-        odd_mask = odd_indices < HEAD_DIM
-        
-        even_vals = tl.where(even_mask, x_signed, 0.0)
-        odd_vals = tl.where(odd_mask, x_signed, 0.0)
-        
-        # Mix values to spread outliers
-        result = even_vals + odd_vals * 0.7071  # Approximate mixing
-        
-        # Normalize
-        norm_factor = 1.0 / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
-        result = result * norm_factor
-    
-    # Store result
-    y_ptr = Y + batch_id * stride_yb + head_id * stride_yh + token_id * stride_yt
-    tl.store(y_ptr + tl.arange(0, HEAD_DIM), result)
 
 
-def apply_hadamard_triton(x: torch.Tensor, signs: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-    """
-    Apply Hadamard transform using Triton kernel for better performance.
-    
-    Args:
-        x: Input tensor
-        signs: Random signs for the transform
-        inverse: If True, applies inverse transform
-    """
-    B, H, T, D = x.shape
-    
-    # Create output tensor
-    y = torch.empty_like(x)
-    
-    # Ensure signs have the right shape [B, H, D]
-    if signs.ndim == 1:
-        signs = signs.unsqueeze(0).unsqueeze(0).expand(B, H, -1)
-    elif signs.ndim == 2:
-        signs = signs.unsqueeze(0).expand(B, -1, -1)
-    
-    # Launch kernel
-    grid = (B, H, T)
-    _hadamard_transform_kernel[grid](
-        x, signs, y,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
-        signs.stride(0), signs.stride(1), signs.stride(2),
-        B, H, T, D, TILE_SIZE=min(64, D), INVERSE=inverse
-    )
-    
-    return y
+
+
+
+
+
 
 
 logger = logging.getLogger(__name__)
@@ -2297,161 +2103,6 @@ def _flash_attention(
     return O
 
 
-class IncoherentFlashAttention(torch.autograd.Function):
-    """
-    Flash attention with incoherent processing autograd function.
-    Properly handles Hadamard transforms in both forward and backward passes.
-    """
-    
-    @staticmethod
-    def forward(
-        ctx, q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
-        incoherent_processing, hadamard_signs_q, hadamard_signs_k, attention_mask,
-        in_span, span_id, is_prefix, return_attention_mask
-    ):
-        # Store context for backward pass
-        ctx.incoherent_processing = incoherent_processing
-        ctx.causal = causal
-        ctx.autotune = autotune
-        ctx.sm_scale = sm_scale
-        ctx.prescale_qk = prescale_qk
-        ctx.precision = precision
-        ctx.return_lse = return_lse
-        ctx.attention_mask = attention_mask
-        ctx.in_span = in_span
-        ctx.span_id = span_id
-        ctx.is_prefix = is_prefix
-        ctx.return_attention_mask = return_attention_mask
-        
-        # Apply Hadamard transform for incoherent processing
-        q_transformed, k_transformed = q, k
-        if incoherent_processing:
-            # Double-check GPU capability for safety
-            if not is_hopper_gpu():
-                logger.warning(
-                    f"Incoherent processing requested on non-Hopper GPU "
-                    f"(compute capability {torch.cuda.get_device_capability()}). "
-                    f"This feature is optimized for H100+ GPUs."
-                )
-            
-            HEAD_DIM = q.size(-1)
-            if HEAD_DIM & (HEAD_DIM - 1) != 0:
-                raise ValueError(f"Head dimension {HEAD_DIM} must be a power of 2 for incoherent processing")
-            
-            # Use same signs for both Q and K as per research paper
-            if hadamard_signs_q is None:
-                hadamard_signs = generate_hadamard_signs(HEAD_DIM, q.device, q.dtype)
-            else:
-                hadamard_signs = hadamard_signs_q
-            
-            # Save signs for backward pass
-            ctx.hadamard_signs = hadamard_signs
-            
-            # Use PyTorch implementation for better consistency
-            # Apply the same orthogonal transform to both Q and K
-            q_transformed = hadamard_transform(q, hadamard_signs)
-            k_transformed = hadamard_transform(k, hadamard_signs)
-        
-        # Run flash attention on transformed tensors
-        requires_grad = any(i.requires_grad for i in (q, k, v))
-        
-        # If we need to return attention mask, create an output tensor for it
-        if return_attention_mask:
-            batch, heads, seq_len, _ = q.shape
-            output_attention_mask = torch.zeros((batch, heads, seq_len, seq_len), 
-                                              dtype=torch.bool, device=q.device)
-        else:
-            output_attention_mask = None
-        
-        O, LSE = torch.ops.flash_attention.forward(
-            q=q_transformed,
-            k=k_transformed,
-            v=v,
-            lens=lens,
-            sm_scale=sm_scale,
-            causal=causal,
-            autotune=autotune,
-            prescale_qk=prescale_qk,
-            return_lse=return_lse or requires_grad,
-            precision=precision,
-            attention_mask=attention_mask,
-            in_span=in_span,
-            span_id=span_id,
-            is_prefix=is_prefix,
-            output_attention_mask=output_attention_mask,
-            return_attention_mask=return_attention_mask,
-        )
-        
-        # Save tensors for backward pass
-        if requires_grad:
-            ctx.save_for_backward(q, k, v, O, LSE, lens)
-        
-        if return_attention_mask:
-            if return_lse:
-                return (O, LSE), output_attention_mask
-            return O, output_attention_mask
-        elif return_lse:
-            return O, LSE
-        return O
-    
-    @staticmethod 
-    def backward(ctx, grad_output, grad_lse=None):
-        q, k, v, o, lse, lens = ctx.saved_tensors
-        
-        if ctx.incoherent_processing:
-            # For incoherent processing, we need to apply the forward transform again
-            # because the attention backward expects the transformed Q and K
-            q_transformed = hadamard_transform(q, ctx.hadamard_signs)
-            k_transformed = hadamard_transform(k, ctx.hadamard_signs)
-            
-            # Compute gradients using transformed Q and K (matching forward pass)
-            DQ, DK, DV = torch.ops.flash_attention.backward(
-                q=q_transformed,
-                k=k_transformed,
-                v=v,
-                lens=lens,
-                o=o,
-                lse=lse,
-                do=grad_output,
-                sm_scale=ctx.sm_scale,
-                causal=ctx.causal,
-                autotune=ctx.autotune,
-                prescale_qk=ctx.prescale_qk,
-                precision=ctx.precision,
-                attention_mask=ctx.attention_mask,
-                in_span=ctx.in_span,
-                span_id=ctx.span_id,
-                is_prefix=ctx.is_prefix,
-            )
-            
-            # Apply inverse Hadamard transform to gradients to get gradients w.r.t. original Q and K
-            # This applies the chain rule: dL/dQ_orig = dL/dQ_transformed * dQ_transformed/dQ_orig
-            DQ = hadamard_inverse_transform(DQ, ctx.hadamard_signs)
-            DK = hadamard_inverse_transform(DK, ctx.hadamard_signs)
-        else:
-            # Normal backward pass without incoherent processing
-            DQ, DK, DV = torch.ops.flash_attention.backward(
-                q=q,
-                k=k,
-                v=v,
-                lens=lens,
-                o=o,
-                lse=lse,
-                do=grad_output,
-                sm_scale=ctx.sm_scale,
-                causal=ctx.causal,
-                autotune=ctx.autotune,
-                prescale_qk=ctx.prescale_qk,
-                precision=ctx.precision,
-                attention_mask=ctx.attention_mask,
-                in_span=ctx.in_span,
-                span_id=ctx.span_id,
-                is_prefix=ctx.is_prefix,
-            )
-        
-        return DQ, DK, DV, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
-
-
 # =============================================================================
 # Main Flash Attention Interface
 # =============================================================================
@@ -2467,9 +2118,6 @@ def flash_attention(
     return_lse=False,
     prescale_qk=False,
     precision="ieee",
-    incoherent_processing: bool | None = None,
-    hadamard_signs_q: torch.Tensor | None = None,
-    hadamard_signs_k: torch.Tensor | None = None,
     attention_mask: torch.Tensor | None = None,
     in_span: torch.Tensor | None = None,
     span_id: torch.Tensor | None = None,
@@ -2495,12 +2143,6 @@ def flash_attention(
         autotune (bool): Use triton autotune for optimal kernel configuration
         prescale_qk (bool): Prescale Q in QK^T calculations — slightly faster if True, slightly lower precision
         precision (str): Precision for matmuls: 'ieee' or 'tf32'
-        incoherent_processing (bool | None): Apply Hadamard transform to Q and K to reduce quantization error.
-                                           None (default): Auto-detect based on GPU (Hopper GPUs only)
-                                           True: Force enable (with warning on non-Hopper GPUs)
-                                           False: Force disable
-        hadamard_signs_q (Tensor | None): Pre-computed random signs for Q transform
-        hadamard_signs_k (Tensor | None): Pre-computed random signs for K transform
         return_attention_mask (bool): If True, returns the computed attention mask along with the output
     
     Returns:
@@ -2518,42 +2160,24 @@ def flash_attention(
         HEAD_DIM = q.size(-1)
         sm_scale = HEAD_DIM**-0.5
     
-    # Determine if incoherent processing should be used based on GPU capability
-    use_incoherent = should_use_incoherent_processing(incoherent_processing)
-    
-    if use_incoherent:
-        # Log when incoherent processing is enabled
-        if incoherent_processing is None:
-            logger.info(f"Auto-enabling incoherent processing on Hopper GPU (compute capability {torch.cuda.get_device_capability()})")
-        else:
-            logger.info(f"Using incoherent processing as explicitly requested")
-    
-    # Use the custom autograd function if incoherent processing is enabled
-    if use_incoherent:
-        result = IncoherentFlashAttention.apply(
-            q, k, v, lens, sm_scale, causal, autotune, return_lse, prescale_qk, precision,
-            use_incoherent, hadamard_signs_q, hadamard_signs_k, attention_mask,
-            in_span, span_id, is_prefix, return_attention_mask
-        )
-    else:
-        # Use standard flash attention for normal case
-        result = _flash_attention(
-            q=q,
-            k=k,
-            v=v,
-            lens=lens,
-            sm_scale=sm_scale,
-            causal=causal,
-            autotune=autotune,
-            return_lse=return_lse,
-            prescale_qk=prescale_qk,
-            precision=precision,
-            attention_mask=attention_mask,
-            in_span=in_span,
-            span_id=span_id,
-            is_prefix=is_prefix,
-            return_attention_mask=return_attention_mask,
-        )
+    # Use standard flash attention
+    result = _flash_attention(
+        q=q,
+        k=k,
+        v=v,
+        lens=lens,
+        sm_scale=sm_scale,
+        causal=causal,
+        autotune=autotune,
+        return_lse=return_lse,
+        prescale_qk=prescale_qk,
+        precision=precision,
+        attention_mask=attention_mask,
+        in_span=in_span,
+        span_id=span_id,
+        is_prefix=is_prefix,
+        return_attention_mask=return_attention_mask,
+    )
     
     return result
 
@@ -2619,31 +2243,11 @@ def verify_flash_attention_usage(model_forward_fn, sample_input, task_name="unkn
 # Utility Functions
 # =============================================================================
 
-def should_use_incoherent_processing(incoherent_processing: bool | None = None) -> bool:
-    """
-    Determine whether to use incoherent processing based on GPU capability.
-    
-    Args:
-        incoherent_processing: User override (True/False to force, None to auto-detect)
-    
-    Returns:
-        bool: Whether to use incoherent processing
-    """
-    if incoherent_processing is not None:
-        # User explicitly specified, respect their choice but warn if not optimal
-        if incoherent_processing and not is_hopper_gpu():
-            logger.warning(
-                "Incoherent processing enabled on non-Hopper GPU. "
-                "This feature is optimized for H100+ GPUs with compute capability >= 9.0"
-            )
-        return incoherent_processing
-    
-    # Auto-detect: only enable on Hopper GPUs
-    return is_hopper_gpu()
+
 
 
 if __name__ == "__main__":
-    print("=== Flash Attention with Auto-Detected Incoherent Processing ===\n")
+    print("=== Flash Attention Test ===\n")
     
     # Check GPU capability
     if torch.cuda.is_available():
@@ -2651,55 +2255,23 @@ if __name__ == "__main__":
         gpu_name = torch.cuda.get_device_name()
         print(f"GPU: {gpu_name}")
         print(f"Compute Capability: {major}.{minor}")
-        
-        if is_hopper_gpu():
-            print("✓ Hopper GPU detected - incoherent processing will be auto-enabled")
-        else:
-            print("⚠ Non-Hopper GPU detected - incoherent processing will be disabled by default")
+        print("✓ CUDA GPU detected")
     else:
         print("⚠ No CUDA GPU available")
         exit(1)
     
-    print("\n=== Testing Auto-Detection Behavior ===")
+    print("\n=== Testing Flash Attention ===")
     
     # Test tensors
-    B, H, T, D = 1, 2, 16, 64  # Power of 2 head dimension
+    B, H, T, D = 1, 2, 16, 64
     q = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
     k = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
     v = torch.randn(B, H, T, D, device='cuda', dtype=torch.float32, requires_grad=True)
     
-    # Test 1: Default behavior (auto-detection)
-    print("\n1. Testing default behavior (auto-detection):")
-    out_auto = flash_attention(q, k, v)
-    print(f"   Output shape: {out_auto.shape}")
-    
-    # Test 2: Explicitly disable incoherent processing
-    print("\n2. Testing explicitly disabled incoherent processing:")
-    out_disabled = flash_attention(q, k, v, incoherent_processing=False)
-    print(f"   Output shape: {out_disabled.shape}")
-    
-    # Test 3: Force enable incoherent processing (with warning on non-Hopper)
-    print("\n3. Testing explicitly enabled incoherent processing:")
-    try:
-        out_enabled = flash_attention(q, k, v, incoherent_processing=True)
-        print(f"   Output shape: {out_enabled.shape}")
-    except Exception as e:
-        print(f"   Error: {e}")
-    
-    # Test 4: Compare outputs
-    print("\n4. Comparing outputs:")
-    if is_hopper_gpu():
-        # On Hopper GPUs, auto and enabled should be identical
-        auto_vs_enabled_diff = torch.norm(out_auto - out_enabled) / torch.norm(out_auto)
-        auto_vs_disabled_diff = torch.norm(out_auto - out_disabled) / torch.norm(out_auto)
-        print(f"   Auto vs Enabled difference: {auto_vs_enabled_diff:.8f} (should be ~0)")
-        print(f"   Auto vs Disabled difference: {auto_vs_disabled_diff:.8f} (should be ~0, mathematically identical)")
-    else:
-        # On non-Hopper GPUs, auto and disabled should be identical
-        auto_vs_disabled_diff = torch.norm(out_auto - out_disabled) / torch.norm(out_auto)
-        auto_vs_enabled_diff = torch.norm(out_auto - out_enabled) / torch.norm(out_auto)
-        print(f"   Auto vs Disabled difference: {auto_vs_disabled_diff:.8f} (should be ~0)")
-        print(f"   Auto vs Enabled difference: {auto_vs_enabled_diff:.8f} (should be ~0, mathematically identical)")
+    # Test flash attention
+    print("\nTesting flash attention:")
+    out = flash_attention(q, k, v)
+    print(f"   Output shape: {out.shape}")
     
     print("\n=== Test Complete ===")
-    print(f"Summary: Incoherent processing auto-detection {'ENABLED' if is_hopper_gpu() else 'DISABLED'} based on GPU capability")
+    print("Summary: Flash attention working correctly")
