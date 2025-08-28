@@ -1956,6 +1956,8 @@ def attention_backward_adapter_op_setup_context(ctx, inputs, output):
         in_span,
         span_id,
         is_prefix,
+        output_attention_mask,
+        return_attention_mask,
     ) = inputs
     ctx.save_for_backward(
         q,
