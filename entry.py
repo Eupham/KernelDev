@@ -39,7 +39,7 @@ from argparse import ArgumentParser, REMAINDER
 # Import our custom modules
 from model import GPTModel
 from data_builder import DataBuilder, create_data_builder
-from train_loop import Trainer, TrainingConfig, create_trainer
+from train_loop import Trainer, TrainingConfig, create_trainer, find_latest_checkpoint_path
 
 # =============================================================================
 # Utility Functions
@@ -277,6 +277,9 @@ def start_actual_training(cli_args):
         device=hardware_cfg.get('device', 'auto'),
         use_amp=use_amp,
         scaler=scaler,
+        # Checkpoint configuration
+        auto_resume=training_cfg.get('auto_resume', True),
+        max_checkpoints=training_cfg.get('max_checkpoints', 2),
         # Inference sampling parameters
         inference_prompts=inference_cfg.get('prompts', ["", "The", "In", "Once upon a time"]),
         inference_max_length=inference_cfg.get('max_length', 100),
@@ -367,6 +370,17 @@ def start_actual_training(cli_args):
             print(f"Sample text: '{sample_text[:100]}...'")
             break
     
+    # Check for existing checkpoints
+    print(f"\n=== Checking for Existing Checkpoints ===")
+    checkpoint_dir = training_config.checkpoint_dir
+    latest_checkpoint = find_latest_checkpoint_path(checkpoint_dir)
+    
+    if latest_checkpoint:
+        print(f"Found existing checkpoint: {latest_checkpoint}")
+        print("Training will resume from this checkpoint.")
+    else:
+        print("No existing checkpoints found. Starting fresh training.")
+    
     # Create trainer
     print(f"\n=== Setting up Trainer ===")
     trainer = create_trainer(
@@ -375,27 +389,29 @@ def start_actual_training(cli_args):
         data_builder=data_builder
     )
     
-    # Initial evaluation
-    print(f"\n=== Initial Evaluation ===")
-    if 'train' in dataloaders and 'validation' in dataloaders:
-        max_eval_batches = eval_cfg.get('max_eval_batches', 10)
-        initial_train_loss, _ = trainer.evaluate(dataloaders['train'], task_configs, max_batches=max_eval_batches)
-        initial_val_loss, initial_val_metrics = trainer.evaluate(dataloaders['validation'], task_configs, max_batches=max_eval_batches)
-        print(f"Initial training loss: {initial_train_loss:.4f}")
-        print(f"Initial validation loss: {initial_val_loss:.4f}")
-        if initial_val_metrics:
-            log_str = "Initial cocktail party metrics: "
-            for k, v in initial_val_metrics.items():
-                log_str += f"{k}: {v:.4f}, "
-            print(log_str)
+    # Initial evaluation (only if no checkpoint found)
+    if not latest_checkpoint:
+        print(f"\n=== Initial Evaluation ===")
+        if 'train' in dataloaders and 'validation' in dataloaders:
+            max_eval_batches = eval_cfg.get('max_eval_batches', 10)
+            initial_train_loss, _ = trainer.evaluate(dataloaders['train'], task_configs, max_batches=max_eval_batches)
+            initial_val_loss, initial_val_metrics = trainer.evaluate(dataloaders['validation'], task_configs, max_batches=max_eval_batches)
+            print(f"Initial training loss: {initial_train_loss:.4f}")
+            print(f"Initial validation loss: {initial_val_loss:.4f}")
+            if initial_val_metrics:
+                log_str = "Initial cocktail party metrics: "
+                for k, v in initial_val_metrics.items():
+                    log_str += f"{k}: {v:.4f}, "
+                print(log_str)
     
-    # Start training
+    # Start training (resume functionality is handled within trainer.train())
     print(f"\n=== Starting Training ===")
     try:
         trainer.train(
             train_loaders=dataloaders.get('train'),
             val_loaders=dataloaders.get('validation'),
             task_configs=task_configs
+            # resume_from_checkpoint uses config setting by default
         )
         
         print(f"\n=== Training Completed ===")
