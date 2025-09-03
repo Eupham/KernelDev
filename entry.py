@@ -273,6 +273,7 @@ def start_actual_training(cli_args):
         eval_every=training_cfg.get('eval_every', 200),
         log_every=training_cfg.get('log_every', 50),
         inference_every=training_cfg.get('inference_every', 500),
+        save_logs_json_every=training_cfg.get('save_logs_json_every', 500),
         checkpoint_dir=training_cfg.get('checkpoint_dir', "checkpoints"),
         device=hardware_cfg.get('device', 'auto'),
         use_amp=use_amp,
