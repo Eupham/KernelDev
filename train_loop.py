@@ -55,6 +55,7 @@ class TrainingConfig:
         log_every: int = 100,
         moving_avg_window: int = 100,
         inference_every: int = 500,
+        save_logs_json_every: int = 500,
         checkpoint_dir: str = "checkpoints",
         device: str = "auto",
         use_amp: bool = False,
@@ -87,6 +88,7 @@ class TrainingConfig:
         self.log_every = log_every
         self.moving_avg_window = moving_avg_window
         self.inference_every = inference_every
+        self.save_logs_json_every = save_logs_json_every
         self.checkpoint_dir = checkpoint_dir
         self.use_amp = use_amp
         self.scaler = scaler
@@ -257,6 +259,22 @@ class TrainingMetrics:
             'best_step': self.best_step
         }
         torch.save(metrics_dict, filepath)
+    
+    def save_metrics_json(self, filepath: str):
+        """Save metrics to a JSON file."""
+        metrics_dict = {
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'cocktail_party_metrics': self.cocktail_party_metrics,
+            'learning_rates': self.learning_rates,
+            'step_times': self.step_times,
+            'total_steps': self.total_steps,
+            'best_val_loss': self.best_val_loss,
+            'best_step': self.best_step,
+            'timestamp': time.time()
+        }
+        with open(filepath, 'w') as f:
+            json.dump(metrics_dict, f, indent=2)
 
 # =============================================================================
 # Main Trainer Class
@@ -770,6 +788,14 @@ class Trainer:
                 # Regular checkpoint saving
                 if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_every == 0:
                     self.save_checkpoint(self.metrics.total_steps)
+
+                # Save training logs to JSON
+                if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_logs_json_every == 0:
+                    logs_dir = Path(self.config.checkpoint_dir) / "training_logs"
+                    logs_dir.mkdir(exist_ok=True)
+                    json_path = logs_dir / "training_logs.json"
+                    self.metrics.save_metrics_json(str(json_path))
+                    print(f"Training logs saved to JSON: {json_path}")
 
                 # Periodic inference
                 if val_loaders is not None and self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.inference_every == 0:

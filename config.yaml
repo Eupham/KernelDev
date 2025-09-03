@@ -28,6 +28,7 @@ training:
   save_every: 1000      # Save checkpoint every N steps
   eval_every: 200      # Evaluate on validation set every N steps
   log_every: 50        # Log training metrics every N steps
+  save_logs_json_every: 500  # Save training logs to JSON every N steps
   
   # Directory to save checkpoints and logs
   checkpoint_dir: "checkpoints"
