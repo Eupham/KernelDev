@@ -59,6 +59,9 @@ class TrainingConfig:
         device: str = "auto",
         use_amp: bool = False,
         scaler: Optional[Any] = None,
+        # Checkpoint configuration
+        auto_resume: bool = True,
+        max_checkpoints: int = 2,
         # Inference sampling parameters
         inference_prompts: List[str] = None,
         inference_max_length: int = 100,
@@ -87,6 +90,10 @@ class TrainingConfig:
         self.checkpoint_dir = checkpoint_dir
         self.use_amp = use_amp
         self.scaler = scaler
+        
+        # Checkpoint configuration
+        self.auto_resume = auto_resume
+        self.max_checkpoints = max_checkpoints
         
         # Inference sampling configuration
         self.inference_prompts = inference_prompts or ["", "The", "In", "Once upon a time"]
@@ -492,16 +499,21 @@ class Trainer:
 
     
     def save_checkpoint(self, step: int, is_best: bool = False):
-        """Save model checkpoint."""
+        """Save model checkpoint with rotation to keep only 2 most recent."""
         if not self.is_distributed or dist.get_rank() == 0:
             model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
+            
+            # Include dataset state in checkpoint if available
+            dataset_state = getattr(self, 'dataset_state', {})
+            
             checkpoint = {
                 'step': step,
                 'model_state_dict': model_to_save.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'scheduler_state_dict': self.scheduler.state_dict(),
                 'metrics': self.metrics.__dict__, # Note: metrics are rank-local
-                'config': self.config.__dict__
+                'config': self.config.__dict__,
+                'dataset_state': dataset_state  # Track dataset iteration state
             }
 
             checkpoint_path = os.path.join(
@@ -509,6 +521,9 @@ class Trainer:
                 f'checkpoint_step_{step}.pt'
             )
             torch.save(checkpoint, checkpoint_path)
+
+            # Manage checkpoint rotation - keep only 2 most recent regular checkpoints
+            self._cleanup_old_checkpoints()
 
             if is_best:
                 best_path = os.path.join(
@@ -524,6 +539,55 @@ class Trainer:
             if self.is_distributed:
                 dist.barrier()
         
+    def _cleanup_old_checkpoints(self):
+        """Keep only the max_checkpoints most recent regular checkpoints."""
+        checkpoint_dir = Path(self.config.checkpoint_dir)
+        
+        # Find all regular checkpoint files (not best_checkpoint.pt)
+        checkpoint_files = []
+        for file_path in checkpoint_dir.glob('checkpoint_step_*.pt'):
+            try:
+                # Extract step number from filename
+                step_num = int(file_path.stem.split('_')[-1])
+                checkpoint_files.append((step_num, file_path))
+            except (ValueError, IndexError):
+                continue
+        
+        # Sort by step number, newest first
+        checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+        
+        # Remove all but the max_checkpoints most recent
+        max_checkpoints = getattr(self.config, 'max_checkpoints', 2)
+        for _, file_path in checkpoint_files[max_checkpoints:]:
+            try:
+                file_path.unlink()
+                print(f"Removed old checkpoint: {file_path}")
+            except FileNotFoundError:
+                pass  # File already removed
+    
+    def find_latest_checkpoint(self) -> Optional[str]:
+        """Find the most recent checkpoint file."""
+        checkpoint_dir = Path(self.config.checkpoint_dir)
+        
+        if not checkpoint_dir.exists():
+            return None
+        
+        # Find all regular checkpoint files
+        checkpoint_files = []
+        for file_path in checkpoint_dir.glob('checkpoint_step_*.pt'):
+            try:
+                step_num = int(file_path.stem.split('_')[-1])
+                checkpoint_files.append((step_num, file_path))
+            except (ValueError, IndexError):
+                continue
+        
+        if not checkpoint_files:
+            return None
+        
+        # Return the most recent checkpoint
+        checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+        return str(checkpoint_files[0][1])
+    
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""
         # Ensure all processes load the same checkpoint
@@ -560,6 +624,10 @@ class Trainer:
         for key, value in checkpoint['metrics'].items():
             setattr(self.metrics, key, value)
         
+        # Restore dataset state if available
+        if 'dataset_state' in checkpoint:
+            self.dataset_state = checkpoint['dataset_state']
+        
         print(f"Checkpoint loaded: {checkpoint_path}")
         return checkpoint['step']
     
@@ -578,8 +646,21 @@ class Trainer:
         # Create iterators for all training dataloaders
         train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
         
+        # Initialize or update dataset state tracking
+        if not hasattr(self, 'dataset_state'):
+            self.dataset_state = {}
+        
+        self.dataset_state.update({
+            'current_epoch': epoch,
+            'steps_per_epoch': self.steps_per_epoch,
+            'total_epochs': self.config.num_epochs
+        })
+        
         for batch_idx in range(self.steps_per_epoch):
             step_start = time.time()
+            
+            # Update batch position in dataset state
+            self.dataset_state['current_batch'] = batch_idx
             
             total_loss = 0
             individual_losses = {}
@@ -730,9 +811,34 @@ class Trainer:
         self,
         train_loaders: Dict[str, DataLoader],
         val_loaders: Optional[Dict[str, DataLoader]] = None,
-        task_configs: Dict[str, Any] = None
+        task_configs: Dict[str, Any] = None,
+        resume_from_checkpoint: Optional[bool] = None
     ):
         """Main training loop."""
+        start_epoch = 0
+        
+        # Use config setting if not explicitly provided
+        if resume_from_checkpoint is None:
+            resume_from_checkpoint = getattr(self.config, 'auto_resume', True)
+        
+        # Check for existing checkpoint to resume from
+        if resume_from_checkpoint:
+            latest_checkpoint = self.find_latest_checkpoint()
+            if latest_checkpoint:
+                try:
+                    loaded_step = self.load_checkpoint(latest_checkpoint)
+                    # Calculate which epoch and batch we should resume from
+                    if hasattr(self, 'dataset_state') and 'current_epoch' in self.dataset_state:
+                        start_epoch = self.dataset_state['current_epoch']
+                        print(f"Resuming training from step {loaded_step}, epoch {start_epoch + 1}")
+                    else:
+                        print(f"Resuming training from step {loaded_step}")
+                except Exception as e:
+                    print(f"Failed to load checkpoint {latest_checkpoint}: {e}")
+                    print("Starting training from scratch...")
+            else:
+                print("No existing checkpoints found. Starting training from scratch...")
+        
         print(f"Starting training for {self.config.num_epochs} epochs...")
 
         if self.is_distributed and dist.get_world_size() > 1:
@@ -765,8 +871,8 @@ class Trainer:
         if not self.is_distributed or dist.get_rank() == 0:
             print(f"Scheduler initialized with T_max = {total_steps} for a single decay.")
 
-        # Initial evaluation
-        if val_loaders and (not self.is_distributed or dist.get_rank() == 0):
+        # Initial evaluation (only if starting from scratch)
+        if start_epoch == 0 and val_loaders and (not self.is_distributed or dist.get_rank() == 0):
             initial_val_loss, initial_cocktail_metrics = self.evaluate(val_loaders, task_configs)
             self.metrics.update(val_loss=initial_val_loss, cocktail_party_metrics=initial_cocktail_metrics)
             print(f"Initial validation loss: {initial_val_loss:.4f}")
@@ -777,7 +883,7 @@ class Trainer:
                 print(log_str)
 
         try:
-            for epoch in range(self.config.num_epochs):
+            for epoch in range(start_epoch, self.config.num_epochs):
                 if self.is_distributed and dist.get_world_size() > 1:
                     for loader in train_loaders.values():
                         loader.sampler.set_epoch(epoch)
@@ -1045,6 +1151,30 @@ class Trainer:
             else:
                 print(f"No prompt → '{generated_text}'")
         print("=" * 50)
+
+
+def find_latest_checkpoint_path(checkpoint_dir: str) -> Optional[str]:
+    """Find the most recent checkpoint file in the given directory."""
+    checkpoint_dir_path = Path(checkpoint_dir)
+    
+    if not checkpoint_dir_path.exists():
+        return None
+    
+    # Find all regular checkpoint files
+    checkpoint_files = []
+    for file_path in checkpoint_dir_path.glob('checkpoint_step_*.pt'):
+        try:
+            step_num = int(file_path.stem.split('_')[-1])
+            checkpoint_files.append((step_num, file_path))
+        except (ValueError, IndexError):
+            continue
+    
+    if not checkpoint_files:
+        return None
+    
+    # Return the most recent checkpoint
+    checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+    return str(checkpoint_files[0][1])
 
 
 def create_trainer(

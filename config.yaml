@@ -32,6 +32,10 @@ training:
   # Directory to save checkpoints and logs
   checkpoint_dir: "checkpoints"
 
+  # Checkpoint management
+  auto_resume: true        # Automatically resume from latest checkpoint
+  max_checkpoints: 2       # Maximum number of regular checkpoints to keep
+
   # Plateau detection parameters
   plateau_monitor_metric: 'val_loss'
   plateau_patience: 10
