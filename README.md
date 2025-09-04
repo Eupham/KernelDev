@@ -233,6 +233,20 @@ The implementation successfully maintains the core flash attention benefits whil
 - numpy, matplotlib (for utilities and visualization)
 - PyYAML (for configuration management)
 
+## Cloud Development with Modal
+
+For cloud-based development and testing with GPU access, use the Modal sandbox:
+
+```bash
+# Full setup and testing
+python sandbox_run.py
+
+# Quick command execution
+python sandbox_simple.py --command "python test_attention_behaviors.py"
+```
+
+See [MODAL_SANDBOX.md](MODAL_SANDBOX.md) for detailed instructions.
+
 ## License
 
 This project is designed for research and educational purposes in transformer architecture and flash attention optimization.
