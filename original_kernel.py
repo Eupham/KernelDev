@@ -522,7 +522,7 @@ def _flash_attn_fwd(
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
         else:
-            mask = True
+            mask = tl.full((TILE_Q_SIZE, TILE_K_SIZE), 1, dtype=tl.int1)
 
         mask = mask & (q_lens_mask & (kv_indices[None, :] < seq_len))
         
@@ -1339,7 +1339,7 @@ def _flash_attn_bwd_dq(
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
         else:
-            mask = True
+            mask = tl.full((TILE_Q_SIZE, TILE_K_SIZE), 1, dtype=tl.int1)
 
         mask = mask & (q_len_mask & (kv_indices[None, :] < seq_len))
 
@@ -1525,7 +1525,7 @@ def _flash_attn_bwd_dkdv(
         elif CAUSAL:
             mask = q_tile_indices[None, :] >= kv_indices[:, None]
         else:
-            mask = True
+            mask = tl.full((TILE_K_SIZE, TILE_Q_SIZE), 1, dtype=tl.int1)
 
         mask = mask & (kv_lens_mask & (q_tile_indices[None, :] < seq_len))
         pT = tl.where(mask, pT, 0.0)
