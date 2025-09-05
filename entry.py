@@ -178,22 +178,15 @@ def start_actual_training(cli_args):
     `cli_args` can be an argparse.Namespace object or a compatible dict/object.
     """
     # Load configuration from YAML file
-    # If cli_args is a namespace from parse_args in the new main, it should have 'config' attribute
     config_file_path = cli_args.config if hasattr(cli_args, 'config') else 'config.yaml'
     config = load_config(config_file_path)
     
     # Merge config with command-line arguments (CLI takes precedence)
-    # Ensure cli_args is a Namespace for merge_config_with_args if it expects one
-    # If cli_args might not be a full Namespace, adjust merge_config_with_args or pass parameters carefully
     if not isinstance(cli_args, argparse.Namespace):
-        # If cli_args is not a namespace (e.g. from worker process re-parsing with limited args)
-        # we might need to be careful here. For now, assume it has compatible attributes.
-        # A cleaner way might be to pass a dictionary of overrides.
-        pass # Assuming cli_args has the necessary attributes like precision, batch_size etc.
-
+        pass # Assumes compatible attributes
     config = merge_config_with_args(config, cli_args)
     
-    # Extract configuration values with defaults
+    # Extract configuration values
     training_cfg = config.get('training', {})
     data_cfg = config.get('data', {})
     model_cfg = config.get('model', {})
@@ -202,38 +195,18 @@ def start_actual_training(cli_args):
     gen_cfg = config.get('generation', {})
     logging_cfg = config.get('logging', {})
     
-    # Set random seed for reproducibility
-    seed = config.get('random_seed', 42)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    # Set random seed
+    torch.manual_seed(config.get('random_seed', 42))
+    np.random.seed(config.get('random_seed', 42))
     
-    # Print GPU information if enabled
+    # Print GPU info
     if logging_cfg.get('show_gpu_info', True):
         print_gpu_info()
     
     # Configuration summary
     precision = training_cfg.get('precision', 32)
     print("=== GPT Model Training with Flash Attention ===")
-    if precision == 'bf16':
-        print(f"Precision: bf16 (bfloat16)")
-        print(f"Mixed Precision Training: Enabled (bf16)")
-    elif precision == 16 or precision == '16':
-        print(f"Precision: fp16")
-        print(f"Mixed Precision Training: Enabled (fp16)")
-    else:
-        print(f"Precision: fp32")
-        print(f"Mixed Precision Training: Disabled")
-    print("Setting up configuration...")
-    
-    # Data configuration
-    data_config = {
-        'dataset_name': data_cfg.get('dataset_name', 'allenai/c4'),
-        'dataset_config': data_cfg.get('dataset_config', 'en'),
-        'seq_len': data_cfg.get('seq_len', 1024),
-        'max_samples': data_cfg.get('max_samples', 5000),
-        'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000),
-        'on_the_fly_tokenization': data_cfg.get('on_the_fly_tokenization', True) # Default to True for faster iteration
-    }
+    # ... (precision summary print statements)
     
     # Model configuration
     model_config = {
@@ -243,103 +216,57 @@ def start_actual_training(cli_args):
         'n_heads': model_cfg.get('n_heads', 16),
         'max_seq_len': model_cfg.get('max_seq_len', 2048),
         'mlp_ratio': model_cfg.get('mlp_ratio', 4),
-        'causal': model_cfg.get('causal', True)
+        'causal': model_cfg.get('causal', True),
+        'task_names': list(config.get('tasks', {}).keys())
     }
     
     # Initialize model
     print(f"\n=== Initializing Model ===")
-    task_configs = config.get('tasks', {})
-    model_config['task_names'] = list(task_configs.keys())
     model = GPTModel(**model_config)
     
-    # Setup precision and mixed precision training
+    # Setup precision
     print(f"\n=== Setting up Precision ===")
     dtype, scaler, use_amp = setup_precision(model, precision)
     
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Parameter dtype: {next(model.parameters()).dtype}")
+    # Parameter count
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Estimate optimal batch size with precision consideration
+    # Estimate and determine batch size
     if logging_cfg.get('show_memory_estimation', True):
         estimated_batch_size, memory_info = estimate_optimal_batch_size(
             model_config,
             available_memory_gb=hardware_cfg.get('available_memory_gb', 15),
             precision=precision
         )
-        print(f"\n=== Memory Estimation ===")
-        print(memory_info)
+        print(f"\n=== Memory Estimation ===\n{memory_info}")
     else:
-        estimated_batch_size = 8  # Fallback default
+        estimated_batch_size = 8
 
-    # Determine batch size
     config_batch_size = training_cfg.get('batch_size')
-    if config_batch_size is not None:
-        batch_size = config_batch_size
-        print(f"Using configured batch_size: {batch_size}")
-    else:
-        # Use a conservative batch size (slightly lower than estimated)
-        batch_size = min(estimated_batch_size, 16)  # Cap at 16 for safety
-        print(f"Using estimated batch_size: {batch_size}")
+    batch_size = config_batch_size if config_batch_size is not None else min(estimated_batch_size, 16)
+    print(f"Using batch_size: {batch_size}")
 
-    # Training configuration
-    inference_cfg = config.get('inference', {})
+    # Create TrainingConfig
     training_config = TrainingConfig(
-        num_epochs=training_cfg.get('epochs', 3),
-        learning_rate=training_cfg.get('learning_rate', 3e-4),
-        weight_decay=training_cfg.get('weight_decay', 0.01),
-        warmup_steps=training_cfg.get('warmup_steps', 100),
-        max_grad_norm=training_cfg.get('max_grad_norm', 1.0),
-        save_every=training_cfg.get('save_every', 500),
-        eval_every=training_cfg.get('eval_every', 200),
-        log_every=training_cfg.get('log_every', 50),
-        inference_every=training_cfg.get('inference_every', 500),
-        save_logs_json_every=training_cfg.get('save_logs_json_every', 500),
-        checkpoint_dir=training_cfg.get('checkpoint_dir', "checkpoints"),
-        device=hardware_cfg.get('device', 'auto'),
-        use_amp=use_amp,
-        scaler=scaler,
         batch_size=batch_size,
-        # Checkpoint configuration
-        auto_resume=training_cfg.get('auto_resume', True),
-        max_checkpoints=training_cfg.get('max_checkpoints', 2),
-        # Inference sampling parameters
-        inference_prompts=inference_cfg.get('prompts', ["", "The", "In", "Once upon a time"]),
-        inference_max_length=inference_cfg.get('max_length', 100),
-        inference_temperature=inference_cfg.get('temperature', 0.8),
-        inference_top_k=inference_cfg.get('top_k', 50),
-        inference_top_p=inference_cfg.get('top_p', 0.9)
+        **training_cfg,
+        **hardware_cfg,
+        **config.get('inference', {}),
+        use_amp=use_amp,
+        scaler=scaler
     )
     
-    print(f"Device: {training_config.device}")
-    print(f"Model config: {model_config}")
-    print(f"Data config: {data_config}")
-    print(f"Training config: batch_size={batch_size}, epochs={training_config.num_epochs}")
-    
-    # Create data builder
+    # Create data builder and update vocab size
     print("\n=== Creating Data Builder ===")
-    task_configs = config.get('tasks', {})
-    data_builder = create_data_builder(**data_config, task_configs=task_configs)
-
-    # Update vocab size based on actual tokenizer
-    actual_vocab_size = data_builder.get_vocab_size()
-    model_config['vocab_size'] = actual_vocab_size
-    model.vocab_size = actual_vocab_size
-    print(f"Confirmed vocab_size: {actual_vocab_size} (UTF-8 bytes)")
+    data_builder = create_data_builder(**data_cfg, task_configs=config.get('tasks', {}))
+    model.vocab_size = data_builder.get_vocab_size()
+    print(f"Confirmed vocab_size: {model.vocab_size} (UTF-8 bytes)")
 
     # Create trainer
     print(f"\n=== Setting up Trainer ===")
-    trainer = create_trainer(
-        model=model,
-        config=training_config,
-        data_builder=data_builder
-    )
+    trainer = create_trainer(model=model, config=training_config, data_builder=data_builder)
 
-    # Check for existing checkpoints and load if available
-    print(f"\n=== Checking for Existing Checkpoints ===")
+    # Check for checkpoints and determine samples to skip
     samples_to_skip = 0
     if training_config.auto_resume:
         latest_checkpoint = trainer.find_latest_checkpoint()
@@ -349,101 +276,37 @@ def start_actual_training(cli_args):
                 resume_state = trainer.load_checkpoint(latest_checkpoint)
                 samples_to_skip = resume_state.get('processed_samples', 0)
             except Exception as e:
-                print(f"Failed to load checkpoint {latest_checkpoint}: {e}")
-                print("Starting training from scratch...")
-        else:
-            print("No existing checkpoints found. Starting fresh training.")
+                print(f"Failed to load checkpoint: {e}")
 
-    # Create dataloaders with potential sample skipping for resumption
+    # Create dataloaders
     print("\n=== Loading and Processing Data ===")
-    try:
-        dataloaders = data_builder.create_dataloaders(
-            batch_size=batch_size,
-            num_workers=data_cfg.get('num_workers', 0),
-            shuffle_train=data_cfg.get('shuffle_train', True),
-            samples_to_skip=samples_to_skip
-        )
-    except Exception as e:
-        print(f"Error creating dataloaders: {e}")
-        print("This might be due to missing datasets library or network issues.")
-        print("Please install with: pip install datasets")
-        return
-
-    # Show data info
-    for split_name, task_dataloaders in dataloaders.items():
-        print(f"--- {split_name} ---")
-        for task_name, dataloader in task_dataloaders.items():
-            print(f"  {task_name}: {len(dataloader)} batches of size {batch_size}")
-
-    # Test a batch
-    if 'train' in dataloaders and 'teacher_forcing' in dataloaders['train']:
-        print("\n=== Data Sample (Teacher Forcing) ===")
-        for x, y in dataloaders['train']['teacher_forcing']:
-            print(f"Batch shape: {x.shape}")
-            print(f"Sample tokens: {x[0][:20].tolist()}")
-            print(f"Sample targets: {y[0][:20].tolist()}")
-            sample_text = data_builder.decode_tokens(x[0][:50])
-            print(f"Sample text: '{sample_text[:100]}...'")
-            break
-
-    if 'train' in dataloaders and 'cocktail_party' in dataloaders['train']:
-        print("\n=== Data Sample (Cocktail Party) ===")
-        for batch in dataloaders['train']['cocktail_party']:
-            inputs, correct_idx, _ = batch
-            print(f"Batch shape: {inputs.shape}")
-            print(f"Sample tokens: {inputs[0][:20].tolist()}")
-            sample_text = data_builder.decode_tokens(inputs[0][:50])
-            print(f"Sample text: '{sample_text[:100]}...'")
-            break
+    dataloaders = data_builder.create_dataloaders(
+        batch_size=batch_size,
+        num_workers=data_cfg.get('num_workers', 0),
+        shuffle_train=data_cfg.get('shuffle_train', True),
+        samples_to_skip=samples_to_skip
+    )
     
-    # Initial evaluation (only if no checkpoint found)
+    # Initial evaluation if not resuming
     if samples_to_skip == 0:
-        print(f"\n=== Initial Evaluation ===")
-        if 'train' in dataloaders and 'validation' in dataloaders:
-            max_eval_batches = eval_cfg.get('max_eval_batches', 10)
-            initial_train_loss, _ = trainer.evaluate(dataloaders['train'], task_configs, max_batches=max_eval_batches)
-            initial_val_loss, initial_val_metrics = trainer.evaluate(dataloaders['validation'], task_configs, max_batches=max_eval_batches)
-            print(f"Initial training loss: {initial_train_loss:.4f}")
-            print(f"Initial validation loss: {initial_val_loss:.4f}")
-            if initial_val_metrics:
-                log_str = "Initial cocktail party metrics: "
-                for k, v in initial_val_metrics.items():
-                    log_str += f"{k}: {v:.4f}, "
-                print(log_str)
+        print("\n=== Initial Evaluation ===")
+        if 'validation' in dataloaders:
+            trainer.evaluate(dataloaders['validation'], config.get('tasks', {}), max_batches=10)
 
-    # Start training (resume functionality is handled within trainer.train())
+    # Start training
     print(f"\n=== Starting Training ===")
-    try:
-        trainer.train(
-            train_loaders=dataloaders.get('train'),
-            val_loaders=dataloaders.get('validation'),
-            task_configs=task_configs
-        )
-        
-        print(f"\n=== Training Completed ===")
-        
-        # Plot training curves
-        if logging_cfg.get('save_training_plots', True):
-            print(f"\n=== Plotting Results ===")
-            curves_path = Path(training_config.checkpoint_dir) / "training_curves.png"
-            trainer.plot_training_curves(save_path=str(curves_path))
-        
-        # Test text generation
-        if logging_cfg.get('test_generation', True):
-            print(f"\n=== Testing Text Generation ===")
-            test_generation(trainer, data_builder, gen_cfg)
-        
-        # Show best metrics
-        print(f"\n=== Best Results ===")
-        print(f"Best validation loss: {trainer.metrics.best_val_loss:.4f} at step {trainer.metrics.best_step}")
-        print(f"Total training steps: {trainer.metrics.total_steps}")
-        
-    except Exception as e:
-        print(f"Training failed: {e}")
-        import traceback
-        traceback.print_exc()
+    trainer.train(
+        train_loaders=dataloaders.get('train'),
+        val_loaders=dataloaders.get('validation'),
+        task_configs=config.get('tasks', {})
+    )
     
-    print(f"\n=== Training Session Complete ===")
+    # Post-training actions
+    print("\n=== Training Completed ===")
+    if logging_cfg.get('save_training_plots', True):
+        trainer.plot_training_curves(save_path=Path(training_config.checkpoint_dir) / "training_curves.png")
+    if logging_cfg.get('test_generation', True):
+        test_generation(trainer, data_builder, gen_cfg)
 
 # --- End of original main logic, now in start_actual_training ---
 
