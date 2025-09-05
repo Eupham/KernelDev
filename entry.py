@@ -245,6 +245,7 @@ def start_actual_training(cli_args):
 
     # Create TrainingConfig
     training_cfg.pop('batch_size', None) # Remove to avoid duplicate keyword argument
+    training_cfg.pop('precision', None) # This is handled separately, not part of TrainingConfig
     training_config = TrainingConfig(
         batch_size=batch_size,
         **training_cfg,
