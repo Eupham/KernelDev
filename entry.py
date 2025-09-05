@@ -93,6 +93,8 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
         config['training']['epochs'] = args.epochs
     if hasattr(args, 'learning_rate') and args.learning_rate is not None:
         config['training']['learning_rate'] = args.learning_rate
+    if hasattr(args, 'output_dir') and args.output_dir is not None:
+        config['training']['checkpoint_dir'] = args.output_dir
     
     return config
 
@@ -590,6 +592,12 @@ if __name__ == "__main__":
         type=float,
         default=None, # Default to None
         help='Learning rate (overrides config)'
+    )
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default=None,
+        help='Directory to save checkpoints and logs (overrides config)'
     )
     # Use parse_args() which will capture all defined args.
     # REMAINDER is not needed here as we explicitly define training args.
