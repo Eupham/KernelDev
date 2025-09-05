@@ -516,7 +516,7 @@ def _flash_attn_fwd(
             mask = (prefix_to_prefix | 
                    context_causal | context_to_prefix |
                    same_span | span_to_context |
-                   maskq_to_spans | maskq_to_cls)
+                   maskq_to_spans | maskq_to_cls).to(tl.int1)
             # --- End of Cocktail Party Attention Pattern ---
 
         elif CAUSAL:
@@ -1334,7 +1334,7 @@ def _flash_attn_bwd_dq(
             mask = (prefix_to_prefix | 
                    context_causal | context_to_prefix |
                    same_span | span_to_context |
-                   maskq_to_spans | maskq_to_cls)
+                   maskq_to_spans | maskq_to_cls).to(tl.int1)
             # --- End of Cocktail Party Attention Pattern ---
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
@@ -1520,7 +1520,7 @@ def _flash_attn_bwd_dkdv(
             mask = (prefix_to_prefix | 
                    context_causal | context_to_prefix |
                    same_span | span_to_context |
-                   maskq_to_spans | maskq_to_cls)
+                   maskq_to_spans | maskq_to_cls).to(tl.int1)
             # --- End of Cocktail Party Attention Pattern ---
         elif CAUSAL:
             mask = q_tile_indices[None, :] >= kv_indices[:, None]
