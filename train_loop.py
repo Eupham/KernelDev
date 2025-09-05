@@ -60,6 +60,7 @@ class TrainingConfig:
         device: str = "auto",
         use_amp: bool = False,
         scaler: Optional[Any] = None,
+        batch_size: int = 8,
         # Checkpoint configuration
         auto_resume: bool = True,
         max_checkpoints: int = 2,
@@ -92,6 +93,7 @@ class TrainingConfig:
         self.checkpoint_dir = checkpoint_dir
         self.use_amp = use_amp
         self.scaler = scaler
+        self.batch_size = batch_size
         
         # Checkpoint configuration
         self.auto_resume = auto_resume
@@ -524,6 +526,8 @@ class Trainer:
             # Include dataset state in checkpoint if available
             dataset_state = getattr(self, 'dataset_state', {})
             
+            processed_samples = self.metrics.total_steps * self.config.batch_size
+
             checkpoint = {
                 'step': step,
                 'model_state_dict': model_to_save.state_dict(),
@@ -531,7 +535,8 @@ class Trainer:
                 'scheduler_state_dict': self.scheduler.state_dict(),
                 'metrics': self.metrics.__dict__, # Note: metrics are rank-local
                 'config': self.config.__dict__,
-                'dataset_state': dataset_state  # Track dataset iteration state
+                'dataset_state': dataset_state,  # Track dataset iteration state
+                'processed_samples': processed_samples
             }
 
             checkpoint_path = os.path.join(
@@ -645,9 +650,11 @@ class Trainer:
         # Restore dataset state if available
         if 'dataset_state' in checkpoint:
             self.dataset_state = checkpoint['dataset_state']
+
+        processed_samples = checkpoint.get('processed_samples', 0)
         
-        print(f"Checkpoint loaded: {checkpoint_path}")
-        return checkpoint['step']
+        print(f"Checkpoint loaded: {checkpoint_path} (resuming from step {checkpoint['step']}, {processed_samples} samples processed)")
+        return {'step': checkpoint['step'], 'processed_samples': processed_samples}
     
     def train_epoch(
         self,
@@ -837,34 +844,15 @@ class Trainer:
         self,
         train_loaders: Dict[str, DataLoader],
         val_loaders: Optional[Dict[str, DataLoader]] = None,
-        task_configs: Dict[str, Any] = None,
-        resume_from_checkpoint: Optional[bool] = None
+        task_configs: Dict[str, Any] = None
     ):
-        """Main training loop."""
+        """Main training loop. Assumes checkpoint has been loaded already."""
+        # Determine start epoch from loaded checkpoint state
         start_epoch = 0
-        
-        # Use config setting if not explicitly provided
-        if resume_from_checkpoint is None:
-            resume_from_checkpoint = getattr(self.config, 'auto_resume', True)
-        
-        # Check for existing checkpoint to resume from
-        if resume_from_checkpoint:
-            latest_checkpoint = self.find_latest_checkpoint()
-            if latest_checkpoint:
-                try:
-                    loaded_step = self.load_checkpoint(latest_checkpoint)
-                    # Calculate which epoch and batch we should resume from
-                    if hasattr(self, 'dataset_state') and 'current_epoch' in self.dataset_state:
-                        start_epoch = self.dataset_state['current_epoch']
-                        print(f"Resuming training from step {loaded_step}, epoch {start_epoch + 1}")
-                    else:
-                        print(f"Resuming training from step {loaded_step}")
-                except Exception as e:
-                    print(f"Failed to load checkpoint {latest_checkpoint}: {e}")
-                    print("Starting training from scratch...")
-            else:
-                print("No existing checkpoints found. Starting training from scratch...")
-        
+        if hasattr(self, 'dataset_state') and 'current_epoch' in self.dataset_state:
+            start_epoch = self.dataset_state['current_epoch']
+            print(f"Resuming training from epoch {start_epoch + 1}")
+
         print(f"Starting training for {self.config.num_epochs} epochs...")
 
         if self.is_distributed and dist.get_world_size() > 1:
@@ -898,7 +886,7 @@ class Trainer:
             print(f"Scheduler initialized with T_max = {total_steps} for a single decay.")
 
         # Initial evaluation (only if starting from scratch)
-        if start_epoch == 0 and val_loaders and (not self.is_distributed or dist.get_rank() == 0):
+        if start_epoch == 0 and self.metrics.total_steps == 0 and val_loaders and (not self.is_distributed or dist.get_rank() == 0):
             initial_val_loss, initial_cocktail_metrics = self.evaluate(val_loaders, task_configs)
             self.metrics.update(val_loss=initial_val_loss, cocktail_party_metrics=initial_cocktail_metrics)
             print(f"Initial validation loss: {initial_val_loss:.4f}")

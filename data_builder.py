@@ -222,7 +222,7 @@ class DataBuilder:
         print(f"Finished processing {dataset_name_logging}. Total valid samples extracted: {len(samples)}")
         return samples
 
-    def load_raw_dataset(self):
+    def load_raw_dataset(self, samples_to_skip: int = 0):
         print(f"Loading dataset: {self.dataset_name}/{self.dataset_config}")
         loaded_samples = []
 
@@ -232,6 +232,9 @@ class DataBuilder:
             dataset_stream = load_dataset(
                 self.dataset_name, name=self.dataset_config, streaming=True, split='train'
             )
+            if samples_to_skip > 0:
+                dataset_stream = dataset_stream.skip(samples_to_skip)
+                print(f"Skipped {samples_to_skip} samples from the training dataset stream.")
             print("C4 'en' (streaming) load_dataset call succeeded. Processing samples...")
             loaded_samples = self._process_iterable_dataset(dataset_stream, "C4 'en' streaming")
             
@@ -403,8 +406,8 @@ class DataBuilder:
             tokenized_data[split_name] = tokens
         return tokenized_data
     
-    def create_datasets(self):
-        raw_dataset = self.load_raw_dataset()
+    def create_datasets(self, samples_to_skip: int = 0):
+        raw_dataset = self.load_raw_dataset(samples_to_skip=samples_to_skip)
         if self.on_the_fly_tokenization:
             datasets = {}
             for split_name, data in raw_dataset.items():
@@ -674,9 +677,9 @@ class DataBuilder:
 
 
     def create_dataloaders(
-        self, batch_size: int = 8, num_workers: int = 0, shuffle_train: bool = True
+        self, batch_size: int = 8, num_workers: int = 0, shuffle_train: bool = True, samples_to_skip: int = 0
     ) -> Dict[str, Dict[str, DataLoader]]:
-        datasets = self.create_datasets()
+        datasets = self.create_datasets(samples_to_skip=samples_to_skip)
         dataloaders = {}
         if not datasets:
             print("Warning: No datasets were created. Returning empty dataloaders dict.")

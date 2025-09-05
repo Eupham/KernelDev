@@ -93,6 +93,8 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
         config['training']['epochs'] = args.epochs
     if hasattr(args, 'learning_rate') and args.learning_rate is not None:
         config['training']['learning_rate'] = args.learning_rate
+    if hasattr(args, 'output_dir') and args.output_dir is not None:
+        config['training']['checkpoint_dir'] = args.output_dir
     
     return config
 
@@ -261,6 +263,16 @@ def start_actual_training(cli_args):
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Parameter dtype: {next(model.parameters()).dtype}")
     
+    # Determine batch size
+    config_batch_size = training_cfg.get('batch_size')
+    if config_batch_size is not None:
+        batch_size = config_batch_size
+        print(f"Using configured batch_size: {batch_size}")
+    else:
+        # Use a conservative batch size (slightly lower than estimated)
+        batch_size = min(estimated_batch_size, 16)  # Cap at 16 for safety
+        print(f"Using estimated batch_size: {batch_size}")
+
     # Training configuration
     inference_cfg = config.get('inference', {})
     training_config = TrainingConfig(
@@ -278,6 +290,7 @@ def start_actual_training(cli_args):
         device=hardware_cfg.get('device', 'auto'),
         use_amp=use_amp,
         scaler=scaler,
+        batch_size=batch_size,
         # Checkpoint configuration
         auto_resume=training_cfg.get('auto_resume', True),
         max_checkpoints=training_cfg.get('max_checkpoints', 2),
@@ -317,29 +330,55 @@ def start_actual_training(cli_args):
     print(f"Training config: batch_size={batch_size}, epochs={training_config.num_epochs}")
     
     # Create data builder
-    print("\n=== Loading and Processing Data ===")
+    print("\n=== Creating Data Builder ===")
     task_configs = config.get('tasks', {})
     data_builder = create_data_builder(**data_config, task_configs=task_configs)
-    
-    # Create dataloaders
+
+    # Update vocab size based on actual tokenizer
+    actual_vocab_size = data_builder.get_vocab_size()
+    model_config['vocab_size'] = actual_vocab_size
+    model.vocab_size = actual_vocab_size
+    print(f"Confirmed vocab_size: {actual_vocab_size} (UTF-8 bytes)")
+
+    # Create trainer
+    print(f"\n=== Setting up Trainer ===")
+    trainer = create_trainer(
+        model=model,
+        config=training_config,
+        data_builder=data_builder
+    )
+
+    # Check for existing checkpoints and load if available
+    print(f"\n=== Checking for Existing Checkpoints ===")
+    samples_to_skip = 0
+    if training_config.auto_resume:
+        latest_checkpoint = trainer.find_latest_checkpoint()
+        if latest_checkpoint:
+            print(f"Found existing checkpoint: {latest_checkpoint}")
+            try:
+                resume_state = trainer.load_checkpoint(latest_checkpoint)
+                samples_to_skip = resume_state.get('processed_samples', 0)
+            except Exception as e:
+                print(f"Failed to load checkpoint {latest_checkpoint}: {e}")
+                print("Starting training from scratch...")
+        else:
+            print("No existing checkpoints found. Starting fresh training.")
+
+    # Create dataloaders with potential sample skipping for resumption
+    print("\n=== Loading and Processing Data ===")
     try:
         dataloaders = data_builder.create_dataloaders(
             batch_size=batch_size,
             num_workers=data_cfg.get('num_workers', 0),
-            shuffle_train=data_cfg.get('shuffle_train', True)
+            shuffle_train=data_cfg.get('shuffle_train', True),
+            samples_to_skip=samples_to_skip
         )
-        
-        # Update vocab size based on actual tokenizer
-        actual_vocab_size = data_builder.get_vocab_size()
-        model_config['vocab_size'] = actual_vocab_size
-        print(f"Confirmed vocab_size: {actual_vocab_size} (UTF-8 bytes)")
-        
     except Exception as e:
         print(f"Error creating dataloaders: {e}")
         print("This might be due to missing datasets library or network issues.")
         print("Please install with: pip install datasets")
         return
-    
+
     # Show data info
     for split_name, task_dataloaders in dataloaders.items():
         print(f"--- {split_name} ---")
@@ -353,8 +392,6 @@ def start_actual_training(cli_args):
             print(f"Batch shape: {x.shape}")
             print(f"Sample tokens: {x[0][:20].tolist()}")
             print(f"Sample targets: {y[0][:20].tolist()}")
-
-            # Decode sample text
             sample_text = data_builder.decode_tokens(x[0][:50])
             print(f"Sample text: '{sample_text[:100]}...'")
             break
@@ -365,33 +402,12 @@ def start_actual_training(cli_args):
             inputs, correct_idx, _ = batch
             print(f"Batch shape: {inputs.shape}")
             print(f"Sample tokens: {inputs[0][:20].tolist()}")
-            
-            # Decode sample text
             sample_text = data_builder.decode_tokens(inputs[0][:50])
             print(f"Sample text: '{sample_text[:100]}...'")
             break
     
-    # Check for existing checkpoints
-    print(f"\n=== Checking for Existing Checkpoints ===")
-    checkpoint_dir = training_config.checkpoint_dir
-    latest_checkpoint = find_latest_checkpoint_path(checkpoint_dir)
-    
-    if latest_checkpoint:
-        print(f"Found existing checkpoint: {latest_checkpoint}")
-        print("Training will resume from this checkpoint.")
-    else:
-        print("No existing checkpoints found. Starting fresh training.")
-    
-    # Create trainer
-    print(f"\n=== Setting up Trainer ===")
-    trainer = create_trainer(
-        model=model,
-        config=training_config,
-        data_builder=data_builder
-    )
-    
     # Initial evaluation (only if no checkpoint found)
-    if not latest_checkpoint:
+    if samples_to_skip == 0:
         print(f"\n=== Initial Evaluation ===")
         if 'train' in dataloaders and 'validation' in dataloaders:
             max_eval_batches = eval_cfg.get('max_eval_batches', 10)
@@ -404,7 +420,7 @@ def start_actual_training(cli_args):
                 for k, v in initial_val_metrics.items():
                     log_str += f"{k}: {v:.4f}, "
                 print(log_str)
-    
+
     # Start training (resume functionality is handled within trainer.train())
     print(f"\n=== Starting Training ===")
     try:
@@ -412,7 +428,6 @@ def start_actual_training(cli_args):
             train_loaders=dataloaders.get('train'),
             val_loaders=dataloaders.get('validation'),
             task_configs=task_configs
-            # resume_from_checkpoint uses config setting by default
         )
         
         print(f"\n=== Training Completed ===")
@@ -590,6 +605,12 @@ if __name__ == "__main__":
         type=float,
         default=None, # Default to None
         help='Learning rate (overrides config)'
+    )
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default=None,
+        help='Directory to save checkpoints and logs (overrides config)'
     )
     # Use parse_args() which will capture all defined args.
     # REMAINDER is not needed here as we explicitly define training args.

@@ -442,7 +442,7 @@ def _flash_attn_fwd(
         kv_indices = kv_token_idx + tile_k_arange
         
         # Decide if we should use token rules based on metadata presence
-        USE_TOKEN_RULES = (IN_SPAN is not None) or (SPAN_ID is not None) or (IS_PREFIX is not None)
+        USE_TOKEN_RULES = ((IN_SPAN is not None) or (SPAN_ID is not None)) or (IS_PREFIX is not None)
         
         if USE_TOKEN_RULES:
             # Safe loads for optional metadata
@@ -516,7 +516,7 @@ def _flash_attn_fwd(
             mask = (prefix_to_prefix | 
                    context_causal | context_to_prefix |
                    same_span | span_to_context |
-                   maskq_to_spans | maskq_to_cls)
+                   maskq_to_spans | maskq_to_cls).to(tl.int1)
             # --- End of Cocktail Party Attention Pattern ---
 
         elif CAUSAL:
@@ -1260,7 +1260,7 @@ def _flash_attn_bwd_dq(
         kv_indices = kv_token_idx + tile_k_arange
         
         # Decide if we should use token rules based on metadata presence
-        USE_TOKEN_RULES = (IN_SPAN is not None) or (SPAN_ID is not None) or (IS_PREFIX is not None)
+        USE_TOKEN_RULES = ((IN_SPAN is not None) or (SPAN_ID is not None)) or (IS_PREFIX is not None)
         
         if USE_TOKEN_RULES:
             # Safe loads for optional metadata
@@ -1334,7 +1334,7 @@ def _flash_attn_bwd_dq(
             mask = (prefix_to_prefix | 
                    context_causal | context_to_prefix |
                    same_span | span_to_context |
-                   maskq_to_spans | maskq_to_cls)
+                   maskq_to_spans | maskq_to_cls).to(tl.int1)
             # --- End of Cocktail Party Attention Pattern ---
         elif CAUSAL:
             mask = q_tile_indices[:, None] >= kv_indices[None, :]
@@ -1446,7 +1446,7 @@ def _flash_attn_bwd_dkdv(
         q_tile_indices = q_token_idx + tile_q_arange
         
         # Decide if we should use token rules based on metadata presence
-        USE_TOKEN_RULES = (IN_SPAN is not None) or (SPAN_ID is not None) or (IS_PREFIX is not None)
+        USE_TOKEN_RULES = ((IN_SPAN is not None) or (SPAN_ID is not None)) or (IS_PREFIX is not None)
         
         if USE_TOKEN_RULES:
             # Safe loads for optional metadata
@@ -1520,7 +1520,7 @@ def _flash_attn_bwd_dkdv(
             mask = (prefix_to_prefix | 
                    context_causal | context_to_prefix |
                    same_span | span_to_context |
-                   maskq_to_spans | maskq_to_cls)
+                   maskq_to_spans | maskq_to_cls).to(tl.int1)
             # --- End of Cocktail Party Attention Pattern ---
         elif CAUSAL:
             mask = q_tile_indices[None, :] >= kv_indices[:, None]
