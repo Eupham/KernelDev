@@ -543,11 +543,11 @@ def _flash_attn_fwd(
             if Q_BLOCK_DIVISIBLE and K_BLOCK_DIVISIBLE:
                 tl.store(
                     output_attn_mask_tile_ptr,
-                    mask.to(tl.int8),  # Convert bool to int8 for storage
+                    tl.where(mask, 1, 0).to(tl.int8),  # Convert bool to int8 for storage
                 )
             else:
                 boundary_mask = (q_tile_indices[:, None] < seq_len) & (kv_indices[None, :] < seq_len)
-                safe_mask_tile = (mask & boundary_mask).to(tl.int8)
+                safe_mask_tile = tl.where(mask & boundary_mask, 1, 0).to(tl.int8)
                 tl.store(
                     output_attn_mask_tile_ptr,
                     safe_mask_tile,
