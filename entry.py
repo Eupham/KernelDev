@@ -181,9 +181,7 @@ def start_actual_training(cli_args):
     config_file_path = cli_args.config if hasattr(cli_args, 'config') else 'config.yaml'
     config = load_config(config_file_path)
     
-    # Merge config with command-line arguments (CLI takes precedence)
-    if not isinstance(cli_args, argparse.Namespace):
-        pass # Assumes compatible attributes
+    # Merge config with command-line arguments
     config = merge_config_with_args(config, cli_args)
     
     # Extract configuration values
@@ -203,10 +201,8 @@ def start_actual_training(cli_args):
     if logging_cfg.get('show_gpu_info', True):
         print_gpu_info()
     
-    # Configuration summary
     precision = training_cfg.get('precision', 32)
-    print("=== GPT Model Training with Flash Attention ===")
-    # ... (precision summary print statements)
+    print(f"=== GPT Model Training with Flash Attention (Precision: {precision}) ===")
     
     # Model configuration
     model_config = {
@@ -227,8 +223,6 @@ def start_actual_training(cli_args):
     # Setup precision
     print(f"\n=== Setting up Precision ===")
     dtype, scaler, use_amp = setup_precision(model, precision)
-    
-    # Parameter count
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Estimate and determine batch size
@@ -243,10 +237,14 @@ def start_actual_training(cli_args):
         estimated_batch_size = 8
 
     config_batch_size = training_cfg.get('batch_size')
-    batch_size = config_batch_size if config_batch_size is not None else min(estimated_batch_size, 16)
+    if config_batch_size is not None:
+        batch_size = config_batch_size
+    else:
+        batch_size = min(estimated_batch_size, 16)
     print(f"Using batch_size: {batch_size}")
 
     # Create TrainingConfig
+    training_cfg.pop('batch_size', None) # Remove to avoid duplicate keyword argument
     training_config = TrainingConfig(
         batch_size=batch_size,
         **training_cfg,
