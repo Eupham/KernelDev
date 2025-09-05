@@ -263,6 +263,18 @@ def start_actual_training(cli_args):
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Parameter dtype: {next(model.parameters()).dtype}")
     
+    # Estimate optimal batch size with precision consideration
+    if logging_cfg.get('show_memory_estimation', True):
+        estimated_batch_size, memory_info = estimate_optimal_batch_size(
+            model_config,
+            available_memory_gb=hardware_cfg.get('available_memory_gb', 15),
+            precision=precision
+        )
+        print(f"\n=== Memory Estimation ===")
+        print(memory_info)
+    else:
+        estimated_batch_size = 8  # Fallback default
+
     # Determine batch size
     config_batch_size = training_cfg.get('batch_size')
     if config_batch_size is not None:
@@ -301,28 +313,6 @@ def start_actual_training(cli_args):
         inference_top_k=inference_cfg.get('top_k', 50),
         inference_top_p=inference_cfg.get('top_p', 0.9)
     )
-    
-    # Estimate optimal batch size with precision consideration
-    if logging_cfg.get('show_memory_estimation', True):
-        estimated_batch_size, memory_info = estimate_optimal_batch_size(
-            model_config, 
-            available_memory_gb=hardware_cfg.get('available_memory_gb', 15), 
-            precision=precision
-        )
-        print(f"\n=== Memory Estimation ===")
-        print(memory_info)
-    else:
-        estimated_batch_size = 8  # Fallback default
-    
-    # Determine batch size
-    config_batch_size = training_cfg.get('batch_size')
-    if config_batch_size is not None:
-        batch_size = config_batch_size
-        print(f"Using configured batch_size: {batch_size}")
-    else:
-        # Use a conservative batch size (slightly lower than estimated)
-        batch_size = min(estimated_batch_size, 16)  # Cap at 16 for safety
-        print(f"Using estimated batch_size: {batch_size}")
     
     print(f"Device: {training_config.device}")
     print(f"Model config: {model_config}")
