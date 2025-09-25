@@ -30,8 +30,9 @@ Use this checklist whenever you need to reach the Modal API from this repository
    ```bash
    sudo perl -0pi -e 's/#?dynamic_chain/dynamic_chain/' /etc/proxychains4.conf
    sudo perl -0pi -e 's/^strict_chain/#strict_chain/' /etc/proxychains4.conf
-   sudo perl -0pi -e 's#^\s*(socks4|socks5|http)\s+.*#http    172.30.3.19 8080# if $.>0 && /\[ProxyList\]/ .. eof' /etc/proxychains4.conf
+   sudo perl -0pi -e 's#^\s*(socks4|socks5|http)\s+.*#http    172.30.2.211 8080# if $.>0 && /\[ProxyList\]/ .. eof' /etc/proxychains4.conf
    ```
+   After running the commands, the first non-comment entry under `[ProxyList]` should read `http    172.30.2.211 8080`.
 
 4. **Load the Modal credentials**  \
    Export the credentials that are injected as environment variables into the current shell session:
