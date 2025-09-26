@@ -1,4 +1,43 @@
-# Modal API Authentication Guide
+# Automated Modal Training Launcher
+
+This guide describes how to use the automated launcher script to run the training process on Modal. The script handles all necessary setup, authentication, and execution steps.
+
+## Automated Workflow using `launcher.py`
+
+The `launcher.py` script is the primary entry point for running the training job. It automates the entire process, including:
+- Installing local dependencies (`modal`, `proxychains4`).
+- Configuring the proxy to connect to the Modal API.
+- Trusting the necessary TLS certificates.
+- Temporarily modifying `config.yaml` to set the number of training samples to 1000.
+- Launching a job on a Modal H100 GPU instance.
+- Setting up the remote environment (cloning the repository, installing dependencies).
+- Running the training script (`entry.py`) inside the Modal environment.
+- Restoring the original `config.yaml` file after the job completes.
+
+### Prerequisites
+
+Before running the launcher, ensure you have set the following environment variables with your Modal credentials:
+
+```bash
+export MODAL_TOKEN_ID="<your_token_id>"
+export MODAL_TOKEN_SECRET="<your_token_secret>"
+```
+
+### How to Run
+
+To start the entire process, simply execute the `launcher.py` script:
+
+```bash
+python launcher.py
+```
+
+The script will provide real-time output from both the local setup and the remote Modal job.
+
+---
+*For reference, the original manual setup instructions are kept below, but they are no longer the recommended workflow.*
+---
+
+# Original Manual Modal API Authentication Guide
 
 Use this checklist whenever you need to reach the Modal API from this repository. The environment sits behind an HTTP proxy that performs TLS inspection, so a few extra steps are required beyond the standard SDK setup.
 
