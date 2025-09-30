@@ -1565,7 +1565,7 @@ def set_t4_optimization(tile_q: int, tile_k: int, num_warps: int):
     """Set T4-optimized tile sizes and warp count."""
     global T4_OPTIMIZED, T4_OPTIMAL_TILE_Q, T4_OPTIMAL_TILE_K, T4_OPTIMAL_WARPS
     T4_OPTIMIZED = True
-    T4_    OPTIMAL_WARPS = num_warps
+    T4_OPTIMAL_WARPS = num_warps
     print(f"T4 optimization enabled: tile_q={tile_q}, tile_k={tile_k}, warps={num_warps}")
 
 
