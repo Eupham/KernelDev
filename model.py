@@ -19,7 +19,16 @@ The model supports two distinct operating modes:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from original_kernel import flash_attention
+import os
+
+# Dynamically import the flash attention kernel
+if os.environ.get("USE_OPTIMIZED_KERNEL") == "1":
+    from optimized_kernel import flash_attention
+    print("INFO: Using OPTIMIZED flash attention kernel.")
+else:
+    from original_kernel import flash_attention
+    print("INFO: Using ORIGINAL flash attention kernel.")
+
 
 # =============================================================================
 # Normalization and Activation Functions

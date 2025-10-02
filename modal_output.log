@@ -1,0 +1,297 @@
+✓ Initialized. View run at
+https://modal.com/apps/ezllm/main/ap-Avf8SgyrKuTOex6ByYbvIP
+✓ Created objects.
+├── 🔨 Created mount /app/launcher.py
+├── 🔨 Created mount /app
+└── 🔨 Created function run_training.
+--- Preparing and launching Modal benchmark job ---
+Modal credentials found.
+Original max_samples: 1000
+Temporarily setting max_samples to 1000 for this run.
+
+==================================================
+>>> LAUNCHING BENCHMARK RUNS
+==================================================
+
+/pkg/modal/client.py:212: UserWarning: Modal tokens provided by MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (or through the config file) are ignored inside containers.
+  warnings.warn(
+--- Starting training run with ORIGINAL kernel ---
+/pkg/modal/client.py:212: UserWarning: Modal tokens provided by MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (or through the config file) are ignored inside containers.
+  warnings.warn(
+--- Starting training run with OPTIMIZED kernel ---
+INFO: Using OPTIMIZED flash attention kernel.
+Running in single process mode (nproc_per_node = 1).
+Configuration loaded from: /root/KernelDev/remote_config.yaml
+=== GPU Information ===
+Device: NVIDIA H100 80GB HBM3
+Compute Capability: (9, 0)
+Total Memory: 79.2 GB
+Current Memory Usage: 0.0 GB
+Current Memory Cached: 0.0 GB
+✓ H100-optimized flash attention kernels will be used
+
+=== GPT Model Training with Flash Attention ===
+Precision: bf16 (bfloat16)
+Mixed Precision Training: Enabled (bf16)
+Setting up configuration...
+
+=== Initializing Model ===
+
+=== Setting up Precision ===
+Setting up mixed precision training (bf16)...
+✓ Model prepared for bf16 mixed precision training
+✓ Gradient scaler initialized for mixed precision
+Total parameters: 810,024,960
+Trainable parameters: 810,024,960
+Parameter dtype: torch.float32
+
+=== Memory Estimation ===
+Estimated memory usage (bf16):
+  Model parameters: 1.1GB
+  Gradients: 2.3GB
+  Optimizer states: 4.5GB
+  Total model memory: 7.9GB
+  Activation memory per sample: 93.8MB
+  Available for activations: 69.1GB
+  Recommended batch size: 737
+Using estimated batch_size: 16
+Device: cuda
+Model config: {'vocab_size': 256, 'dim': 2048, 'n_layers': 12, 'n_heads': 16, 'max_seq_len': 2048, 'mlp_ratio': 4, 'causal': True, 'task_names': ['cocktail_party', 'teacher_forcing']}
+Data config: {'dataset_name': 'allenai/c4', 'dataset_config': 'en', 'seq_len': 1024, 'max_samples': 1000, 'max_eval_tokens': 50000, 'on_the_fly_tokenization': True}
+Training config: batch_size=16, epochs=1
+
+=== Loading and Processing Data ===
+Using UTF-8 byte tokenization with vocabulary size: 262
+Max evaluation tokens per split: 50000
+Will attempt to load up to 1000 samples from the dataset.
+Loading dataset: allenai/c4/en
+Attempting Method 1: Load C4 'en' (streaming)...
+C4 'en' (streaming) load_dataset call succeeded. Processing samples...
+Raw iterated 500 items from C4 'en' streaming, processed 500 valid samples...
+Raw iterated 1000 items from C4 'en' streaming, processed 1000 valid samples...
+Reached max_samples (1000) for C4 'en' streaming.
+Finished processing C4 'en' streaming. Total valid samples extracted: 1000
+Successfully processed 1000 samples from C4 'en' stream.
+Successfully loaded 1000 samples using C4 'en'.
+Final dataset loaded with 1000 samples.
+Returning dataset splits: train=800, val=100, test=100
+train dataset (on-the-fly): 800 samples
+validation dataset (on-the-fly): 100 samples
+test dataset (on-the-fly): 100 samples
+Confirmed vocab_size: 262 (UTF-8 bytes)
+--- train ---
+  teacher_forcing: 50 batches of size 16
+  cocktail_party: 100 batches of size 16
+--- validation ---
+  teacher_forcing: 7 batches of size 16
+  cocktail_party: 13 batches of size 16
+--- test ---
+  teacher_forcing: 7 batches of size 16
+  cocktail_party: 13 batches of size 16
+
+=== Data Sample (Teacher Forcing) ===
+Batch shape: torch.Size([16, 1024])
+Sample tokens: [1, 38, 71, 116, 38, 123, 114, 122, 120, 103, 38, 114, 123, 126, 123, 120, 111, 117, 123, 121]
+Sample targets: [38, 71, 116, 38, 123, 114, 122, 120, 103, 38, 114, 123, 126, 123, 120, 111, 117, 123, 121, 38]
+Sample text: '[CLS] An ultra luxurious resort-style compound located...'
+
+=== Data Sample (Cocktail Party) ===
+Batch shape: torch.Size([6, 1024])
+Sample tokens: [1, 38, 89, 107, 103, 120, 105, 110, 111, 116, 109, 38, 110, 117, 115, 107, 121, 38, 108, 117]
+Sample text: '[CLS] Searching homes for sale in Charlotte County, FL...'
+
+=== Checking for Existing Checkpoints ===
+No existing checkpoints found. Starting fresh training.
+
+=== Setting up Trainer ===
+RANK, WORLD_SIZE, or LOCAL_RANK environment variables are not valid integers.
+Running in non-distributed mode on device: cuda
+✓ PyTorch optimization flags enabled for speed
+Model moved to device: cuda (non-distributed or world_size=1).
+Trainer initialized on device: cuda
+Model parameters: 810,024,960
+
+=== Initial Evaluation ===
+Evaluation for task teacher_forcing limited to 10 batches for speed
+Evaluation for task cocktail_party limited to 10 batches for speed
+Evaluation for task cocktail_party limited to 10 batches for speed
+Initial training loss: 5.7009
+Initial validation loss: 5.4741
+Initial cocktail party metrics: accuracy: 0.2625,
+
+=== Starting Training ===
+No existing checkpoints found. Starting training from scratch...
+Starting training for 1 epochs...
+Calculated steps_per_epoch: 100
+Scheduler initialized with T_max = 100 for a single decay.
+Initial validation loss: 5.6298
+Initial cocktail party metrics: accuracy: 0.2830,
+Epoch 1, Step 50, Rank 0, Total Loss: 4.4404 (MA: 6.4346, Var: 8.6106), teacher_forcing: 3.1228, cocktail_party: 1.3176, LR: 0.000016, Step Time: 0.795s
+Epoch 1, Step 100, Rank 0, Total Loss: 4.5264 (MA: 4.4604, Var: 0.0149), teacher_forcing: 3.0112, cocktail_party: 1.5152, LR: 0.000000, Step Time: 0.677s
+Epoch 1 completed (Rank 0): Avg Loss: 5.4294, Time: 101.51s
+Checkpoint saved by Rank 0: checkpoints/checkpoint_step_101.pt
+Training metrics saved (Rank 0): checkpoints/training_metrics.pt
+
+=== Training Completed ===
+
+=== Plotting Results ===
+Training curves saved: checkpoints/training_curves.png
+
+=== Testing Text Generation ===
+Generating sample text...
+Generated text (no prompt):
+'[CLS] t r le io inroen  s noan tnmcil tl h oianhenlh sc'
+
+Generated text (prompt: 'The'):
+'[CLS] The h siase enoieerlo dhnd iros te anhr nn ynooft n m'
+
+Generated text (prompt: 'In a world where'):
+'[CLS] In a world whereeitur ane tes mnn cn ce cealder audnilr rtoaar seh'
+
+
+=== Best Results ===
+Best validation loss: 5.6298 at step 0
+Total training steps: 101
+
+=== Training Session Complete ===
+INFO: Using ORIGINAL flash attention kernel.
+Running in single process mode (nproc_per_node = 1).
+Configuration loaded from: /root/KernelDev/remote_config.yaml
+=== GPU Information ===
+Device: NVIDIA H100 80GB HBM3
+Compute Capability: (9, 0)
+Total Memory: 79.2 GB
+Current Memory Usage: 0.0 GB
+Current Memory Cached: 0.0 GB
+✓ H100-optimized flash attention kernels will be used
+
+=== GPT Model Training with Flash Attention ===
+Precision: bf16 (bfloat16)
+Mixed Precision Training: Enabled (bf16)
+Setting up configuration...
+
+=== Initializing Model ===
+
+=== Setting up Precision ===
+Setting up mixed precision training (bf16)...
+✓ Model prepared for bf16 mixed precision training
+✓ Gradient scaler initialized for mixed precision
+Total parameters: 810,024,960
+Trainable parameters: 810,024,960
+Parameter dtype: torch.float32
+
+=== Memory Estimation ===
+Estimated memory usage (bf16):
+  Model parameters: 1.1GB
+  Gradients: 2.3GB
+  Optimizer states: 4.5GB
+  Total model memory: 7.9GB
+  Activation memory per sample: 93.8MB
+  Available for activations: 69.1GB
+  Recommended batch size: 737
+Using estimated batch_size: 16
+Device: cuda
+Model config: {'vocab_size': 256, 'dim': 2048, 'n_layers': 12, 'n_heads': 16, 'max_seq_len': 2048, 'mlp_ratio': 4, 'causal': True, 'task_names': ['cocktail_party', 'teacher_forcing']}
+Data config: {'dataset_name': 'allenai/c4', 'dataset_config': 'en', 'seq_len': 1024, 'max_samples': 1000, 'max_eval_tokens': 50000, 'on_the_fly_tokenization': True}
+Training config: batch_size=16, epochs=1
+
+=== Loading and Processing Data ===
+Using UTF-8 byte tokenization with vocabulary size: 262
+Max evaluation tokens per split: 50000
+Will attempt to load up to 1000 samples from the dataset.
+Loading dataset: allenai/c4/en
+Attempting Method 1: Load C4 'en' (streaming)...
+C4 'en' (streaming) load_dataset call succeeded. Processing samples...
+Raw iterated 500 items from C4 'en' streaming, processed 500 valid samples...
+Raw iterated 1000 items from C4 'en' streaming, processed 1000 valid samples...
+Reached max_samples (1000) for C4 'en' streaming.
+Finished processing C4 'en' streaming. Total valid samples extracted: 1000
+Successfully processed 1000 samples from C4 'en' stream.
+Successfully loaded 1000 samples using C4 'en'.
+Final dataset loaded with 1000 samples.
+Returning dataset splits: train=800, val=100, test=100
+train dataset (on-the-fly): 800 samples
+validation dataset (on-the-fly): 100 samples
+test dataset (on-the-fly): 100 samples
+Confirmed vocab_size: 262 (UTF-8 bytes)
+--- train ---
+  teacher_forcing: 50 batches of size 16
+  cocktail_party: 100 batches of size 16
+--- validation ---
+  teacher_forcing: 7 batches of size 16
+  cocktail_party: 13 batches of size 16
+--- test ---
+  teacher_forcing: 7 batches of size 16
+  cocktail_party: 13 batches of size 16
+
+=== Data Sample (Teacher Forcing) ===
+Batch shape: torch.Size([16, 1024])
+Sample tokens: [1, 38, 71, 116, 38, 123, 114, 122, 120, 103, 38, 114, 123, 126, 123, 120, 111, 117, 123, 121]
+Sample targets: [38, 71, 116, 38, 123, 114, 122, 120, 103, 38, 114, 123, 126, 123, 120, 111, 117, 123, 121, 38]
+Sample text: '[CLS] An ultra luxurious resort-style compound located...'
+
+=== Data Sample (Cocktail Party) ===
+Batch shape: torch.Size([8, 1024])
+Sample tokens: [1, 38, 200, 175, 38, 56, 54, 55, 61, 38, 72, 103, 120, 2, 104, 103, 52, 3, 120, 103]
+Sample text: '[CLS] © 2017 Bar[MASK]ba.[SPAN]racuda Boat & RV Storage. All Ri...'
+
+=== Checking for Existing Checkpoints ===
+No existing checkpoints found. Starting fresh training.
+
+=== Setting up Trainer ===
+RANK, WORLD_SIZE, or LOCAL_RANK environment variables are not valid integers.
+Running in non-distributed mode on device: cuda
+✓ PyTorch optimization flags enabled for speed
+Model moved to device: cuda (non-distributed or world_size=1).
+Trainer initialized on device: cuda
+Model parameters: 810,024,960
+
+=== Initial Evaluation ===
+Evaluation for task teacher_forcing limited to 10 batches for speed
+Evaluation for task cocktail_party limited to 10 batches for speed
+Evaluation for task cocktail_party limited to 10 batches for speed
+Initial training loss: 5.5941
+Initial validation loss: 5.1121
+Initial cocktail party metrics: accuracy: 0.3107,
+
+=== Starting Training ===
+No existing checkpoints found. Starting training from scratch...
+Starting training for 1 epochs...
+Calculated steps_per_epoch: 100
+Scheduler initialized with T_max = 100 for a single decay.
+Initial validation loss: 6.1776
+Initial cocktail party metrics: accuracy: 0.2651,
+Epoch 1, Step 50, Rank 0, Total Loss: 4.5693 (MA: 6.7777, Var: 16.1813), teacher_forcing: 3.1268, cocktail_party: 1.4425, LR: 0.000016, Step Time: 0.811s
+Epoch 1, Step 100, Rank 0, Total Loss: 4.6850 (MA: 4.4851, Var: 0.0266), teacher_forcing: 3.0125, cocktail_party: 1.6726, LR: 0.000000, Step Time: 0.684s
+Epoch 1 completed (Rank 0): Avg Loss: 5.6082, Time: 102.22s
+Checkpoint saved by Rank 0: checkpoints/checkpoint_step_101.pt
+Training metrics saved (Rank 0): checkpoints/training_metrics.pt
+
+=== Training Completed ===
+
+=== Plotting Results ===
+Training curves saved: checkpoints/training_curves.png
+
+=== Testing Text Generation ===
+Generating sample text...
+Generated text (no prompt):
+'[CLS] t r le io ilraen  s ecan t mcil tl h oianhenlh sc'
+
+Generated text (prompt: 'The'):
+'[CLS] Theth siase enoieerlo dhnd iros te anhr nn nnooft n m'
+
+Generated text (prompt: 'In a world where'):
+'[CLS] In a world whereeitur ane ras men cn ce ceayderaaudn lrtrtoaa pseh'
+
+
+=== Best Results ===
+Best validation loss: 6.1776 at step 0
+Total training steps: 101
+
+=== Training Session Complete ===
+--- Training with OPTIMIZED kernel complete ---
+--- Training with ORIGINAL kernel complete ---
+--- Modal benchmark finished ---
+Stopping app - local entrypoint completed.
+✓ App completed. View run at
+https://modal.com/apps/ezllm/main/ap-Avf8SgyrKuTOex6ByYbvIP
