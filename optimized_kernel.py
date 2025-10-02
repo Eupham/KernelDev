@@ -1567,24 +1567,12 @@ flash_forward_autotune = triton.autotune(
                 TILE_K_SIZE=tile_k,
             ),
             num_warps=num_warps,
-            num_stages=pipe,
+            num_stages=max(1, pipe - 1),
         )
-        for num_warps in [2, 4]  # Reduced warps for T4
-        for pipe in [1]  # Reduced pipelining for T4
-        for tile_q in [
-            2**i
-            for i in range(
-                int(math.log2(MIN_TILE_SIZE) + 0.1),
-                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-            )
-        ]
-        for tile_k in [
-            2**i
-            for i in range(
-                int(math.log2(MIN_TILE_SIZE) + 0.1),
-                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-            )
-        ]
+        for num_warps in [4, 8]
+        for pipe in [1, 2]
+        for tile_q in [64, 128]
+        for tile_k in [64, 128]
     ],
     key=[
         "HEAD_DIM",
@@ -1626,38 +1614,14 @@ flash_backward_autotune = triton.autotune(
                 TILE_DK_K_SIZE=tile_kk,
             ),
             num_warps=num_warps,
-            num_stages=pipe,
+            num_stages=max(1, pipe - 1),
         )
         for num_warps in [4, 8]
-        for pipe in [1, 2, 3]
-        for tile_qq in [
-            2**i
-            for i in range(
-                int(math.log2(MIN_TILE_SIZE) + 0.1),
-                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-            )
-        ]
-        for tile_qk in [
-            2**i
-            for i in range(
-                int(math.log2(MIN_TILE_SIZE) + 0.1),
-                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-            )
-        ]
-        for tile_kq in [
-            2**i
-            for i in range(
-                int(math.log2(MIN_TILE_SIZE) + 0.1),
-                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-            )
-        ]
-        for tile_kk in [
-            2**i
-            for i in range(
-                int(math.log2(MIN_TILE_SIZE) + 0.1),
-                int(math.log2(MAX_TILE_SIZE) + 0.1) + 1,
-            )
-        ]
+        for pipe in [1, 2]
+        for tile_qq in [64, 128]
+        for tile_qk in [64, 128]
+        for tile_kq in [64, 128]
+        for tile_kk in [64, 128]
     ],
     key=[
         "HEAD_DIM",
