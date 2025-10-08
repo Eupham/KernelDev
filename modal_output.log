@@ -1,5 +1,5 @@
 ✓ Initialized. View run at
-https://modal.com/apps/ezllm/main/ap-Avf8SgyrKuTOex6ByYbvIP
+https://modal.com/apps/workspace-mzieroo/main/ap-Tra0sMF8kenMuoQeXkgjy3
 ✓ Created objects.
 ├── 🔨 Created mount /app/launcher.py
 ├── 🔨 Created mount /app
@@ -19,6 +19,77 @@ Temporarily setting max_samples to 1000 for this run.
 /pkg/modal/client.py:212: UserWarning: Modal tokens provided by MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (or through the config file) are ignored inside containers.
   warnings.warn(
 --- Starting training run with OPTIMIZED kernel ---
+Traceback (most recent call last):
+  File "/root/KernelDev/entry.py", line 411, in start_actual_training
+    trainer.train(
+  File "/root/KernelDev/train_loop.py", line 917, in train
+    self.train_epoch(train_loaders, val_loaders, epoch, task_configs)
+  File "/root/KernelDev/train_loop.py", line 708, in train_epoch
+    self.config.scaler.scale(total_loss).backward()
+  File "/usr/local/lib/python3.11/site-packages/torch/_tensor.py", line 647, in backward
+    torch.autograd.backward(
+  File "/usr/local/lib/python3.11/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/usr/local/lib/python3.11/site-packages/torch/autograd/graph.py", line 829, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/torch/autograd/function.py", line 311, in apply
+    return user_fn(self, *args)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/torch/_library/autograd.py", line 77, in backward
+    result = info._backward_fn(ctx, *grads)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/KernelDev/optimized_kernel.py", line 1275, in attention_backward_adapter_op
+    DQ, DK, DV = torch.ops.flash_attention.backward(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/torch/_ops.py", line 1243, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/torch/_library/autograd.py", line 111, in autograd_impl
+    result = forward_no_grad(*args, Metadata(keyset, keyword_only_args))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/torch/_library/autograd.py", line 40, in forward_no_grad
+    result = op.redispatch(keyset & _C._after_autograd_keyset, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/torch/_ops.py", line 836, in redispatch
+    return self._handle.redispatch_boxed(keyset, *args, **kwargs)  # type: ignore[return-value]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/torch/_library/custom_ops.py", line 344, in backend_impl
+    result = self._backend_fns[device_type](*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/torch/_compile.py", line 53, in inner
+    return disable_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 929, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/torch/_library/custom_ops.py", line 377, in wrapped_fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/KernelDev/optimized_kernel.py", line 1174, in attention_backward_adapter
+    _attn_bwd_preprocess[pre_grid](
+  File "/usr/local/lib/python3.11/site-packages/triton/runtime/jit.py", line 390, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/triton/runtime/jit.py", line 594, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/triton/compiler/compiler.py", line 339, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/triton/compiler/compiler.py", line 83, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 7:31:
+def _attn_bwd_preprocess(O, DO,  #
+                         Delta,  #
+                         Z, H, N_CTX,  #
+                         *,
+                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr  #
+                         ):
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+                               ^
+NameError('BLOCK_M is not defined')
 INFO: Using OPTIMIZED flash attention kernel.
 Running in single process mode (nproc_per_node = 1).
 Configuration loaded from: /root/KernelDev/remote_config.yaml
@@ -115,45 +186,42 @@ Model parameters: 810,024,960
 Evaluation for task teacher_forcing limited to 10 batches for speed
 Evaluation for task cocktail_party limited to 10 batches for speed
 Evaluation for task cocktail_party limited to 10 batches for speed
-Initial training loss: 5.7009
-Initial validation loss: 5.4741
-Initial cocktail party metrics: accuracy: 0.2625,
+Initial training loss: 4.5425
+Initial validation loss: 5.5329
+Initial cocktail party metrics: accuracy: 0.2714,
 
 === Starting Training ===
 No existing checkpoints found. Starting training from scratch...
 Starting training for 1 epochs...
 Calculated steps_per_epoch: 100
 Scheduler initialized with T_max = 100 for a single decay.
-Initial validation loss: 5.6298
-Initial cocktail party metrics: accuracy: 0.2830,
-Epoch 1, Step 50, Rank 0, Total Loss: 4.4404 (MA: 6.4346, Var: 8.6106), teacher_forcing: 3.1228, cocktail_party: 1.3176, LR: 0.000016, Step Time: 0.795s
-Epoch 1, Step 100, Rank 0, Total Loss: 4.5264 (MA: 4.4604, Var: 0.0149), teacher_forcing: 3.0112, cocktail_party: 1.5152, LR: 0.000000, Step Time: 0.677s
-Epoch 1 completed (Rank 0): Avg Loss: 5.4294, Time: 101.51s
-Checkpoint saved by Rank 0: checkpoints/checkpoint_step_101.pt
+Initial validation loss: 4.6137
+Initial cocktail party metrics: accuracy: 0.2266,
+
+Training failed with error: at 7:31:
+def _attn_bwd_preprocess(O, DO,  #
+                         Delta,  #
+                         Z, H, N_CTX,  #
+                         *,
+                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr  #
+                         ):
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+                               ^
+NameError('BLOCK_M is not defined')
 Training metrics saved (Rank 0): checkpoints/training_metrics.pt
-
-=== Training Completed ===
-
-=== Plotting Results ===
-Training curves saved: checkpoints/training_curves.png
-
-=== Testing Text Generation ===
-Generating sample text...
-Generated text (no prompt):
-'[CLS] t r le io inroen  s noan tnmcil tl h oianhenlh sc'
-
-Generated text (prompt: 'The'):
-'[CLS] The h siase enoieerlo dhnd iros te anhr nn ynooft n m'
-
-Generated text (prompt: 'In a world where'):
-'[CLS] In a world whereeitur ane tes mnn cn ce cealder audnilr rtoaar seh'
-
-
-=== Best Results ===
-Best validation loss: 5.6298 at step 0
-Total training steps: 101
+Training failed: at 7:31:
+def _attn_bwd_preprocess(O, DO,  #
+                         Delta,  #
+                         Z, H, N_CTX,  #
+                         *,
+                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr  #
+                         ):
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+                               ^
+NameError('BLOCK_M is not defined')
 
 === Training Session Complete ===
+--- Training with OPTIMIZED kernel complete ---
 INFO: Using ORIGINAL flash attention kernel.
 Running in single process mode (nproc_per_node = 1).
 Configuration loaded from: /root/KernelDev/remote_config.yaml
@@ -231,9 +299,9 @@ Sample targets: [38, 71, 116, 38, 123, 114, 122, 120, 103, 38, 114, 123, 126, 12
 Sample text: '[CLS] An ultra luxurious resort-style compound located...'
 
 === Data Sample (Cocktail Party) ===
-Batch shape: torch.Size([8, 1024])
-Sample tokens: [1, 38, 200, 175, 38, 56, 54, 55, 61, 38, 72, 103, 120, 2, 104, 103, 52, 3, 120, 103]
-Sample text: '[CLS] © 2017 Bar[MASK]ba.[SPAN]racuda Boat & RV Storage. All Ri...'
+Batch shape: torch.Size([6, 1024])
+Sample tokens: [1, 38, 89, 107, 103, 120, 105, 110, 111, 116, 109, 38, 110, 117, 115, 107, 121, 38, 108, 117]
+Sample text: '[CLS] Searching homes for sale in Charlotte County, FL...'
 
 === Checking for Existing Checkpoints ===
 No existing checkpoints found. Starting fresh training.
@@ -250,20 +318,20 @@ Model parameters: 810,024,960
 Evaluation for task teacher_forcing limited to 10 batches for speed
 Evaluation for task cocktail_party limited to 10 batches for speed
 Evaluation for task cocktail_party limited to 10 batches for speed
-Initial training loss: 5.5941
-Initial validation loss: 5.1121
-Initial cocktail party metrics: accuracy: 0.3107,
+Initial training loss: 5.3240
+Initial validation loss: 5.4447
+Initial cocktail party metrics: accuracy: 0.3250,
 
 === Starting Training ===
 No existing checkpoints found. Starting training from scratch...
 Starting training for 1 epochs...
 Calculated steps_per_epoch: 100
 Scheduler initialized with T_max = 100 for a single decay.
-Initial validation loss: 6.1776
-Initial cocktail party metrics: accuracy: 0.2651,
-Epoch 1, Step 50, Rank 0, Total Loss: 4.5693 (MA: 6.7777, Var: 16.1813), teacher_forcing: 3.1268, cocktail_party: 1.4425, LR: 0.000016, Step Time: 0.811s
-Epoch 1, Step 100, Rank 0, Total Loss: 4.6850 (MA: 4.4851, Var: 0.0266), teacher_forcing: 3.0125, cocktail_party: 1.6726, LR: 0.000000, Step Time: 0.684s
-Epoch 1 completed (Rank 0): Avg Loss: 5.6082, Time: 102.22s
+Initial validation loss: 5.5182
+Initial cocktail party metrics: accuracy: 0.2019,
+Epoch 1, Step 50, Rank 0, Total Loss: 4.4381 (MA: 6.6896, Var: 9.8433), teacher_forcing: 3.1533, cocktail_party: 1.2847, LR: 0.000016, Step Time: 0.815s
+Epoch 1, Step 100, Rank 0, Total Loss: 4.4470 (MA: 4.5304, Var: 0.0133), teacher_forcing: 3.0603, cocktail_party: 1.3867, LR: 0.000000, Step Time: 0.685s
+Epoch 1 completed (Rank 0): Avg Loss: 5.5890, Time: 102.30s
 Checkpoint saved by Rank 0: checkpoints/checkpoint_step_101.pt
 Training metrics saved (Rank 0): checkpoints/training_metrics.pt
 
@@ -275,23 +343,22 @@ Training curves saved: checkpoints/training_curves.png
 === Testing Text Generation ===
 Generating sample text...
 Generated text (no prompt):
-'[CLS] t r le io ilraen  s ecan t mcil tl h oianhenlh sc'
+'[CLS] t rile io i roen  s eoan on cil tl h gianhenlh sc'
 
 Generated text (prompt: 'The'):
-'[CLS] Theth siase enoieerlo dhnd iros te anhr nn nnooft n m'
+'[CLS] Theth siase enoieerlo dhnd iros te gnhr  n nnooft n t'
 
 Generated text (prompt: 'In a world where'):
-'[CLS] In a world whereeitur ane ras men cn ce ceayderaaudn lrtrtoaa pseh'
+'[CLS] In a world whereeittr ane r s men cn ce cealder audnilr rtoaa pshh'
 
 
 === Best Results ===
-Best validation loss: 6.1776 at step 0
+Best validation loss: 5.5182 at step 0
 Total training steps: 101
 
 === Training Session Complete ===
---- Training with OPTIMIZED kernel complete ---
 --- Training with ORIGINAL kernel complete ---
 --- Modal benchmark finished ---
 Stopping app - local entrypoint completed.
 ✓ App completed. View run at
-https://modal.com/apps/ezllm/main/ap-Avf8SgyrKuTOex6ByYbvIP
+https://modal.com/apps/workspace-mzieroo/main/ap-Tra0sMF8kenMuoQeXkgjy3
