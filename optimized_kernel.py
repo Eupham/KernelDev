@@ -404,11 +404,12 @@ def _flash_attn_fwd(
         pass
 
     if Q_BLOCK_DIVISIBLE:
-        q_tile = tl.load(q_tile_ptr)
+        q_tile = tl.load(q_tile_ptr, eviction_policy="evict_first")
     else:
         q_tile = tl.load(
             q_tile_ptr,
             boundary_check=(0,),
+            eviction_policy="evict_first",
         )
 
     softmax_scale: tl.constexpr = tl.cast(SM_SCALE * RCP_LN2, q_tile.dtype)
@@ -429,18 +430,22 @@ def _flash_attn_fwd(
         if K_BLOCK_DIVISIBLE or not last_iter:
             kt_tile = tl.load(
                 tl.advance(kt_tile_ptr, (0, kv_token_idx)),
+                eviction_policy="evict_first",
             )
             v_tile = tl.load(
                 tl.advance(v_tile_ptr, (kv_token_idx, 0)),
+                eviction_policy="evict_first",
             )
         else:
             kt_tile = tl.load(
                 tl.advance(kt_tile_ptr, (0, kv_token_idx)),
                 boundary_check=(1,),
+                eviction_policy="evict_first",
             )
             v_tile = tl.load(
                 tl.advance(v_tile_ptr, (kv_token_idx, 0)),
                 boundary_check=(0,),
+                eviction_policy="evict_first",
             )
 
         qk = tl.dot(
@@ -681,11 +686,11 @@ def _flash_attn_bwd_precompute(
     )
 
     if BLOCK_DIVISIBLE:
-        o_tile = tl.load(o_tile_ptr, )
-        do_tile = tl.load(do_tile_ptr, )
+        o_tile = tl.load(o_tile_ptr, eviction_policy="evict_first")
+        do_tile = tl.load(do_tile_ptr, eviction_policy="evict_first")
     else:
-        o_tile = tl.load(o_tile_ptr, boundary_check=(0,))
-        do_tile = tl.load(do_tile_ptr, boundary_check=(0,))
+        o_tile = tl.load(o_tile_ptr, boundary_check=(0,), eviction_policy="evict_first")
+        do_tile = tl.load(do_tile_ptr, boundary_check=(0,), eviction_policy="evict_first")
 
     res = tl.sum(o_tile.to(tl.float32) * do_tile.to(tl.float32), 1)
 
@@ -914,15 +919,15 @@ def _flash_attn_bwd_dq_inner(
     )
 
     if DQ_Q_BLOCK_DIVISIBLE:
-        q = tl.load(q_tile_ptr)
-        m = tl.load(lse_tile_ptr)[:, None]
-        di = tl.load(delta_tile_ptr)
-        do = tl.load(do_tile_ptr)
+        q = tl.load(q_tile_ptr, eviction_policy="evict_first")
+        m = tl.load(lse_tile_ptr, eviction_policy="evict_first")[:, None]
+        di = tl.load(delta_tile_ptr, eviction_policy="evict_first")
+        do = tl.load(do_tile_ptr, eviction_policy="evict_first")
     else:
-        q = tl.load(q_tile_ptr, boundary_check=(0,))
-        m = tl.load(lse_tile_ptr, boundary_check=(0,))[:, None]
-        di = tl.load(delta_tile_ptr, boundary_check=(0,))
-        do = tl.load(do_tile_ptr, boundary_check=(0,))
+        q = tl.load(q_tile_ptr, boundary_check=(0,), eviction_policy="evict_first")
+        m = tl.load(lse_tile_ptr, boundary_check=(0,), eviction_policy="evict_first")[:, None]
+        di = tl.load(delta_tile_ptr, boundary_check=(0,), eviction_policy="evict_first")
+        do = tl.load(do_tile_ptr, boundary_check=(0,), eviction_policy="evict_first")
 
     kbatch_head_offset = batch * stride_kb + head * stride_kh
     kt_tile_ptr = tl.make_block_ptr(
@@ -1092,18 +1097,22 @@ def _flash_attn_bwd_dkdv_inner(
     if DK_K_BLOCK_DIVISIBLE:
         k = tl.load(
                 k_tile_ptr,
+                eviction_policy="evict_first",
             )
         v = tl.load(
                 v_tile_ptr,
+                eviction_policy="evict_first",
             )
     else:
         k = tl.load(
                 k_tile_ptr,
                 boundary_check=(0,),
+                eviction_policy="evict_first",
             )
         v = tl.load(
                 v_tile_ptr,
                 boundary_check=(0,),
+                eviction_policy="evict_first",
             )
 
     dk, dv = _flash_attn_bwd_dkdv(
@@ -2094,7 +2103,7 @@ def flash_attention(
     autotune=False,
     return_lse=False,
     prescale_qk=False,
-    precision="ieee",
+    precision="tf32",
     attention_mask: torch.Tensor | None = None,
     in_span: torch.Tensor | None = None,
     span_id: torch.Tensor | None = None,
