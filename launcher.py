@@ -41,7 +41,7 @@ def run_training(config: dict):
         yaml.dump(config, f)
 
     training_command = (
-        f"python /root/KernelDev/entry.py "
+        f"python -u /root/KernelDev/entry.py "
         f"--nproc_per_node=1 "
         f"--config {remote_config_path} "
         f"--epochs 1 "
