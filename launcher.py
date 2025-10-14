@@ -27,7 +27,7 @@ app = modal.App(
     secrets=[modal.Secret.from_local_environ(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])],
 )
 
-@app.function(gpu="h100", timeout=3600, scaledown_window=300)
+@app.function(gpu="h100", timeout=86400, scaledown_window=300)
 def run_training(config: dict):
     """
     This function runs the training script in a remote Modal container.
