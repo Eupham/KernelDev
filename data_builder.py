@@ -27,6 +27,7 @@ from datasets import load_dataset
 import numpy as np
 from typing import Optional, Dict, Any, List
 import random
+import os
 
 # =============================================================================
 # Configuration Constants
@@ -93,7 +94,8 @@ class DataBuilder:
         vocab_size: int = 256,
         max_eval_tokens: int = 50000,
         on_the_fly_tokenization: bool = False,
-        task_configs: dict = None
+        task_configs: dict = None,
+        cache_path: Optional[str] = None,
     ):
         self.on_the_fly_tokenization = on_the_fly_tokenization
         self.dataset_name = dataset_name
@@ -103,6 +105,7 @@ class DataBuilder:
         self.vocab_size = vocab_size + NUM_SPECIAL_TOKENS
         self.max_eval_tokens = max_eval_tokens
         self.task_configs = task_configs or {}
+        self.cache_path = cache_path
 
         print(f"Using UTF-8 byte tokenization with vocabulary size: {self.vocab_size}")
         print(f"Max evaluation tokens per split: {self.max_eval_tokens}")
@@ -216,13 +219,17 @@ class DataBuilder:
                 samples.append({'text': text_content})
                 processed_count += 1
 
-            if (i + 1) % 500 == 0 and (i+1) > 0:
+            if (i + 1) % 100 == 0 and (i+1) > 0:
                 print(f"Raw iterated {i+1} items from {dataset_name_logging}, processed {processed_count} valid samples...")
         
         print(f"Finished processing {dataset_name_logging}. Total valid samples extracted: {len(samples)}")
         return samples
 
     def load_raw_dataset(self):
+        if self.cache_path and os.path.exists(self.cache_path):
+            print(f"Loading cached dataset from {self.cache_path}")
+            return torch.load(self.cache_path)
+
         print(f"Loading dataset: {self.dataset_name}/{self.dataset_config}")
         loaded_samples = []
 
@@ -333,11 +340,17 @@ class DataBuilder:
         if not final_test_data and final_train_data: final_test_data = final_train_data[:max(1, len(final_train_data)//10)] # 10% of train for test
 
         print(f"Returning dataset splits: train={len(final_train_data)}, val={len(final_val_data)}, test={len(final_test_data)}")
-        return {
+        dataset = {
             'train': final_train_data,
             'validation': final_val_data,
             'test': final_test_data
         }
+
+        if self.cache_path:
+            print(f"Saving dataset to cache: {self.cache_path}")
+            torch.save(dataset, self.cache_path)
+
+        return dataset
 
     def _create_fallback_dataset(self):
         # ... (method content as in original file, ensure it uses self.max_samples correctly)
@@ -732,14 +745,16 @@ def create_data_builder(
     seq_len: int = 512, max_samples: Optional[int] = 2000,
     max_eval_tokens: int = 50000,
     on_the_fly_tokenization: bool = False,
-    task_configs: dict = None
+    task_configs: dict = None,
+    cache_path: Optional[str] = None,
 ) -> DataBuilder:
     return DataBuilder(
         dataset_name=dataset_name, dataset_config=dataset_config,
         seq_len=seq_len, max_samples=max_samples,
         max_eval_tokens=max_eval_tokens,
         on_the_fly_tokenization=on_the_fly_tokenization,
-        task_configs=task_configs
+        task_configs=task_configs,
+        cache_path=cache_path,
     )
 
 if __name__ == "__main__":

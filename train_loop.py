@@ -45,6 +45,7 @@ class TrainingConfig:
     
     def __init__(
         self,
+        volume_path: Optional[str] = None,
         num_epochs: int = 10,
         learning_rate: float = 1e-3,
         weight_decay: float = 0.01,
@@ -69,11 +70,6 @@ class TrainingConfig:
         inference_temperature: float = 0.8,
         inference_top_k: int = 50,
         inference_top_p: float = 0.9,
-        # Plateau detection parameters
-        plateau_monitor_metric: str = 'val_loss',
-        plateau_patience: int = 10,
-        plateau_threshold: float = 1e-4,
-        plateau_mode: str = 'min',
         # Scheduler parameters
         scheduler_T0_epoch_fraction: float = 0.1,
         scheduler_T_mult: int = 1
@@ -89,7 +85,10 @@ class TrainingConfig:
         self.moving_avg_window = moving_avg_window
         self.inference_every = inference_every
         self.save_logs_json_every = save_logs_json_every
-        self.checkpoint_dir = checkpoint_dir
+        if volume_path:
+            self.checkpoint_dir = os.path.join(volume_path, checkpoint_dir)
+        else:
+            self.checkpoint_dir = checkpoint_dir
         self.use_amp = use_amp
         self.scaler = scaler
         
@@ -104,11 +103,6 @@ class TrainingConfig:
         self.inference_top_k = inference_top_k
         self.inference_top_p = inference_top_p
 
-        # Plateau detection parameters
-        self.plateau_monitor_metric = plateau_monitor_metric
-        self.plateau_patience = plateau_patience
-        self.plateau_threshold = plateau_threshold
-        self.plateau_mode = plateau_mode
 
         # Scheduler parameters
         self.scheduler_T0_epoch_fraction = scheduler_T0_epoch_fraction
@@ -295,9 +289,6 @@ class Trainer:
         self.metrics = TrainingMetrics(moving_avg_window=self.config.log_every)
         self.is_distributed = False # Will be set by init_distributed
 
-        # Initialize plateau tracking attributes
-        self.plateau_patience_counter: int = 0
-        self.plateau_best_metric_val: float = float('inf') if self.config.plateau_mode == 'min' else float('-inf')
         self.steps_per_epoch: Optional[int] = None
 
         # Initialize distributed training
@@ -612,7 +603,7 @@ class Trainer:
         # In DDP, it's common to load checkpoint on all ranks,
         # or load on rank 0 and then broadcast. Loading on all ranks is simpler.
         map_location = self.config.device
-        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
 
         state_dict = checkpoint['model_state_dict']
         model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
@@ -636,7 +627,8 @@ class Trainer:
 
         model_to_load.load_state_dict(state_dict)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'scheduler_state_dict' in checkpoint and self.scheduler:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
         # Restore metrics (rank-local)
         for key, value in checkpoint['metrics'].items():
@@ -764,26 +756,6 @@ class Trainer:
                     if is_best:
                         self.save_checkpoint(self.metrics.total_steps, is_best=True)
 
-                    # Plateau detection logic
-                    improved = False
-                    if self.config.plateau_mode == 'min':
-                        if val_loss < self.plateau_best_metric_val - self.config.plateau_threshold:
-                            improved = True
-                    else: # max mode
-                        if val_loss > self.plateau_best_metric_val + self.config.plateau_threshold:
-                            improved = True
-
-                    if improved:
-                        self.plateau_best_metric_val = val_loss
-                        self.plateau_patience_counter = 0
-                        print(f"Metric improved to {val_loss:.4f}. Resetting plateau patience.")
-                    else:
-                        self.plateau_patience_counter += 1
-                        print(f"Metric did not improve. Plateau patience: {self.plateau_patience_counter}/{self.config.plateau_patience}")
-
-                    if self.plateau_patience_counter >= self.config.plateau_patience:
-                        print("Plateau detected! Consider stopping training or adjusting learning rate manually.")
-                        self.plateau_patience_counter = 0
 
                 # Regular checkpoint saving
                 if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_every == 0:
@@ -838,17 +810,13 @@ class Trainer:
         train_loaders: Dict[str, DataLoader],
         val_loaders: Optional[Dict[str, DataLoader]] = None,
         task_configs: Dict[str, Any] = None,
-        resume_from_checkpoint: Optional[bool] = None
+        resume: bool = False
     ):
         """Main training loop."""
         start_epoch = 0
         
-        # Use config setting if not explicitly provided
-        if resume_from_checkpoint is None:
-            resume_from_checkpoint = getattr(self.config, 'auto_resume', True)
-        
         # Check for existing checkpoint to resume from
-        if resume_from_checkpoint:
+        if resume:
             latest_checkpoint = self.find_latest_checkpoint()
             if latest_checkpoint:
                 try:
@@ -864,6 +832,8 @@ class Trainer:
                     print("Starting training from scratch...")
             else:
                 print("No existing checkpoints found. Starting training from scratch...")
+        else:
+            print("Starting a new training run from scratch...")
         
         print(f"Starting training for {self.config.num_epochs} epochs...")
 

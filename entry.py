@@ -264,6 +264,7 @@ def start_actual_training(cli_args):
     # Training configuration
     inference_cfg = config.get('inference', {})
     training_config = TrainingConfig(
+        volume_path=config.get('volume_path'),
         num_epochs=training_cfg.get('epochs', 3),
         learning_rate=training_cfg.get('learning_rate', 3e-4),
         weight_decay=training_cfg.get('weight_decay', 0.01),
@@ -319,6 +320,8 @@ def start_actual_training(cli_args):
     # Create data builder
     print("\n=== Loading and Processing Data ===")
     task_configs = config.get('tasks', {})
+    if config.get('volume_path'):
+        data_config['cache_path'] = os.path.join(config['volume_path'], f"{data_cfg.get('dataset_name', 'c4').replace('/', '_')}.pt")
     data_builder = create_data_builder(**data_config, task_configs=task_configs)
     
     # Create dataloaders
@@ -411,8 +414,8 @@ def start_actual_training(cli_args):
         trainer.train(
             train_loaders=dataloaders.get('train'),
             val_loaders=dataloaders.get('validation'),
-            task_configs=task_configs
-            # resume_from_checkpoint uses config setting by default
+            task_configs=task_configs,
+            resume=training_cfg.get('auto_resume', True)
         )
         
         print(f"\n=== Training Completed ===")
