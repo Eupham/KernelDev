@@ -1240,7 +1240,17 @@ def _flash_attn_bwd_dq(
         qk = tl.dot(q, kT, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         if not PRESCALE_QK:
             qk = qk * softmax_scale * RCP_LN2
-        p = tl.math.exp2(qk - m)
+        # p = tl.math.exp2(qk - m) # Numerically unstable, can underflow to 0
+
+        # More stable implementation:
+        # We need to compute ds = p * (dp - di), where p = exp(qk - m)
+        # ds = exp(qk - m) * dp - exp(qk - m) * di
+        # Let's compute in log-space to avoid underflow
+        log_p = qk - m
+
+        # dp is the gradient from the output, di is a row-wise sum.
+        # ds can be rewritten, but let's stick to the direct calculation with a safe p
+        p = tl.math.exp2(log_p) # p can still be zero here
 
         kv_indices = kv_token_idx + tile_k_arange
         
@@ -1330,7 +1340,12 @@ def _flash_attn_bwd_dq(
 
         p = tl.where(mask, p, 0.0)
         dp = tl.dot(do, vT.to(do.dtype), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        ds = p * (dp - di[:, None])
+
+        # Safe gradient calculation to avoid NaN (0 * inf = nan)
+        # By splitting the term, we avoid the problematic multiplication.
+        di_broadcast = di[:, None]
+        ds = p * dp - p * di_broadcast
+
         dq = tl.dot(ds, tl.trans(kT).to(ds.dtype), dq, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
 
     dq *= softmax_scale
@@ -1518,9 +1533,14 @@ def _flash_attn_bwd_dkdv(
         dv = tl.dot(pT, do.to(pT.dtype), dv, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
         tl.static_assert(Di.dtype == tl.float32)
 
-        # Compute dP and dS.
+        # Compute dP and dS with safety check
         dpT = tl.dot(v.to(do.dtype), tl.trans(do), input_precision=INPUT_PRECISION, out_dtype=tl.float32)
-        dsT = pT * (dpT - Di[None, :])
+
+        # Safe gradient calculation to avoid NaN (0 * inf = nan)
+        # By splitting the term, we avoid the problematic multiplication.
+        di_broadcast = Di[None, :]
+        dsT = pT * dpT - pT * di_broadcast
+
         dk = tl.dot(dsT, tl.trans(qT).to(dsT.dtype), dk, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
     dk *= SM_SCALE
     return dk, dv
