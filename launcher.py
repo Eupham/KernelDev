@@ -98,7 +98,7 @@ def run_training_remotely(config_overrides=None):
         config.update(config_overrides)
 
     print(f"Original max_samples: {config.get('data', {}).get('max_samples')}")
-    config['data']['max_samples'] = 5000
+    config['data']['max_samples'] = 500000
     print(f"Setting max_samples to {config['data']['max_samples']} for this run.")
 
     # Add volume path to config
