@@ -571,12 +571,13 @@ def _flash_attn_fwd(
         )
         m_i = m_ij
 
-    if not PERFECT_MATCHING:
-        l_i = tl.where(q_attended, l_i, 1)
-        acc = acc / l_i[:, None]
-    else:
-        acc = acc / l_i[:, None]
-        acc = tl.where(q_lens_mask, acc, 0.0)
+    # Universal safety check to prevent division by zero,
+    # which can happen if a query token attends to no key tokens.
+    l_i_safe = tl.where(l_i == 0, 1.0, l_i)
+    acc = acc / l_i_safe[:, None]
+
+    # Ensure that outputs for padding tokens are zeroed out.
+    acc = tl.where(q_lens_mask, acc, 0.0)
 
 
     obatch_head_offset = batch * stride_ob + head * stride_oh
