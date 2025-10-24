@@ -28,7 +28,7 @@ app = modal.App(
     secrets=[modal.Secret.from_local_environ(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])],
 )
 
-@app.function(gpu="h100", timeout=28800, scaledown_window=300, volumes={"/root/data": volume})
+@app.function(gpu="h100", timeout=43200, scaledown_window=300, volumes={"/root/data": volume})
 def run_training(config: dict):
     """
     This function runs the training script in a remote Modal container.
@@ -98,7 +98,7 @@ def run_training_remotely(config_overrides=None):
         config.update(config_overrides)
 
     print(f"Original max_samples: {config.get('data', {}).get('max_samples')}")
-    config['data']['max_samples'] = 5000
+    config['data']['max_samples'] = 500000
     print(f"Setting max_samples to {config['data']['max_samples']} for this run.")
 
     # Add volume path to config

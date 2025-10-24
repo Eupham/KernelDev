@@ -28,6 +28,7 @@ import numpy as np
 from typing import Optional, Dict, Any, List
 import random
 import os
+from pathlib import Path
 
 # =============================================================================
 # Configuration Constants
@@ -226,127 +227,60 @@ class DataBuilder:
         return samples
 
     def load_raw_dataset(self):
+        """
+        Loads and processes the C4 dataset. This function is simplified to only
+        load 'allenai/c4' with the 'en' configuration, as per requirements.
+        """
         if self.cache_path and os.path.exists(self.cache_path):
             print(f"Loading cached dataset from {self.cache_path}")
             return torch.load(self.cache_path)
 
-        print(f"Loading dataset: {self.dataset_name}/{self.dataset_config}")
+        print("Loading dataset: 'allenai/c4' (config: 'en')")
         loaded_samples = []
 
-        # Attempt 1: C4 'en' (streaming)
         try:
-            print("Attempting Method 1: Load C4 'en' (streaming)...")
+            # Directly load the required dataset using streaming to handle its large size.
             dataset_stream = load_dataset(
-                self.dataset_name, name=self.dataset_config, streaming=True, split='train'
+                "allenai/c4", name="en", streaming=True, split='train'
             )
-            print("C4 'en' (streaming) load_dataset call succeeded. Processing samples...")
-            loaded_samples = self._process_iterable_dataset(dataset_stream, "C4 'en' streaming")
-            
-            if len(loaded_samples) < self.max_samples and self.max_samples != float('inf'):
-                if len(loaded_samples) == 0 and self.max_samples > 0:
-                    raise ValueError(f"Streaming C4 'en' yielded 0 samples when {self.max_samples} were requested.")
-                print(f"Streaming C4 'en' loaded {len(loaded_samples)} samples, less than requested {self.max_samples}. Will try non-streaming.")
-                # Do not reset loaded_samples here, keep what was loaded and attempt non-streaming to supplement or replace
-                if len(loaded_samples) == 0 : # Only raise if completely empty, otherwise proceed to non-streaming to try and get more
-                    raise ValueError("Triggering non-streaming C4 'en' due to 0 samples from stream.")
-            print(f"Successfully processed {len(loaded_samples)} samples from C4 'en' stream.")
-        except Exception as e_c4_en_stream:
-            print(f"Method 1 (C4 'en' streaming) failed: {e_c4_en_stream}")
-            loaded_samples = [] # Ensure it's empty if this path failed before trying non-streaming
+            print("Successfully initiated streaming for 'allenai/c4', config 'en'.")
+            loaded_samples = self._process_iterable_dataset(dataset_stream, "allenai/c4 'en' streaming")
 
-            # Attempt 1.5: C4 'en' (non-streaming, sliced)
-            if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
-                try:
-                    print("Attempting Method 1.5: Load C4 'en' (non-streaming, sliced)...")
-                    fetch_n = int(self.max_samples * 1.5) if self.max_samples != float('inf') else 5000
-                    fetch_n = max(fetch_n, 100) # Ensure a minimum fetch
-                    print(f"Will try to fetch up to {fetch_n} records for non-streaming C4 'en'.")
-                    dataset_non_stream = load_dataset(
-                        self.dataset_name, name=self.dataset_config, split=f'train[:{fetch_n}]'
-                    )
-                    print("C4 'en' (non-streaming) load_dataset call succeeded. Processing samples...")
-                    loaded_samples = self._process_iterable_dataset(dataset_non_stream, "C4 'en' non-streaming")
-                    if not loaded_samples and self.max_samples > 0:
-                        raise ValueError("Non-streaming C4 'en' also yielded no samples.")
-                    print(f"Successfully loaded {len(loaded_samples)} samples via C4 'en' non-streaming.")
-                except Exception as e_c4_en_non_stream:
-                    print(f"Method 1.5 (C4 'en' non-streaming) failed: {e_c4_en_non_stream}")
-                    loaded_samples = [] # Ensure empty if this also failed
-
-        if loaded_samples and (len(loaded_samples) >= self.max_samples or self.max_samples == float('inf')):
-            print(f"Successfully loaded {len(loaded_samples)} samples using C4 'en'.")
-        elif loaded_samples: # Loaded some, but less than max_samples
-             print(f"Loaded {len(loaded_samples)} (less than {self.max_samples}) from C4 'en'. Proceeding with these or trying other datasets.")
-        else: # No samples from C4 'en'
-            print("All C4 'en' attempts (streaming/non-streaming) failed or yielded no samples.")
-
-        # If not enough samples from C4 'en', try other methods
-        if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
-            print(f"Attempting other datasets as C4 'en' yielded {len(loaded_samples)}/{self.max_samples} samples.")
-            # Attempt 2: C4 without 'en' config (streaming)
-            try:
-                print("Attempting Method 2: Load C4 (no config) (streaming)...")
-                dataset_m2 = load_dataset(self.dataset_name, streaming=True, split='train')
-                print("C4 (no config, streaming) load_dataset call succeeded. Processing samples...")
-                loaded_samples = self._process_iterable_dataset(dataset_m2, "C4 (no config) streaming")
-                if not loaded_samples and self.max_samples > 0:
-                    raise ValueError("Method 2 (C4 no config, streaming) yielded no samples.")
-                print(f"Successfully loaded {len(loaded_samples)} samples using C4 (no config).")
-            except Exception as e_method2:
-                print(f"Method 2 (C4 no config, streaming) failed: {e_method2}")
-                loaded_samples = []
-
-        # If still not enough, try wikitext
-        if not loaded_samples or (len(loaded_samples) < self.max_samples and self.max_samples != float('inf')):
-            print(f"Attempting wikitext as previous methods yielded {len(loaded_samples)}/{self.max_samples} samples.")
-            # Attempt 3: Wikitext (streaming)
-            try:
-                print("Attempting Method 3: Load wikitext (streaming)...")
-                dataset_m3 = load_dataset("wikitext", "wikitext-2-raw-v1", streaming=True, split='train')
-                print("Wikitext (streaming) load_dataset call succeeded. Processing samples...")
-                loaded_samples = self._process_iterable_dataset(dataset_m3, "wikitext streaming")
-                if not loaded_samples and self.max_samples > 0:
-                    raise ValueError("Method 3 (wikitext, streaming) yielded no samples.")
-                print(f"Successfully loaded {len(loaded_samples)} samples using wikitext.")
-            except Exception as e_method3:
-                print(f"Method 3 (wikitext, streaming) failed: {e_method3}")
-                loaded_samples = []
-
-        # Final check and fallback
-        if loaded_samples and (len(loaded_samples) >= self.max_samples or self.max_samples == float('inf')):
-            print(f"Final dataset loaded with {len(loaded_samples)} samples.")
-        elif loaded_samples: # Loaded some, but maybe not enough
-            print(f"Warning: Final dataset loaded with {len(loaded_samples)} samples, requested {self.max_samples}. Using available data.")
-        else:
-            print("All primary dataset loading methods failed or yielded no usable samples. Falling back to simple text dataset...")
+        except Exception as e:
+            print(f"FATAL: Failed to load the primary dataset 'allenai/c4': {e}")
+            print("Falling back to a small, synthetic dataset for emergency use.")
             return self._create_fallback_dataset()
 
+        if not loaded_samples:
+            print("Warning: No samples were loaded from 'allenai/c4'. This is unexpected.")
+            print("Falling back to a small, synthetic dataset.")
+            return self._create_fallback_dataset()
+
+        print(f"Successfully loaded {len(loaded_samples)} samples.")
+
         # Split data for train/validation/test
-        train_split = int(0.8 * len(loaded_samples))
-        val_split = int(0.9 * len(loaded_samples))
-        # Ensure validation and test sets are not empty if train_split is too large
-        if train_split == len(loaded_samples) and len(loaded_samples) > 0: train_split = len(loaded_samples) -2 # min 1 for val, 1 for test
-        if val_split <= train_split and val_split < len(loaded_samples) -1 : val_split = train_split + 1
-        if val_split >= len(loaded_samples): val_split = len(loaded_samples) -1
-        if train_split < 0: train_split = 0
+        if len(loaded_samples) < 3:
+            print("Warning: Not enough samples to create train/val/test splits. Using all for training.")
+            train_data = loaded_samples
+            val_data = loaded_samples
+            test_data = loaded_samples
+        else:
+            train_split = int(0.9 * len(loaded_samples))
+            val_split = int(0.95 * len(loaded_samples))
+            train_data = loaded_samples[:train_split]
+            val_data = loaded_samples[train_split:val_split]
+            test_data = loaded_samples[val_split:]
 
-        final_train_data = loaded_samples[:train_split]
-        final_val_data = loaded_samples[train_split:val_split] if val_split > train_split else []
-        final_test_data = loaded_samples[val_split:] if val_split < len(loaded_samples) else []
-
-        # Handle cases where splits might be empty due to small loaded_samples size
-        if not final_train_data and loaded_samples: final_train_data = loaded_samples # Use all for train if splits fail
-        if not final_val_data and final_train_data: final_val_data = final_train_data[:max(1, len(final_train_data)//10)] # 10% of train for val
-        if not final_test_data and final_train_data: final_test_data = final_train_data[:max(1, len(final_train_data)//10)] # 10% of train for test
-
-        print(f"Returning dataset splits: train={len(final_train_data)}, val={len(final_val_data)}, test={len(final_test_data)}")
         dataset = {
-            'train': final_train_data,
-            'validation': final_val_data,
-            'test': final_test_data
+            'train': train_data,
+            'validation': val_data,
+            'test': test_data
         }
 
+        print(f"Dataset splits created: train={len(train_data)}, val={len(val_data)}, test={len(test_data)}")
+
         if self.cache_path:
+            Path(self.cache_path).parent.mkdir(parents=True, exist_ok=True)
             print(f"Saving dataset to cache: {self.cache_path}")
             torch.save(dataset, self.cache_path)
 

@@ -379,9 +379,11 @@ def start_actual_training(cli_args):
     checkpoint_dir = training_config.checkpoint_dir
     latest_checkpoint = find_latest_checkpoint_path(checkpoint_dir)
     
-    if latest_checkpoint:
+    if latest_checkpoint and training_cfg.get('auto_resume', True):
         print(f"Found existing checkpoint: {latest_checkpoint}")
         print("Training will resume from this checkpoint.")
+    elif latest_checkpoint:
+        print(f"Found existing checkpoint: {latest_checkpoint}, but auto_resume is False. Starting fresh.")
     else:
         print("No existing checkpoints found. Starting fresh training.")
     
@@ -414,8 +416,7 @@ def start_actual_training(cli_args):
         trainer.train(
             train_loaders=dataloaders.get('train'),
             val_loaders=dataloaders.get('validation'),
-            task_configs=task_configs,
-            resume=training_cfg.get('auto_resume', True)
+            task_configs=task_configs
         )
         
         print(f"\n=== Training Completed ===")
@@ -656,9 +657,8 @@ if __name__ == "__main__":
         sys.exit(0) # Main launcher process exits after workers are done
     else:
         print("Running in single process mode (nproc_per_node = 1).")
-        # In single process mode, RANK and WORLD_SIZE might not be set by an external launcher.
-        # For consistency with how init_distributed in train_loop might expect these for non-DDP single GPU:
-        if "RANK" not in os.environ: os.environ["RANK"] = "0"
-        if "WORLD_SIZE" not in os.environ: os.environ["WORLD_SIZE"] = "1"
-        if "LOCAL_RANK" not in os.environ: os.environ["LOCAL_RANK"] = "0"
+        # Set environment variables for non-distributed mode.
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("LOCAL_RANK", "0")
         start_actual_training(args)

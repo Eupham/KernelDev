@@ -304,11 +304,8 @@ class Trainer:
             if torch.cuda.is_available():
                 torch.backends.cudnn.benchmark = True
                 
-                # Allow TF32 for speed on modern GPUs
-                if hasattr(torch.backends.cudnn, 'allow_tf32'):
-                    torch.backends.cudnn.allow_tf32 = True
-                if hasattr(torch.backends.cuda, 'matmul'):
-                    torch.backends.cuda.matmul.allow_tf32 = True
+                # Use the new API for TF32 precision
+                torch.backends.cuda.matmul.fp32_precision = 'tf32'
                     
             if not self.is_distributed or dist.get_rank() == 0:
                 print("✓ PyTorch optimization flags enabled for speed")
@@ -507,13 +504,20 @@ class Trainer:
         return avg_loss, avg_cocktail_party_metrics
 
     
-    def save_checkpoint(self, step: int, is_best: bool = False):
+    def save_checkpoint(self, step: int, is_best: bool = False, train_loaders: Optional[Dict[str, DataLoader]] = None):
         """Save model checkpoint with rotation to keep only 2 most recent."""
         if not self.is_distributed or dist.get_rank() == 0:
             model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
             
             # Include dataset state in checkpoint if available
             dataset_state = getattr(self, 'dataset_state', {})
+
+            # Include sampler states
+            sampler_states = {}
+            if train_loaders:
+                for task_name, loader in train_loaders.items():
+                    if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'state_dict'):
+                        sampler_states[task_name] = loader.sampler.state_dict()
             
             checkpoint = {
                 'step': step,
@@ -522,7 +526,8 @@ class Trainer:
                 'scheduler_state_dict': self.scheduler.state_dict(),
                 'metrics': self.metrics.__dict__, # Note: metrics are rank-local
                 'config': self.config.__dict__,
-                'dataset_state': dataset_state  # Track dataset iteration state
+                'dataset_state': dataset_state,  # Track dataset iteration state
+                'sampler_states': sampler_states
             }
 
             checkpoint_path = os.path.join(
@@ -597,7 +602,7 @@ class Trainer:
         checkpoint_files.sort(key=lambda x: x[0], reverse=True)
         return str(checkpoint_files[0][1])
     
-    def load_checkpoint(self, checkpoint_path: str):
+    def load_checkpoint(self, checkpoint_path: str, train_loaders: Optional[Dict[str, DataLoader]] = None):
         """Load model checkpoint."""
         # Ensure all processes load the same checkpoint
         # In DDP, it's common to load checkpoint on all ranks,
@@ -626,9 +631,21 @@ class Trainer:
             # else: non-DDP to non-DDP, no change needed
 
         model_to_load.load_state_dict(state_dict)
+
+        print("\n=== Restoring Optimizer and Scheduler States ===")
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # Log optimizer state
+        current_lr = self.optimizer.param_groups[0]['lr']
+        print(f"  - Optimizer state loaded. Current learning rate: {current_lr:.6f}")
+
         if 'scheduler_state_dict' in checkpoint and self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            # Log scheduler state
+            last_lr = self.scheduler.get_last_lr()[0]
+            print(f"  - Scheduler state loaded. Last learning rate: {last_lr:.6f}")
+        else:
+            print("  - No scheduler state found in checkpoint or scheduler not initialized.")
+
 
         # Restore metrics (rank-local)
         for key, value in checkpoint['metrics'].items():
@@ -637,8 +654,38 @@ class Trainer:
         # Restore dataset state if available
         if 'dataset_state' in checkpoint:
             self.dataset_state = checkpoint['dataset_state']
+            epoch = self.dataset_state.get('current_epoch', 'N/A')
+            batch = self.dataset_state.get('current_batch', 'N/A')
+            print(f"\n=== Restoring Dataset Position ===\n  - Resuming from epoch {epoch}, batch {batch}")
+
+
+        # Restore sampler states if available
+        if 'sampler_states' in checkpoint and train_loaders:
+            print("\n=== Restoring Sampler States ===")
+            for task_name, state in checkpoint['sampler_states'].items():
+                if task_name in train_loaders and hasattr(train_loaders[task_name].sampler, 'load_state_dict'):
+                    train_loaders[task_name].sampler.load_state_dict(state)
+                    # Log details to verify the state was restored
+                    restored_epoch = train_loaders[task_name].sampler.epoch
+                    if hasattr(train_loaders[task_name].sampler, 'num_samples'): # For DistributedSampler
+                        num_samples = train_loaders[task_name].sampler.num_samples
+                        total_samples = train_loaders[task_name].sampler.total_size
+
+                        # Correctly calculate samples processed
+                        # Note: This is an approximation. The exact number of samples processed
+                        # depends on how many times the dataloader has been iterated.
+                        # The epoch number is the most reliable indicator of progress.
+                        samples_processed = restored_epoch * total_samples
+
+                        print(f"  - Task '{task_name}': Sampler restored to epoch {restored_epoch}.")
+                        print(f"    - Approx. {samples_processed}/{total_samples} samples processed.")
+
+                    else: # For other samplers
+                         print(f"  - Task '{task_name}': Sampler restored.")
+
         
-        print(f"Checkpoint loaded: {checkpoint_path}")
+        print(f"\nCheckpoint loaded from {checkpoint_path}")
+        print(f"Resuming from step: {checkpoint['step']}")
         return checkpoint['step']
     
     def train_epoch(
@@ -646,6 +693,7 @@ class Trainer:
         train_loaders: Dict[str, DataLoader],
         val_loaders: Optional[Dict[str, DataLoader]] = None,
         epoch: int = 0,
+        start_batch: int = 0,
         task_configs: Dict[str, Any] = None
     ):
         """Train for one epoch."""
@@ -656,6 +704,21 @@ class Trainer:
         # Create iterators for all training dataloaders
         train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
         
+        # Fast-forward iterators to the start_batch
+        if start_batch > 0:
+            print(f"Resuming epoch {epoch} from batch {start_batch}...")
+            for task_name, task_iter in train_iters.items():
+                for _ in range(start_batch):
+                    try:
+                        next(task_iter)
+                    except StopIteration:
+                        # This can happen if the dataloader is exhausted,
+                        # which shouldn't be the case if steps_per_epoch is correct.
+                        # Re-create the iterator to be safe.
+                        train_iters[task_name] = iter(train_loaders[task_name])
+                        print(f"Warning: Reached end of dataloader for task {task_name} while fast-forwarding.")
+                        break
+
         # Initialize or update dataset state tracking
         if not hasattr(self, 'dataset_state'):
             self.dataset_state = {}
@@ -666,7 +729,7 @@ class Trainer:
             'total_epochs': self.config.num_epochs
         })
         
-        for batch_idx in range(self.steps_per_epoch):
+        for batch_idx in range(start_batch, self.steps_per_epoch):
             step_start = time.time()
             
             # Update batch position in dataset state
@@ -759,7 +822,7 @@ class Trainer:
 
                 # Regular checkpoint saving
                 if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_every == 0:
-                    self.save_checkpoint(self.metrics.total_steps)
+                    self.save_checkpoint(self.metrics.total_steps, train_loaders=train_loaders)
 
                 # Save training logs to JSON
                 if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_logs_json_every == 0:
@@ -809,36 +872,51 @@ class Trainer:
         self,
         train_loaders: Dict[str, DataLoader],
         val_loaders: Optional[Dict[str, DataLoader]] = None,
-        task_configs: Dict[str, Any] = None,
-        resume: bool = False
+        task_configs: Dict[str, Any] = None
     ):
         """Main training loop."""
         start_epoch = 0
+        start_batch = 0
         
+        # Calculate steps_per_epoch based on the largest dataloader
+        self.steps_per_epoch = max(len(loader) for loader in train_loaders.values())
+        if not self.is_distributed or dist.get_rank() == 0:
+            print(f"Calculated steps_per_epoch: {self.steps_per_epoch}")
+
+        # Initialize the scheduler *before* loading the checkpoint
+        total_steps = self.steps_per_epoch * self.config.num_epochs
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=total_steps, eta_min=0
+        )
+        if not self.is_distributed or dist.get_rank() == 0:
+            print(f"Scheduler initialized with T_max = {total_steps} for a single decay.")
+
         # Check for existing checkpoint to resume from
-        if resume:
-            latest_checkpoint = self.find_latest_checkpoint()
-            if latest_checkpoint:
-                try:
-                    loaded_step = self.load_checkpoint(latest_checkpoint)
-                    # Calculate which epoch and batch we should resume from
-                    if hasattr(self, 'dataset_state') and 'current_epoch' in self.dataset_state:
-                        start_epoch = self.dataset_state['current_epoch']
-                        print(f"Resuming training from step {loaded_step}, epoch {start_epoch + 1}")
-                    else:
-                        print(f"Resuming training from step {loaded_step}")
-                except Exception as e:
-                    print(f"Failed to load checkpoint {latest_checkpoint}: {e}")
-                    print("Starting training from scratch...")
-            else:
-                print("No existing checkpoints found. Starting training from scratch...")
+        latest_checkpoint = self.find_latest_checkpoint()
+        if latest_checkpoint:
+            print(f"Found checkpoint: {latest_checkpoint}. Attempting to resume...")
+            try:
+                # The scheduler must be initialized before this call
+                loaded_step = self.load_checkpoint(latest_checkpoint, train_loaders=train_loaders)
+
+                # Calculate which epoch and batch we should resume from
+                if hasattr(self, 'dataset_state') and 'current_epoch' in self.dataset_state:
+                    start_epoch = self.dataset_state.get('current_epoch', 0)
+                    start_batch = self.dataset_state.get('current_batch', 0)
+                else:
+                    # Fallback if dataset_state is not in the checkpoint
+                    print(f"Resuming training from step {loaded_step}")
+            except Exception as e:
+                print(f"Failed to load checkpoint {latest_checkpoint}: {e}")
+                print("Starting training from scratch...")
         else:
-            print("Starting a new training run from scratch...")
+            print("No existing checkpoints found. Starting a new training run from scratch...")
         
         print(f"Starting training for {self.config.num_epochs} epochs...")
 
         if self.is_distributed and dist.get_world_size() > 1:
             # Re-wrap dataloaders with DistributedSampler if in DDP mode
+            # This is done after potential checkpoint loading to ensure samplers are correctly set up
             for task, loader in train_loaders.items():
                 sampler = DistributedSampler(loader.dataset, shuffle=True, num_replicas=dist.get_world_size(), rank=dist.get_rank())
                 train_loaders[task] = DataLoader(
@@ -855,17 +933,24 @@ class Trainer:
                         collate_fn=loader.collate_fn
                     )
 
-        # Calculate steps_per_epoch based on the largest dataloader
-        self.steps_per_epoch = max(len(loader) for loader in train_loaders.values())
-        if not self.is_distributed or dist.get_rank() == 0:
-            print(f"Calculated steps_per_epoch: {self.steps_per_epoch}")
+        if latest_checkpoint and hasattr(self, 'dataset_state') and 'current_epoch' in self.dataset_state:
+            # Enhanced dataset progress logging
+            total_records = 0
+            if train_loaders:
+                # Get the largest dataset size among all tasks
+                for loader in train_loaders.values():
+                    if hasattr(loader.dataset, '__len__'):
+                        total_records = max(total_records, len(loader.dataset))
 
-        total_steps = self.steps_per_epoch * self.config.num_epochs
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=total_steps, eta_min=0
-        )
-        if not self.is_distributed or dist.get_rank() == 0:
-            print(f"Scheduler initialized with T_max = {total_steps} for a single decay.")
+            if total_records > 0:
+                batch_size = next(iter(train_loaders.values())).batch_size if train_loaders else 1
+                records_processed = (start_epoch * self.steps_per_epoch + start_batch) * batch_size
+                total_training_records = self.config.num_epochs * self.steps_per_epoch * batch_size
+                progress_percent = (records_processed / total_training_records) * 100
+
+                print("\n=== Dataset Progress ===")
+                print(f"  - Resuming at epoch {start_epoch + 1}, batch {start_batch}")
+                print(f"  - Records processed: {records_processed} / {total_training_records} ({progress_percent:.2f}%)")
 
         # Initial evaluation (only if starting from scratch)
         if start_epoch == 0 and val_loaders and (not self.is_distributed or dist.get_rank() == 0):
@@ -883,27 +968,34 @@ class Trainer:
                 if self.is_distributed and dist.get_world_size() > 1:
                     for loader in train_loaders.values():
                         loader.sampler.set_epoch(epoch)
-
-                self.train_epoch(train_loaders, val_loaders, epoch, task_configs)
                 
-                self.save_checkpoint(self.metrics.total_steps)
+                # If resuming, only pass start_batch for the first epoch
+                current_start_batch = start_batch if epoch == start_epoch else 0
+                self.train_epoch(
+                    train_loaders, val_loaders, epoch,
+                    start_batch=current_start_batch,
+                    task_configs=task_configs
+                )
         
         except KeyboardInterrupt:
-            print("\nTraining interrupted by user.")
+            print("\nTraining interrupted by user. Saving final checkpoint...")
         
         except Exception as e:
             print(f"\nTraining failed with error: {e}")
             raise
         
         finally:
-            # Save final metrics (rank 0 guarded)
+            # Save a final checkpoint on exit or interruption
             if not self.is_distributed or dist.get_rank() == 0:
+                print("Saving final state...")
+                self.save_checkpoint(self.metrics.total_steps, train_loaders=train_loaders)
+
                 metrics_path = os.path.join(
                     self.config.checkpoint_dir,
-                    'training_metrics.pt' # rank 0's metrics
+                    'training_metrics.pt'
                 )
                 self.metrics.save_metrics(metrics_path)
-                print(f"Training metrics saved (Rank 0): {metrics_path}")
+                print(f"Final metrics saved by Rank 0 to: {metrics_path}")
     
     def plot_training_curves(self, save_path: Optional[str] = None):
         """Plot training curves."""
