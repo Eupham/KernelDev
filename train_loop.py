@@ -660,23 +660,6 @@ class Trainer:
         print(f"Checkpoint loaded from {checkpoint_path} at step {checkpoint['step']}")
         return checkpoint['step']
     
-    def _fast_forward_dataloader(self, dataloader: DataLoader, batch_to_resume: int):
-        """Fast-forwards a dataloader iterator to a specific batch index."""
-        if batch_to_resume == 0:
-            return iter(dataloader)
-
-        print(f"Fast-forwarding dataloader to batch {batch_to_resume}...")
-        it = iter(dataloader)
-        for _ in range(batch_to_resume):
-            try:
-                next(it)
-            except StopIteration:
-                print(f"Warning: Reached end of dataloader while fast-forwarding.")
-                # Return a new iterator from the beginning
-                return iter(dataloader)
-        print("Fast-forward complete.")
-        return it
-
     def train_epoch(
         self,
         train_loaders: Dict[str, DataLoader],
@@ -690,13 +673,14 @@ class Trainer:
         start_time = time.time()
         epoch_losses = []
 
+        train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
         if batch_to_resume > 0:
-            train_iters = {
-                task: self._fast_forward_dataloader(loader, batch_to_resume)
-                for task, loader in train_loaders.items()
-            }
-        else:
-            train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
+            for task_name, task_iter in train_iters.items():
+                for _ in range(batch_to_resume):
+                    try:
+                        next(task_iter)
+                    except StopIteration:
+                        break
 
         if not hasattr(self, 'dataset_state'):
             self.dataset_state = {}
@@ -866,6 +850,9 @@ class Trainer:
                 
                 self.train_epoch(train_loaders, val_loaders, epoch, task_configs, batch_to_resume)
                 batch_to_resume = 0  # Reset for subsequent epochs
+
+                if not self.is_distributed or dist.get_rank() == 0:
+                    self.save_checkpoint(self.metrics.total_steps, train_loaders)
 
         except KeyboardInterrupt:
             print("\nTraining interrupted. Saving final checkpoint...")
