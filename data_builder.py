@@ -27,6 +27,9 @@ from datasets import load_dataset
 import numpy as np
 from typing import Optional, Dict, Any, List
 import random
+import os
+import pickle
+from pathlib import Path
 
 # =============================================================================
 # Configuration Constants
@@ -88,16 +91,18 @@ class DataBuilder:
         self,
         dataset_name: str = "allenai/c4",
         dataset_config: str = "en",
+        dataset_cache_dir: str = "dataset_cache",
         seq_len: int = 512,
         max_samples: Optional[int] = 2000,
         vocab_size: int = 256,
         max_eval_tokens: int = 50000,
         on_the_fly_tokenization: bool = False,
-        task_configs: dict = None
+        task_configs: dict = None,
     ):
         self.on_the_fly_tokenization = on_the_fly_tokenization
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
+        self.dataset_cache_dir = dataset_cache_dir
         self.seq_len = seq_len
         self.max_samples = max_samples if max_samples is not None else float('inf')
         self.vocab_size = vocab_size + NUM_SPECIAL_TOKENS
@@ -404,6 +409,14 @@ class DataBuilder:
         return tokenized_data
     
     def create_datasets(self):
+        cache_path = Path(self.dataset_cache_dir)
+        cache_file = cache_path / f"{self.dataset_name.replace('/', '_')}_{self.dataset_config}_{self.max_samples}.pkl"
+
+        if cache_file.exists():
+            print(f"Loading tokenized dataset from cache: {cache_file}")
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+
         raw_dataset = self.load_raw_dataset()
         if self.on_the_fly_tokenization:
             datasets = {}
@@ -413,9 +426,15 @@ class DataBuilder:
                     print(f"{split_name} dataset (on-the-fly): {len(datasets[split_name])} samples")
                 else:
                     print(f"Warning: {split_name} split has no data. Skipping dataset creation.")
+
+            if not cache_path.exists():
+                cache_path.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, 'wb') as f:
+                pickle.dump(datasets, f)
+            print(f"Saved on-the-fly dataset to cache: {cache_file}")
+
             return datasets
         else:
-            # ... (original pre-tokenization logic)
             tokenized_data = self.tokenize_dataset(raw_dataset)
 
             datasets = {}
@@ -436,7 +455,6 @@ class DataBuilder:
                             tokens = tokens[:current_max_eval_tokens]
                             print(f"Limited {split_name} to {len(tokens)} tokens for faster evaluation (target: {current_max_eval_tokens})")
 
-                    # This part needs to be adapted. Let's assume the original TokenizedDataset is still defined for this path.
                     from torch.utils.data import Dataset
                     class TokenizedDataset(Dataset):
                         def __init__(self, tokenized_data, seq_len=512):
@@ -453,6 +471,13 @@ class DataBuilder:
                     print(f"{split_name} dataset: {len(datasets[split_name])} samples")
                 else:
                     print(f"Warning: {split_name} split has insufficient tokens ({len(tokens)}) for seq_len {self.seq_len}. Skipping dataset.")
+
+            if not cache_path.exists():
+                cache_path.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, 'wb') as f:
+                pickle.dump(datasets, f)
+            print(f"Saved tokenized dataset to cache: {cache_file}")
+
             return datasets
 
     def _collate_fn_teacher_forcing(self, batch):
@@ -728,18 +753,24 @@ class DataBuilder:
 
 
 def create_data_builder(
-    dataset_name: str = "allenai/c4", dataset_config: str = "en",
-    seq_len: int = 512, max_samples: Optional[int] = 2000,
+    dataset_name: str = "allenai/c4",
+    dataset_config: str = "en",
+    dataset_cache_dir: str = "dataset_cache",
+    seq_len: int = 512,
+    max_samples: Optional[int] = 2000,
     max_eval_tokens: int = 50000,
     on_the_fly_tokenization: bool = False,
-    task_configs: dict = None
+    task_configs: dict = None,
 ) -> DataBuilder:
     return DataBuilder(
-        dataset_name=dataset_name, dataset_config=dataset_config,
-        seq_len=seq_len, max_samples=max_samples,
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
+        dataset_cache_dir=dataset_cache_dir,
+        seq_len=seq_len,
+        max_samples=max_samples,
         max_eval_tokens=max_eval_tokens,
         on_the_fly_tokenization=on_the_fly_tokenization,
-        task_configs=task_configs
+        task_configs=task_configs,
     )
 
 if __name__ == "__main__":

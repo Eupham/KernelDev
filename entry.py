@@ -227,6 +227,7 @@ def start_actual_training(cli_args):
     data_config = {
         'dataset_name': data_cfg.get('dataset_name', 'allenai/c4'),
         'dataset_config': data_cfg.get('dataset_config', 'en'),
+        'dataset_cache_dir': data_cfg.get('dataset_cache_dir', 'dataset_cache'),
         'seq_len': data_cfg.get('seq_len', 1024),
         'max_samples': data_cfg.get('max_samples', 5000),
         'max_eval_tokens': data_cfg.get('max_eval_tokens', 50000),

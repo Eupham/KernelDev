@@ -30,6 +30,7 @@ import os
 import json
 import math
 from pathlib import Path
+from safetensors.torch import save_file, load_file
 
 # =============================================================================
 # Configuration Classes
@@ -530,9 +531,11 @@ class Trainer:
             dataset_state = getattr(self, 'dataset_state', {})
             dataset_state['sampler_states'] = sampler_states
 
-            checkpoint = {
+            # Separate tensors from metadata
+            model_state_dict = model_to_save.state_dict()
+
+            metadata = {
                 'step': step,
-                'model_state_dict': model_to_save.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
                 'metrics': self.metrics.__dict__,
@@ -540,23 +543,33 @@ class Trainer:
                 'dataset_state': dataset_state,
             }
 
-            checkpoint_path = os.path.join(
-                self.config.checkpoint_dir,
-                f'checkpoint_step_{step}.pt'
-            )
-            torch.save(checkpoint, checkpoint_path)
+            # Define file paths
+            checkpoint_dir = Path(self.config.checkpoint_dir) / f'step_{step}'
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-            # Manage checkpoint rotation - keep only 2 most recent regular checkpoints
+            model_path = checkpoint_dir / 'model.safetensors'
+            metadata_path = checkpoint_dir / 'metadata.json'
+
+            # Save model weights and metadata
+            save_file(model_state_dict, model_path)
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=4)
+
+            print(f"Checkpoint saved by Rank 0 to {checkpoint_dir}")
+
+            # Manage checkpoint rotation
             self._cleanup_old_checkpoints()
 
             if is_best:
-                best_path = os.path.join(
-                    self.config.checkpoint_dir,
-                    'best_checkpoint.pt'
-                )
-                torch.save(checkpoint, best_path)
+                best_dir = Path(self.config.checkpoint_dir) / 'best'
+                best_dir.mkdir(parents=True, exist_ok=True)
+                best_model_path = best_dir / 'model.safetensors'
+                best_metadata_path = best_dir / 'metadata.json'
 
-            print(f"Checkpoint saved by Rank 0: {checkpoint_path}")
+                save_file(model_state_dict, best_model_path)
+                with open(best_metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=4)
+                print(f"Best checkpoint saved to {best_dir}")
         else:
             # Ensure all processes are synchronized before rank 0 might save a new checkpoint
             # or other processes might proceed with a new model state if loading occurs.
@@ -567,98 +580,89 @@ class Trainer:
         """Keep only the max_checkpoints most recent regular checkpoints."""
         checkpoint_dir = Path(self.config.checkpoint_dir)
         
-        # Find all regular checkpoint files (not best_checkpoint.pt)
-        checkpoint_files = []
-        for file_path in checkpoint_dir.glob('checkpoint_step_*.pt'):
-            try:
-                # Extract step number from filename
-                step_num = int(file_path.stem.split('_')[-1])
-                checkpoint_files.append((step_num, file_path))
-            except (ValueError, IndexError):
-                continue
+        # Find all checkpoint directories (e.g., 'step_1000', 'step_2000')
+        checkpoint_dirs = []
+        for dir_path in checkpoint_dir.iterdir():
+            if dir_path.is_dir() and dir_path.name.startswith('step_'):
+                try:
+                    step_num = int(dir_path.name.split('_')[-1])
+                    checkpoint_dirs.append((step_num, dir_path))
+                except (ValueError, IndexError):
+                    continue
         
         # Sort by step number, newest first
-        checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+        checkpoint_dirs.sort(key=lambda x: x[0], reverse=True)
         
         # Remove all but the max_checkpoints most recent
         max_checkpoints = getattr(self.config, 'max_checkpoints', 2)
-        for _, file_path in checkpoint_files[max_checkpoints:]:
+        for _, dir_path in checkpoint_dirs[max_checkpoints:]:
             try:
-                file_path.unlink()
-                print(f"Removed old checkpoint: {file_path}")
-            except FileNotFoundError:
-                pass  # File already removed
+                # Recursively delete the directory
+                import shutil
+                shutil.rmtree(dir_path)
+                print(f"Removed old checkpoint directory: {dir_path}")
+            except Exception as e:
+                print(f"Error removing old checkpoint {dir_path}: {e}")
     
     def find_latest_checkpoint(self) -> Optional[str]:
-        """Find the most recent checkpoint file."""
+        """Find the most recent checkpoint directory."""
         checkpoint_dir = Path(self.config.checkpoint_dir)
         
         if not checkpoint_dir.exists():
             return None
         
-        # Find all regular checkpoint files
-        checkpoint_files = []
-        for file_path in checkpoint_dir.glob('checkpoint_step_*.pt'):
-            try:
-                step_num = int(file_path.stem.split('_')[-1])
-                checkpoint_files.append((step_num, file_path))
-            except (ValueError, IndexError):
-                continue
+        # Find all checkpoint directories
+        checkpoint_dirs = []
+        for dir_path in checkpoint_dir.iterdir():
+            if dir_path.is_dir() and dir_path.name.startswith('step_'):
+                try:
+                    step_num = int(dir_path.name.split('_')[-1])
+                    checkpoint_dirs.append((step_num, dir_path))
+                except (ValueError, IndexError):
+                    continue
         
-        if not checkpoint_files:
+        if not checkpoint_dirs:
             return None
         
-        # Return the most recent checkpoint
-        checkpoint_files.sort(key=lambda x: x[0], reverse=True)
-        return str(checkpoint_files[0][1])
+        # Return the path to the most recent checkpoint directory
+        checkpoint_dirs.sort(key=lambda x: x[0], reverse=True)
+        return str(checkpoint_dirs[0][1])
     
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint."""
-        # Ensure all processes load the same checkpoint
-        # In DDP, it's common to load checkpoint on all ranks,
-        # or load on rank 0 and then broadcast. Loading on all ranks is simpler.
-        map_location = self.config.device
-        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    def load_checkpoint(self, checkpoint_dir: str):
+        """Load model checkpoint from a directory."""
+        checkpoint_dir = Path(checkpoint_dir)
+        model_path = checkpoint_dir / 'model.safetensors'
+        metadata_path = checkpoint_dir / 'metadata.json'
 
-        state_dict = checkpoint['model_state_dict']
+        if not model_path.exists() or not metadata_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found in {checkpoint_dir}")
+
+        # Load metadata
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+
+        # Load model weights
+        state_dict = load_file(model_path, device=self.config.device)
         model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
-
-        # Handle 'module.' prefix differences
-        current_keys_have_module = all(k.startswith('module.') for k in model_to_load.state_dict().keys())
-        checkpoint_keys_have_module = all(k.startswith('module.') for k in state_dict.keys())
-
-        if isinstance(self.model, DDP): # Current model is DDP
-            if not checkpoint_keys_have_module: # Checkpoint from non-DDP
-                # self.model.module.load_state_dict(state_dict) # Already handled by model_to_load
-                pass
-            else: # Checkpoint from DDP (has module. prefix)
-                new_state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
-                state_dict = new_state_dict
-        else: # Current model is NOT DDP
-            if checkpoint_keys_have_module: # Checkpoint from DDP
-                new_state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
-                state_dict = new_state_dict
-            # else: non-DDP to non-DDP, no change needed
-
         model_to_load.load_state_dict(state_dict)
 
-        if 'optimizer_state_dict' in checkpoint and self.optimizer:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'optimizer_state_dict' in metadata and self.optimizer:
+            self.optimizer.load_state_dict(metadata['optimizer_state_dict'])
             print("Optimizer state loaded.")
 
-        if 'scheduler_state_dict' in checkpoint and self.scheduler:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'scheduler_state_dict' in metadata and self.scheduler:
+            self.scheduler.load_state_dict(metadata['scheduler_state_dict'])
             print("Scheduler state loaded.")
 
-        for key, value in checkpoint['metrics'].items():
+        for key, value in metadata['metrics'].items():
             setattr(self.metrics, key, value)
         
-        if 'dataset_state' in checkpoint:
-            self.dataset_state = checkpoint['dataset_state']
+        if 'dataset_state' in metadata:
+            self.dataset_state = metadata['dataset_state']
             print(f"Dataset state loaded: epoch {self.dataset_state.get('current_epoch', 'N/A')}, batch {self.dataset_state.get('current_batch', 'N/A')}")
         
-        print(f"Checkpoint loaded from {checkpoint_path} at step {checkpoint['step']}")
-        return checkpoint['step']
+        print(f"Checkpoint loaded from {checkpoint_dir} at step {metadata['step']}")
+        return metadata['step']
     
     def train_epoch(
         self,

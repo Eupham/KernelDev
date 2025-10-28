@@ -15,7 +15,7 @@ image = (
         "apt-get update -y",
         "apt-get install -y software-properties-common build-essential",
         "pip install uv",
-        "uv pip install --system torch ninja datasets matplotlib triton pyyaml",
+        "uv pip install --system torch ninja datasets matplotlib triton pyyaml safetensors",
     )
     .add_local_dir(".", remote_path="/root/KernelDev")
 )
