@@ -538,11 +538,17 @@ class Trainer:
                 'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
                 'sampler_states': sampler_states,
             }
+            if self.config.use_amp and self.config.scaler:
+                training_state['scaler_state_dict'] = self.config.scaler.state_dict()
+
+            # Prepare config for JSON serialization by removing non-serializable objects
+            config_to_save = self.config.__dict__.copy()
+            config_to_save.pop('scaler', None)
 
             metadata = {
                 'step': step,
                 'metrics': self.metrics.__dict__,
-                'config': self.config.__dict__,
+                'config': config_to_save,
                 'dataset_state': getattr(self, 'dataset_state', {}),
             }
 
@@ -658,6 +664,10 @@ class Trainer:
         if 'scheduler_state_dict' in training_state and self.scheduler:
             self.scheduler.load_state_dict(training_state['scheduler_state_dict'])
             print("Scheduler state loaded.")
+
+        if 'scaler_state_dict' in training_state and self.config.use_amp and self.config.scaler:
+            self.config.scaler.load_state_dict(training_state['scaler_state_dict'])
+            print("GradScaler state loaded.")
 
         if 'sampler_states' in training_state:
             for name, state in training_state['sampler_states'].items():
