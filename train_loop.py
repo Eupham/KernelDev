@@ -516,22 +516,28 @@ class Trainer:
         return avg_loss, avg_cocktail_party_metrics
 
     
-    def save_checkpoint(self, step: int, is_best: bool = False):
-        """Save model checkpoint with rotation to keep only 2 most recent."""
+    def save_checkpoint(self, step: int, train_loaders: Dict[str, DataLoader], is_best: bool = False):
+        """Save model checkpoint with rotation to keep only the 2 most recent."""
         if not self.is_distributed or dist.get_rank() == 0:
             model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
             
-            # Include dataset state in checkpoint if available
-            dataset_state = getattr(self, 'dataset_state', {})
+            sampler_states = {
+                name: loader.sampler.state_dict()
+                for name, loader in train_loaders.items()
+                if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'state_dict')
+            }
             
+            dataset_state = getattr(self, 'dataset_state', {})
+            dataset_state['sampler_states'] = sampler_states
+
             checkpoint = {
                 'step': step,
                 'model_state_dict': model_to_save.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
-                'scheduler_state_dict': self.scheduler.state_dict(),
-                'metrics': self.metrics.__dict__, # Note: metrics are rank-local
+                'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+                'metrics': self.metrics.__dict__,
                 'config': self.config.__dict__,
-                'dataset_state': dataset_state  # Track dataset iteration state
+                'dataset_state': dataset_state,
             }
 
             checkpoint_path = os.path.join(
@@ -635,49 +641,74 @@ class Trainer:
             # else: non-DDP to non-DDP, no change needed
 
         model_to_load.load_state_dict(state_dict)
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-        # Restore metrics (rank-local)
+        if 'optimizer_state_dict' in checkpoint and self.optimizer:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("Optimizer state loaded.")
+
+        if 'scheduler_state_dict' in checkpoint and self.scheduler:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print("Scheduler state loaded.")
+
         for key, value in checkpoint['metrics'].items():
             setattr(self.metrics, key, value)
         
-        # Restore dataset state if available
         if 'dataset_state' in checkpoint:
             self.dataset_state = checkpoint['dataset_state']
+            print(f"Dataset state loaded: epoch {self.dataset_state.get('current_epoch', 'N/A')}, batch {self.dataset_state.get('current_batch', 'N/A')}")
         
-        print(f"Checkpoint loaded: {checkpoint_path}")
+        print(f"Checkpoint loaded from {checkpoint_path} at step {checkpoint['step']}")
         return checkpoint['step']
     
+    def _fast_forward_dataloader(self, dataloader: DataLoader, batch_to_resume: int):
+        """Fast-forwards a dataloader iterator to a specific batch index."""
+        if batch_to_resume == 0:
+            return iter(dataloader)
+
+        print(f"Fast-forwarding dataloader to batch {batch_to_resume}...")
+        it = iter(dataloader)
+        for _ in range(batch_to_resume):
+            try:
+                next(it)
+            except StopIteration:
+                print(f"Warning: Reached end of dataloader while fast-forwarding.")
+                # Return a new iterator from the beginning
+                return iter(dataloader)
+        print("Fast-forward complete.")
+        return it
+
     def train_epoch(
         self,
         train_loaders: Dict[str, DataLoader],
         val_loaders: Optional[Dict[str, DataLoader]] = None,
         epoch: int = 0,
-        task_configs: Dict[str, Any] = None
+        task_configs: Dict[str, Any] = None,
+        batch_to_resume: int = 0,
     ):
         """Train for one epoch."""
         self.model.train()
-        epoch_losses = []
         start_time = time.time()
+        epoch_losses = []
 
-        # Create iterators for all training dataloaders
-        train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
-        
-        # Initialize or update dataset state tracking
+        if batch_to_resume > 0:
+            train_iters = {
+                task: self._fast_forward_dataloader(loader, batch_to_resume)
+                for task, loader in train_loaders.items()
+            }
+        else:
+            train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
+
         if not hasattr(self, 'dataset_state'):
             self.dataset_state = {}
         
         self.dataset_state.update({
             'current_epoch': epoch,
             'steps_per_epoch': self.steps_per_epoch,
-            'total_epochs': self.config.num_epochs
+            'total_epochs': self.config.num_epochs,
         })
         
-        for batch_idx in range(self.steps_per_epoch):
+        for batch_idx in range(batch_to_resume, self.steps_per_epoch):
             step_start = time.time()
-            
-            # Update batch position in dataset state
             self.dataset_state['current_batch'] = batch_idx
             
             total_loss = 0
@@ -691,20 +722,17 @@ class Trainer:
                     batch = next(train_iters[task_name])
 
                 loss = self.train_step(batch, task_name, task_configs)
+                if loss is not None and not (isinstance(loss, float) and loss == 0.0):
+                    individual_losses[task_name] = loss.item()
+                    total_loss += loss
 
-                if loss is None or (isinstance(loss, float) and loss == 0.0):
-                    continue
-
-                individual_losses[task_name] = loss.item()
-
-                # Direct loss accumulation without uncertainty weighting
-                total_loss += loss
+            if not isinstance(total_loss, torch.Tensor):
+                continue
 
             epoch_losses.append(total_loss.item())
 
-            # Backpropagate combined loss
             self.optimizer.zero_grad()
-            if self.config.use_amp and self.config.scaler is not None:
+            if self.config.use_amp and self.config.scaler:
                 self.config.scaler.scale(total_loss).backward()
                 if self.config.max_grad_norm > 0:
                     self.config.scaler.unscale_(self.optimizer)
@@ -717,79 +745,35 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
 
-            # Get current LR *before* scheduler steps to log the correct value for the current step
             current_lr = self.optimizer.param_groups[0]['lr']
-
-            if self.scheduler is not None:
+            if self.scheduler:
                 self.scheduler.step()
             
-            # Update metrics
             step_time = time.time() - step_start
             self.metrics.update(
                 train_loss=total_loss.item(),
                 learning_rate=current_lr,
                 step_time=step_time
             )
-            
 
-            # Logging (only on rank 0 if distributed)
-            if (not self.is_distributed or dist.get_rank() == 0) and \
-               self.metrics.total_steps % self.config.log_every == 0:
+            if (not self.is_distributed or dist.get_rank() == 0) and self.metrics.total_steps % self.config.log_every == 0:
                 avg_step_time = self.metrics.get_avg_step_time()
                 loss_ma = self.metrics.get_loss_moving_average()
-                loss_var = self.metrics.get_loss_variance()
-                log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Rank {dist.get_rank() if self.is_distributed else 0}, "
-                log_str += f"Total Loss: {total_loss.item():.4f} (MA: {loss_ma:.4f}, Var: {loss_var:.4f}), "
-                for task_name, loss_value in individual_losses.items():
-                    log_str += f"{task_name}: {loss_value:.4f}, "
-
-                log_str += f"LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
+                log_str = f"Epoch {epoch+1}, Step {self.metrics.total_steps}, Total Loss: {total_loss.item():.4f} (MA: {loss_ma:.4f}), LR: {current_lr:.6f}, Step Time: {avg_step_time:.3f}s"
                 print(log_str)
 
-            # Evaluation, saving, and inference block (runs on rank 0)
             if (not self.is_distributed or dist.get_rank() == 0):
-                # Evaluation
-                if val_loaders is not None and self.metrics.total_steps % self.config.eval_every == 0:
+                if val_loaders and self.metrics.total_steps % self.config.eval_every == 0:
                     val_loss, cocktail_party_metrics = self.evaluate(val_loaders, task_configs)
                     self.metrics.update(val_loss=val_loss, cocktail_party_metrics=cocktail_party_metrics)
-
                     is_best = val_loss < self.metrics.best_val_loss
                     print(f"Validation Loss: {val_loss:.4f} {'(Best!)' if is_best else ''}")
-                    if cocktail_party_metrics:
-                        log_str = "Overall Cocktail Party Metrics: "
-                        for k, v in cocktail_party_metrics.items():
-                            log_str += f"{k}: {v:.4f}, "
-                        print(log_str)
-
                     if is_best:
-                        self.save_checkpoint(self.metrics.total_steps, is_best=True)
+                        self.save_checkpoint(self.metrics.total_steps, train_loaders, is_best=True)
 
-                    # Plateau detection logic
-                    improved = False
-                    if self.config.plateau_mode == 'min':
-                        if val_loss < self.plateau_best_metric_val - self.config.plateau_threshold:
-                            improved = True
-                    else: # max mode
-                        if val_loss > self.plateau_best_metric_val + self.config.plateau_threshold:
-                            improved = True
-
-                    if improved:
-                        self.plateau_best_metric_val = val_loss
-                        self.plateau_patience_counter = 0
-                        print(f"Metric improved to {val_loss:.4f}. Resetting plateau patience.")
-                    else:
-                        self.plateau_patience_counter += 1
-                        print(f"Metric did not improve. Plateau patience: {self.plateau_patience_counter}/{self.config.plateau_patience}")
-
-                    if self.plateau_patience_counter >= self.config.plateau_patience:
-                        print("Plateau detected! Consider stopping training or adjusting learning rate manually.")
-                        self.plateau_patience_counter = 0
-
-                # Regular checkpoint saving
                 if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_every == 0:
-                    self.save_checkpoint(self.metrics.total_steps)
+                    self.save_checkpoint(self.metrics.total_steps, train_loaders)
 
-                # Save training logs to JSON
                 if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_logs_json_every == 0:
                     logs_dir = Path(self.config.checkpoint_dir) / "training_logs"
                     logs_dir.mkdir(exist_ok=True)
@@ -842,98 +826,57 @@ class Trainer:
     ):
         """Main training loop."""
         start_epoch = 0
+        batch_to_resume = 0
         
-        # Use config setting if not explicitly provided
         if resume_from_checkpoint is None:
-            resume_from_checkpoint = getattr(self.config, 'auto_resume', True)
+            resume_from_checkpoint = self.config.auto_resume
+
+        # Initialize scheduler here so it can be loaded from checkpoint
+        self.steps_per_epoch = max(len(loader) for loader in train_loaders.values())
+        total_steps = self.steps_per_epoch * self.config.num_epochs
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=total_steps, eta_min=0)
         
-        # Check for existing checkpoint to resume from
         if resume_from_checkpoint:
             latest_checkpoint = self.find_latest_checkpoint()
             if latest_checkpoint:
                 try:
                     loaded_step = self.load_checkpoint(latest_checkpoint)
-                    # Calculate which epoch and batch we should resume from
-                    if hasattr(self, 'dataset_state') and 'current_epoch' in self.dataset_state:
-                        start_epoch = self.dataset_state['current_epoch']
-                        print(f"Resuming training from step {loaded_step}, epoch {start_epoch + 1}")
-                    else:
-                        print(f"Resuming training from step {loaded_step}")
+                    if hasattr(self, 'dataset_state'):
+                        start_epoch = self.dataset_state.get('current_epoch', 0)
+                        batch_to_resume = self.dataset_state.get('current_batch', 0) + 1
+
+                        if 'sampler_states' in self.dataset_state:
+                            for name, state in self.dataset_state['sampler_states'].items():
+                                if name in train_loaders and hasattr(train_loaders[name].sampler, 'load_state_dict'):
+                                    train_loaders[name].sampler.load_state_dict(state)
+                                    print(f"Loaded sampler state for '{name}'.")
+
+                        print(f"Resuming training from step {loaded_step}, epoch {start_epoch + 1}, batch {batch_to_resume}")
                 except Exception as e:
                     print(f"Failed to load checkpoint {latest_checkpoint}: {e}")
-                    print("Starting training from scratch...")
             else:
-                print("No existing checkpoints found. Starting training from scratch...")
-        
-        print(f"Starting training for {self.config.num_epochs} epochs...")
-
-        if self.is_distributed and dist.get_world_size() > 1:
-            # Re-wrap dataloaders with DistributedSampler if in DDP mode
-            for task, loader in train_loaders.items():
-                sampler = DistributedSampler(loader.dataset, shuffle=True, num_replicas=dist.get_world_size(), rank=dist.get_rank())
-                train_loaders[task] = DataLoader(
-                    loader.dataset, batch_size=loader.batch_size, sampler=sampler,
-                    num_workers=getattr(loader, 'num_workers', 0), pin_memory=getattr(loader, 'pin_memory', False),
-                    collate_fn=loader.collate_fn
-                )
-            if val_loaders:
-                for task, loader in val_loaders.items():
-                    sampler = DistributedSampler(loader.dataset, shuffle=False, num_replicas=dist.get_world_size(), rank=dist.get_rank())
-                    val_loaders[task] = DataLoader(
-                        loader.dataset, batch_size=loader.batch_size, sampler=sampler,
-                        num_workers=getattr(loader, 'num_workers', 0), pin_memory=getattr(loader, 'pin_memory', False),
-                        collate_fn=loader.collate_fn
-                    )
-
-        # Calculate steps_per_epoch based on the largest dataloader
-        self.steps_per_epoch = max(len(loader) for loader in train_loaders.values())
-        if not self.is_distributed or dist.get_rank() == 0:
-            print(f"Calculated steps_per_epoch: {self.steps_per_epoch}")
-
-        total_steps = self.steps_per_epoch * self.config.num_epochs
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=total_steps, eta_min=0
-        )
-        if not self.is_distributed or dist.get_rank() == 0:
-            print(f"Scheduler initialized with T_max = {total_steps} for a single decay.")
-
-        # Initial evaluation (only if starting from scratch)
-        if start_epoch == 0 and val_loaders and (not self.is_distributed or dist.get_rank() == 0):
-            initial_val_loss, initial_cocktail_metrics = self.evaluate(val_loaders, task_configs)
-            self.metrics.update(val_loss=initial_val_loss, cocktail_party_metrics=initial_cocktail_metrics)
-            print(f"Initial validation loss: {initial_val_loss:.4f}")
-            if initial_cocktail_metrics:
-                log_str = "Initial cocktail party metrics: "
-                for k, v in initial_cocktail_metrics.items():
-                    log_str += f"{k}: {v:.4f}, "
-                print(log_str)
+                print("No existing checkpoints found. Starting fresh.")
 
         try:
             for epoch in range(start_epoch, self.config.num_epochs):
-                if self.is_distributed and dist.get_world_size() > 1:
+                if self.is_distributed:
                     for loader in train_loaders.values():
-                        loader.sampler.set_epoch(epoch)
-
-                self.train_epoch(train_loaders, val_loaders, epoch, task_configs)
+                        if hasattr(loader.sampler, 'set_epoch'):
+                            loader.sampler.set_epoch(epoch)
                 
-                self.save_checkpoint(self.metrics.total_steps)
-        
+                self.train_epoch(train_loaders, val_loaders, epoch, task_configs, batch_to_resume)
+                batch_to_resume = 0  # Reset for subsequent epochs
+
         except KeyboardInterrupt:
-            print("\nTraining interrupted by user.")
-        
-        except Exception as e:
-            print(f"\nTraining failed with error: {e}")
-            raise
+            print("\nTraining interrupted. Saving final checkpoint...")
         
         finally:
-            # Save final metrics (rank 0 guarded)
             if not self.is_distributed or dist.get_rank() == 0:
-                metrics_path = os.path.join(
-                    self.config.checkpoint_dir,
-                    'training_metrics.pt' # rank 0's metrics
-                )
-                self.metrics.save_metrics(metrics_path)
-                print(f"Training metrics saved (Rank 0): {metrics_path}")
+                print("Saving final checkpoint and metrics...")
+                self.save_checkpoint(self.metrics.total_steps, train_loaders)
+                metrics_path = Path(self.config.checkpoint_dir) / 'training_metrics.json'
+                self.metrics.save_metrics_json(str(metrics_path))
+                print(f"Final metrics saved to {metrics_path}")
     
     def plot_training_curves(self, save_path: Optional[str] = None):
         """Plot training curves."""

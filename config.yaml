@@ -1,4 +1,5 @@
 data:
+  dataset_cache_dir: /data/dataset
   dataset_config: en
   dataset_name: allenai/c4
   max_eval_tokens: 50000
@@ -48,7 +49,7 @@ tasks:
 training:
   auto_resume: true
   batch_size: null
-  checkpoint_dir: checkpoints
+  checkpoint_dir: /data/checkpoints
   epochs: 3
   eval_every: 200
   learning_rate: 3.0e-05

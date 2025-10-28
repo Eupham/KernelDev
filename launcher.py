@@ -27,11 +27,26 @@ app = modal.App(
     secrets=[modal.Secret.from_local_environ(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])],
 )
 
-@app.function(gpu="h100", timeout=86400, scaledown_window=300)
+# --- Modal Storage Volume ---
+# We define a persistent storage volume for checkpoints and datasets.
+# This avoids re-downloading the dataset on every run.
+volume = modal.Volume.from_name("kernel-dev-storage", create_if_missing=True)
+
+
+@app.function(
+    gpu="h100",
+    timeout=86400,
+    scaledown_window=300,
+    volumes={"/data": volume},  # Mount the volume at /data
+)
 def run_training(config: dict):
     """
     This function runs the training script in a remote Modal container.
     """
+    # Reload the volume to ensure we have the latest state from previous runs
+    volume.reload()
+    print("Modal volume reloaded. Current state is available.")
+
     print(f"--- Starting training run with optimized kernel ---")
 
     # The config is passed in as an argument, so we write it to a file
@@ -63,6 +78,12 @@ def run_training(config: dict):
         print(line, end="")
 
     return_code = process.wait()
+
+    # Commit changes to the volume to persist them
+    print("Committing changes to the modal volume...")
+    volume.commit()
+    print("Changes committed.")
+
     if return_code != 0:
         print(f"Training script exited with non-zero code: {return_code}")
         sys.exit(return_code)
