@@ -170,7 +170,7 @@ def print_gpu_info():
         print("CUDA not available!")
 
 
-def start_actual_training(cli_args, volume=None):
+def start_actual_training(cli_args):
     """
     Encapsulates the actual training setup and execution.
     `cli_args` can be an argparse.Namespace object or a compatible dict/object.
@@ -387,8 +387,7 @@ def start_actual_training(cli_args, volume=None):
     trainer = create_trainer(
         model=model,
         config=training_config,
-        data_builder=data_builder,
-        volume=volume
+        data_builder=data_builder
     )
     
     # Initial evaluation (only if no checkpoint found)

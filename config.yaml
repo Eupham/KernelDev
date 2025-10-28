@@ -61,7 +61,7 @@ training:
   plateau_patience: 10
   plateau_threshold: 0.0001
   precision: bf16
-  save_every: 1000
+  save_every: 500
   save_logs_json_every: 500
   scheduler_T0_epoch_fraction: 0.1
   scheduler_T_mult: 1
