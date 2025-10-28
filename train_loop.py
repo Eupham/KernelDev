@@ -534,6 +534,11 @@ class Trainer:
             # Separate tensors from metadata
             model_state_dict = model_to_save.state_dict()
 
+            # Handle tied weights for safetensors
+            if 'head.weight' in model_state_dict and 'token_emb.weight' in model_state_dict:
+                if torch.all(model_state_dict['head.weight'] == model_state_dict['token_emb.weight']):
+                    del model_state_dict['token_emb.weight']
+
             metadata = {
                 'step': step,
                 'optimizer_state_dict': self.optimizer.state_dict(),
@@ -644,7 +649,7 @@ class Trainer:
         # Load model weights
         state_dict = load_file(model_path, device=self.config.device)
         model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
-        model_to_load.load_state_dict(state_dict)
+        model_to_load.load_state_dict(state_dict, strict=False)
 
         if 'optimizer_state_dict' in metadata and self.optimizer:
             self.optimizer.load_state_dict(metadata['optimizer_state_dict'])
