@@ -30,6 +30,7 @@ import os
 import json
 import math
 from pathlib import Path
+from safetensors.torch import save_file, load_file
 
 # =============================================================================
 # Configuration Classes
@@ -957,7 +958,10 @@ class Trainer:
                     for loader in train_loaders.values():
                         loader.sampler.set_epoch(epoch)
 
-                self.train_epoch(train_loaders, val_loaders, epoch, task_configs)
+                self.train_epoch(train_loaders, val_loaders, epoch, task_configs, batch_to_resume=batch_to_resume)
+
+                # After each epoch, reset the batch_to_resume to 0 for the next epoch
+                batch_to_resume = 0
 
                 self.save_checkpoint(self.metrics.total_steps, train_loaders)
 
