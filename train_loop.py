@@ -30,7 +30,6 @@ import os
 import json
 import math
 from pathlib import Path
-from safetensors.torch import save_file, load_file
 
 # =============================================================================
 # Configuration Classes
@@ -518,60 +517,59 @@ class Trainer:
 
     
     def save_checkpoint(self, step: int, train_loaders: Dict[str, DataLoader], is_best: bool = False):
-        """Save model checkpoint with rotation to keep only the 2 most recent."""
+        """Save model checkpoint with rotation to keep only 2 most recent."""
         if not self.is_distributed or dist.get_rank() == 0:
             model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
             
+            model_state_dict = model_to_save.state_dict()
+            if 'head.weight' in model_state_dict and 'token_emb.weight' in model_state_dict:
+                if torch.all(model_state_dict['head.weight'] == model_state_dict['token_emb.weight']):
+                    del model_state_dict['token_emb.weight']
+
             sampler_states = {
                 name: loader.sampler.state_dict()
                 for name, loader in train_loaders.items()
                 if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'state_dict')
             }
 
-            dataset_state = getattr(self, 'dataset_state', {})
-            dataset_state['sampler_states'] = sampler_states
-
-            # Separate tensors from metadata
-            model_state_dict = model_to_save.state_dict()
-
-            # Handle tied weights for safetensors
-            if 'head.weight' in model_state_dict and 'token_emb.weight' in model_state_dict:
-                if torch.all(model_state_dict['head.weight'] == model_state_dict['token_emb.weight']):
-                    del model_state_dict['token_emb.weight']
+            training_state = {
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+                'sampler_states': sampler_states,
+            }
 
             metadata = {
                 'step': step,
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
                 'metrics': self.metrics.__dict__,
                 'config': self.config.__dict__,
-                'dataset_state': dataset_state,
+                'dataset_state': getattr(self, 'dataset_state', {}),
             }
 
-            # Define file paths
             checkpoint_dir = Path(self.config.checkpoint_dir) / f'step_{step}'
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
             model_path = checkpoint_dir / 'model.safetensors'
+            training_state_path = checkpoint_dir / 'training_state.pt'
             metadata_path = checkpoint_dir / 'metadata.json'
 
-            # Save model weights and metadata
             save_file(model_state_dict, model_path)
+            torch.save(training_state, training_state_path)
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=4)
 
             print(f"Checkpoint saved by Rank 0 to {checkpoint_dir}")
 
-            # Manage checkpoint rotation
             self._cleanup_old_checkpoints()
 
             if is_best:
                 best_dir = Path(self.config.checkpoint_dir) / 'best'
                 best_dir.mkdir(parents=True, exist_ok=True)
                 best_model_path = best_dir / 'model.safetensors'
+                best_training_state_path = best_dir / 'training_state.pt'
                 best_metadata_path = best_dir / 'metadata.json'
 
                 save_file(model_state_dict, best_model_path)
+                torch.save(training_state, best_training_state_path)
                 with open(best_metadata_path, 'w') as f:
                     json.dump(metadata, f, indent=4)
                 print(f"Best checkpoint saved to {best_dir}")
@@ -585,79 +583,86 @@ class Trainer:
         """Keep only the max_checkpoints most recent regular checkpoints."""
         checkpoint_dir = Path(self.config.checkpoint_dir)
         
-        # Find all checkpoint directories (e.g., 'step_1000', 'step_2000')
-        checkpoint_dirs = []
-        for dir_path in checkpoint_dir.iterdir():
-            if dir_path.is_dir() and dir_path.name.startswith('step_'):
-                try:
-                    step_num = int(dir_path.name.split('_')[-1])
-                    checkpoint_dirs.append((step_num, dir_path))
-                except (ValueError, IndexError):
-                    continue
+        # Find all regular checkpoint files (not best_checkpoint.pt)
+        checkpoint_files = []
+        for file_path in checkpoint_dir.glob('checkpoint_step_*.pt'):
+            try:
+                # Extract step number from filename
+                step_num = int(file_path.stem.split('_')[-1])
+                checkpoint_files.append((step_num, file_path))
+            except (ValueError, IndexError):
+                continue
         
         # Sort by step number, newest first
-        checkpoint_dirs.sort(key=lambda x: x[0], reverse=True)
+        checkpoint_files.sort(key=lambda x: x[0], reverse=True)
         
         # Remove all but the max_checkpoints most recent
         max_checkpoints = getattr(self.config, 'max_checkpoints', 2)
-        for _, dir_path in checkpoint_dirs[max_checkpoints:]:
+        for _, file_path in checkpoint_files[max_checkpoints:]:
             try:
-                # Recursively delete the directory
-                import shutil
-                shutil.rmtree(dir_path)
-                print(f"Removed old checkpoint directory: {dir_path}")
-            except Exception as e:
-                print(f"Error removing old checkpoint {dir_path}: {e}")
+                file_path.unlink()
+                print(f"Removed old checkpoint: {file_path}")
+            except FileNotFoundError:
+                pass  # File already removed
     
     def find_latest_checkpoint(self) -> Optional[str]:
-        """Find the most recent checkpoint directory."""
+        """Find the most recent checkpoint file."""
         checkpoint_dir = Path(self.config.checkpoint_dir)
         
         if not checkpoint_dir.exists():
             return None
         
-        # Find all checkpoint directories
-        checkpoint_dirs = []
-        for dir_path in checkpoint_dir.iterdir():
-            if dir_path.is_dir() and dir_path.name.startswith('step_'):
-                try:
-                    step_num = int(dir_path.name.split('_')[-1])
-                    checkpoint_dirs.append((step_num, dir_path))
-                except (ValueError, IndexError):
-                    continue
+        # Find all regular checkpoint files
+        checkpoint_files = []
+        for file_path in checkpoint_dir.glob('checkpoint_step_*.pt'):
+            try:
+                step_num = int(file_path.stem.split('_')[-1])
+                checkpoint_files.append((step_num, file_path))
+            except (ValueError, IndexError):
+                continue
         
-        if not checkpoint_dirs:
+        if not checkpoint_files:
             return None
         
-        # Return the path to the most recent checkpoint directory
-        checkpoint_dirs.sort(key=lambda x: x[0], reverse=True)
-        return str(checkpoint_dirs[0][1])
+        # Return the most recent checkpoint
+        checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+        return str(checkpoint_files[0][1])
     
-    def load_checkpoint(self, checkpoint_dir: str):
+    def load_checkpoint(self, checkpoint_dir: str, train_loaders: Dict[str, DataLoader]):
         """Load model checkpoint from a directory."""
         checkpoint_dir = Path(checkpoint_dir)
         model_path = checkpoint_dir / 'model.safetensors'
+        training_state_path = checkpoint_dir / 'training_state.pt'
         metadata_path = checkpoint_dir / 'metadata.json'
 
-        if not model_path.exists() or not metadata_path.exists():
+        if not model_path.exists() or not metadata_path.exists() or not training_state_path.exists():
             raise FileNotFoundError(f"Checkpoint not found in {checkpoint_dir}")
 
         # Load metadata
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
 
+        # Load training state
+        training_state = torch.load(training_state_path, map_location=self.config.device)
+
         # Load model weights
         state_dict = load_file(model_path, device=self.config.device)
         model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
         model_to_load.load_state_dict(state_dict, strict=False)
 
-        if 'optimizer_state_dict' in metadata and self.optimizer:
-            self.optimizer.load_state_dict(metadata['optimizer_state_dict'])
+        if 'optimizer_state_dict' in training_state and self.optimizer:
+            self.optimizer.load_state_dict(training_state['optimizer_state_dict'])
             print("Optimizer state loaded.")
 
-        if 'scheduler_state_dict' in metadata and self.scheduler:
-            self.scheduler.load_state_dict(metadata['scheduler_state_dict'])
+        if 'scheduler_state_dict' in training_state and self.scheduler:
+            self.scheduler.load_state_dict(training_state['scheduler_state_dict'])
             print("Scheduler state loaded.")
+
+        if 'sampler_states' in training_state:
+            for name, state in training_state['sampler_states'].items():
+                if name in train_loaders and hasattr(train_loaders[name].sampler, 'load_state_dict'):
+                    train_loaders[name].sampler.load_state_dict(state)
+                    print(f"Loaded sampler state for '{name}'.")
 
         for key, value in metadata['metrics'].items():
             setattr(self.metrics, key, value)
@@ -683,13 +688,6 @@ class Trainer:
         epoch_losses = []
 
         train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
-        if batch_to_resume > 0:
-            for task_name, task_iter in train_iters.items():
-                for _ in range(batch_to_resume):
-                    try:
-                        next(task_iter)
-                    except StopIteration:
-                        break
 
         if not hasattr(self, 'dataset_state'):
             self.dataset_state = {}
@@ -788,7 +786,7 @@ class Trainer:
                         print(log_str)
 
                     if is_best:
-                        self.save_checkpoint(self.metrics.total_steps, train_loaders, is_best=True)
+                        self.save_checkpoint(self.metrics.total_steps, is_best=True)
 
                     # Plateau detection logic
                     improved = False
@@ -813,7 +811,7 @@ class Trainer:
 
                 # Regular checkpoint saving
                 if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_every == 0:
-                    self.save_checkpoint(self.metrics.total_steps, train_loaders)
+                    self.save_checkpoint(self.metrics.total_steps)
 
                 # Save training logs to JSON
                 if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_logs_json_every == 0:
@@ -882,16 +880,10 @@ class Trainer:
             latest_checkpoint = self.find_latest_checkpoint()
             if latest_checkpoint:
                 try:
-                    loaded_step = self.load_checkpoint(latest_checkpoint)
+                    loaded_step = self.load_checkpoint(latest_checkpoint, train_loaders)
                     if hasattr(self, 'dataset_state'):
                         start_epoch = self.dataset_state.get('current_epoch', 0)
                         batch_to_resume = self.dataset_state.get('current_batch', 0) + 1
-
-                        if 'sampler_states' in self.dataset_state:
-                            for name, state in self.dataset_state['sampler_states'].items():
-                                if name in train_loaders and hasattr(train_loaders[name].sampler, 'load_state_dict'):
-                                    train_loaders[name].sampler.load_state_dict(state)
-                                    print(f"Loaded sampler state for '{name}'.")
 
                         print(f"Resuming training from step {loaded_step}, epoch {start_epoch + 1}, batch {batch_to_resume}")
                 except Exception as e:
@@ -899,29 +891,75 @@ class Trainer:
             else:
                 print("No existing checkpoints found. Starting fresh.")
 
+        print(f"Starting training for {self.config.num_epochs} epochs...")
+
+        if self.is_distributed and dist.get_world_size() > 1:
+            # Re-wrap dataloaders with DistributedSampler if in DDP mode
+            for task, loader in train_loaders.items():
+                sampler = DistributedSampler(loader.dataset, shuffle=True, num_replicas=dist.get_world_size(), rank=dist.get_rank())
+                train_loaders[task] = DataLoader(
+                    loader.dataset, batch_size=loader.batch_size, sampler=sampler,
+                    num_workers=getattr(loader, 'num_workers', 0), pin_memory=getattr(loader, 'pin_memory', False),
+                    collate_fn=loader.collate_fn
+                )
+            if val_loaders:
+                for task, loader in val_loaders.items():
+                    sampler = DistributedSampler(loader.dataset, shuffle=False, num_replicas=dist.get_world_size(), rank=dist.get_rank())
+                    val_loaders[task] = DataLoader(
+                        loader.dataset, batch_size=loader.batch_size, sampler=sampler,
+                        num_workers=getattr(loader, 'num_workers', 0), pin_memory=getattr(loader, 'pin_memory', False),
+                        collate_fn=loader.collate_fn
+                    )
+
+        # Calculate steps_per_epoch based on the largest dataloader
+        self.steps_per_epoch = max(len(loader) for loader in train_loaders.values())
+        if not self.is_distributed or dist.get_rank() == 0:
+            print(f"Calculated steps_per_epoch: {self.steps_per_epoch}")
+
+        total_steps = self.steps_per_epoch * self.config.num_epochs
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=total_steps, eta_min=0
+        )
+        if not self.is_distributed or dist.get_rank() == 0:
+            print(f"Scheduler initialized with T_max = {total_steps} for a single decay.")
+
+        # Initial evaluation (only if starting from scratch)
+        if start_epoch == 0 and val_loaders and (not self.is_distributed or dist.get_rank() == 0):
+            initial_val_loss, initial_cocktail_metrics = self.evaluate(val_loaders, task_configs)
+            self.metrics.update(val_loss=initial_val_loss, cocktail_party_metrics=initial_cocktail_metrics)
+            print(f"Initial validation loss: {initial_val_loss:.4f}")
+            if initial_cocktail_metrics:
+                log_str = "Initial cocktail party metrics: "
+                for k, v in initial_cocktail_metrics.items():
+                    log_str += f"{k}: {v:.4f}, "
+                print(log_str)
+
         try:
             for epoch in range(start_epoch, self.config.num_epochs):
-                if self.is_distributed:
+                if self.is_distributed and dist.get_world_size() > 1:
                     for loader in train_loaders.values():
-                        if hasattr(loader.sampler, 'set_epoch'):
-                            loader.sampler.set_epoch(epoch)
+                        loader.sampler.set_epoch(epoch)
 
-                self.train_epoch(train_loaders, val_loaders, epoch, task_configs, batch_to_resume)
-                batch_to_resume = 0  # Reset for subsequent epochs
+                self.train_epoch(train_loaders, val_loaders, epoch, task_configs)
 
-                if not self.is_distributed or dist.get_rank() == 0:
-                    self.save_checkpoint(self.metrics.total_steps, train_loaders)
+                self.save_checkpoint(self.metrics.total_steps)
 
         except KeyboardInterrupt:
-            print("\nTraining interrupted. Saving final checkpoint...")
+            print("\nTraining interrupted by user.")
+
+        except Exception as e:
+            print(f"\nTraining failed with error: {e}")
+            raise
         
         finally:
+            # Save final metrics (rank 0 guarded)
             if not self.is_distributed or dist.get_rank() == 0:
-                print("Saving final checkpoint and metrics...")
-                self.save_checkpoint(self.metrics.total_steps, train_loaders)
-                metrics_path = Path(self.config.checkpoint_dir) / 'training_metrics.json'
-                self.metrics.save_metrics_json(str(metrics_path))
-                print(f"Final metrics saved to {metrics_path}")
+                metrics_path = os.path.join(
+                    self.config.checkpoint_dir,
+                    'training_metrics.pt' # rank 0's metrics
+                )
+                self.metrics.save_metrics(metrics_path)
+                print(f"Training metrics saved (Rank 0): {metrics_path}")
     
     def plot_training_curves(self, save_path: Optional[str] = None):
         """Plot training curves."""
