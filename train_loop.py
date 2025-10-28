@@ -689,6 +689,23 @@ class Trainer:
 
         train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
 
+        # Fast-forward dataloaders if resuming from a checkpoint mid-epoch
+        if batch_to_resume > 0:
+            if not self.is_distributed or dist.get_rank() == 0:
+                print(f"Fast-forwarding dataloaders to batch index {batch_to_resume}...")
+
+            for i in range(batch_to_resume):
+                for task_name, task_iter in train_iters.items():
+                    try:
+                        next(task_iter)
+                    except StopIteration:
+                        # This handles cases where one dataloader is shorter than others.
+                        # Re-initialize the iterator and consume one batch to keep all iterators in sync.
+                        if not self.is_distributed or dist.get_rank() == 0:
+                            print(f"Warning: DataLoader for task '{task_name}' re-initialized during fast-forward.")
+                        train_iters[task_name] = iter(train_loaders[task_name])
+                        next(train_iters[task_name])
+
         if not hasattr(self, 'dataset_state'):
             self.dataset_state = {}
         
@@ -786,7 +803,7 @@ class Trainer:
                         print(log_str)
 
                     if is_best:
-                        self.save_checkpoint(self.metrics.total_steps, is_best=True)
+                        self.save_checkpoint(self.metrics.total_steps, train_loaders, is_best=True)
 
                     # Plateau detection logic
                     improved = False
@@ -811,7 +828,7 @@ class Trainer:
 
                 # Regular checkpoint saving
                 if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_every == 0:
-                    self.save_checkpoint(self.metrics.total_steps)
+                    self.save_checkpoint(self.metrics.total_steps, train_loaders)
 
                 # Save training logs to JSON
                 if self.metrics.total_steps > 0 and self.metrics.total_steps % self.config.save_logs_json_every == 0:
@@ -942,7 +959,7 @@ class Trainer:
 
                 self.train_epoch(train_loaders, val_loaders, epoch, task_configs)
 
-                self.save_checkpoint(self.metrics.total_steps)
+                self.save_checkpoint(self.metrics.total_steps, train_loaders)
 
         except KeyboardInterrupt:
             print("\nTraining interrupted by user.")
