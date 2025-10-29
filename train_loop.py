@@ -544,6 +544,9 @@ class Trainer:
             # Prepare config for JSON serialization by removing non-serializable objects
             config_to_save = self.config.__dict__.copy()
             config_to_save.pop('scaler', None)
+            # Convert torch.device to string for JSON serialization
+            if 'device' in config_to_save and isinstance(config_to_save['device'], torch.device):
+                config_to_save['device'] = str(config_to_save['device'])
 
             metadata = {
                 'step': step,
@@ -588,52 +591,60 @@ class Trainer:
         
     def _cleanup_old_checkpoints(self):
         """Keep only the max_checkpoints most recent regular checkpoints."""
+        import shutil
         checkpoint_dir = Path(self.config.checkpoint_dir)
         
-        # Find all regular checkpoint files (not best_checkpoint.pt)
-        checkpoint_files = []
-        for file_path in checkpoint_dir.glob('checkpoint_step_*.pt'):
+        # Find all regular checkpoint directories (e.g., "step_1000")
+        checkpoint_dirs = []
+        for dir_path in checkpoint_dir.glob('step_*'):
+            if not dir_path.is_dir():
+                continue
             try:
-                # Extract step number from filename
-                step_num = int(file_path.stem.split('_')[-1])
-                checkpoint_files.append((step_num, file_path))
+                step_num = int(dir_path.name.split('_')[-1])
+                checkpoint_dirs.append((step_num, dir_path))
             except (ValueError, IndexError):
                 continue
         
         # Sort by step number, newest first
-        checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+        checkpoint_dirs.sort(key=lambda x: x[0], reverse=True)
         
         # Remove all but the max_checkpoints most recent
         max_checkpoints = getattr(self.config, 'max_checkpoints', 2)
-        for _, file_path in checkpoint_files[max_checkpoints:]:
+        for _, dir_path in checkpoint_dirs[max_checkpoints:]:
             try:
-                file_path.unlink()
-                print(f"Removed old checkpoint: {file_path}")
-            except FileNotFoundError:
-                pass  # File already removed
+                shutil.rmtree(dir_path)
+                print(f"Removed old checkpoint directory: {dir_path}")
+            except OSError as e:
+                print(f"Error removing old checkpoint {dir_path}: {e}")
     
     def find_latest_checkpoint(self) -> Optional[str]:
-        """Find the most recent checkpoint file."""
+        """Find the path to the most recent checkpoint directory."""
         checkpoint_dir = Path(self.config.checkpoint_dir)
         
         if not checkpoint_dir.exists():
             return None
         
-        # Find all regular checkpoint files
-        checkpoint_files = []
-        for file_path in checkpoint_dir.glob('checkpoint_step_*.pt'):
+        # Find all regular checkpoint directories
+        checkpoint_dirs = []
+        for dir_path in checkpoint_dir.glob('step_*'):
+            if not dir_path.is_dir():
+                continue
             try:
-                step_num = int(file_path.stem.split('_')[-1])
-                checkpoint_files.append((step_num, file_path))
+                step_num = int(dir_path.name.split('_')[-1])
+                checkpoint_dirs.append((step_num, dir_path))
             except (ValueError, IndexError):
                 continue
         
-        if not checkpoint_files:
+        if not checkpoint_dirs:
+            # Fallback for "best" checkpoint if no regular checkpoints exist
+            best_dir = checkpoint_dir / 'best'
+            if best_dir.exists():
+                return str(best_dir)
             return None
         
-        # Return the most recent checkpoint
-        checkpoint_files.sort(key=lambda x: x[0], reverse=True)
-        return str(checkpoint_files[0][1])
+        # Return the path of the most recent checkpoint directory
+        checkpoint_dirs.sort(key=lambda x: x[0], reverse=True)
+        return str(checkpoint_dirs[0][1])
     
     def load_checkpoint(self, checkpoint_dir: str, train_loaders: Dict[str, DataLoader]):
         """Load model checkpoint from a directory."""
