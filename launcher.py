@@ -3,6 +3,7 @@ import os
 import sys
 import yaml
 import subprocess
+from pathlib import Path
 
 # --- Configuration ---
 CONFIG_FILE = "config.yaml"
@@ -15,7 +16,7 @@ image = (
         "apt-get update -y",
         "apt-get install -y software-properties-common build-essential",
         "pip install uv",
-        "uv pip install --system torch ninja datasets matplotlib triton pyyaml safetensors 'pyarrow==14.0.1' 'numpy<2'",
+        "uv pip install --system torch ninja datasets matplotlib triton pyyaml safensors 'pyarrow==14.0.1' 'numpy<2'",
     )
     .add_local_dir(".", remote_path="/root/KernelDev")
 )
@@ -27,7 +28,7 @@ app = modal.App(
     secrets=[modal.Secret.from_local_environ(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])],
 )
 
-volume = modal.Volume.from_name("kernel-dev-storage", create_if_missing=True)
+volume = modal.Volume.from_name("checkpoint-volume", create_if_missing=True)
 
 @app.function(
     gpu="h100",
@@ -41,6 +42,31 @@ def run_training(config: dict):
     """
     volume.reload()
     print(f"--- Starting training run with optimized kernel ---")
+
+    # Add the project directory to the Python path so we can import modules
+    sys.path.append("/root/KernelDev")
+
+    import json
+    from train_loop import Trainer, TrainingConfig
+
+    # Initialize a temporary trainer to find the latest checkpoint
+    temp_config = TrainingConfig(checkpoint_dir=config['training']['checkpoint_dir'])
+    temp_trainer = Trainer(model=None, config=temp_config, data_builder=None)
+    latest_checkpoint = temp_trainer.find_latest_checkpoint()
+
+    if latest_checkpoint:
+        print(f"Found checkpoint, loading config from: {latest_checkpoint}")
+        try:
+            with open(Path(latest_checkpoint) / 'metadata.json', 'r') as f:
+                metadata = json.load(f)
+            # Override the model config with the one from the checkpoint
+            config['model'] = metadata['config']['model']
+            # The vocab_size is not in the model dict, so manually set it.
+            # In a more robust system, this would also be in the checkpoint.
+            config['model']['vocab_size'] = 50257
+            print("Overrode current model config with checkpoint config.")
+        except (FileNotFoundError, KeyError) as e:
+            print(f"Could not load metadata from checkpoint, running with base config. Error: {e}")
 
     # The config is passed in as an argument, so we write it to a file
     # in the container for the training script to use.
@@ -106,6 +132,13 @@ def main():
     print(f"Original max_samples: {config.get('data', {}).get('max_samples')}")
     config['data']['max_samples'] = 500000
     print(f"Setting max_samples to {config['data']['max_samples']} for this run.")
+
+    # Define volume name and paths consistently
+    volume_name = "checkpoint-volume"
+    data_dir = "/data"
+    config['training']['checkpoint_dir'] = str(Path(data_dir) / "checkpoints")
+    config['data']['dataset_cache_dir'] = str(Path(data_dir) / "dataset")
+
 
     # 3. Run the remote function and wait for it to complete.
     print("\n" + "="*50)

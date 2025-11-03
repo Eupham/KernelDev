@@ -304,53 +304,59 @@ class Trainer:
         # Initialize distributed training
         init_distributed(self)
         
-        # Apply speed optimizations
-        self._apply_pytorch_optimizations()
+        # If a model is provided at initialization, apply optimizations immediately.
+        # Otherwise, the user is responsible for calling finalize_initialization later.
+        if self.model is not None:
+            self.finalize_initialization()
 
-    def _apply_pytorch_optimizations(self):
+    def finalize_initialization(self):
+        """Finalizes the model and optimizer setup."""
+        if self.model is None:
+            raise ValueError("Cannot finalize initialization without a model.")
+
+        self._enable_speed_optimizations()
+        self._finalize_model_setup()
+        self._initialize_optimizer()
+
+        print(f"Trainer initialized on device: {self.config.device}")
+        if self.model:
+            print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+
+    def _enable_speed_optimizations(self):
         """Apply PyTorch optimization flags for speed"""
         try:
-            # Enable cuDNN benchmark for consistent input sizes
             if torch.cuda.is_available():
                 torch.backends.cudnn.benchmark = True
-                
-                # Allow TF32 for speed on modern GPUs
                 if hasattr(torch.backends.cudnn, 'allow_tf32'):
                     torch.backends.cudnn.allow_tf32 = True
                 if hasattr(torch.backends.cuda, 'matmul'):
                     torch.backends.cuda.matmul.allow_tf32 = True
-                    
             if not self.is_distributed or dist.get_rank() == 0:
                 print("✓ PyTorch optimization flags enabled for speed")
         except Exception as e:
             if not self.is_distributed or dist.get_rank() == 0:
                 print(f"⚠ Could not apply all PyTorch optimizations: {e}")
 
+    def _finalize_model_setup(self):
+        """Moves model to device and wraps with DDP if needed."""
         if self.is_distributed and dist.get_world_size() > 1:
-            # self.config.device is set in init_distributed
             self.model.to(self.config.device)
-            # find_unused_parameters can be true if some outputs of the model are not used in loss calculation
             self.model = DDP(self.model, device_ids=[self.config.local_rank], output_device=self.config.local_rank, find_unused_parameters=False)
             print(f"Model moved to device: {self.config.device} and wrapped with DDP (world size: {dist.get_world_size()}).")
         else:
-            # self.config.device is set in init_distributed or by original logic
             self.model.to(self.config.device)
             print(f"Model moved to device: {self.config.device} (non-distributed or world_size=1).")
 
-        # Initialize optimizer
+    def _initialize_optimizer(self):
+        """Initializes the optimizer and scheduler."""
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
             fused=True
         )
-        
-        # Initialize learning rate scheduler
         self.initial_lr = self.config.learning_rate
         self.scheduler = None # Will be initialized in train()
-        
-        print(f"Trainer initialized on device: {self.config.device}")
-        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
     
     def warmup_lr(self, step: int) -> float:
         """Calculate learning rate with warmup."""
