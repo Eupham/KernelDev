@@ -660,16 +660,18 @@ class Trainer:
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
 
-        # Restore config from checkpoint, then convert device back to a torch.device object
+        # Restore config from checkpoint
         for key, value in metadata['config'].items():
             setattr(self.config, key, value)
-        self.config.device = torch.device(self.config.device)
 
-        # Load training state
+        # Load training state using the device string from the restored config
         training_state = torch.load(training_state_path, map_location=self.config.device)
 
-        # Load model weights
+        # Load model weights using the device string from the restored config
         state_dict = load_file(model_path, device=self.config.device)
+
+        # Now that all file loading is done, convert the device string to a torch.device object
+        self.config.device = torch.device(self.config.device)
         model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
         model_to_load.load_state_dict(state_dict, strict=False)
 
