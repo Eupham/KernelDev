@@ -93,7 +93,7 @@ def main():
         sys.exit(1)
 
     print(f"Original max_samples: {config.get('data', {}).get('max_samples')}")
-    config['data']['max_samples'] = 500000
+    config['data']['max_samples'] = 5000000
     print(f"Setting max_samples to {config['data']['max_samples']} for this run.")
 
     # 3. Run the remote function and wait for it to complete.
