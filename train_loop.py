@@ -722,24 +722,14 @@ class Trainer:
         start_time = time.time()
         epoch_losses = []
 
+        from itertools import islice
+
         train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
 
-        # Fast-forward dataloaders if resuming from a checkpoint mid-epoch
+        # Efficiently skip to the starting batch
         if batch_to_resume > 0:
-            if not self.is_distributed or dist.get_rank() == 0:
-                print(f"Fast-forwarding dataloaders to batch index {batch_to_resume}...")
-
-            for i in range(batch_to_resume):
-                for task_name, task_iter in train_iters.items():
-                    try:
-                        next(task_iter)
-                    except StopIteration:
-                        # This handles cases where one dataloader is shorter than others.
-                        # Re-initialize the iterator and consume one batch to keep all iterators in sync.
-                        if not self.is_distributed or dist.get_rank() == 0:
-                            print(f"Warning: DataLoader for task '{task_name}' re-initialized during fast-forward.")
-                        train_iters[task_name] = iter(train_loaders[task_name])
-                        next(train_iters[task_name])
+            for task_name, task_iter in train_iters.items():
+                train_iters[task_name] = islice(task_iter, batch_to_resume, None)
 
         if not hasattr(self, 'dataset_state'):
             self.dataset_state = {}
@@ -988,9 +978,14 @@ class Trainer:
 
         try:
             for epoch in range(start_epoch, self.config.num_epochs):
-                if self.is_distributed and dist.get_world_size() > 1:
-                    for loader in train_loaders.values():
-                        loader.sampler.set_epoch(epoch)
+                # Set the epoch for the samplers
+                for sampler in train_samplers.values():
+                    sampler.set_epoch(epoch)
+
+                # Reset the start index for all but the first epoch
+                if epoch > start_epoch:
+                    for sampler in train_samplers.values():
+                        sampler.set_start_index(0)
 
                 self.train_epoch(train_loaders, val_loaders, epoch, task_configs, batch_to_resume=batch_to_resume)
 
