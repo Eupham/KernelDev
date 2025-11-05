@@ -935,12 +935,13 @@ class Trainer:
 
         print(f"Starting training for {self.config.num_epochs} epochs...")
 
+        train_samplers = {}
         if self.is_distributed and dist.get_world_size() > 1:
             # Re-wrap dataloaders with DistributedSampler if in DDP mode
             for task, loader in train_loaders.items():
-                sampler = DistributedSampler(loader.dataset, shuffle=True, num_replicas=dist.get_world_size(), rank=dist.get_rank())
+                train_samplers[task] = DistributedSampler(loader.dataset, shuffle=True, num_replicas=dist.get_world_size(), rank=dist.get_rank())
                 train_loaders[task] = DataLoader(
-                    loader.dataset, batch_size=loader.batch_size, sampler=sampler,
+                    loader.dataset, batch_size=loader.batch_size, sampler=train_samplers[task],
                     num_workers=getattr(loader, 'num_workers', 0), pin_memory=getattr(loader, 'pin_memory', False),
                     collate_fn=loader.collate_fn
                 )
@@ -978,14 +979,9 @@ class Trainer:
 
         try:
             for epoch in range(start_epoch, self.config.num_epochs):
-                # Set the epoch for the samplers
-                for sampler in train_samplers.values():
-                    sampler.set_epoch(epoch)
-
-                # Reset the start index for all but the first epoch
-                if epoch > start_epoch:
+                if self.is_distributed:
                     for sampler in train_samplers.values():
-                        sampler.set_start_index(0)
+                        sampler.set_epoch(epoch)
 
                 self.train_epoch(train_loaders, val_loaders, epoch, task_configs, batch_to_resume=batch_to_resume)
 
