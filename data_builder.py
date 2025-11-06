@@ -510,6 +510,10 @@ class DataBuilder:
             except ValueError:
                 original_tokens = original_tokens_padded
 
+            # Filter out records that are too short
+            if len(original_tokens) < min_span_size + 20: # 20 is a buffer for context
+                continue
+
             # 2. Find [CLS] to separate task instructions from context
             cls_token = SPECIAL_TOKENS['[CLS]']
             try:
