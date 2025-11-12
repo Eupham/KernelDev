@@ -273,6 +273,12 @@ class GPTModel(nn.Module):
             span_starts = (x == span_start_id).nonzero()
             span_ends = (x == span_end_id).nonzero()
 
+            # Robustness check: Ensure equal numbers of start and end tokens
+            if span_starts.shape[0] != span_ends.shape[0]:
+                print(f"Warning: Mismatched span tokens found. Skipping cocktail party processing for this batch.")
+                # Return empty scores and zero loss to skip the batch
+                return torch.empty(0), torch.tensor(0.0, device=x.device)
+
             if span_starts.numel() == 0:
                 return torch.empty(0), torch.tensor(0.0, device=x.device)
 

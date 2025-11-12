@@ -521,15 +521,6 @@ class DataBuilder:
                 task_prefix = []
                 context_tokens = original_tokens
 
-            # Sanitize context by removing any pre-existing special tokens
-            special_ids_to_remove = {
-                SPECIAL_TOKENS['[MASK]'],
-                SPECIAL_TOKENS['[SPAN]'],
-                SPECIAL_TOKENS['[ES]'],
-                SPECIAL_TOKENS['[MASKQ]']
-            }
-            context_tokens = [tok for tok in context_tokens if tok not in special_ids_to_remove]
-
             # 3. Sample span only from context (not from task instructions)
             span_size = random.randint(min_span_size, max_span_size)
             if len(context_tokens) <= span_size:
