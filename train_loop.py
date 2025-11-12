@@ -554,6 +554,23 @@ class Trainer:
             if 'device' in config_to_save and isinstance(config_to_save['device'], torch.device):
                 config_to_save['device'] = str(config_to_save['device'])
 
+            # Ensure the model config is present
+            if 'model' not in config_to_save:
+                # If the model config isn't directly in the TrainingConfig,
+                # we need to get it from the model itself. This is a fallback.
+                if hasattr(model_to_save, 'config'):
+                    config_to_save['model'] = model_to_save.config
+                else:
+                    # As a last resort, create a dictionary of the model's key attributes.
+                    # This is not ideal but better than nothing.
+                    config_to_save['model'] = {
+                        'dim': model_to_save.dim,
+                        'n_layers': len(model_to_save.blocks),
+                        'n_heads': model_to_save.n_heads,
+                        'max_seq_len': model_to_save.max_seq_len,
+                        'vocab_size': model_to_save.token_emb.num_embeddings
+                    }
+
             metadata = {
                 'step': step,
                 'metrics': self.metrics.__dict__,
