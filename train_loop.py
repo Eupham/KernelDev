@@ -696,6 +696,32 @@ class Trainer:
         # Now that all file loading is done, convert the device string to a torch.device object
         self.config.device = torch.device(self.config.device)
         model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
+
+        # --- Checkpoint Migration Logic ---
+        current_vocab_size = model_to_load.token_emb.weight.size(0)
+
+        # Handle token embedding resizing
+        if 'token_emb.weight' in state_dict:
+            ckpt_vocab_size = state_dict['token_emb.weight'].size(0)
+            if current_vocab_size != ckpt_vocab_size:
+                print(f"Resizing token_emb from {ckpt_vocab_size} to {current_vocab_size}")
+                new_emb = model_to_load.token_emb.weight.data.clone()
+                # Copy the overlapping weights
+                copy_size = min(current_vocab_size, ckpt_vocab_size)
+                new_emb[:copy_size, :] = state_dict['token_emb.weight'][:copy_size, :]
+                state_dict['token_emb.weight'] = new_emb
+
+        # Handle output head resizing (due to weight tying, this uses the same logic)
+        if 'head.weight' in state_dict:
+            ckpt_vocab_size = state_dict['head.weight'].size(0)
+            if current_vocab_size != ckpt_vocab_size:
+                print(f"Resizing head.weight from {ckpt_vocab_size} to {current_vocab_size}")
+                new_head = model_to_load.head.weight.data.clone()
+                # Copy the overlapping weights
+                copy_size = min(current_vocab_size, ckpt_vocab_size)
+                new_head[:copy_size, :] = state_dict['head.weight'][:copy_size, :]
+                state_dict['head.weight'] = new_head
+
         model_to_load.load_state_dict(state_dict, strict=False)
 
         if 'optimizer_state_dict' in training_state and self.optimizer:
