@@ -61,9 +61,6 @@ def run_training(config: dict):
                 metadata = json.load(f)
             # Override the model config with the one from the checkpoint
             config['model'] = metadata['config']['model']
-            # The vocab_size is not in the model dict, so manually set it.
-            # In a more robust system, this would also be in the checkpoint.
-            config['model']['vocab_size'] = 50257
             print("Overrode current model config with checkpoint config.")
         except (FileNotFoundError, KeyError) as e:
             print(f"Could not load metadata from checkpoint, running with base config. Error: {e}")
