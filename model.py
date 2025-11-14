@@ -273,9 +273,12 @@ class GPTModel(nn.Module):
             span_starts = (x == span_start_id).nonzero()
             span_ends = (x == span_end_id).nonzero()
 
-            # Robustness check: Ensure equal numbers of start and end tokens
-            if span_starts.shape[0] != span_ends.shape[0]:
-                print(f"Warning: Mismatched span tokens found. Skipping cocktail party processing for this batch.")
+            # Robustness check: Ensure equal numbers of start and end tokens per sequence
+            start_counts = (x == span_start_id).sum(dim=1)
+            end_counts = (x == span_end_id).sum(dim=1)
+
+            if not torch.equal(start_counts, end_counts):
+                print(f"Warning: Mismatched span tokens found in at least one sequence. Skipping cocktail party processing for this batch.")
                 # Return empty scores and zero loss to skip the batch
                 return torch.empty(0), torch.tensor(0.0, device=x.device)
 
@@ -284,15 +287,22 @@ class GPTModel(nn.Module):
 
             # Create a tensor to map each span to its batch index
             batch_indices = span_starts[:, 0]
+            batch_indices_ends = span_ends[:, 0]
 
             # Calculate max number of spans for padding
-            max_spans = (x == span_start_id).sum(dim=1).max()
+            max_spans = start_counts.max()
 
             h_spans = x_embed.new_zeros(B, max_spans, D)
 
             for i in range(B):
                 st_indices = span_starts[batch_indices == i, 1]
-                ed_indices = span_ends[batch_indices == i, 1]
+                ed_indices = span_ends[batch_indices_ends == i, 1]
+
+                # Additional check within the loop for safety
+                if len(st_indices) != len(ed_indices):
+                    # This should not happen if the counts are equal, but as a safeguard:
+                    print(f"Warning: Mismatch for batch item {i} despite passing checks. Skipping item.")
+                    continue
 
                 for j, (st, ed) in enumerate(zip(st_indices, ed_indices)):
                     if st + 1 < ed:

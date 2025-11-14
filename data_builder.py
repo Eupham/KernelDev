@@ -523,8 +523,9 @@ class DataBuilder:
 
             # 3. Sample span only from context (not from task instructions)
             span_size = random.randint(min_span_size, max_span_size)
-            if len(context_tokens) <= span_size:
-                continue  # Skip if context too short
+            # Robustness: Ensure context is substantially larger than the span to be extracted
+            if len(context_tokens) <= span_size + min_span_size:
+                continue  # Skip if context is too short to be meaningful
                 
             span_start_in_context = random.randint(0, len(context_tokens) - span_size)
             true_span = context_tokens[span_start_in_context : span_start_in_context + span_size]
