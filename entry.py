@@ -391,6 +391,11 @@ def start_actual_training(cli_args):
         data_builder=data_builder
     )
     
+    # Log initial model dimensions
+    model_to_inspect = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
+    print(f"Initial model token_emb.weight shape: {model_to_inspect.token_emb.weight.shape}")
+    print(f"Initial model head.weight shape: {model_to_inspect.head.weight.shape}")
+
     # Initial evaluation (only if no checkpoint found)
     if not latest_checkpoint:
         print(f"\n=== Initial Evaluation ===")

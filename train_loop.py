@@ -724,6 +724,10 @@ class Trainer:
 
         model_to_load.load_state_dict(state_dict, strict=False)
 
+        # Log model dimensions after loading checkpoint to confirm migration
+        print(f"Post-checkpoint load token_emb.weight shape: {model_to_load.token_emb.weight.shape}")
+        print(f"Post-checkpoint load head.weight shape: {model_to_load.head.weight.shape}")
+
         if 'optimizer_state_dict' in training_state and self.optimizer:
             self.optimizer.load_state_dict(training_state['optimizer_state_dict'])
             print("Optimizer state loaded.")
