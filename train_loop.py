@@ -22,6 +22,7 @@ from torch.distributions import Bernoulli
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from custom_sampler import ResumableDistributedSampler
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Tuple, Any
@@ -779,14 +780,7 @@ class Trainer:
         start_time = time.time()
         epoch_losses = []
 
-        from itertools import islice
-
         train_iters = {task: iter(loader) for task, loader in train_loaders.items()}
-
-        # Efficiently skip to the starting batch
-        if batch_to_resume > 0:
-            for task_name, task_iter in train_iters.items():
-                train_iters[task_name] = islice(task_iter, batch_to_resume, None)
 
         if not hasattr(self, 'dataset_state'):
             self.dataset_state = {}
@@ -1001,20 +995,34 @@ class Trainer:
 
         train_samplers = {}
         if self.is_distributed and dist.get_world_size() > 1:
-            # Re-wrap dataloaders with DistributedSampler if in DDP mode
+            # Re-wrap dataloaders with ResumableDistributedSampler for efficient resumption
             for task, loader in train_loaders.items():
-                train_samplers[task] = DistributedSampler(loader.dataset, shuffle=True, num_replicas=dist.get_world_size(), rank=dist.get_rank())
+                train_samplers[task] = ResumableDistributedSampler(
+                    loader.dataset,
+                    shuffle=True,
+                    num_replicas=dist.get_world_size(),
+                    rank=dist.get_rank(),
+                    start_batch=batch_to_resume,
+                    batch_size=loader.batch_size
+                )
                 train_loaders[task] = DataLoader(
-                    loader.dataset, batch_size=loader.batch_size, sampler=train_samplers[task],
-                    num_workers=getattr(loader, 'num_workers', 0), pin_memory=getattr(loader, 'pin_memory', False),
+                    loader.dataset,
+                    batch_size=loader.batch_size,
+                    sampler=train_samplers[task],
+                    num_workers=getattr(loader, 'num_workers', 0),
+                    pin_memory=getattr(loader, 'pin_memory', False),
                     collate_fn=loader.collate_fn
                 )
             if val_loaders:
                 for task, loader in val_loaders.items():
+                    # Validation samplers don't need to be resumable
                     sampler = DistributedSampler(loader.dataset, shuffle=False, num_replicas=dist.get_world_size(), rank=dist.get_rank())
                     val_loaders[task] = DataLoader(
-                        loader.dataset, batch_size=loader.batch_size, sampler=sampler,
-                        num_workers=getattr(loader, 'num_workers', 0), pin_memory=getattr(loader, 'pin_memory', False),
+                        loader.dataset,
+                        batch_size=loader.batch_size,
+                        sampler=sampler,
+                        num_workers=getattr(loader, 'num_workers', 0),
+                        pin_memory=getattr(loader, 'pin_memory', False),
                         collate_fn=loader.collate_fn
                     )
 
