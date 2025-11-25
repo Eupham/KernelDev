@@ -671,6 +671,7 @@ class Trainer:
     
     def load_checkpoint(self, checkpoint_dir: str, train_loaders: Dict[str, DataLoader]):
         """Load model checkpoint from a directory."""
+        migration_occurred = False
         checkpoint_dir = Path(checkpoint_dir)
         model_path = checkpoint_dir / 'model.safetensors'
         training_state_path = checkpoint_dir / 'training_state.pt'
@@ -704,6 +705,7 @@ class Trainer:
         if 'token_emb.weight' in state_dict:
             ckpt_vocab_size = state_dict['token_emb.weight'].size(0)
             if current_vocab_size != ckpt_vocab_size:
+                migration_occurred = True
                 print(f"Resizing token_emb from {ckpt_vocab_size} to {current_vocab_size}")
                 new_emb = model_to_load.token_emb.weight.data.clone()
                 # Copy the overlapping weights
@@ -715,6 +717,7 @@ class Trainer:
         if 'head.weight' in state_dict:
             ckpt_vocab_size = state_dict['head.weight'].size(0)
             if current_vocab_size != ckpt_vocab_size:
+                migration_occurred = True
                 print(f"Resizing head.weight from {ckpt_vocab_size} to {current_vocab_size}")
                 new_head = model_to_load.head.weight.data.clone()
                 # Copy the overlapping weights
@@ -729,12 +732,19 @@ class Trainer:
         print(f"Post-checkpoint load head.weight shape: {model_to_load.head.weight.shape}")
 
         if 'optimizer_state_dict' in training_state and self.optimizer:
-            self.optimizer.load_state_dict(training_state['optimizer_state_dict'])
-            print("Optimizer state loaded.")
+            if not migration_occurred:
+                self.optimizer.load_state_dict(training_state['optimizer_state_dict'])
+                print("Optimizer state loaded.")
+            else:
+                print("Migration occurred, skipping optimizer state load.")
 
         if 'scheduler_state_dict' in training_state and self.scheduler:
-            self.scheduler.load_state_dict(training_state['scheduler_state_dict'])
-            print("Scheduler state loaded.")
+            if not migration_occurred:
+                self.scheduler.load_state_dict(training_state['scheduler_state_dict'])
+                print("Scheduler state loaded.")
+            else:
+                print("Migration occurred, skipping scheduler state load.")
+
 
         if 'scaler_state_dict' in training_state and self.config.use_amp and self.config.scaler:
             self.config.scaler.load_state_dict(training_state['scaler_state_dict'])
@@ -754,7 +764,7 @@ class Trainer:
             print(f"Dataset state loaded: epoch {self.dataset_state.get('current_epoch', 'N/A')}, batch {self.dataset_state.get('current_batch', 'N/A')}")
         
         print(f"Checkpoint loaded from {checkpoint_dir} at step {metadata['step']}")
-        return metadata['step']
+        return metadata['step'], migration_occurred
     
     def train_epoch(
         self,
@@ -969,7 +979,14 @@ class Trainer:
             latest_checkpoint = self.find_latest_checkpoint()
             if latest_checkpoint:
                 try:
-                    loaded_step = self.load_checkpoint(latest_checkpoint, train_loaders)
+                    loaded_step, migration_occurred = self.load_checkpoint(latest_checkpoint, train_loaders)
+                    if migration_occurred:
+                        print("Re-initializing optimizer and scheduler due to model migration.")
+                        self._initialize_optimizer()
+                        # Re-initialize scheduler with the new optimizer
+                        total_steps = self.steps_per_epoch * self.config.num_epochs
+                        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=total_steps, eta_min=0)
+
                     if hasattr(self, 'dataset_state'):
                         start_epoch = self.dataset_state.get('current_epoch', 0)
                         batch_to_resume = self.dataset_state.get('current_batch', 0) + 1
