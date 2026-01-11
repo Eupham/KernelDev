@@ -16,7 +16,7 @@ image = (
         "apt-get update -y",
         "apt-get install -y software-properties-common build-essential",
         "pip install uv",
-        "uv pip install --system --index-url https://pypi.org/simple torch ninja datasets matplotlib triton pyyaml safetensors 'pyarrow==14.0.1' 'numpy<2'",
+        "uv pip install --system 'torch>=2.0' ninja datasets matplotlib triton pyyaml safetensors 'pyarrow==14.0.1' 'numpy<2'",
     )
     .add_local_dir(".", remote_path="/root/KernelDev")
 )
@@ -61,9 +61,6 @@ def run_training(config: dict):
                 metadata = json.load(f)
             # Override the model config with the one from the checkpoint
             config['model'] = metadata['config']['model']
-            # The vocab_size is not in the model dict, so manually set it.
-            # In a more robust system, this would also be in the checkpoint.
-            config['model']['vocab_size'] = 50257
             print("Overrode current model config with checkpoint config.")
         except (FileNotFoundError, KeyError) as e:
             print(f"Could not load metadata from checkpoint, running with base config. Error: {e}")
