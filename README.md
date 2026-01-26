@@ -202,6 +202,80 @@ Optimized for modern NVIDIA GPUs:
 - **H100**: Cutting-edge optimizations for maximum throughput
 - **Hopper**: Advanced incoherent processing features
 
+## Performance Benchmarking and Experiment Tracking
+
+### Benchmarking Suite
+
+The project includes comprehensive performance benchmarking tools:
+
+**Training Throughput Benchmark:**
+```bash
+python benchmarks/training_throughput.py --config config.yaml --steps 100
+```
+Measures tokens/second, samples/second, step times, and memory usage.
+
+**Memory Profiling:**
+```bash
+python benchmarks/memory_profile.py --config config.yaml
+```
+Analyzes memory usage by component (model, optimizer, activations, gradients).
+
+See `BENCHMARKING.md` for complete documentation.
+
+### Experiment Tracking
+
+Built-in experiment tracking with Weights & Biases integration:
+
+```python
+from experiment_tracking import create_experiment_tracker
+
+tracker = create_experiment_tracker(config, enable=True)
+tracker.log_metrics({'train_loss': 0.5}, step=100)
+tracker.finish()
+```
+
+Features:
+- Automatic hyperparameter logging
+- Real-time metrics tracking
+- Model versioning and artifacts
+- Local JSON fallback (works offline)
+- W&B dashboard integration
+
+Configure in `config.yaml`:
+```yaml
+experiment_tracking:
+  enable: true
+  enable_wandb: false  # Set true after: wandb login
+  project_name: kerneldev
+```
+
+See `EXPERIMENT_TRACKING.md` for complete documentation.
+
+## Development Status
+
+### Current Phase: Infrastructure & Tooling (Phase 2) - 70% Complete
+
+**Completed:**
+- ✅ Core GPT model with hierarchical flash attention
+- ✅ Training infrastructure with multi-task support
+- ✅ Checkpointing system with automatic resume
+- ✅ JSON metrics logging
+- ✅ Performance benchmarking suite
+- ✅ Experiment tracking integration
+- ✅ Modal cloud deployment
+
+**In Progress:**
+- 🔄 Enhanced test coverage
+- 🔄 Training visualization dashboard
+- 🔄 CI/CD pipeline
+
+**Planned (Phase 3):**
+- ⏳ Performance optimization (2x throughput target)
+- ⏳ Multi-node distributed training
+- ⏳ Large model support (10B+ parameters)
+
+See `PROJECT_PHASES.md` for complete roadmap and `PHASE2_SUMMARY.md` for latest updates.
+
 ## Status and Future Directions
 
 ### Current Flash Attention Status
@@ -232,6 +306,31 @@ The implementation successfully maintains the core flash attention benefits whil
 - datasets (for data loading)
 - numpy, matplotlib (for utilities and visualization)
 - PyYAML (for configuration management)
+- wandb (optional, for experiment tracking)
+
+### Installation
+
+```bash
+# Core dependencies
+pip install torch triton datasets numpy matplotlib pyyaml
+
+# Optional: For experiment tracking
+pip install wandb
+wandb login
+```
+
+## Documentation
+
+- `README.md` - This file, project overview
+- `PROJECT_PHASES.md` - Complete development roadmap
+- `PHASE2_SUMMARY.md` - Latest Phase 2 implementations
+- `BENCHMARKING.md` - Performance benchmarking guide
+- `EXPERIMENT_TRACKING.md` - Experiment tracking guide
+- `CHECKPOINTING.md` - Checkpoint system documentation
+- `JSON_LOGGING.md` - JSON metrics logging guide
+- `AGENTS.md` - Modal cloud deployment guide
+- `README_tests.md` - Testing documentation
+- `FIX_SUMMARY.md` - Test suite overview
 
 ## License
 
