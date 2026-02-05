@@ -103,6 +103,11 @@ class DataBuilder:
         self.vocab_size = vocab_size + NUM_SPECIAL_TOKENS
         self.max_eval_tokens = max_eval_tokens
         self.task_configs = task_configs or {}
+        
+        # ACT-R related attributes
+        self.actr_association_table = {}  # Dict[token, Set[token]] for corpus-level associations
+        self.actr_window_size = 5  # Window size for building associations
+        self.actr_corpus_processed = False
 
         print(f"Using UTF-8 byte tokenization with vocabulary size: {self.vocab_size}")
         print(f"Max evaluation tokens per split: {self.max_eval_tokens}")
@@ -664,10 +669,16 @@ class DataBuilder:
         span_id_batch = torch.stack([mask_dict['span_id'] for mask_dict in batch_attn_masks])
         is_prefix_batch = torch.stack([mask_dict['is_prefix'] for mask_dict in batch_attn_masks])
         
+        # Add ACT-R metrics if corpus has been processed
+        actr_metrics = None
+        if self.actr_corpus_processed:
+            actr_metrics = self._calculate_actr_metrics_for_batch(batch_attn_masks, valid_items)
+        
         metadata = {
             'in_span': in_span_batch,
             'span_id': span_id_batch, 
-            'is_prefix': is_prefix_batch
+            'is_prefix': is_prefix_batch,
+            'actr_metrics': actr_metrics
         }
 
         return inputs, correct_indices, metadata
@@ -720,6 +731,167 @@ class DataBuilder:
 
     def get_vocab_size(self) -> int:
         return self.vocab_size
+    
+    # =============================================================================
+    # ACT-R Fan Effect Functionality 
+    # =============================================================================
+    
+    def build_actr_association_table(self, datasets):
+        """
+        Build corpus-level association table for ACT-R fan calculation.
+        For each token, count distinct tokens that co-occur within a window.
+        """
+        print("Building ACT-R association table...")
+        
+        # Initialize association table
+        self.actr_association_table = {}
+        
+        # Process all datasets to build associations
+        total_processed = 0
+        for split_name, dataset in datasets.items():
+            if hasattr(dataset, 'data'):
+                # Handle pre-tokenized datasets
+                tokens_list = dataset.data
+            else:
+                # Handle on-the-fly tokenized datasets  
+                print(f"Processing {split_name} split for ACT-R associations...")
+                tokens_list = []
+                for i in range(min(len(dataset), 1000)):  # Limit for efficiency
+                    try:
+                        item = dataset[i]
+                        if isinstance(item, tuple):
+                            tokens = item[0]  # Get tokens from (tokens, _) tuple
+                        else:
+                            tokens = item
+                        if hasattr(tokens, 'tolist'):
+                            tokens = tokens.tolist()
+                        tokens_list.extend(tokens)
+                        total_processed += len(tokens)
+                    except Exception as e:
+                        continue
+                        
+            # Build associations from token sequence
+            self._build_associations_from_tokens(tokens_list)
+            
+        print(f"ACT-R association table built from {total_processed} tokens")
+        print(f"Association table covers {len(self.actr_association_table)} unique tokens")
+        self.actr_corpus_processed = True
+    
+    def _build_associations_from_tokens(self, tokens):
+        """Build associations from a sequence of tokens using sliding window."""
+        for i, anchor_token in enumerate(tokens):
+            # Skip special tokens for association building
+            if anchor_token < NUM_SPECIAL_TOKENS:
+                continue
+                
+            if anchor_token not in self.actr_association_table:
+                self.actr_association_table[anchor_token] = set()
+            
+            # Look within window around anchor token
+            start_idx = max(0, i - self.actr_window_size)
+            end_idx = min(len(tokens), i + self.actr_window_size + 1)
+            
+            for j in range(start_idx, end_idx):
+                if i != j and tokens[j] >= NUM_SPECIAL_TOKENS:  # Skip self and special tokens
+                    self.actr_association_table[anchor_token].add(tokens[j])
+    
+    def calculate_fan(self, anchor_token):
+        """
+        Calculate ACT-R fan for a given anchor token.
+        Fan = number of distinct associates that co-occur with the anchor.
+        """
+        if not self.actr_corpus_processed:
+            return 0  # No associations available
+            
+        if anchor_token not in self.actr_association_table:
+            return 0  # No associations for this token
+            
+        return len(self.actr_association_table[anchor_token])
+    
+    def get_anchor_token_from_span(self, span_tokens):
+        """
+        Extract anchor token from a span for fan calculation.
+        Uses the first non-special token as anchor (can be extended with more sophisticated logic).
+        """
+        for token in span_tokens:
+            if token >= NUM_SPECIAL_TOKENS:  # Skip special tokens
+                return token
+        return None
+    
+    def calculate_similarity(self, span1_tokens, span2_tokens):
+        """
+        Calculate simple token overlap similarity between two spans.
+        Returns Jaccard similarity: |intersection| / |union|
+        """
+        set1 = set(span1_tokens)
+        set2 = set(span2_tokens)
+        
+        if len(set1) == 0 and len(set2) == 0:
+            return 1.0
+        
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def categorize_fan_tertile(self, fan_value, fan_distribution):
+        """
+        Categorize fan value into low/medium/high tertiles.
+        """
+        if not fan_distribution:
+            return "unknown"
+            
+        sorted_fans = sorted(fan_distribution)
+        n = len(sorted_fans)
+        
+        low_threshold = sorted_fans[n // 3] if n > 2 else 0
+        high_threshold = sorted_fans[2 * n // 3] if n > 2 else 1
+        
+        if fan_value <= low_threshold:
+            return "low"
+        elif fan_value <= high_threshold:
+            return "medium"
+        else:
+            return "high"
+    
+    def _calculate_actr_metrics_for_batch(self, batch_items, valid_items):
+        """
+        Calculate ACT-R metrics for a batch of cocktail party items.
+        Returns dict with per-item metrics including fan, similarities, etc.
+        """
+        actr_batch_metrics = []
+        
+        for idx, (item_data, valid_item) in enumerate(zip(batch_items, valid_items)):
+            # Get the true span and distractors
+            true_span = valid_item['true_span']
+            distractors = valid_item['distractors']
+            
+            # Calculate anchor token and fan
+            anchor_token = self.get_anchor_token_from_span(true_span)
+            fan_value = self.calculate_fan(anchor_token) if anchor_token is not None else 0
+            
+            # Calculate similarities
+            true_span_set = set(true_span)
+            similarities_to_distractors = []
+            for distractor in distractors:
+                sim = self.calculate_similarity(true_span, distractor)
+                similarities_to_distractors.append(sim)
+            
+            max_distractor_sim = max(similarities_to_distractors) if similarities_to_distractors else 0.0
+            
+            # Store metrics for this item
+            item_metrics = {
+                'anchor_token': anchor_token,
+                'fan': fan_value,
+                'sim_gold': 1.0,  # Gold similarity is always 1.0 (self-similarity)
+                'max_sim_distractor': max_distractor_sim,
+                'distractor_similarities': similarities_to_distractors,
+                'true_span_length': len(true_span),
+                'num_distractors': len(distractors)
+            }
+            actr_batch_metrics.append(item_metrics)
+        
+        return actr_batch_metrics
     
     def decode_tokens(self, tokens, skip_special_tokens=False):
         if isinstance(tokens, torch.Tensor):

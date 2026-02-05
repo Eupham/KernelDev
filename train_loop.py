@@ -196,6 +196,9 @@ class TrainingMetrics:
         self.best_step = 0
         self.moving_avg_window = moving_avg_window
         self.recent_train_losses = []
+        
+        # ACT-R specific metrics
+        self.actr_metrics = []  # Store trial-level ACT-R data
     
     def update(
         self,
@@ -228,6 +231,11 @@ class TrainingMetrics:
             self.step_times.append(step_time)
         
         self.total_steps += 1
+    
+    def update_actr_metrics(self, actr_trial_data: Dict):
+        """Update ACT-R specific metrics with trial data."""
+        if actr_trial_data:
+            self.actr_metrics.append(actr_trial_data)
 
     def get_loss_moving_average(self) -> float:
         if not self.recent_train_losses:
@@ -246,6 +254,74 @@ class TrainingMetrics:
         recent_times = self.step_times[-last_n:]
         return np.mean(recent_times)
     
+    def analyze_actr_fan_effect(self):
+        """
+        Analyze ACT-R fan effect: higher fan should lead to lower accuracy/margin.
+        Returns analysis results with accuracy and margin vs fan.
+        """
+        if not self.actr_metrics:
+            return None
+        
+        import numpy as np
+        
+        # Collect data for analysis
+        fan_values = []
+        accuracies = []
+        margins = []
+        
+        for trial in self.actr_metrics:
+            if 'fan' in trial and 'accuracy' in trial and 'margin' in trial:
+                fan_values.append(trial['fan'])
+                accuracies.append(trial['accuracy'])
+                margins.append(trial['margin'])
+        
+        if len(fan_values) == 0:
+            return None
+        
+        # Group by fan tertiles
+        unique_fans = sorted(set(fan_values))
+        if len(unique_fans) < 3:
+            return None
+            
+        # Calculate tertile thresholds
+        n = len(unique_fans)
+        low_threshold = unique_fans[n // 3]
+        high_threshold = unique_fans[2 * n // 3]
+        
+        # Group trials by fan tertile
+        low_fan_acc, med_fan_acc, high_fan_acc = [], [], []
+        low_fan_margin, med_fan_margin, high_fan_margin = [], [], []
+        
+        for fan, acc, margin in zip(fan_values, accuracies, margins):
+            if fan <= low_threshold:
+                low_fan_acc.append(acc)
+                low_fan_margin.append(margin)
+            elif fan <= high_threshold:
+                med_fan_acc.append(acc)
+                med_fan_margin.append(margin)
+            else:
+                high_fan_acc.append(acc)
+                high_fan_margin.append(margin)
+        
+        # Calculate means for each tertile
+        results = {
+            'fan_tertiles': {
+                'low': {'accuracy': np.mean(low_fan_acc) if low_fan_acc else 0, 
+                       'margin': np.mean(low_fan_margin) if low_fan_margin else 0,
+                       'count': len(low_fan_acc)},
+                'medium': {'accuracy': np.mean(med_fan_acc) if med_fan_acc else 0,
+                          'margin': np.mean(med_fan_margin) if med_fan_margin else 0, 
+                          'count': len(med_fan_acc)},
+                'high': {'accuracy': np.mean(high_fan_acc) if high_fan_acc else 0,
+                        'margin': np.mean(high_fan_margin) if high_fan_margin else 0,
+                        'count': len(high_fan_acc)}
+            },
+            'total_trials': len(fan_values),
+            'fan_range': [min(fan_values), max(fan_values)]
+        }
+        
+        return results
+    
     def save_metrics(self, filepath: str):
         """Save metrics to a file."""
         metrics_dict = {
@@ -256,7 +332,8 @@ class TrainingMetrics:
             'step_times': self.step_times,
             'total_steps': self.total_steps,
             'best_val_loss': self.best_val_loss,
-            'best_step': self.best_step
+            'best_step': self.best_step,
+            'actr_metrics': self.actr_metrics
         }
         torch.save(metrics_dict, filepath)
     
@@ -439,6 +516,54 @@ class Trainer:
         predicted_idx = torch.argmax(scores, dim=1)
         accuracy = (predicted_idx == correct_idx).float().mean().item()
         return {'accuracy': accuracy}
+    
+    def _process_actr_metrics(self, actr_batch_metrics, scores, correct_idx):
+        """
+        Process ACT-R metrics for a batch and update the trainer's metrics.
+        """
+        import torch.nn.functional as F
+        
+        # Convert tensors to CPU for processing
+        scores_cpu = scores.cpu()
+        correct_idx_cpu = correct_idx.cpu()
+        
+        # Calculate margins and predictions for each item in batch
+        probs = F.softmax(scores_cpu, dim=1)
+        predicted_idx = torch.argmax(scores_cpu, dim=1)
+        
+        for batch_idx, item_metrics in enumerate(actr_batch_metrics):
+            if batch_idx >= len(scores_cpu):
+                continue
+                
+            # Calculate margin (difference between correct and max incorrect logits)
+            correct_logit = scores_cpu[batch_idx, correct_idx_cpu[batch_idx]].item()
+            
+            # Find max logit among incorrect options
+            mask = torch.ones(scores_cpu.shape[1], dtype=torch.bool)
+            mask[correct_idx_cpu[batch_idx]] = False
+            max_incorrect_logit = scores_cpu[batch_idx][mask].max().item()
+            
+            margin = correct_logit - max_incorrect_logit
+            
+            # Calculate accuracy for this trial
+            trial_accuracy = 1.0 if predicted_idx[batch_idx] == correct_idx_cpu[batch_idx] else 0.0
+            
+            # Create trial data for ACT-R analysis
+            trial_data = {
+                'fan': item_metrics.get('fan', 0),
+                'anchor_token': item_metrics.get('anchor_token'),
+                'sim_gold': item_metrics.get('sim_gold', 1.0),
+                'max_sim_distractor': item_metrics.get('max_sim_distractor', 0.0),
+                'logits': scores_cpu[batch_idx].tolist(),
+                'correct_choice': correct_idx_cpu[batch_idx].item(),
+                'predicted_choice': predicted_idx[batch_idx].item(),
+                'accuracy': trial_accuracy,
+                'margin': margin,
+                'correct_prob': probs[batch_idx, correct_idx_cpu[batch_idx]].item()
+            }
+            
+            # Update metrics
+            self.metrics.update_actr_metrics(trial_data)
 
     def evaluate(self, dataloaders: Dict[str, DataLoader], task_configs: Dict[str, Any], max_batches: Optional[int] = 50, task_to_evaluate: Optional[str] = None) -> Tuple[float, Dict[str, float]]:
         """Evaluate the model on a dataset."""
@@ -482,6 +607,10 @@ class Trainer:
                                 if k not in cocktail_party_metrics:
                                     cocktail_party_metrics[k] = []
                                 cocktail_party_metrics[k].append(v)
+                            
+                            # Process ACT-R metrics if available
+                            if isinstance(metadata, dict) and 'actr_metrics' in metadata and metadata['actr_metrics']:
+                                self._process_actr_metrics(metadata['actr_metrics'], scores, correct_idx)
                     else:
                         # Teacher forcing and other tasks
                         x, y = batch

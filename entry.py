@@ -334,6 +334,12 @@ def start_actual_training(cli_args):
         model_config['vocab_size'] = actual_vocab_size
         print(f"Confirmed vocab_size: {actual_vocab_size} (UTF-8 bytes)")
         
+        # Build ACT-R association table for fan calculation
+        if 'cocktail_party' in task_configs:
+            print("\n=== Building ACT-R Association Table ===")
+            datasets = data_builder.create_datasets()
+            data_builder.build_actr_association_table(datasets)
+        
     except Exception as e:
         print(f"Error creating dataloaders: {e}")
         print("This might be due to missing datasets library or network issues.")
@@ -432,6 +438,20 @@ def start_actual_training(cli_args):
         print(f"\n=== Best Results ===")
         print(f"Best validation loss: {trainer.metrics.best_val_loss:.4f} at step {trainer.metrics.best_step}")
         print(f"Total training steps: {trainer.metrics.total_steps}")
+        
+        # ACT-R analysis and reporting
+        if 'cocktail_party' in task_configs:
+            print(f"\n=== ACT-R Fan Effect Analysis ===")
+            actr_results = trainer.metrics.analyze_actr_fan_effect()
+            if actr_results:
+                print(f"Total ACT-R trials analyzed: {actr_results['total_trials']}")
+                print(f"Fan range: {actr_results['fan_range']}")
+                print("\nFan Effect Results (expectation: accuracy ↓ as fan ↑):")
+                for tertile, metrics in actr_results['fan_tertiles'].items():
+                    print(f"  {tertile.capitalize()} fan: accuracy={metrics['accuracy']:.3f}, "
+                          f"margin={metrics['margin']:.3f}, trials={metrics['count']}")
+            else:
+                print("No ACT-R trial data available for analysis")
         
     except Exception as e:
         print(f"Training failed: {e}")
