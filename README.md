@@ -332,6 +332,20 @@ wandb login
 - `README_tests.md` - Testing documentation
 - `FIX_SUMMARY.md` - Test suite overview
 
+## Cloud Development with Modal
+
+For cloud-based development and testing with GPU access, use the Modal sandbox:
+
+```bash
+# Full setup and testing
+python sandbox_run.py
+
+# Quick command execution
+python sandbox_simple.py --command "python test_attention_behaviors.py"
+```
+
+See [MODAL_SANDBOX.md](MODAL_SANDBOX.md) for detailed instructions.
+
 ## License
 
 This project is designed for research and educational purposes in transformer architecture and flash attention optimization.
